@@ -11,6 +11,9 @@
 #include "rfdetr/validate_internal.h"
 #include "worker_pool.h"
 
+#include "rfdetr/common/dataset_utils.h"
+#include "rfdetr/common/tensor_utils.h"
+
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
@@ -56,19 +59,6 @@ const std::filesystem::path& model_input_path(const ResolvedModelArtifacts& arti
         return artifacts.input_path;
     }
     return artifacts.weights_path;
-}
-
-std::pair<torch::Tensor, torch::Tensor> make_normalization_tensors(int device_id) {
-    return {
-        torch::tensor(
-            {0.485f, 0.456f, 0.406f},
-            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, device_id))
-            .view({1, 3, 1, 1}),
-        torch::tensor(
-            {0.229f, 0.224f, 0.225f},
-            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, device_id))
-            .view({1, 3, 1, 1}),
-    };
 }
 
 std::string choose_backend_name(const std::string& requested_backend,
@@ -153,24 +143,8 @@ std::vector<std::unique_ptr<InferenceBackend>> make_backend_lanes(
     throw std::runtime_error("unsupported RF-DETR backend: " + backend_name);
 }
 
-std::vector<std::string> loader_class_names(const DatasetLoader& loader) {
-    std::vector<std::string> names;
-    names.reserve(loader.num_classes());
-    for (uint32_t index = 0; index < loader.num_classes(); ++index) {
-        names.emplace_back(loader.class_name(index));
-    }
-    return names;
-}
-
 std::vector<int> load_image_ids(const std::filesystem::path& compiled_path) {
     return CocoDataset::load_from_binary(compiled_path).image_ids();
-}
-
-int64_t image_id_for_dataset_index(const std::vector<int>& image_ids, int64_t dataset_index) {
-    if (dataset_index >= 0 && static_cast<size_t>(dataset_index) < image_ids.size()) {
-        return image_ids[static_cast<size_t>(dataset_index)];
-    }
-    return dataset_index + 1;
 }
 
 std::shared_ptr<NativeRfDetrModel> load_native_model(const ResolvedModelArtifacts& artifacts, int device_id) {
@@ -282,14 +256,12 @@ PredictionRunResult run_prediction_native(const PredictOptions& options,
         options.workers,
         1,
         options.cpu_affinity));
-    DatasetLoader loader(make_loader_config(options.compiled_path.string(),
-                                            std::max<size_t>(1, options.batch_size),
-                                            false,
-                                            static_cast<int>(kDefaultPrefetchFactor),
-                                            0,
-                                            runtime.loader_affinity_string(),
-                                            options.device_id,
-                                            42));
+    DatasetLoader loader(make_inference_loader_config(
+        options.compiled_path.string(),
+        std::max<size_t>(1, options.batch_size),
+        runtime.loader_affinity_string(),
+        options.device_id,
+        static_cast<int>(kDefaultPrefetchFactor)));
 
     PredictionRunResult result;
     result.artifacts = artifacts;
@@ -414,10 +386,7 @@ PredictionRunResult run_prediction_native(const PredictOptions& options,
         bar->close();
     }
 
-    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count();
-    result.timing.seconds = elapsed;
-    result.timing.images = result.records.size();
-    result.timing.img_per_s = elapsed > 0.0 ? static_cast<double>(result.records.size()) / elapsed : 0.0;
+    result.timing = elapsed_timing(started_at, result.records.size());
     return result;
 }
 
@@ -428,14 +397,12 @@ PredictionRunResult run_prediction_native_parallel(const PredictOptions& options
         options.workers,
         options.lanes,
         options.cpu_affinity));
-    DatasetLoader loader(make_loader_config(options.compiled_path.string(),
-                                            1,
-                                            false,
-                                            static_cast<int>(kDefaultPrefetchFactor),
-                                            0,
-                                            runtime.loader_affinity_string(),
-                                            options.device_id,
-                                            42));
+    DatasetLoader loader(make_inference_loader_config(
+        options.compiled_path.string(),
+        1,
+        runtime.loader_affinity_string(),
+        options.device_id,
+        static_cast<int>(kDefaultPrefetchFactor)));
 
     PredictionRunResult result;
     result.artifacts = artifacts;
@@ -610,10 +577,7 @@ PredictionRunResult run_prediction_native_parallel(const PredictOptions& options
     if (bar.has_value()) {
         bar->close();
     }
-    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count();
-    result.timing.seconds = elapsed;
-    result.timing.images = result.records.size();
-    result.timing.img_per_s = elapsed > 0.0 ? static_cast<double>(result.records.size()) / elapsed : 0.0;
+    result.timing = elapsed_timing(started_at, result.records.size());
 
     std::sort(result.records.begin(),
               result.records.end(),
@@ -643,14 +607,12 @@ PredictionRunResult run_prediction_sequential(const PredictOptions& options,
         options.workers,
         effective_lane_count(options.batch_size, options.lanes),
         options.cpu_affinity));
-    DatasetLoader loader(make_loader_config(options.compiled_path.string(),
-                                            1,
-                                            false,
-                                            static_cast<int>(kDefaultPrefetchFactor),
-                                            0,
-                                            runtime.loader_affinity_string(),
-                                            options.device_id,
-                                            42));
+    DatasetLoader loader(make_inference_loader_config(
+        options.compiled_path.string(),
+        1,
+        runtime.loader_affinity_string(),
+        options.device_id,
+        static_cast<int>(kDefaultPrefetchFactor)));
 
     PredictionRunResult result;
     result.artifacts = artifacts;
@@ -713,10 +675,7 @@ PredictionRunResult run_prediction_sequential(const PredictOptions& options,
     if (bar.has_value()) {
         bar->close();
     }
-    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count();
-    result.timing.seconds = elapsed;
-    result.timing.images = result.records.size();
-    result.timing.img_per_s = elapsed > 0.0 ? static_cast<double>(result.records.size()) / elapsed : 0.0;
+    result.timing = elapsed_timing(started_at, result.records.size());
     return result;
 }
 
@@ -727,14 +686,12 @@ PredictionRunResult run_prediction_parallel(const PredictOptions& options,
         options.workers,
         effective_lane_count(options.batch_size, options.lanes),
         options.cpu_affinity));
-    DatasetLoader loader(make_loader_config(options.compiled_path.string(),
-                                            1,
-                                            false,
-                                            static_cast<int>(kDefaultPrefetchFactor),
-                                            0,
-                                            runtime.loader_affinity_string(),
-                                            options.device_id,
-                                            42));
+    DatasetLoader loader(make_inference_loader_config(
+        options.compiled_path.string(),
+        1,
+        runtime.loader_affinity_string(),
+        options.device_id,
+        static_cast<int>(kDefaultPrefetchFactor)));
 
     PredictionRunResult result;
     result.artifacts = artifacts;
@@ -886,10 +843,7 @@ PredictionRunResult run_prediction_parallel(const PredictOptions& options,
     if (bar.has_value()) {
         bar->close();
     }
-    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count();
-    result.timing.seconds = elapsed;
-    result.timing.images = result.records.size();
-    result.timing.img_per_s = elapsed > 0.0 ? static_cast<double>(result.records.size()) / elapsed : 0.0;
+    result.timing = elapsed_timing(started_at, result.records.size());
 
     std::sort(result.records.begin(),
               result.records.end(),

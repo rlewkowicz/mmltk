@@ -8,6 +8,8 @@
 #include "rfdetr/progress_bar.h"
 #include "rfdetr/runtime.h"
 
+#include "rfdetr/common/tensor_utils.h"
+
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
@@ -167,19 +169,6 @@ void print_model_metadata_impl(const ModelInfo& info,
     for (const TensorInfo& output : info.outputs) {
         ProgressBar::log("  output: " + output.name + " " + shape_to_string(output.shape) + " " + output.dtype);
     }
-}
-
-std::pair<torch::Tensor, torch::Tensor> make_normalization_tensors(int device_id) {
-    return {
-        torch::tensor(
-            {0.485f, 0.456f, 0.406f},
-            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, device_id))
-            .view({1, 3, 1, 1}),
-        torch::tensor(
-            {0.229f, 0.224f, 0.225f},
-            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, device_id))
-            .view({1, 3, 1, 1}),
-    };
 }
 
 AlignmentStats merge_alignment(const AlignmentStats& lhs, const AlignmentStats& rhs) {
