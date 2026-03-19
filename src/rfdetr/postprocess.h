@@ -1,3 +1,3 @@
 #pragma once
 
-#include "rfdetr/inference/postprocess.h"
+#include "fastloader/rfdetr/postprocess.h"

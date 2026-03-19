@@ -1,3 +1,7 @@
 #pragma once
 
-#include "rfdetr/cli/cli.h"
+namespace fastloader::rfdetr {
+
+int handle_cli(int argc, char** argv);
+
+} // namespace fastloader::rfdetr
