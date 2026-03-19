@@ -173,7 +173,7 @@ option(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER
     ${BUILD_RFDETR_NATIVE})
 
 add_library(fastloader_rfdetr_lsap STATIC
-    src/rfdetr/scipy_rectangular_lsap.cpp
+    src/rfdetr/utils/scipy_rectangular_lsap.cpp
 )
 target_include_directories(fastloader_rfdetr_lsap
     PUBLIC
@@ -375,9 +375,9 @@ if(BUILD_RFDETR_NATIVE)
     endif()
 
     add_library(fastloader_rfdetr_cuda_ops STATIC
-        src/rfdetr/ms_deform_attn_op.cpp
-        src/rfdetr/ms_deform_attn_cuda_wrapper.cpp
-        src/rfdetr/training_mask_ops_cuda_wrapper.cpp
+        src/rfdetr/layers/ms_deform_attn_op.cpp
+        src/rfdetr/layers/ms_deform_attn_cuda_wrapper.cpp
+        src/rfdetr/layers/training_mask_ops_cuda_wrapper.cpp
         src/rfdetr/cuda/ms_deform_attn_cuda.cu
         src/rfdetr/cuda/training_mask_ops_cuda.cu
         src/rfdetr/cuda/detr_ops_cuda.cu
@@ -417,26 +417,26 @@ if(BUILD_RFDETR_NATIVE)
     )
 
     add_library(fastloader_rfdetr_native STATIC
-        src/rfdetr/backend_onnx.cpp
-        src/rfdetr/backend_tensorrt.cpp
+        src/rfdetr/inference/backend_onnx.cpp
+        src/rfdetr/inference/backend_tensorrt.cpp
         src/rfdetr/checkpoint.cpp
-        src/rfdetr/cli.cpp
+        src/rfdetr/cli/cli.cpp
         src/rfdetr/detection_ops.cpp
-        src/rfdetr/evaluator.cpp
-        src/rfdetr/model.cpp
-        src/rfdetr/model_components.cpp
-        src/rfdetr/model_config.cpp
-        src/rfdetr/modules.cpp
+        src/rfdetr/inference/evaluator.cpp
+        src/rfdetr/layers/model.cpp
+        src/rfdetr/layers/model_components.cpp
+        src/rfdetr/layers/model_config.cpp
+        src/rfdetr/layers/modules.cpp
         src/rfdetr/draw.cpp
-        src/rfdetr/native_optimizer.cpp
-        src/rfdetr/postprocess.cpp
-        src/rfdetr/predict.cpp
-        src/rfdetr/python_checkpoint_bridge.cpp
-        src/rfdetr/runtime.cpp
+        src/rfdetr/training/native_optimizer.cpp
+        src/rfdetr/inference/postprocess.cpp
+        src/rfdetr/inference/predict.cpp
+        src/rfdetr/checkpoint/python_checkpoint_bridge.cpp
+        src/rfdetr/core/runtime.cpp
         src/rfdetr/target_builder.cpp
-        src/rfdetr/train.cpp
-        src/rfdetr/validate.cpp
-        src/rfdetr/validate_workers.cpp
+        src/rfdetr/training/train.cpp
+        src/rfdetr/inference/validate.cpp
+        src/rfdetr/inference/validate_workers.cpp
         src/rfdetr/weight_catalog.cpp
     )
     target_include_directories(fastloader_rfdetr_native

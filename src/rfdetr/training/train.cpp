@@ -15,6 +15,9 @@
 #include "rfdetr/validate_internal.h"
 #include "fastloader/rfdetr/draw_cuda.h"
 
+#include "rfdetr/common/dataset_utils.h"
+#include "rfdetr/common/tensor_utils.h"
+
 #include <c10/cuda/CUDAGuard.h>
 #if defined(USE_C10D_NCCL)
 #include <torch/csrc/distributed/c10d/FileStore.hpp>
@@ -82,28 +85,6 @@ struct DistributedContext {
 
 void distributed_all_reduce_tensor(const DistributedContext& distributed, torch::Tensor& tensor);
 
-std::pair<torch::Tensor, torch::Tensor> make_normalization_tensors(int device_id) {
-    return {
-        torch::tensor(
-            {0.485f, 0.456f, 0.406f},
-            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, device_id))
-            .view({1, 3, 1, 1}),
-        torch::tensor(
-            {0.229f, 0.224f, 0.225f},
-            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, device_id))
-            .view({1, 3, 1, 1}),
-    };
-}
-
-std::vector<std::string> loader_class_names(const DatasetLoader& loader) {
-    std::vector<std::string> names;
-    names.reserve(loader.num_classes());
-    for (uint32_t index = 0; index < loader.num_classes(); ++index) {
-        names.emplace_back(loader.class_name(index));
-    }
-    return names;
-}
-
 int rfdetr_output_class_count(uint32_t dataset_class_count) {
     // Mirror rf-detr/src/rfdetr/models/lwdetr.py: build_model() and
     // build_criterion_and_postprocessors() both use args.num_classes + 1.
@@ -116,13 +97,6 @@ int checked_inference_batch_size(size_t batch_size) {
         throw std::runtime_error("batch_size exceeds supported inference compilation range");
     }
     return static_cast<int>(effective_batch_size);
-}
-
-int64_t image_id_for_dataset_index(const std::vector<int>& image_ids, int64_t dataset_index) {
-    if (dataset_index >= 0 && static_cast<size_t>(dataset_index) < image_ids.size()) {
-        return image_ids[static_cast<size_t>(dataset_index)];
-    }
-    return dataset_index + 1;
 }
 
 std::string phase_progress_label(const char* phase, int epoch, int total_epochs) {
