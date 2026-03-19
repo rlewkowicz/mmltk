@@ -423,10 +423,10 @@ if(BUILD_RFDETR_NATIVE)
         src/rfdetr/cli/cli.cpp
         src/rfdetr/detection_ops.cpp
         src/rfdetr/inference/evaluator.cpp
-        src/rfdetr/layers/model.cpp
-        src/rfdetr/layers/model_components.cpp
-        src/rfdetr/layers/model_config.cpp
-        src/rfdetr/layers/modules.cpp
+        src/rfdetr/model.cpp
+        src/rfdetr/model_components.cpp
+        src/rfdetr/model_config.cpp
+        src/rfdetr/modules.cpp
         src/rfdetr/draw.cpp
         src/rfdetr/training/native_optimizer.cpp
         src/rfdetr/inference/postprocess.cpp
