@@ -2,7 +2,7 @@
 #include "profile_utils.h"
 #include "rfdetr/cuda_utils.h"
 #include "rfdetr/postprocess.h"
-#include "rfdetr/scipy_rectangular_lsap.h"
+#include "rfdetr/utils/scipy_rectangular_lsap.h"
 #include "rfdetr/training_mask_ops_cuda.h"
 #include "rfdetr/cuda/detr_ops_cuda.h"
 

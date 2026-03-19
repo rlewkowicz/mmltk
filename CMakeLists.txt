@@ -173,7 +173,7 @@ option(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER
     ${BUILD_RFDETR_NATIVE})
 
 add_library(fastloader_rfdetr_lsap STATIC
-    src/rfdetr/scipy_rectangular_lsap.cpp
+    src/rfdetr/utils/scipy_rectangular_lsap.cpp
 )
 target_include_directories(fastloader_rfdetr_lsap
     PUBLIC
@@ -375,9 +375,9 @@ if(BUILD_RFDETR_NATIVE)
     endif()
 
     add_library(fastloader_rfdetr_cuda_ops STATIC
-        src/rfdetr/ms_deform_attn_op.cpp
-        src/rfdetr/ms_deform_attn_cuda_wrapper.cpp
-        src/rfdetr/training_mask_ops_cuda_wrapper.cpp
+        src/rfdetr/layers/ms_deform_attn_op.cpp
+        src/rfdetr/layers/ms_deform_attn_cuda_wrapper.cpp
+        src/rfdetr/layers/training_mask_ops_cuda_wrapper.cpp
         src/rfdetr/cuda/ms_deform_attn_cuda.cu
         src/rfdetr/cuda/training_mask_ops_cuda.cu
         src/rfdetr/cuda/detr_ops_cuda.cu

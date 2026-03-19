@@ -31,7 +31,7 @@ This file is adapted from SciPy's rectangular_lsap.cpp implementation:
 https://github.com/scipy/scipy/blob/main/scipy/optimize/rectangular_lsap/rectangular_lsap.cpp
 */
 
-#include "scipy_rectangular_lsap.h"
+#include "rfdetr/utils/scipy_rectangular_lsap.h"
 
 #include <algorithm>
 #include <cmath>
