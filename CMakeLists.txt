@@ -128,6 +128,9 @@ target_include_directories(stb SYSTEM INTERFACE ${CMAKE_SOURCE_DIR}/third_party/
 add_library(nlohmann_json INTERFACE)
 target_include_directories(nlohmann_json SYSTEM INTERFACE ${CMAKE_SOURCE_DIR}/third_party/json/include)
 
+add_library(cli11 INTERFACE)
+target_include_directories(cli11 SYSTEM INTERFACE ${CMAKE_SOURCE_DIR}/third_party)
+
 add_library(fastloader_build_options INTERFACE)
 target_compile_definitions(fastloader_build_options INTERFACE
     FASTLOADER_ENABLE_PROFILING=$<IF:$<CONFIG:Dev>,1,0>
@@ -164,7 +167,7 @@ target_link_libraries(fastloader_core PUBLIC
 
 # ---- CLI tool ----
 add_executable(fastloader_cli src/cli.cpp)
-target_link_libraries(fastloader_cli PRIVATE fastloader_core fastloader_build_options)
+target_link_libraries(fastloader_cli PRIVATE fastloader_core fastloader_build_options cli11)
 target_include_directories(fastloader_cli PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 option(BUILD_RFDETR_NATIVE "Build native RF-DETR validation backends" ON)
@@ -423,10 +426,10 @@ if(BUILD_RFDETR_NATIVE)
         src/rfdetr/cli/cli.cpp
         src/rfdetr/detection_ops.cpp
         src/rfdetr/inference/evaluator.cpp
-        src/rfdetr/model.cpp
-        src/rfdetr/model_components.cpp
-        src/rfdetr/model_config.cpp
-        src/rfdetr/modules.cpp
+        src/rfdetr/layers/model.cpp
+        src/rfdetr/layers/model_components.cpp
+        src/rfdetr/layers/model_config.cpp
+        src/rfdetr/layers/modules.cpp
         src/rfdetr/draw.cpp
         src/rfdetr/training/native_optimizer.cpp
         src/rfdetr/inference/postprocess.cpp
@@ -457,6 +460,7 @@ if(BUILD_RFDETR_NATIVE)
             fastloader_build_options
             fastloader_rfdetr_lsap
             fastloader_rfdetr_cuda_ops
+            cli11
         PRIVATE
             ${ONNXRUNTIME_LIBRARY}
             ${TENSORRT_NVINFER_LIBRARY}

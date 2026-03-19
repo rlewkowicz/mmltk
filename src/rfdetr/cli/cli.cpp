@@ -8,6 +8,7 @@
 #include "rfdetr/validate.h"
 #include "dataset_compiler.h"
 #include "rfdetr/progress_bar.h"
+#include "CLI11.hpp"
 
 #include <cuda_runtime_api.h>
 
@@ -34,6 +35,8 @@ namespace fastloader::rfdetr {
 
 namespace {
 
+constexpr int kCliParseSuccess = static_cast<int>(CLI::ExitCodes::Success);
+
 struct BuildEngineOptions {
     std::filesystem::path onnx_path;
     std::filesystem::path output_path;
@@ -51,6 +54,22 @@ struct PredictCliOptions : PredictOptions {};
 struct EvaluateCliOptions : EvaluateOptions {};
 struct TrainCliOptions : TrainOptions {};
 
+struct PredictCliState {
+    PredictCliOptions options;
+    std::string compile_mode = "selective";
+};
+
+struct EvaluateCliState {
+    EvaluateCliOptions options;
+    std::string compile_mode = "selective";
+};
+
+struct TrainCliState {
+    TrainCliOptions options;
+    std::string device_ids;
+    std::string compile_mode = "selective";
+};
+
 struct NormalizeWeightsOptions {
     std::filesystem::path input_path;
     std::filesystem::path output_path;
@@ -61,6 +80,11 @@ struct CompileCliOptions {
     std::filesystem::path output_dir;
     int resolution = 432;
 };
+
+int handle_parse_error(CLI::App& app, const CLI::ParseError& error) {
+    app.exit(error);
+    return error.get_exit_code() == kCliParseSuccess ? 0 : 1;
+}
 
 CompilationMode parse_compilation_mode(const std::string& value) {
     if (value == "none") return CompilationMode::kNone;
@@ -79,14 +103,6 @@ void require_model_input(const Options& options, const char* command) {
         throw std::runtime_error(
             std::string("rfdetr ") + command + " requires exactly one of --weights, --onnx, or --tensorrt");
     }
-}
-
-std::string require_value(int& index, int argc, char** argv, const char* option) {
-    if (index + 1 >= argc) {
-        throw std::runtime_error(std::string("missing value for ") + option);
-    }
-    ++index;
-    return argv[index];
 }
 
 std::vector<int> parse_device_ids(const std::string& value) {
@@ -283,133 +299,109 @@ int spawn_distributed_training_workers(const TrainCliOptions& options, int argc,
     return failed ? failed_status : 0;
 }
 
-std::optional<CompileCliOptions> parse_compile_args(int argc, char** argv) {
-    if (argc < 3 || std::string(argv[2]) != "compile") {
-        return std::nullopt;
-    }
-    CompileCliOptions options;
-    for (int index = 3; index < argc; ++index) {
-        const std::string arg = argv[index];
-        if (arg == "--source-dir") {
-            options.source_dir = require_value(index, argc, argv, "--source-dir");
-        } else if (arg == "--output-dir") {
-            options.output_dir = require_value(index, argc, argv, "--output-dir");
-        } else if (arg == "--resolution") {
-            options.resolution = std::stoi(require_value(index, argc, argv, "--resolution"));
-        } else {
-            throw std::runtime_error("unknown rfdetr compile option: " + arg);
-        }
-    }
+CLI::Option* add_path_option(CLI::App* command,
+                             const std::string& name,
+                             std::filesystem::path& value,
+                             const char* description) {
+    return command->add_option(name, value, description)->type_name("PATH");
+}
+
+void add_compile_mode_option(CLI::App* command, std::string& compile_mode) {
+    command->add_option(
+               "--compile-mode",
+               compile_mode,
+               "Native PyTorch compilation mode: none, selective, or full")
+        ->type_name("MODE");
+}
+
+void add_model_input_options(CLI::App* command,
+                             ModelArtifactRequest& request,
+                             const char* tensorrt_description) {
+    add_path_option(command, "--weights", request.weights_path, "RF-DETR checkpoint path");
+    add_path_option(command, "--onnx", request.onnx_path, "ONNX model path");
+    add_path_option(command, "--tensorrt", request.tensorrt_path, tensorrt_description);
+}
+
+void finalize_compile_options(const CompileCliOptions& options) {
     if (options.source_dir.empty() || options.output_dir.empty()) {
         throw std::runtime_error("rfdetr compile requires --source-dir and --output-dir");
     }
-    return options;
 }
 
-std::optional<InfoOptions> parse_info_args(int argc, char** argv) {
-    if (argc < 3 || std::string(argv[2]) != "info") {
-        return std::nullopt;
-    }
-    InfoOptions options;
-    for (int index = 3; index < argc; ++index) {
-        const std::string arg = argv[index];
-        if (arg == "--onnx") {
-            options.onnx_path = require_value(index, argc, argv, "--onnx");
-        } else if (arg == "--tensorrt") {
-            options.tensorrt_path = require_value(index, argc, argv, "--tensorrt");
-        } else if (arg == "--device-id") {
-            options.device_id = std::stoi(require_value(index, argc, argv, "--device-id"));
-        } else {
-            throw std::runtime_error("unknown rfdetr info option: " + arg);
-        }
-    }
+void finalize_info_options(const InfoOptions& options) {
     if (options.onnx_path.empty() == options.tensorrt_path.empty()) {
         throw std::runtime_error("rfdetr info requires exactly one of --onnx or --tensorrt");
     }
-    return options;
 }
 
-std::optional<BuildEngineOptions> parse_build_engine_args(int argc, char** argv) {
-    if (argc < 3 || std::string(argv[2]) != "build-engine") {
-        return std::nullopt;
-    }
-    BuildEngineOptions options;
-    for (int index = 3; index < argc; ++index) {
-        const std::string arg = argv[index];
-        if (arg == "--onnx") {
-            options.onnx_path = require_value(index, argc, argv, "--onnx");
-        } else if (arg == "--output") {
-            options.output_path = require_value(index, argc, argv, "--output");
-        } else if (arg == "--device-id") {
-            options.device_id = std::stoi(require_value(index, argc, argv, "--device-id"));
-        } else if (arg == "--fp16") {
-            options.allow_fp16 = true;
-        } else if (arg == "--no-fp16") {
-            options.allow_fp16 = false;
-        } else {
-            throw std::runtime_error("unknown rfdetr build-engine option: " + arg);
-        }
-    }
+void finalize_build_engine_options(const BuildEngineOptions& options) {
     if (options.onnx_path.empty() || options.output_path.empty()) {
         throw std::runtime_error("rfdetr build-engine requires --onnx and --output");
     }
-    return options;
 }
 
-std::optional<ValidationOptions> parse_validate_args(int argc, char** argv) {
-    if (argc < 3 || std::string(argv[2]) != "validate") {
-        return std::nullopt;
+void finalize_predict_options(PredictCliState& state) {
+    state.options.compilation_mode = parse_compilation_mode(state.compile_mode);
+    if (state.options.compiled_path.empty() || state.options.output_path.empty()) {
+        throw std::runtime_error("rfdetr predict requires --compiled and --output");
     }
-    ValidationOptions options;
-    for (int index = 3; index < argc; ++index) {
-        const std::string arg = argv[index];
-        if (arg == "--compiled") {
-            options.compiled_path = require_value(index, argc, argv, "--compiled");
-        } else if (arg == "--source") {
-            options.source_dir = require_value(index, argc, argv, "--source");
-        } else if (arg == "--split") {
-            options.split = require_value(index, argc, argv, "--split");
-        } else if (arg == "--resolution") {
-            options.resolution = static_cast<uint32_t>(std::stoul(require_value(index, argc, argv, "--resolution")));
-        } else if (arg == "--onnx") {
-            options.onnx_path = require_value(index, argc, argv, "--onnx");
-        } else if (arg == "--tensorrt") {
-            options.tensorrt_path = require_value(index, argc, argv, "--tensorrt");
-        } else if (arg == "--save-engine") {
-            options.save_engine_path = require_value(index, argc, argv, "--save-engine");
-        } else if (arg == "--report-json") {
-            options.report_json_path = require_value(index, argc, argv, "--report-json");
-        } else if (arg == "--eval-order") {
-            options.eval_order = require_value(index, argc, argv, "--eval-order");
-        } else if (arg == "--limit-images") {
-            options.limit_images = static_cast<size_t>(std::stoull(require_value(index, argc, argv, "--limit-images")));
-        } else if (arg == "--alignment-images") {
-            options.alignment_images =
-                static_cast<size_t>(std::stoull(require_value(index, argc, argv, "--alignment-images")));
-        } else if (arg == "--eval-max-dets") {
-            options.eval_max_dets =
-                static_cast<size_t>(std::stoull(require_value(index, argc, argv, "--eval-max-dets")));
-        } else if (arg == "--device-id") {
-            options.device_id = std::stoi(require_value(index, argc, argv, "--device-id"));
-        } else if (arg == "--workers") {
-            options.workers = std::stoi(require_value(index, argc, argv, "--workers"));
-        } else if (arg == "--batch-size") {
-            options.batch_size = static_cast<size_t>(std::stoull(require_value(index, argc, argv, "--batch-size")));
-        } else if (arg == "--cpu-affinity") {
-            options.cpu_affinity = require_value(index, argc, argv, "--cpu-affinity");
-        } else if (arg == "--recompile") {
-            options.recompile = true;
-        } else if (arg == "--profile") {
-            options.profile = true;
-        } else if (arg == "--fp16") {
-            options.allow_fp16 = true;
-        } else if (arg == "--no-fp16") {
-            options.allow_fp16 = false;
-        } else {
-            throw std::runtime_error("unknown rfdetr validate option: " + arg);
+    require_model_input(state.options, "predict");
+}
+
+void finalize_evaluate_options(EvaluateCliState& state) {
+    state.options.compilation_mode = parse_compilation_mode(state.compile_mode);
+    if (state.options.compiled_path.empty()) {
+        throw std::runtime_error("rfdetr evaluate requires --compiled");
+    }
+    require_model_input(state.options, "evaluate");
+}
+
+void finalize_normalize_options(const NormalizeWeightsOptions& options) {
+    if (options.input_path.empty() || options.output_path.empty()) {
+        throw std::runtime_error("rfdetr normalize-weights requires --input and --output");
+    }
+}
+
+void finalize_train_options(TrainCliState& state, bool saw_device_id, bool saw_device_ids) {
+    state.options.compilation_mode = parse_compilation_mode(state.compile_mode);
+    if (state.options.train_compiled_path.empty() ||
+        state.options.val_compiled_path.empty() ||
+        state.options.output_dir.empty()) {
+        throw std::runtime_error("rfdetr train requires --train-compiled, --val-compiled, and --output-dir");
+    }
+    const size_t selected_input_count =
+        static_cast<size_t>(!state.options.weights_path.empty()) +
+        static_cast<size_t>(!state.options.resume_path.empty());
+    if (selected_input_count != 1) {
+        throw std::runtime_error("rfdetr train requires exactly one of --weights or --resume");
+    }
+    if (state.options.lr_scheduler != "step" && state.options.lr_scheduler != "cosine") {
+        throw std::runtime_error("rfdetr train --lr-scheduler must be 'step' or 'cosine'");
+    }
+    if (saw_device_id && saw_device_ids) {
+        throw std::runtime_error("rfdetr train accepts only one of --device-id or --device-ids");
+    }
+    if (saw_device_ids) {
+        state.options.device_ids = parse_device_ids(state.device_ids);
+        if (state.options.device_ids.size() == 1) {
+            state.options.device_id = state.options.device_ids.front();
+            state.options.device_ids.clear();
         }
     }
+    if (state.options.distributed_worker) {
+        if (state.options.distributed_rank < 0 ||
+            state.options.distributed_world_size <= 1 ||
+            state.options.distributed_store_path.empty()) {
+            throw std::runtime_error("invalid internal RF-DETR distributed worker arguments");
+        }
+    } else if (state.options.distributed_world_size != 1 ||
+               state.options.distributed_rank != 0 ||
+               !state.options.distributed_store_path.empty()) {
+        throw std::runtime_error("internal RF-DETR distributed worker options require --dist-worker");
+    }
+}
 
+void finalize_validate_options(ValidationOptions& options) {
     if (options.compiled_path.empty()) {
         throw std::runtime_error("rfdetr validate requires --compiled");
     }
@@ -427,272 +419,6 @@ std::optional<ValidationOptions> parse_validate_args(int argc, char** argv) {
     }
     options.log_mode = ValidationLogMode::Interactive;
     options.write_report_json = true;
-    return options;
-}
-
-std::optional<PredictCliOptions> parse_predict_args(int argc, char** argv) {
-    if (argc < 3 || std::string(argv[2]) != "predict") {
-        return std::nullopt;
-    }
-    PredictCliOptions options;
-    for (int index = 3; index < argc; ++index) {
-        const std::string arg = argv[index];
-        if (arg == "--compiled") {
-            options.compiled_path = require_value(index, argc, argv, "--compiled");
-        } else if (arg == "--weights") {
-            options.weights_path = require_value(index, argc, argv, "--weights");
-        } else if (arg == "--onnx") {
-            options.onnx_path = require_value(index, argc, argv, "--onnx");
-        } else if (arg == "--tensorrt") {
-            options.tensorrt_path = require_value(index, argc, argv, "--tensorrt");
-        } else if (arg == "--output") {
-            options.output_path = require_value(index, argc, argv, "--output");
-        } else if (arg == "--batch-size") {
-            options.batch_size = static_cast<size_t>(std::stoull(require_value(index, argc, argv, "--batch-size")));
-        } else if (arg == "--device-id") {
-            options.device_id = std::stoi(require_value(index, argc, argv, "--device-id"));
-        } else if (arg == "--threshold") {
-            options.threshold = std::stof(require_value(index, argc, argv, "--threshold"));
-        } else if (arg == "--workers") {
-            options.workers = std::stoi(require_value(index, argc, argv, "--workers"));
-        } else if (arg == "--lanes") {
-            options.lanes = std::stoi(require_value(index, argc, argv, "--lanes"));
-        } else if (arg == "--cpu-affinity") {
-            options.cpu_affinity = require_value(index, argc, argv, "--cpu-affinity");
-        } else if (arg == "--backend") {
-            options.backend = require_value(index, argc, argv, "--backend");
-        } else if (arg == "--fp16") {
-            options.allow_fp16 = true;
-        } else if (arg == "--no-fp16") {
-            options.allow_fp16 = false;
-        } else if (arg == "--progress") {
-            options.progress_bar = true;
-        } else if (arg == "--no-progress") {
-            options.progress_bar = false;
-        } else if (arg == "--compile-mode") {
-            options.compilation_mode = parse_compilation_mode(require_value(index, argc, argv, "--compile-mode"));
-        } else {
-            throw std::runtime_error("unknown rfdetr predict option: " + arg);
-        }
-    }
-
-    if (options.compiled_path.empty() || options.output_path.empty()) {
-        throw std::runtime_error("rfdetr predict requires --compiled and --output");
-    }
-    require_model_input(options, "predict");
-    return options;
-}
-
-std::optional<EvaluateCliOptions> parse_evaluate_args(int argc, char** argv) {
-    if (argc < 3) {
-        return std::nullopt;
-    }
-    const std::string command = argv[2];
-    if (command != "evaluate" && command != "eval" && command != "val") {
-        return std::nullopt;
-    }
-    EvaluateCliOptions options;
-    for (int index = 3; index < argc; ++index) {
-        const std::string arg = argv[index];
-        if (arg == "--compiled") {
-            options.compiled_path = require_value(index, argc, argv, "--compiled");
-        } else if (arg == "--weights") {
-            options.weights_path = require_value(index, argc, argv, "--weights");
-        } else if (arg == "--onnx") {
-            options.onnx_path = require_value(index, argc, argv, "--onnx");
-        } else if (arg == "--tensorrt") {
-            options.tensorrt_path = require_value(index, argc, argv, "--tensorrt");
-        } else if (arg == "--batch-size") {
-            options.batch_size = static_cast<size_t>(std::stoull(require_value(index, argc, argv, "--batch-size")));
-        } else if (arg == "--device-id") {
-            options.device_id = std::stoi(require_value(index, argc, argv, "--device-id"));
-        } else if (arg == "--limit-images") {
-            options.limit_images = static_cast<size_t>(std::stoull(require_value(index, argc, argv, "--limit-images")));
-        } else if (arg == "--eval-max-dets") {
-            options.eval_max_dets = static_cast<size_t>(std::stoull(require_value(index, argc, argv, "--eval-max-dets")));
-        } else if (arg == "--workers") {
-            options.workers = std::stoi(require_value(index, argc, argv, "--workers"));
-        } else if (arg == "--lanes") {
-            options.lanes = std::stoi(require_value(index, argc, argv, "--lanes"));
-        } else if (arg == "--cpu-affinity") {
-            options.cpu_affinity = require_value(index, argc, argv, "--cpu-affinity");
-        } else if (arg == "--backend") {
-            options.backend = require_value(index, argc, argv, "--backend");
-        } else if (arg == "--fp16") {
-            options.allow_fp16 = true;
-        } else if (arg == "--no-fp16") {
-            options.allow_fp16 = false;
-        } else if (arg == "--progress") {
-            options.progress_bar = true;
-        } else if (arg == "--no-progress") {
-            options.progress_bar = false;
-        } else if (arg == "--compile-mode") {
-            options.compilation_mode = parse_compilation_mode(require_value(index, argc, argv, "--compile-mode"));
-        } else {
-            throw std::runtime_error("unknown rfdetr evaluate option: " + arg);
-        }
-    }
-
-    if (options.compiled_path.empty()) {
-        throw std::runtime_error("rfdetr evaluate requires --compiled");
-    }
-    require_model_input(options, "evaluate");
-    return options;
-}
-
-std::optional<NormalizeWeightsOptions> parse_normalize_weights_args(int argc, char** argv) {
-    if (argc < 3 || std::string(argv[2]) != "normalize-weights") {
-        return std::nullopt;
-    }
-    NormalizeWeightsOptions options;
-    for (int index = 3; index < argc; ++index) {
-        const std::string arg = argv[index];
-        if (arg == "--input") {
-            options.input_path = require_value(index, argc, argv, "--input");
-        } else if (arg == "--output") {
-            options.output_path = require_value(index, argc, argv, "--output");
-        } else {
-            throw std::runtime_error("unknown rfdetr normalize-weights option: " + arg);
-        }
-    }
-    if (options.input_path.empty() || options.output_path.empty()) {
-        throw std::runtime_error("rfdetr normalize-weights requires --input and --output");
-    }
-    return options;
-}
-
-std::optional<TrainCliOptions> parse_train_args(int argc, char** argv) {
-    if (argc < 3 || std::string(argv[2]) != "train") {
-        return std::nullopt;
-    }
-
-    TrainCliOptions options;
-    bool saw_device_id = false;
-    bool saw_device_ids = false;
-    for (int index = 3; index < argc; ++index) {
-        const std::string arg = argv[index];
-        if (arg == "--train-compiled") {
-            options.train_compiled_path = require_value(index, argc, argv, "--train-compiled");
-        } else if (arg == "--val-compiled") {
-            options.val_compiled_path = require_value(index, argc, argv, "--val-compiled");
-        } else if (arg == "--test-compiled") {
-            options.test_compiled_path = require_value(index, argc, argv, "--test-compiled");
-        } else if (arg == "--output-dir") {
-            options.output_dir = require_value(index, argc, argv, "--output-dir");
-        } else if (arg == "--weights") {
-            options.weights_path = require_value(index, argc, argv, "--weights");
-        } else if (arg == "--resume") {
-            options.resume_path = require_value(index, argc, argv, "--resume");
-        } else if (arg == "--batch-size") {
-            options.batch_size = static_cast<size_t>(std::stoull(require_value(index, argc, argv, "--batch-size")));
-        } else if (arg == "--val-batch-size") {
-            options.val_batch_size = static_cast<size_t>(std::stoull(require_value(index, argc, argv, "--val-batch-size")));
-        } else if (arg == "--epochs") {
-            options.epochs = std::stoi(require_value(index, argc, argv, "--epochs"));
-        } else if (arg == "--grad-accum-steps") {
-            options.grad_accum_steps = std::stoi(require_value(index, argc, argv, "--grad-accum-steps"));
-        } else if (arg == "--lr") {
-            options.lr = std::stod(require_value(index, argc, argv, "--lr"));
-        } else if (arg == "--lr-encoder") {
-            options.lr_encoder = std::stod(require_value(index, argc, argv, "--lr-encoder"));
-        } else if (arg == "--lr-component-decay") {
-            options.lr_component_decay = std::stod(require_value(index, argc, argv, "--lr-component-decay"));
-        } else if (arg == "--encoder-layer-decay") {
-            options.encoder_layer_decay = std::stod(require_value(index, argc, argv, "--encoder-layer-decay"));
-        } else if (arg == "--weight-decay") {
-            options.weight_decay = std::stod(require_value(index, argc, argv, "--weight-decay"));
-        } else if (arg == "--lr-drop") {
-            options.lr_drop = std::stoi(require_value(index, argc, argv, "--lr-drop"));
-        } else if (arg == "--lr-scheduler") {
-            options.lr_scheduler = require_value(index, argc, argv, "--lr-scheduler");
-            if (options.lr_scheduler != "step" && options.lr_scheduler != "cosine") {
-                throw std::runtime_error("rfdetr train --lr-scheduler must be 'step' or 'cosine'");
-            }
-        } else if (arg == "--lr-min-factor") {
-            options.lr_min_factor = std::stod(require_value(index, argc, argv, "--lr-min-factor"));
-        } else if (arg == "--warmup-epochs") {
-            options.warmup_epochs = std::stod(require_value(index, argc, argv, "--warmup-epochs"));
-        } else if (arg == "--clip-max-norm") {
-            options.clip_max_norm = std::stod(require_value(index, argc, argv, "--clip-max-norm"));
-        } else if (arg == "--fused-optimizer") {
-            options.fused_optimizer = true;
-        } else if (arg == "--no-fused-optimizer") {
-            options.fused_optimizer = false;
-        } else if (arg == "--use-ema") {
-            options.use_ema = true;
-        } else if (arg == "--no-ema") {
-            options.use_ema = false;
-        } else if (arg == "--ema-decay") {
-            options.ema_decay = std::stod(require_value(index, argc, argv, "--ema-decay"));
-        } else if (arg == "--ema-tau") {
-            options.ema_tau = std::stoi(require_value(index, argc, argv, "--ema-tau"));
-        } else if (arg == "--device-id") {
-            options.device_id = std::stoi(require_value(index, argc, argv, "--device-id"));
-            saw_device_id = true;
-        } else if (arg == "--device-ids") {
-            options.device_ids = parse_device_ids(require_value(index, argc, argv, "--device-ids"));
-            saw_device_ids = true;
-        } else if (arg == "--workers") {
-            options.workers = std::stoi(require_value(index, argc, argv, "--workers"));
-        } else if (arg == "--lanes") {
-            options.lanes = std::stoi(require_value(index, argc, argv, "--lanes"));
-        } else if (arg == "--cpu-affinity") {
-            options.cpu_affinity = require_value(index, argc, argv, "--cpu-affinity");
-        } else if (arg == "--prefetch-factor") {
-            options.prefetch_factor = std::stoi(require_value(index, argc, argv, "--prefetch-factor"));
-        } else if (arg == "--print-freq") {
-            options.print_freq = std::stoi(require_value(index, argc, argv, "--print-freq"));
-        } else if (arg == "--seed") {
-            options.seed = std::stoi(require_value(index, argc, argv, "--seed"));
-        } else if (arg == "--eval-max-dets") {
-            options.eval_max_dets = static_cast<size_t>(std::stoull(require_value(index, argc, argv, "--eval-max-dets")));
-        } else if (arg == "--amp") {
-            options.amp = true;
-        } else if (arg == "--no-amp") {
-            options.amp = false;
-        } else if (arg == "--progress") {
-            options.progress_bar = true;
-        } else if (arg == "--no-progress") {
-            options.progress_bar = false;
-        } else if (arg == "--dist-worker") {
-            options.distributed_worker = true;
-        } else if (arg == "--dist-rank") {
-            options.distributed_rank = std::stoi(require_value(index, argc, argv, "--dist-rank"));
-        } else if (arg == "--dist-world-size") {
-            options.distributed_world_size = std::stoi(require_value(index, argc, argv, "--dist-world-size"));
-        } else if (arg == "--dist-store-file") {
-            options.distributed_store_path = require_value(index, argc, argv, "--dist-store-file");
-        } else if (arg == "--compile-mode") {
-            options.compilation_mode = parse_compilation_mode(require_value(index, argc, argv, "--compile-mode"));
-        } else {
-            throw std::runtime_error("unknown rfdetr train option: " + arg);
-        }
-    }
-
-    if (options.train_compiled_path.empty() || options.val_compiled_path.empty() || options.output_dir.empty()) {
-        throw std::runtime_error("rfdetr train requires --train-compiled, --val-compiled, and --output-dir");
-    }
-    const size_t selected_input_count =
-        static_cast<size_t>(!options.weights_path.empty()) +
-        static_cast<size_t>(!options.resume_path.empty());
-    if (selected_input_count != 1) {
-        throw std::runtime_error("rfdetr train requires exactly one of --weights or --resume");
-    }
-    if (saw_device_id && saw_device_ids) {
-        throw std::runtime_error("rfdetr train accepts only one of --device-id or --device-ids");
-    }
-    if (saw_device_ids && options.device_ids.size() == 1) {
-        options.device_id = options.device_ids.front();
-        options.device_ids.clear();
-    }
-    if (options.distributed_worker) {
-        if (options.distributed_rank < 0 || options.distributed_world_size <= 1 || options.distributed_store_path.empty()) {
-            throw std::runtime_error("invalid internal RF-DETR distributed worker arguments");
-        }
-    } else if (options.distributed_world_size != 1 || options.distributed_rank != 0 || !options.distributed_store_path.empty()) {
-        throw std::runtime_error("internal RF-DETR distributed worker options require --dist-worker");
-    }
-    return options;
 }
 
 void run_compile(const CompileCliOptions& options) {
@@ -718,7 +444,7 @@ void run_compile(const CompileCliOptions& options) {
                     bar.add(done - last_done);
                     last_done = done;
                 }
-                
+
                 const size_t num_images = (current_total - 2) / 2;
                 if (done < num_images) {
                     bar.set_postfix("labels");
@@ -736,41 +462,6 @@ void run_compile(const CompileCliOptions& options) {
     }
 }
 
-void print_validate_usage() {
-    std::fprintf(stderr,
-                 "Usage:\n"
-                 "  fastloader rfdetr predict --compiled <split.bin> --weights <weights.pt> --output <predictions.json> "
-                 "[--batch-size <n>] [--device-id <n>] [--threshold <f>] [--workers <n>] [--lanes <n>] "
-                 "[--cpu-affinity <list>] [--progress|--no-progress]\n"
-                 "  fastloader rfdetr predict --compiled <split.bin> (--onnx <model.onnx> | --tensorrt <model.engine>) "
-                 "--output <predictions.json> [--batch-size <n>] [--device-id <n>] [--threshold <f>] [--workers <n>] "
-                 "[--lanes <n>] [--cpu-affinity <list>] [--backend auto|onnx|tensorrt] [--progress|--no-progress]\n"
-                 "  fastloader rfdetr evaluate|eval|val --compiled <split.bin> --weights <weights.pt> [--batch-size <n>] "
-                 "[--device-id <n>] [--limit-images <n>] [--eval-max-dets <n>] [--workers <n>] [--lanes <n>] "
-                 "[--cpu-affinity <list>] [--progress|--no-progress]\n"
-                 "  fastloader rfdetr evaluate|eval|val --compiled <split.bin> (--onnx <model.onnx> | --tensorrt <model.engine>) "
-                 "[--batch-size <n>] [--device-id <n>] [--limit-images <n>] [--eval-max-dets <n>] [--workers <n>] "
-                 "[--lanes <n>] [--cpu-affinity <list>] [--backend auto|onnx|tensorrt] [--progress|--no-progress]\n"
-                 "  fastloader rfdetr train --train-compiled <train.bin> --val-compiled <val.bin> --output-dir <dir> "
-                 "(--weights <weights.pt> | --resume <checkpoint.pt>) [--epochs <n>] [--batch-size <n>] [--val-batch-size <n>] "
-                 "[--grad-accum-steps <n>] [--lr <f>] [--lr-encoder <f>] [--lr-component-decay <f>] "
-                 "[--encoder-layer-decay <f>] [--weight-decay <f>] [--lr-drop <n>] [--lr-scheduler step|cosine] "
-                 "[--lr-min-factor <f>] [--warmup-epochs <f>] [--clip-max-norm <f>] "
-                 "[--fused-optimizer|--no-fused-optimizer] [--use-ema|--no-ema] [--ema-decay <f>] [--ema-tau <n>] "
-                 "[--device-id <n> | --device-ids <n,n,...>] [--workers <n>] [--lanes <n>] [--cpu-affinity <list>] [--prefetch-factor <n>] "
-                 "[--print-freq <n>] [--seed <n>] [--eval-max-dets <n>] [--amp|--no-amp] [--progress|--no-progress]\n"
-                 "  fastloader rfdetr validate --compiled <split.bin> [--source <dataset_dir> --split <name> "
-                 "--resolution <n> --recompile] [--onnx <model.onnx>] [--tensorrt <model.engine|model.onnx>] "
-                 "[--save-engine <path.engine>] [--workers <n>] [--batch-size <n>] [--cpu-affinity <list>] "
-                 "[--profile] [--report-json <path>]\n"
-                 "  note: weights overlap mode requires --batch-size 1 when predict/evaluate --weights uses --lanes > 1\n"
-                 "  note: native train --lanes supports 0, 1, 2, or 3; with --lanes > 1, effective batch per rank is batch_size * lanes * grad_accum_steps\n"
-                 "  fastloader rfdetr normalize-weights --input <weights.pt> --output <native.pt>\n"
-                 "  fastloader rfdetr build-engine --onnx <model.onnx> --output <model.engine> [--fp16]\n"
-                 "  fastloader rfdetr compile --source-dir <dir> --output-dir <dir> [--resolution <n>]\n"
-                 "  fastloader rfdetr info (--onnx <model.onnx> | --tensorrt <model.engine|model.onnx>)\n");
-}
-
 } // namespace
 
 int handle_cli(int argc, char** argv) {
@@ -778,70 +469,405 @@ int handle_cli(int argc, char** argv) {
         return -1;
     }
     try {
-        if (const auto compile = parse_compile_args(argc, argv)) {
-            run_compile(*compile);
+        CLI::App app{"RF-DETR model tooling for compilation, inference, evaluation, and training"};
+        app.name("fastloader rfdetr");
+        app.option_defaults()->always_capture_default();
+        app.require_subcommand(1);
+        app.footer(
+            "notes:\n"
+            "  weights overlap mode requires --batch-size 1 when predict/evaluate --weights uses --lanes > 1\n"
+            "  native train --lanes supports 0, 1, 2, or 3; with --lanes > 1, effective batch per rank is "
+            "batch_size * lanes * grad_accum_steps");
+
+        CompileCliOptions compile_options;
+        auto* compile_cmd = app.add_subcommand(
+            "compile",
+            "Compile train and val splits for RF-DETR experiments");
+        auto* compile_dataset = compile_cmd->add_option_group("Dataset");
+        add_path_option(compile_dataset, "--source-dir", compile_options.source_dir,
+                        "Source dataset root");
+        add_path_option(compile_dataset, "--output-dir", compile_options.output_dir,
+                        "Output directory for compiled train/val binaries");
+        compile_dataset->add_option("--resolution", compile_options.resolution,
+                                    "Square image resolution for both splits")
+            ->type_name("INT");
+
+        InfoOptions info_options;
+        auto* info_cmd = app.add_subcommand(
+            "info",
+            "Inspect ONNX or TensorRT model metadata");
+        auto* info_model = info_cmd->add_option_group("Model input");
+        add_path_option(info_model, "--onnx", info_options.onnx_path, "ONNX model path");
+        add_path_option(info_model, "--tensorrt", info_options.tensorrt_path,
+                        "TensorRT engine path or ONNX path to build from");
+        info_cmd->add_option("--device-id", info_options.device_id, "CUDA device id")
+            ->type_name("INT");
+
+        BuildEngineOptions build_engine_options;
+        auto* build_engine_cmd = app.add_subcommand(
+            "build-engine",
+            "Build a TensorRT engine from an ONNX model");
+        auto* build_engine_io = build_engine_cmd->add_option_group("Input and output");
+        add_path_option(build_engine_io, "--onnx", build_engine_options.onnx_path, "ONNX model path");
+        add_path_option(build_engine_io, "--output", build_engine_options.output_path,
+                        "Output TensorRT engine path");
+        auto* build_engine_exec = build_engine_cmd->add_option_group("Execution");
+        build_engine_exec->add_option("--device-id", build_engine_options.device_id, "CUDA device id")
+            ->type_name("INT");
+        build_engine_exec->add_flag("--fp16,!--no-fp16", build_engine_options.allow_fp16,
+                                    "Enable FP16 TensorRT kernels when supported");
+
+        PredictCliState predict_state;
+        auto* predict_cmd = app.add_subcommand(
+            "predict",
+            "Run RF-DETR inference and write predictions to JSON");
+        auto* predict_dataset = predict_cmd->add_option_group("Dataset");
+        add_path_option(predict_dataset, "--compiled", predict_state.options.compiled_path,
+                        "Compiled dataset split (.bin)");
+        add_path_option(predict_dataset, "--output", predict_state.options.output_path,
+                        "Prediction JSON output path");
+        auto* predict_model = predict_cmd->add_option_group("Model input");
+        add_model_input_options(
+            predict_model,
+            predict_state.options,
+            "TensorRT engine path or ONNX path to build from");
+        auto* predict_execution = predict_cmd->add_option_group("Execution");
+        predict_execution->add_option("--batch-size", predict_state.options.batch_size,
+                                      "Batch size for inference")
+            ->type_name("INT");
+        predict_execution->add_option("--device-id", predict_state.options.device_id, "CUDA device id")
+            ->type_name("INT");
+        predict_execution->add_option("--threshold", predict_state.options.threshold,
+                                      "Minimum score threshold for saved detections")
+            ->type_name("FLOAT");
+        predict_execution->add_option("--workers", predict_state.options.workers,
+                                      "Dataset worker count")
+            ->type_name("INT");
+        predict_execution->add_option("--lanes", predict_state.options.lanes,
+                                      "Parallel backend lane count")
+            ->type_name("INT");
+        predict_execution->add_option("--cpu-affinity", predict_state.options.cpu_affinity,
+                                      "Linux CPU list or range string for workers");
+        predict_execution->add_option("--backend", predict_state.options.backend,
+                                      "Backend preference for ONNX/TensorRT artifacts: auto, onnx, or tensorrt");
+        predict_execution->add_flag("--fp16,!--no-fp16", predict_state.options.allow_fp16,
+                                    "Enable FP16 backend execution when supported");
+        predict_execution->add_flag("--progress,!--no-progress", predict_state.options.progress_bar,
+                                    "Render interactive progress output");
+        add_compile_mode_option(predict_execution, predict_state.compile_mode);
+
+        EvaluateCliState evaluate_state;
+        auto* evaluate_cmd = app.add_subcommand(
+            "evaluate",
+            "Run RF-DETR evaluation on a compiled dataset split");
+        evaluate_cmd->alias("eval");
+        evaluate_cmd->alias("val");
+        auto* evaluate_dataset = evaluate_cmd->add_option_group("Dataset");
+        add_path_option(evaluate_dataset, "--compiled", evaluate_state.options.compiled_path,
+                        "Compiled dataset split (.bin)");
+        auto* evaluate_model = evaluate_cmd->add_option_group("Model input");
+        add_model_input_options(
+            evaluate_model,
+            evaluate_state.options,
+            "TensorRT engine path or ONNX path to build from");
+        auto* evaluate_execution = evaluate_cmd->add_option_group("Execution");
+        evaluate_execution->add_option("--batch-size", evaluate_state.options.batch_size,
+                                       "Batch size for evaluation")
+            ->type_name("INT");
+        evaluate_execution->add_option("--device-id", evaluate_state.options.device_id, "CUDA device id")
+            ->type_name("INT");
+        evaluate_execution->add_option("--limit-images", evaluate_state.options.limit_images,
+                                       "Limit the number of evaluated images")
+            ->type_name("INT");
+        evaluate_execution->add_option("--eval-max-dets", evaluate_state.options.eval_max_dets,
+                                       "Maximum detections per image during evaluation")
+            ->type_name("INT");
+        evaluate_execution->add_option("--workers", evaluate_state.options.workers,
+                                       "Dataset worker count")
+            ->type_name("INT");
+        evaluate_execution->add_option("--lanes", evaluate_state.options.lanes,
+                                       "Parallel backend lane count")
+            ->type_name("INT");
+        evaluate_execution->add_option("--cpu-affinity", evaluate_state.options.cpu_affinity,
+                                       "Linux CPU list or range string for workers");
+        evaluate_execution->add_option("--backend", evaluate_state.options.backend,
+                                       "Backend preference for ONNX/TensorRT artifacts: auto, onnx, or tensorrt");
+        evaluate_execution->add_flag("--fp16,!--no-fp16", evaluate_state.options.allow_fp16,
+                                     "Enable FP16 backend execution when supported");
+        evaluate_execution->add_flag("--progress,!--no-progress", evaluate_state.options.progress_bar,
+                                     "Render interactive progress output");
+        add_compile_mode_option(evaluate_execution, evaluate_state.compile_mode);
+
+        TrainCliState train_state;
+        auto* train_cmd = app.add_subcommand(
+            "train",
+            "Train RF-DETR natively against compiled datasets");
+        auto* train_dataset = train_cmd->add_option_group("Dataset");
+        add_path_option(train_dataset, "--train-compiled", train_state.options.train_compiled_path,
+                        "Compiled training split (.bin)");
+        add_path_option(train_dataset, "--val-compiled", train_state.options.val_compiled_path,
+                        "Compiled validation split (.bin)");
+        add_path_option(train_dataset, "--test-compiled", train_state.options.test_compiled_path,
+                        "Optional compiled test split (.bin)");
+        auto* train_checkpoint = train_cmd->add_option_group("Checkpoint");
+        add_path_option(train_checkpoint, "--output-dir", train_state.options.output_dir,
+                        "Output directory for checkpoints and logs");
+        add_path_option(train_checkpoint, "--weights", train_state.options.weights_path,
+                        "Source checkpoint used for initialization");
+        add_path_option(train_checkpoint, "--resume", train_state.options.resume_path,
+                        "Existing native checkpoint to resume");
+        auto* train_optimization = train_cmd->add_option_group("Optimization");
+        train_optimization->add_option("--batch-size", train_state.options.batch_size,
+                                       "Per-rank training batch size")
+            ->type_name("INT");
+        train_optimization->add_option("--val-batch-size", train_state.options.val_batch_size,
+                                       "Validation batch size, 0 reuses --batch-size")
+            ->type_name("INT");
+        train_optimization->add_option("--epochs", train_state.options.epochs,
+                                       "Number of training epochs")
+            ->type_name("INT");
+        train_optimization->add_option("--grad-accum-steps", train_state.options.grad_accum_steps,
+                                       "Gradient accumulation steps")
+            ->type_name("INT");
+        train_optimization->add_option("--lr", train_state.options.lr, "Decoder/base learning rate")
+            ->type_name("FLOAT");
+        train_optimization->add_option("--lr-encoder", train_state.options.lr_encoder,
+                                       "Encoder learning rate")
+            ->type_name("FLOAT");
+        train_optimization->add_option("--lr-component-decay", train_state.options.lr_component_decay,
+                                       "Component-wise learning rate decay")
+            ->type_name("FLOAT");
+        train_optimization->add_option("--encoder-layer-decay", train_state.options.encoder_layer_decay,
+                                       "Per-layer encoder learning rate decay")
+            ->type_name("FLOAT");
+        train_optimization->add_option("--weight-decay", train_state.options.weight_decay,
+                                       "AdamW weight decay")
+            ->type_name("FLOAT");
+        train_optimization->add_option("--lr-drop", train_state.options.lr_drop,
+                                       "Step scheduler drop epoch")
+            ->type_name("INT");
+        train_optimization->add_option("--lr-scheduler", train_state.options.lr_scheduler,
+                                       "Learning rate scheduler: step or cosine");
+        train_optimization->add_option("--lr-min-factor", train_state.options.lr_min_factor,
+                                       "Minimum LR multiplier for cosine decay")
+            ->type_name("FLOAT");
+        train_optimization->add_option("--warmup-epochs", train_state.options.warmup_epochs,
+                                       "Warmup duration in epochs")
+            ->type_name("FLOAT");
+        train_optimization->add_option("--clip-max-norm", train_state.options.clip_max_norm,
+                                       "Gradient clipping max norm")
+            ->type_name("FLOAT");
+        train_optimization->add_flag("--fused-optimizer,!--no-fused-optimizer",
+                                     train_state.options.fused_optimizer,
+                                     "Use the native fused optimizer when available");
+        train_optimization->add_flag("--use-ema,!--no-ema", train_state.options.use_ema,
+                                     "Maintain an EMA shadow model");
+        train_optimization->add_option("--ema-decay", train_state.options.ema_decay,
+                                       "EMA decay factor")
+            ->type_name("FLOAT");
+        train_optimization->add_option("--ema-tau", train_state.options.ema_tau,
+                                       "EMA warmup tau in steps")
+            ->type_name("INT");
+        train_optimization->add_option("--eval-max-dets", train_state.options.eval_max_dets,
+                                       "Maximum detections per image during validation")
+            ->type_name("INT");
+        auto* train_execution = train_cmd->add_option_group("Execution");
+        auto* train_device_id = train_execution->add_option("--device-id", train_state.options.device_id,
+                                                            "Single CUDA device id")
+                                    ->type_name("INT");
+        auto* train_device_ids = train_execution->add_option(
+            "--device-ids",
+            train_state.device_ids,
+            "Comma-separated CUDA device ids for distributed training");
+        train_device_ids->type_name("LIST");
+        train_execution->add_option("--workers", train_state.options.workers,
+                                    "Dataset worker count")
+            ->type_name("INT");
+        train_execution->add_option("--lanes", train_state.options.lanes,
+                                    "Parallel backend lane count")
+            ->type_name("INT");
+        train_execution->add_option("--cpu-affinity", train_state.options.cpu_affinity,
+                                    "Linux CPU list or range string for workers");
+        train_execution->add_option("--prefetch-factor", train_state.options.prefetch_factor,
+                                    "Per-rank prefetch factor")
+            ->type_name("INT");
+        train_execution->add_option("--print-freq", train_state.options.print_freq,
+                                    "Logging frequency in training steps")
+            ->type_name("INT");
+        train_execution->add_option("--seed", train_state.options.seed, "Random seed")
+            ->type_name("INT");
+        train_execution->add_flag("--amp,!--no-amp", train_state.options.amp,
+                                  "Enable automatic mixed precision");
+        train_execution->add_flag("--progress,!--no-progress", train_state.options.progress_bar,
+                                  "Render interactive progress output");
+        add_compile_mode_option(train_execution, train_state.compile_mode);
+        auto* train_internal = train_cmd->add_option_group("Distributed (internal)");
+        train_internal->add_flag("--dist-worker", train_state.options.distributed_worker,
+                                 "Internal flag for forked distributed workers");
+        train_internal->add_option("--dist-rank", train_state.options.distributed_rank,
+                                   "Internal worker rank")
+            ->type_name("INT");
+        train_internal->add_option("--dist-world-size", train_state.options.distributed_world_size,
+                                   "Internal worker world size")
+            ->type_name("INT");
+        add_path_option(train_internal, "--dist-store-file", train_state.options.distributed_store_path,
+                        "Internal distributed rendezvous file");
+
+        NormalizeWeightsOptions normalize_options;
+        auto* normalize_cmd = app.add_subcommand(
+            "normalize-weights",
+            "Convert an upstream RF-DETR checkpoint into fastloader's native format");
+        auto* normalize_io = normalize_cmd->add_option_group("Input and output");
+        add_path_option(normalize_io, "--input", normalize_options.input_path,
+                        "Input upstream checkpoint path");
+        add_path_option(normalize_io, "--output", normalize_options.output_path,
+                        "Output native checkpoint path");
+
+        ValidationOptions validate_options;
+        auto* validate_cmd = app.add_subcommand(
+            "validate",
+            "Compare ONNX and TensorRT backends against a compiled dataset split");
+        auto* validate_dataset = validate_cmd->add_option_group("Dataset");
+        add_path_option(validate_dataset, "--compiled", validate_options.compiled_path,
+                        "Compiled dataset split (.bin)");
+        add_path_option(validate_dataset, "--source", validate_options.source_dir,
+                        "Source dataset root used for optional recompiles");
+        validate_dataset->add_option("--split", validate_options.split,
+                                     "Source dataset split name used when recompiling");
+        validate_dataset->add_option("--resolution", validate_options.resolution,
+                                     "Square resolution for recompiles")
+            ->type_name("INT");
+        validate_dataset->add_flag("--recompile", validate_options.recompile,
+                                   "Recompile the source dataset before validation");
+        auto* validate_model = validate_cmd->add_option_group("Model input");
+        add_path_option(validate_model, "--onnx", validate_options.onnx_path, "ONNX model path");
+        add_path_option(validate_model, "--tensorrt", validate_options.tensorrt_path,
+                        "TensorRT engine path or ONNX path to build from");
+        add_path_option(validate_model, "--save-engine", validate_options.save_engine_path,
+                        "Optional path to save a built TensorRT engine");
+        auto* validate_reports = validate_cmd->add_option_group("Reports");
+        add_path_option(validate_reports, "--report-json", validate_options.report_json_path,
+                        "Validation report JSON path");
+        validate_reports->add_option("--eval-order", validate_options.eval_order,
+                                     "Comma-separated backend evaluation order");
+        auto* validate_execution = validate_cmd->add_option_group("Execution");
+        validate_execution->add_option("--limit-images", validate_options.limit_images,
+                                       "Limit the number of validated images")
+            ->type_name("INT");
+        validate_execution->add_option("--alignment-images", validate_options.alignment_images,
+                                       "Number of images used for backend alignment probes")
+            ->type_name("INT");
+        validate_execution->add_option("--eval-max-dets", validate_options.eval_max_dets,
+                                       "Maximum detections per image during evaluation")
+            ->type_name("INT");
+        validate_execution->add_option("--device-id", validate_options.device_id, "CUDA device id")
+            ->type_name("INT");
+        validate_execution->add_option("--workers", validate_options.workers,
+                                       "Dataset worker count")
+            ->type_name("INT");
+        validate_execution->add_option("--batch-size", validate_options.batch_size,
+                                       "Backend batch size")
+            ->type_name("INT");
+        validate_execution->add_option("--cpu-affinity", validate_options.cpu_affinity,
+                                       "Linux CPU list or range string for workers");
+        validate_execution->add_flag("--profile", validate_options.profile,
+                                     "Collect detailed timing metrics during validation");
+        validate_execution->add_flag("--fp16,!--no-fp16", validate_options.allow_fp16,
+                                     "Enable FP16 TensorRT execution when supported");
+
+        std::vector<std::string> args;
+        args.reserve(static_cast<size_t>(argc - 1));
+        args.emplace_back("fastloader rfdetr");
+        for (int index = 2; index < argc; ++index) {
+            args.emplace_back(argv[index]);
+        }
+        std::vector<const char*> raw_args;
+        raw_args.reserve(args.size());
+        for (const auto& arg : args) {
+            raw_args.push_back(arg.c_str());
+        }
+
+        try {
+            app.parse(static_cast<int>(raw_args.size()), raw_args.data());
+        } catch (const CLI::ParseError& error) {
+            return handle_parse_error(app, error);
+        }
+
+        if (compile_cmd->parsed()) {
+            finalize_compile_options(compile_options);
+            run_compile(compile_options);
             return 0;
         }
 
-        if (const auto info = parse_info_args(argc, argv)) {
+        if (info_cmd->parsed()) {
+            finalize_info_options(info_options);
             std::unique_ptr<InferenceBackend> backend =
-                !info->onnx_path.empty() ? make_onnx_backend(info->onnx_path, info->device_id)
-                                         : make_tensorrt_backend(info->tensorrt_path, info->device_id, true);
+                !info_options.onnx_path.empty()
+                    ? make_onnx_backend(info_options.onnx_path, info_options.device_id)
+                    : make_tensorrt_backend(info_options.tensorrt_path, info_options.device_id, true);
             print_model_metadata(backend->info(), 0, 0, ValidationLogMode::Interactive);
             return 0;
         }
 
-        if (const auto build_engine = parse_build_engine_args(argc, argv)) {
+        if (build_engine_cmd->parsed()) {
+            finalize_build_engine_options(build_engine_options);
             make_tensorrt_backend(
-                build_engine->onnx_path,
-                build_engine->device_id,
-                build_engine->allow_fp16,
-                build_engine->output_path);
-            std::fprintf(stderr, "tensorrt: wrote engine to %s\n", build_engine->output_path.c_str());
+                build_engine_options.onnx_path,
+                build_engine_options.device_id,
+                build_engine_options.allow_fp16,
+                build_engine_options.output_path);
+            std::fprintf(stderr, "tensorrt: wrote engine to %s\n", build_engine_options.output_path.c_str());
             return 0;
         }
 
-        if (const auto predict = parse_predict_args(argc, argv)) {
-            const PredictionRunResult result = run_prediction(*predict);
-            write_prediction_json(*predict, result);
-            print_prediction_summary(*predict, result);
+        if (predict_cmd->parsed()) {
+            finalize_predict_options(predict_state);
+            const PredictionRunResult result = run_prediction(predict_state.options);
+            write_prediction_json(predict_state.options, result);
+            print_prediction_summary(predict_state.options, result);
             return 0;
         }
 
-        if (const auto evaluate = parse_evaluate_args(argc, argv)) {
-            const EvaluationRunResult result = run_evaluation(*evaluate);
-            print_evaluation_summary(*evaluate, result);
+        if (evaluate_cmd->parsed()) {
+            finalize_evaluate_options(evaluate_state);
+            const EvaluationRunResult result = run_evaluation(evaluate_state.options);
+            print_evaluation_summary(evaluate_state.options, result);
             return 0;
         }
 
-        if (const auto train = parse_train_args(argc, argv)) {
-            if (!train->distributed_worker && train->device_ids.size() > 1) {
-                return spawn_distributed_training_workers(*train, argc, argv);
+        if (train_cmd->parsed()) {
+            finalize_train_options(
+                train_state,
+                train_device_id->count() > 0,
+                train_device_ids->count() > 0);
+            if (!train_state.options.distributed_worker && train_state.options.device_ids.size() > 1) {
+                return spawn_distributed_training_workers(train_state.options, argc, argv);
             }
-            const TrainRunResult result = run_training(*train);
-            print_training_summary(*train, result);
+            const TrainRunResult result = run_training(train_state.options);
+            print_training_summary(train_state.options, result);
             return 0;
         }
 
-        if (const auto normalize = parse_normalize_weights_args(argc, argv)) {
+        if (normalize_cmd->parsed()) {
+            finalize_normalize_options(normalize_options);
             const NativeCheckpoint checkpoint =
-                normalize_checkpoint_to_native(normalize->input_path, normalize->output_path);
+                normalize_checkpoint_to_native(normalize_options.input_path, normalize_options.output_path);
             std::fprintf(stderr,
                          "rfdetr.normalize-weights: wrote %zu tensors for preset=%s to %s\n",
                          checkpoint.state_dict.size(),
                          checkpoint.metadata.preset_name.c_str(),
-                         normalize->output_path.c_str());
+                         normalize_options.output_path.c_str());
             return 0;
         }
 
-        if (const auto validate = parse_validate_args(argc, argv)) {
-            const ValidationRunResult result = run_validation(*validate);
-            write_validation_report(*validate, result);
-            print_validation_run_summary(*validate, result);
+        if (validate_cmd->parsed()) {
+            finalize_validate_options(validate_options);
+            const ValidationRunResult result = run_validation(validate_options);
+            write_validation_report(validate_options, result);
+            print_validation_run_summary(validate_options, result);
             return 0;
         }
 
-        print_validate_usage();
         return 1;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "fastloader rfdetr error: %s\n", error.what());

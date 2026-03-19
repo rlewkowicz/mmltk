@@ -41,6 +41,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -64,6 +65,13 @@ struct EvalPassResult {
     double loss = 0.0;
     EvalSummary summary;
     PhaseTiming timing;
+};
+
+struct CapturedEvalSample {
+    torch::Tensor image;
+    torch::Tensor boxes;
+    torch::Tensor labels;
+    torch::Tensor masks;
 };
 
 struct ResumeState {
@@ -1152,12 +1160,20 @@ EvalPassResult evaluate_model(const TrainOptions& options,
     const auto started_at = std::chrono::steady_clock::now();
     size_t image_count = 0;
     size_t batch_count = 0;
-    bool captured_this_epoch = false;
+    size_t seen_images = 0;
     double loss_sum = 0.0;
+    std::optional<CapturedEvalSample> captured_sample;
+    const bool capture_eval_sample =
+        current_epoch.has_value() && progress_label.rfind("val ", 0) == 0;
     std::optional<ProgressBar> progress;
     if (options.progress_bar) {
         progress.emplace(std::move(progress_label), loader.num_images(), "img");
     }
+    std::mt19937_64 sample_rng(
+        static_cast<uint64_t>(options.seed) ^
+        (current_epoch.has_value()
+             ? (0x9e3779b97f4a7c15ULL + static_cast<uint64_t>(*current_epoch + 1))
+             : 0xd1b54a32d192ed03ULL));
 
     struct EvalPredictionLane {
         c10::cuda::CUDAStream stream;
@@ -1271,32 +1287,40 @@ EvalPassResult evaluate_model(const TrainOptions& options,
             const int64_t dataset_index = static_cast<int64_t>(batch.image_indices[image_pos]);
             const int image_id = static_cast<int>(image_id_for_dataset_index(image_ids, dataset_index));
             const size_t lane_index = submitted_images % lanes.size();
-            
-            if (current_epoch.has_value() && !captured_this_epoch) {
-                captured_this_epoch = true;
-                auto scores = processed[image_pos].at("scores");
-                auto labels = processed[image_pos].at("labels");
-                auto boxes = processed[image_pos].at("boxes");
-                auto masks_found = processed[image_pos].find("masks");
-                torch::Tensor masks = masks_found != processed[image_pos].end() ? masks_found->second : torch::Tensor();
 
-                auto keep = scores > 0.35f;
-                auto f_boxes = boxes.index({keep});
-                auto f_labels = labels.index({keep});
-                auto f_masks = masks.defined() ? masks.index({keep}) : torch::Tensor();
+            if (capture_eval_sample) {
+                ++seen_images;
+                std::uniform_int_distribution<size_t> select_current(0, seen_images - 1);
+                if (select_current(sample_rng) == 0) {
+                    const auto& image_result = processed[image_pos];
+                    const auto scores = image_result.at("scores");
+                    const auto labels = image_result.at("labels");
+                    const auto boxes = image_result.at("boxes");
+                    const auto masks_found = image_result.find("masks");
+                    const torch::Tensor masks =
+                        masks_found != image_result.end() ? masks_found->second : torch::Tensor();
+                    const auto keep = scores > 0.35f;
 
-                const auto image_chw = make_device_batch_tensor(
-                                           batch,
-                                           options.device_id,
-                                           loader.image_height(),
-                                           loader.image_width())
-                                           .select(0, static_cast<int64_t>(image_pos));
-                
-                RenderSampleOptions render_options;
-                render_options.num_classes = model.config().num_classes;
-                render_options.output_path = options.output_dir / "eval_samples" / ("epoch_" + std::to_string(*current_epoch + 1) + ".jpg");
-                
-                draw_eval_sample_async_gpu(image_chw, f_boxes, f_labels, f_masks, render_options);
+                    auto image_chw = make_device_batch_tensor(
+                                         batch,
+                                         options.device_id,
+                                         loader.image_height(),
+                                         loader.image_width())
+                                         .select(0, static_cast<int64_t>(image_pos))
+                                         .clone();
+                    auto f_boxes = boxes.index({keep}).clone();
+                    auto f_labels = labels.index({keep}).clone();
+                    torch::Tensor f_masks;
+                    if (masks.defined()) {
+                        f_masks = masks.index({keep}).clone();
+                    }
+                    captured_sample = CapturedEvalSample{
+                        std::move(image_chw),
+                        std::move(f_boxes),
+                        std::move(f_labels),
+                        std::move(f_masks),
+                    };
+                }
             }
 
             TensorMap image_result = std::move(processed[image_pos]);
@@ -1344,6 +1368,17 @@ EvalPassResult evaluate_model(const TrainOptions& options,
     }
     while (!cpu_futures.empty()) {
         drain_cpu();
+    }
+    if (capture_eval_sample && captured_sample.has_value()) {
+        RenderSampleOptions render_options;
+        render_options.num_classes = model.config().num_classes;
+        render_options.output_path =
+            options.output_dir / "eval_samples" / ("epoch_" + std::to_string(*current_epoch + 1) + ".png");
+        draw_eval_sample_async_gpu(captured_sample->image,
+                                   captured_sample->boxes,
+                                   captured_sample->labels,
+                                   captured_sample->masks,
+                                   render_options);
     }
     if (progress.has_value()) {
         progress->close();
@@ -1881,6 +1916,14 @@ TrainRunResult run_training(const TrainOptions& options) {
                         options.device_id,
                         "parallel train parameter readiness event");
                 }
+            }
+        }
+
+        {
+            FASTLOADER_PROFILE_SCOPE("rfdetr.train.drain_loader");
+            Batch drain_batch{};
+            while (train_loader.next_batch(drain_batch)) {
+                train_loader.release_batch(drain_batch);
             }
         }
 

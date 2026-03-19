@@ -5,13 +5,16 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 
+#include <algorithm>
+#include <cctype>
 #include <deque>
-#include <filesystem>
 #include <cmath>
+#include <filesystem>
 #include <future>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include <stb_image_write.h>
@@ -43,6 +46,7 @@ struct PendingEvalSampleWrite {
     std::string output_path;
     int width = 0;
     int height = 0;
+    int device_id = 0;
     torch::Tensor image_host;
     std::shared_ptr<CudaEventHandle> ready_event;
 };
@@ -58,19 +62,45 @@ EvalSampleWriterState& eval_sample_writer_state() {
     return state;
 }
 
-void enqueue_eval_sample_write(PendingEvalSampleWrite pending) {
-    auto& state = eval_sample_writer_state();
-    std::future<void> future = state.pool.enqueue([pending = std::move(pending)]() mutable {
-        ensure_cuda_ok(cudaEventSynchronize(pending.ready_event->get()),
-                       "cudaEventSynchronize for eval sample write");
+std::string lowercase_copy(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return value;
+}
+
+void write_eval_sample_image(const PendingEvalSampleWrite& pending) {
+    const std::string extension =
+        lowercase_copy(std::filesystem::path(pending.output_path).extension().string());
+    if (extension == ".jpg" || extension == ".jpeg") {
         if (stbi_write_jpg(pending.output_path.c_str(),
                            pending.width,
                            pending.height,
                            3,
                            pending.image_host.data_ptr<uint8_t>(),
-                           90) == 0) {
+                           98) == 0) {
             throw std::runtime_error("failed to write eval sample image: " + pending.output_path);
         }
+        return;
+    }
+
+    if (stbi_write_png(pending.output_path.c_str(),
+                       pending.width,
+                       pending.height,
+                       3,
+                       pending.image_host.data_ptr<uint8_t>(),
+                       pending.width * 3) == 0) {
+        throw std::runtime_error("failed to write eval sample image: " + pending.output_path);
+    }
+}
+
+void enqueue_eval_sample_write(PendingEvalSampleWrite pending) {
+    auto& state = eval_sample_writer_state();
+    std::future<void> future = state.pool.enqueue([pending = std::move(pending)]() mutable {
+        ensure_cuda_ok(cudaSetDevice(pending.device_id), "cudaSetDevice for eval sample write");
+        ensure_cuda_ok(cudaEventSynchronize(pending.ready_event->get()),
+                       "cudaEventSynchronize for eval sample write");
+        write_eval_sample_image(pending);
     });
     std::lock_guard<std::mutex> lock(state.mutex);
     state.futures.push_back(std::move(future));
@@ -115,8 +145,8 @@ void draw_eval_sample_async_gpu(
     const torch::Tensor& result_masks,
     const RenderSampleOptions& options
 ) {
-    if (result_boxes.numel() == 0 || image_chw.numel() == 0) {
-        return; // nothing to draw
+    if (image_chw.numel() == 0) {
+        return;
     }
 
     const auto device = image_chw.device();
@@ -179,7 +209,12 @@ void draw_eval_sample_async_gpu(
     {
         c10::cuda::CUDAStreamGuard stream_guard(draw_stream);
         image_hwc = image_chw.permute({1, 2, 0}).contiguous();
-        image_u8 = image_hwc.clamp(0, 255).to(torch::kUInt8);
+        const double image_max = image_hwc.max().item<double>();
+        if (image_max <= 1.0) {
+            image_u8 = image_hwc.mul(255.0f).clamp(0, 255).to(torch::kUInt8);
+        } else {
+            image_u8 = image_hwc.clamp(0, 255).to(torch::kUInt8);
+        }
         boxes_t = result_boxes.to(device, torch::kFloat32).contiguous();
         if (result_masks.defined()) {
             masks_t = result_masks.to(device, torch::kBool).contiguous();
@@ -190,18 +225,20 @@ void draw_eval_sample_async_gpu(
         colors_gpu = torch::tensor(colors, torch::TensorOptions().dtype(torch::kUInt8).device(device));
         labels_gpu = torch::tensor(labels_int, torch::TensorOptions().dtype(torch::kInt32).device(device));
 
-        launch_draw_masks_boxes(
-            image_u8.data_ptr<uint8_t>(),
-            width,
-            height,
-            masks_t.data_ptr<bool>(),
-            boxes_t.data_ptr<float>(),
-            colors_gpu.data_ptr<uint8_t>(),
-            labels_gpu.data_ptr<int>(),
-            num_instances,
-            options.mask_alpha,
-            static_cast<int>(options.box_thickness),
-            draw_stream.stream());
+        if (num_instances > 0) {
+            launch_draw_masks_boxes(
+                image_u8.data_ptr<uint8_t>(),
+                width,
+                height,
+                masks_t.data_ptr<bool>(),
+                boxes_t.data_ptr<float>(),
+                colors_gpu.data_ptr<uint8_t>(),
+                labels_gpu.data_ptr<int>(),
+                num_instances,
+                options.mask_alpha,
+                static_cast<int>(options.box_thickness),
+                draw_stream.stream());
+        }
 
         image_host = torch::empty(
             {height, width, 3},
@@ -228,6 +265,7 @@ void draw_eval_sample_async_gpu(
         options.output_path.string(),
         width,
         height,
+        device.index(),
         std::move(image_host),
         std::move(ready),
     });

@@ -5,36 +5,41 @@
 #include "dataset_loader.h"
 #include "profile_utils.h"
 #include "rfdetr/progress_bar.h"
+#include "CLI11.hpp"
 #if FASTLOADER_BUILD_RFDETR_NATIVE
 #include "rfdetr/cli.h"
 #endif
-#include <exception>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
-#include <chrono>
+#include <exception>
+#include <string>
 
 using namespace fastloader;
 
-static void print_usage() {
-    fprintf(stderr, "Usage:\n");
-    fprintf(stderr, "  fastloader compile <source_dir> <output_dir> <split> [width] [height]\n");
-    fprintf(stderr, "  fastloader bench <compiled.bin> [batch_size] [num_epochs]\n");
-    fprintf(stderr, "  fastloader info <compiled.bin>\n");
-#if FASTLOADER_BUILD_RFDETR_NATIVE
-    fprintf(stderr, "  fastloader rfdetr <predict|evaluate|train|validate|build-engine|normalize-weights|info> ...\n");
-#endif
+namespace {
+
+constexpr int kCliParseSuccess = static_cast<int>(CLI::ExitCodes::Success);
+
+int handle_parse_error(CLI::App& app, const CLI::ParseError& error) {
+    app.exit(error);
+    return error.get_exit_code() == kCliParseSuccess ? 0 : 1;
 }
 
-static void cmd_compile(int argc, char** argv) {
+CLI::Option* add_path_option(CLI::App* command,
+                             const std::string& name,
+                             std::string& value,
+                             const char* description,
+                             bool required = false) {
+    auto* option = command->add_option(name, value, description)->type_name("PATH");
+    if (required) {
+        option->required();
+    }
+    return option;
+}
+
+void cmd_compile(const CompilerConfig& cfg) {
     FASTLOADER_PROFILE_RUN_LABEL("fastloader_cli compile");
-    if (argc < 5) { print_usage(); return; }
-    CompilerConfig cfg;
-    cfg.source_dir = argv[2];
-    cfg.output_dir = argv[3];
-    cfg.split = argv[4];
-    if (argc > 5) cfg.target_width = std::stoi(argv[5]);
-    if (argc > 6) cfg.target_height = std::stoi(argv[6]);
-    else cfg.target_height = cfg.target_width;
 
     auto t0 = std::chrono::steady_clock::now();
     size_t last_done = 0;
@@ -62,11 +67,10 @@ static void cmd_compile(int argc, char** argv) {
             std::chrono::duration<double>(t1 - t0).count());
 }
 
-static void cmd_info(int argc, char** argv) {
+void cmd_info(const std::string& compiled_path) {
     FASTLOADER_PROFILE_RUN_LABEL("fastloader_cli info");
-    if (argc < 3) { print_usage(); return; }
-    const FileHeader header = read_compiled_header(argv[2]);
-    printf("File: %s\n", argv[2]);
+    const FileHeader header = read_compiled_header(compiled_path);
+    printf("File: %s\n", compiled_path.c_str());
     printf("Images: %u\n", header.num_images);
     printf("Size: %ux%u\n", header.image_width, header.image_height);
     printf("Stride: %zu bytes/image (%.2f KB)\n",
@@ -79,14 +83,8 @@ static void cmd_info(int argc, char** argv) {
     printf("Batches (bs=1): %u\n", header.num_images);
 }
 
-static void cmd_bench(int argc, char** argv) {
+void cmd_bench(const DatasetLoader::Config& cfg, int num_epochs) {
     FASTLOADER_PROFILE_RUN_LABEL("fastloader_cli bench");
-    if (argc < 3) { print_usage(); return; }
-    DatasetLoader::Config cfg;
-    cfg.compiled_path = argv[2];
-    cfg.batch_size = argc > 3 ? std::stoi(argv[3]) : 32;
-    cfg.shuffle = true;
-    int num_epochs = argc > 4 ? std::stoi(argv[4]) : 1;
 
     DatasetLoader loader(cfg);
     printf("Benchmarking: %zu images, batch=%zu, stride=%zu, epochs=%d\n",
@@ -109,19 +107,94 @@ static void cmd_bench(int argc, char** argv) {
     }
 }
 
+} // namespace
+
 int main(int argc, char** argv) {
     try {
-        if (argc < 2) { print_usage(); return 1; }
 #if FASTLOADER_BUILD_RFDETR_NATIVE
-        if (strcmp(argv[1], "rfdetr") == 0) {
+        if (argc > 1 && std::strcmp(argv[1], "rfdetr") == 0) {
             return fastloader::rfdetr::handle_cli(argc, argv);
         }
 #endif
-        if (strcmp(argv[1], "compile") == 0) cmd_compile(argc, argv);
-        else if (strcmp(argv[1], "info") == 0) cmd_info(argc, argv);
-        else if (strcmp(argv[1], "bench") == 0) cmd_bench(argc, argv);
-        else { print_usage(); return 1; }
-        return 0;
+
+        CLI::App app{"High-throughput dataset compilation, inspection, and streaming benchmarks"};
+        app.name("fastloader");
+        app.option_defaults()->always_capture_default();
+        app.require_subcommand(1);
+
+        CompilerConfig compile_config;
+        auto* compile_cmd = app.add_subcommand(
+            "compile",
+            "Compile a raw dataset split into fastloader's mmap-friendly binary format");
+        add_path_option(compile_cmd, "--source-dir,source_dir", compile_config.source_dir,
+                        "Source dataset directory", true);
+        add_path_option(compile_cmd, "--output-dir,output_dir", compile_config.output_dir,
+                        "Output directory for compiled binaries", true);
+        compile_cmd->add_option("--split,split", compile_config.split, "Dataset split name")
+            ->required();
+        auto* compile_width = compile_cmd->add_option(
+            "--width,width",
+            compile_config.target_width,
+            "Target image width in pixels");
+        auto* compile_height = compile_cmd->add_option(
+            "--height,height",
+            compile_config.target_height,
+            "Target image height in pixels");
+        compile_width->type_name("INT");
+        compile_height->type_name("INT");
+
+        DatasetLoader::Config bench_config;
+        bench_config.shuffle = true;
+        bench_config.batch_size = 32;
+        int bench_epochs = 1;
+        auto* bench_cmd = app.add_subcommand(
+            "bench",
+            "Benchmark streaming throughput over a compiled dataset");
+        add_path_option(bench_cmd, "--compiled,compiled", bench_config.compiled_path,
+                        "Compiled dataset binary", true);
+        bench_cmd->add_option("--batch-size,batch_size", bench_config.batch_size,
+                              "Batch size to stream during the benchmark")
+            ->type_name("INT");
+        bench_cmd->add_option("--epochs,num_epochs", bench_epochs,
+                              "Number of epochs to run during the benchmark")
+            ->type_name("INT");
+
+        std::string info_compiled_path;
+        auto* info_cmd = app.add_subcommand(
+            "info",
+            "Inspect metadata from a compiled dataset binary");
+        add_path_option(info_cmd, "--compiled,compiled", info_compiled_path,
+                        "Compiled dataset binary", true);
+
+#if FASTLOADER_BUILD_RFDETR_NATIVE
+        app.add_subcommand(
+               "rfdetr",
+               "RF-DETR model tooling, inference, evaluation, and training")
+            ->footer("Run `fastloader rfdetr --help` for the full RF-DETR command surface.");
+#endif
+
+        try {
+            app.parse(argc, argv);
+        } catch (const CLI::ParseError& error) {
+            return handle_parse_error(app, error);
+        }
+
+        if (compile_cmd->parsed()) {
+            if (compile_width->count() > 0 && compile_height->count() == 0) {
+                compile_config.target_height = compile_config.target_width;
+            }
+            cmd_compile(compile_config);
+            return 0;
+        }
+        if (bench_cmd->parsed()) {
+            cmd_bench(bench_config, bench_epochs);
+            return 0;
+        }
+        if (info_cmd->parsed()) {
+            cmd_info(info_compiled_path);
+            return 0;
+        }
+        return 1;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "fastloader error: %s\n", error.what());
     } catch (...) {

@@ -15,6 +15,8 @@
 
 #include <unistd.h>
 
+#include "stb_image.h"
+
 namespace fs = std::filesystem;
 
 namespace {
@@ -60,10 +62,10 @@ void test_eval_sample_writer_flushes_output() {
     c10::cuda::CUDAGuard guard(0);
 
     const ScopedTempDir temp_dir("fastloader_eval_sample_writer");
-    const fs::path output_path = temp_dir.path() / "sample.jpg";
+    const fs::path output_path = temp_dir.path() / "sample.png";
 
     auto image = torch::full({3, 16, 16},
-                             96.0f,
+                             0.35f,
                              torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, 0));
     auto boxes = torch::tensor({{2.0f, 2.0f, 13.0f, 13.0f}},
                                torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, 0));
@@ -84,6 +86,23 @@ void test_eval_sample_writer_flushes_output() {
     assert(output_exists);
     const auto output_size = fs::file_size(output_path);
     assert(output_size > 0);
+
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    stbi_uc* decoded = stbi_load(output_path.c_str(), &width, &height, &channels, 3);
+    if (decoded == nullptr) {
+        throw std::runtime_error("stbi_load failed for eval sample output");
+    }
+
+    const int center_offset = ((height / 2) * width + (width / 2)) * 3;
+    const int center_sum = static_cast<int>(decoded[center_offset]) +
+                           static_cast<int>(decoded[center_offset + 1]) +
+                           static_cast<int>(decoded[center_offset + 2]);
+    stbi_image_free(decoded);
+    assert(width == 16);
+    assert(height == 16);
+    assert(center_sum > 100);
 }
 
 } // namespace
