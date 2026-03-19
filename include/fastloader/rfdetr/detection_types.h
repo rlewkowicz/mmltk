@@ -73,6 +73,7 @@ struct DetectionConfig {
     bool aux_loss = false;
     bool two_stage = false;
     bool include_masks = false;
+    bool use_jit_traced_loss_ops = false;
     int64_t mask_point_sample_ratio = 16;
     double focal_alpha = 0.25;
     double cls_loss_coef = 1.0;

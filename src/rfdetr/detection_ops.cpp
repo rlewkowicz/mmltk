@@ -9,9 +9,13 @@
 #include <ATen/TensorIndexing.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#include <torch/nn/functional/activation.h>
 #include <torch/nn/functional/loss.h>
 #include <torch/nn/functional/upsampling.h>
 #include <torch/nn/functional/vision.h>
+#include <torch/script.h>
+#include <torch/csrc/jit/frontend/tracer.h>
+#include <torch/csrc/jit/api/function_impl.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -102,6 +106,47 @@ struct LsapScratch {
     }
 };
 
+struct TracedBinaryLossOp {
+    torch::jit::Module module;
+    c10::DeviceType input_device_type = c10::DeviceType::CPU;
+    c10::DeviceType target_device_type = c10::DeviceType::CPU;
+    c10::ScalarType input_dtype = c10::ScalarType::Undefined;
+    c10::ScalarType target_dtype = c10::ScalarType::Undefined;
+    int64_t input_dim = -1;
+    int64_t target_dim = -1;
+    bool initialized = false;
+};
+
+struct TracedParametricBinaryLossOp : TracedBinaryLossOp {
+    double alpha = std::numeric_limits<double>::quiet_NaN();
+    double gamma = std::numeric_limits<double>::quiet_NaN();
+};
+
+struct TracedTernaryLossOp {
+    torch::jit::Module module;
+    c10::DeviceType first_device_type = c10::DeviceType::CPU;
+    c10::DeviceType second_device_type = c10::DeviceType::CPU;
+    c10::DeviceType third_device_type = c10::DeviceType::CPU;
+    c10::ScalarType first_dtype = c10::ScalarType::Undefined;
+    c10::ScalarType second_dtype = c10::ScalarType::Undefined;
+    c10::ScalarType third_dtype = c10::ScalarType::Undefined;
+    int64_t first_dim = -1;
+    int64_t second_dim = -1;
+    int64_t third_dim = -1;
+    bool initialized = false;
+};
+
+struct TracedLossOpCache {
+    TracedBinaryLossOp sigmoid_ce;
+    TracedBinaryLossOp dice;
+    TracedBinaryLossOp batch_dice;
+    TracedBinaryLossOp batch_sigmoid_ce;
+    TracedParametricBinaryLossOp sigmoid_focal;
+    TracedParametricBinaryLossOp sigmoid_varifocal;
+    TracedParametricBinaryLossOp position_supervised;
+    TracedTernaryLossOp ia_bce;
+};
+
 using MatchIndices = std::vector<std::pair<torch::Tensor, torch::Tensor>>;
 
 MatcherCostScratch& matcher_cost_scratch() {
@@ -114,6 +159,138 @@ MatcherCostScratch& matcher_cost_scratch() {
 LsapScratch& lsap_scratch() {
     thread_local auto* scratch = new LsapScratch();
     return *scratch;
+}
+
+TracedLossOpCache& traced_loss_op_cache() {
+    thread_local auto* cache = new TracedLossOpCache();
+    return *cache;
+}
+
+bool matches_binary_signature(const TracedBinaryLossOp& cache,
+                              const torch::Tensor& input,
+                              const torch::Tensor& target) {
+    return cache.initialized &&
+           cache.input_device_type == input.device().type() &&
+           cache.target_device_type == target.device().type() &&
+           cache.input_dtype == input.scalar_type() &&
+           cache.target_dtype == target.scalar_type() &&
+           cache.input_dim == input.dim() &&
+           cache.target_dim == target.dim();
+}
+
+bool matches_parametric_binary_signature(const TracedParametricBinaryLossOp& cache,
+                                         const torch::Tensor& input,
+                                         const torch::Tensor& target,
+                                         double alpha,
+                                         double gamma) {
+    return matches_binary_signature(cache, input, target) &&
+           cache.alpha == alpha &&
+           cache.gamma == gamma;
+}
+
+bool matches_ternary_signature(const TracedTernaryLossOp& cache,
+                               const torch::Tensor& first,
+                               const torch::Tensor& second,
+                               const torch::Tensor& third) {
+    return cache.initialized &&
+           cache.first_device_type == first.device().type() &&
+           cache.second_device_type == second.device().type() &&
+           cache.third_device_type == third.device().type() &&
+           cache.first_dtype == first.scalar_type() &&
+           cache.second_dtype == second.scalar_type() &&
+           cache.third_dtype == third.scalar_type() &&
+           cache.first_dim == first.dim() &&
+           cache.second_dim == second.dim() &&
+           cache.third_dim == third.dim();
+}
+
+template <typename TraceFn>
+void ensure_binary_loss_trace(TracedBinaryLossOp& cache,
+                              const char* class_name,
+                              const torch::Tensor& input,
+                              const torch::Tensor& target,
+                              TraceFn&& fn) {
+    if (matches_binary_signature(cache, input, target)) {
+        return;
+    }
+
+    auto cu = std::make_shared<torch::jit::CompilationUnit>();
+    auto cls = torch::jit::ClassType::create(class_name, cu, true);
+    cache.module = torch::jit::Module(cu, cls);
+
+    const auto example_input = input.detach().contiguous();
+    const auto example_target = target.detach().contiguous();
+    auto trace_res = torch::jit::tracer::trace(
+        {example_input, example_target},
+        [&](torch::jit::Stack args) -> torch::jit::Stack {
+            return {fn(args[0].toTensor(), args[1].toTensor())};
+        },
+        [](const torch::autograd::Variable&) { return ""; },
+        false, false, &cache.module
+    );
+    cache.module.type()->addMethod(cu->create_function("forward", trace_res.first->graph, true));
+    cache.input_device_type = input.device().type();
+    cache.target_device_type = target.device().type();
+    cache.input_dtype = input.scalar_type();
+    cache.target_dtype = target.scalar_type();
+    cache.input_dim = input.dim();
+    cache.target_dim = target.dim();
+    cache.initialized = true;
+}
+
+template <typename TraceFn>
+void ensure_parametric_binary_loss_trace(TracedParametricBinaryLossOp& cache,
+                                         const char* class_name,
+                                         const torch::Tensor& input,
+                                         const torch::Tensor& target,
+                                         double alpha,
+                                         double gamma,
+                                         TraceFn&& fn) {
+    if (matches_parametric_binary_signature(cache, input, target, alpha, gamma)) {
+        return;
+    }
+    ensure_binary_loss_trace(cache, class_name, input, target, std::forward<TraceFn>(fn));
+    cache.alpha = alpha;
+    cache.gamma = gamma;
+}
+
+template <typename TraceFn>
+void ensure_ternary_loss_trace(TracedTernaryLossOp& cache,
+                               const char* class_name,
+                               const torch::Tensor& first,
+                               const torch::Tensor& second,
+                               const torch::Tensor& third,
+                               TraceFn&& fn) {
+    if (matches_ternary_signature(cache, first, second, third)) {
+        return;
+    }
+
+    auto cu = std::make_shared<torch::jit::CompilationUnit>();
+    auto cls = torch::jit::ClassType::create(class_name, cu, true);
+    cache.module = torch::jit::Module(cu, cls);
+
+    const auto example_first = first.detach().contiguous();
+    const auto example_second = second.detach().contiguous();
+    const auto example_third = third.detach().contiguous();
+    auto trace_res = torch::jit::tracer::trace(
+        {example_first, example_second, example_third},
+        [&](torch::jit::Stack args) -> torch::jit::Stack {
+            return {fn(args[0].toTensor(), args[1].toTensor(), args[2].toTensor())};
+        },
+        [](const torch::autograd::Variable&) { return ""; },
+        false, false, &cache.module
+    );
+    cache.module.type()->addMethod(cu->create_function("forward", trace_res.first->graph, true));
+    cache.first_device_type = first.device().type();
+    cache.second_device_type = second.device().type();
+    cache.third_device_type = third.device().type();
+    cache.first_dtype = first.scalar_type();
+    cache.second_dtype = second.scalar_type();
+    cache.third_dtype = third.scalar_type();
+    cache.first_dim = first.dim();
+    cache.second_dim = second.dim();
+    cache.third_dim = third.dim();
+    cache.initialized = true;
 }
 
 torch::Tensor point_sample(const torch::Tensor& input,
@@ -314,24 +491,55 @@ void sanitize_cost_matrix_cpu_(const torch::Tensor& cost_cpu) {
     }
 }
 
-torch::Tensor stable_softplus(const torch::Tensor& value) {
-    return torch::clamp_min(value, 0) + torch::log1p(torch::exp(-torch::abs(value)));
-}
-
-torch::Tensor stable_binary_cross_entropy_with_logits(const torch::Tensor& inputs, const torch::Tensor& targets) {
-    return torch::clamp_min(inputs, 0) - inputs * targets + torch::log1p(torch::exp(-torch::abs(inputs)));
+torch::Tensor binary_cross_entropy_with_logits_none(const torch::Tensor& inputs,
+                                                    const torch::Tensor& targets) {
+    return F::binary_cross_entropy_with_logits(
+        inputs,
+        targets,
+        F::BinaryCrossEntropyWithLogitsFuncOptions().reduction(torch::kNone)
+    );
 }
 
 torch::Tensor sigmoid_ce_loss(const torch::Tensor& inputs,
                               const torch::Tensor& targets,
-                              double num_masks) {
-    const auto loss = stable_binary_cross_entropy_with_logits(inputs, targets);
+                              double num_masks,
+                              bool use_jit_traced_loss_ops) {
+    if (use_jit_traced_loss_ops) {
+        auto& cache = traced_loss_op_cache();
+        ensure_binary_loss_trace(
+            cache.sigmoid_ce,
+            "__torch__.NativeRfDetrSigmoidCeLoss",
+            inputs,
+            targets,
+            [](const torch::Tensor& traced_inputs, const torch::Tensor& traced_targets) {
+                return binary_cross_entropy_with_logits_none(traced_inputs, traced_targets).mean(1).sum();
+            });
+        return cache.sigmoid_ce.module.forward({inputs, targets}).toTensor() / num_masks;
+    }
+    const auto loss = binary_cross_entropy_with_logits_none(inputs, targets);
     return loss.mean(1).sum() / num_masks;
 }
 
 torch::Tensor dice_loss(const torch::Tensor& inputs,
                         const torch::Tensor& targets,
-                        double num_masks) {
+                        double num_masks,
+                        bool use_jit_traced_loss_ops) {
+    if (use_jit_traced_loss_ops) {
+        auto& cache = traced_loss_op_cache();
+        ensure_binary_loss_trace(
+            cache.dice,
+            "__torch__.NativeRfDetrDiceLoss",
+            inputs,
+            targets,
+            [](const torch::Tensor& traced_inputs, const torch::Tensor& traced_targets) {
+                const auto probs = traced_inputs.sigmoid().flatten(1);
+                const auto flat_targets = traced_targets.flatten(1);
+                const auto numerator = 2 * (probs * flat_targets).sum(-1);
+                const auto denominator = probs.sum(-1) + flat_targets.sum(-1);
+                return (1 - (numerator + 1) / (denominator + 1)).sum();
+            });
+        return cache.dice.module.forward({inputs, targets}).toTensor() / num_masks;
+    }
     const auto probs = inputs.sigmoid().flatten(1);
     const auto flat_targets = targets.flatten(1);
     const auto numerator = 2 * (probs * flat_targets).sum(-1);
@@ -340,7 +548,25 @@ torch::Tensor dice_loss(const torch::Tensor& inputs,
     return loss.sum() / num_masks;
 }
 
-torch::Tensor batch_dice_loss(const torch::Tensor& inputs, const torch::Tensor& targets) {
+torch::Tensor batch_dice_loss(const torch::Tensor& inputs,
+                              const torch::Tensor& targets,
+                              bool use_jit_traced_loss_ops) {
+    if (use_jit_traced_loss_ops) {
+        auto& cache = traced_loss_op_cache();
+        ensure_binary_loss_trace(
+            cache.batch_dice,
+            "__torch__.NativeRfDetrBatchDiceLoss",
+            inputs,
+            targets,
+            [](const torch::Tensor& traced_inputs, const torch::Tensor& traced_targets) {
+                const auto probs = traced_inputs.sigmoid().flatten(1);
+                const auto flat_targets = traced_targets.flatten(1);
+                const auto numerator = 2 * torch::einsum("nc,mc->nm", {probs, flat_targets});
+                const auto denominator = probs.sum(-1).unsqueeze(1) + flat_targets.sum(-1).unsqueeze(0);
+                return 1 - (numerator + 1) / (denominator + 1);
+            });
+        return cache.batch_dice.module.forward({inputs, targets}).toTensor();
+    }
     const auto probs = inputs.sigmoid().flatten(1);
     const auto flat_targets = targets.flatten(1);
     const auto numerator = 2 * torch::einsum("nc,mc->nm", {probs, flat_targets});
@@ -348,13 +574,35 @@ torch::Tensor batch_dice_loss(const torch::Tensor& inputs, const torch::Tensor& 
     return 1 - (numerator + 1) / (denominator + 1);
 }
 
-torch::Tensor batch_sigmoid_ce_loss(const torch::Tensor& inputs, const torch::Tensor& targets) {
+torch::Tensor batch_sigmoid_ce_loss(const torch::Tensor& inputs,
+                                    const torch::Tensor& targets,
+                                    bool use_jit_traced_loss_ops) {
+    if (use_jit_traced_loss_ops) {
+        auto& cache = traced_loss_op_cache();
+        ensure_binary_loss_trace(
+            cache.batch_sigmoid_ce,
+            "__torch__.NativeRfDetrBatchSigmoidCeLoss",
+            inputs,
+            targets,
+            [](const torch::Tensor& traced_inputs, const torch::Tensor& traced_targets) {
+                const auto flat_targets = traced_targets.flatten(1);
+                const auto positives =
+                    binary_cross_entropy_with_logits_none(traced_inputs, torch::ones_like(traced_inputs));
+                const auto negatives =
+                    binary_cross_entropy_with_logits_none(traced_inputs, torch::zeros_like(traced_inputs));
+                return (torch::einsum("nc,mc->nm", {positives, flat_targets}) +
+                        torch::einsum("nc,mc->nm", {negatives, 1 - flat_targets})) /
+                       static_cast<double>(flat_targets.size(1));
+            });
+        return cache.batch_sigmoid_ce.module.forward({inputs, targets}).toTensor();
+    }
     const auto flat_targets = targets.flatten(1);
-    const auto negatives = F::softplus(inputs);
-    const auto negative_term = negatives.sum(-1).unsqueeze(1);
-    const auto positive_adjust = torch::matmul(inputs, flat_targets.transpose(0, 1));
-    const auto loss = negative_term - positive_adjust;
-    return loss / static_cast<double>(inputs.size(1));
+    const auto positives = binary_cross_entropy_with_logits_none(inputs, torch::ones_like(inputs));
+    const auto negatives = binary_cross_entropy_with_logits_none(inputs, torch::zeros_like(inputs));
+    const auto loss =
+        torch::einsum("nc,mc->nm", {positives, flat_targets}) +
+        torch::einsum("nc,mc->nm", {negatives, 1 - flat_targets});
+    return loss / static_cast<double>(flat_targets.size(1));
 }
 
 torch::Tensor point_sample(const torch::Tensor& input,
@@ -573,13 +821,32 @@ torch::Tensor sigmoid_focal_loss(const torch::Tensor& inputs,
                                  const torch::Tensor& targets,
                                  double num_boxes,
                                  double alpha,
-                                 double gamma) {
-    if (inputs.device().is_cuda() && targets.device().is_cuda()) {
-        const auto loss = sigmoid_focal_loss_cuda(inputs, targets, alpha, gamma);
-        return loss.mean(1).sum() / num_boxes;
+                                 double gamma,
+                                 bool use_jit_traced_loss_ops) {
+    if (use_jit_traced_loss_ops) {
+        auto& cache = traced_loss_op_cache();
+        ensure_parametric_binary_loss_trace(
+            cache.sigmoid_focal,
+            "__torch__.NativeRfDetrSigmoidFocalLoss",
+            inputs,
+            targets,
+            alpha,
+            gamma,
+            [alpha, gamma](const torch::Tensor& traced_inputs, const torch::Tensor& traced_targets) {
+                const auto prob = traced_inputs.sigmoid();
+                const auto ce_loss = binary_cross_entropy_with_logits_none(traced_inputs, traced_targets);
+                const auto p_t = prob * traced_targets + (1 - prob) * (1 - traced_targets);
+                auto loss = ce_loss * torch::pow(1 - p_t, gamma);
+                if (alpha >= 0.0) {
+                    const auto alpha_t = alpha * traced_targets + (1 - alpha) * (1 - traced_targets);
+                    loss = alpha_t * loss;
+                }
+                return loss.mean(1).sum();
+            });
+        return cache.sigmoid_focal.module.forward({inputs, targets}).toTensor() / num_boxes;
     }
     const auto prob = inputs.sigmoid();
-    const auto ce_loss = stable_binary_cross_entropy_with_logits(inputs, targets);
+    const auto ce_loss = binary_cross_entropy_with_logits_none(inputs, targets);
     const auto p_t = prob * targets + (1 - prob) * (1 - targets);
     auto loss = ce_loss * torch::pow(1 - p_t, gamma);
     if (alpha >= 0.0) {
@@ -593,12 +860,33 @@ torch::Tensor sigmoid_varifocal_loss(const torch::Tensor& inputs,
                                      const torch::Tensor& targets,
                                      double num_boxes,
                                      double alpha,
-                                     double gamma) {
+                                     double gamma,
+                                     bool use_jit_traced_loss_ops) {
+    if (use_jit_traced_loss_ops) {
+        auto& cache = traced_loss_op_cache();
+        ensure_parametric_binary_loss_trace(
+            cache.sigmoid_varifocal,
+            "__torch__.NativeRfDetrSigmoidVarifocalLoss",
+            inputs,
+            targets,
+            alpha,
+            gamma,
+            [alpha, gamma](const torch::Tensor& traced_inputs, const torch::Tensor& traced_targets) {
+                const auto prob = traced_inputs.sigmoid();
+                const auto focal_weight =
+                    traced_targets * traced_targets.gt(0.0).to(traced_inputs.dtype()) +
+                    (1 - alpha) * torch::pow((prob - traced_targets).abs(), gamma) *
+                        traced_targets.le(0.0).to(traced_inputs.dtype());
+                const auto ce_loss = binary_cross_entropy_with_logits_none(traced_inputs, traced_targets);
+                return (ce_loss * focal_weight).mean(1).sum();
+            });
+        return cache.sigmoid_varifocal.module.forward({inputs, targets}).toTensor() / num_boxes;
+    }
     const auto prob = inputs.sigmoid();
     const auto focal_weight =
         targets * targets.gt(0.0).to(inputs.dtype()) +
         (1 - alpha) * torch::pow((prob - targets).abs(), gamma) * targets.le(0.0).to(inputs.dtype());
-    const auto ce_loss = stable_binary_cross_entropy_with_logits(inputs, targets);
+    const auto ce_loss = binary_cross_entropy_with_logits_none(inputs, targets);
     return (ce_loss * focal_weight).mean(1).sum() / num_boxes;
 }
 
@@ -606,15 +894,63 @@ torch::Tensor position_supervised_loss(const torch::Tensor& inputs,
                                        const torch::Tensor& targets,
                                        double num_boxes,
                                        double alpha,
-                                       double gamma) {
+                                       double gamma,
+                                       bool use_jit_traced_loss_ops) {
+    if (use_jit_traced_loss_ops) {
+        auto& cache = traced_loss_op_cache();
+        ensure_parametric_binary_loss_trace(
+            cache.position_supervised,
+            "__torch__.NativeRfDetrPositionSupervisedLoss",
+            inputs,
+            targets,
+            alpha,
+            gamma,
+            [alpha, gamma](const torch::Tensor& traced_inputs, const torch::Tensor& traced_targets) {
+                const auto prob = traced_inputs.sigmoid();
+                auto loss = binary_cross_entropy_with_logits_none(traced_inputs, traced_targets) *
+                            torch::pow((traced_targets - prob).abs(), gamma);
+                if (alpha >= 0.0) {
+                    const auto alpha_t = alpha * traced_targets.gt(0.0).to(traced_inputs.dtype()) +
+                                         (1 - alpha) * traced_targets.le(0.0).to(traced_inputs.dtype());
+                    loss = alpha_t * loss;
+                }
+                return loss.mean(1).sum();
+            });
+        return cache.position_supervised.module.forward({inputs, targets}).toTensor() / num_boxes;
+    }
     const auto prob = inputs.sigmoid();
-    auto loss = stable_binary_cross_entropy_with_logits(inputs, targets) * torch::pow((targets - prob).abs(), gamma);
+    auto loss = binary_cross_entropy_with_logits_none(inputs, targets) * torch::pow((targets - prob).abs(), gamma);
     if (alpha >= 0.0) {
         const auto alpha_t = alpha * targets.gt(0.0).to(inputs.dtype()) +
                              (1 - alpha) * targets.le(0.0).to(inputs.dtype());
         loss = alpha_t * loss;
     }
     return loss.mean(1).sum() / num_boxes;
+}
+
+torch::Tensor ia_bce_loss(const torch::Tensor& inputs,
+                          const torch::Tensor& pos_weights,
+                          const torch::Tensor& neg_weights,
+                          double num_boxes,
+                          bool use_jit_traced_loss_ops) {
+    if (use_jit_traced_loss_ops) {
+        auto& cache = traced_loss_op_cache();
+        ensure_ternary_loss_trace(
+            cache.ia_bce,
+            "__torch__.NativeRfDetrIaBceLoss",
+            inputs,
+            pos_weights,
+            neg_weights,
+            [](const torch::Tensor& traced_inputs,
+               const torch::Tensor& traced_pos_weights,
+               const torch::Tensor& traced_neg_weights) {
+                return (traced_neg_weights * traced_inputs -
+                        F::logsigmoid(traced_inputs) * (traced_pos_weights + traced_neg_weights))
+                    .sum();
+            });
+        return cache.ia_bce.module.forward({inputs, pos_weights, neg_weights}).toTensor() / num_boxes;
+    }
+    return (neg_weights * inputs - F::logsigmoid(inputs) * (pos_weights + neg_weights)).sum() / num_boxes;
 }
 
 torch::Tensor accuracy_top1(const torch::Tensor& output, const torch::Tensor& target) {
@@ -874,9 +1210,9 @@ torch::Tensor build_matcher_cost(const OutputLayer& layer,
     {
         FASTLOADER_PROFILE_SCOPE("rfdetr.matcher.cost_class");
         const auto neg_cost_class =
-            (1 - alpha) * torch::pow(out_prob, gamma) * stable_softplus(flat_pred_logits);
+            (1 - alpha) * torch::pow(out_prob, gamma) * (-F::logsigmoid(-flat_pred_logits));
         const auto pos_cost_class =
-            alpha * torch::pow(1 - out_prob, gamma) * stable_softplus(-flat_pred_logits);
+            alpha * torch::pow(1 - out_prob, gamma) * (-F::logsigmoid(flat_pred_logits));
         cost_class = pos_cost_class.index({Slice(), tgt_ids}) - neg_cost_class.index({Slice(), tgt_ids});
     }
 
@@ -943,8 +1279,10 @@ torch::Tensor build_matcher_cost(const OutputLayer& layer,
             "native RF-DETR mask matcher")
             .to(pred_masks_logits.dtype());
         cost = cost +
-               config.mask_ce_loss_coef * batch_sigmoid_ce_loss(pred_masks_logits, tgt_masks_flat) +
-               config.mask_dice_loss_coef * batch_dice_loss(pred_masks_logits, tgt_masks_flat);
+               config.mask_ce_loss_coef *
+                   batch_sigmoid_ce_loss(pred_masks_logits, tgt_masks_flat, config.use_jit_traced_loss_ops) +
+               config.mask_dice_loss_coef *
+                   batch_dice_loss(pred_masks_logits, tgt_masks_flat, config.use_jit_traced_loss_ops);
     }
 
     return cost.reshape({bs, num_queries, total_targets}).to(torch::kFloat32);
@@ -1096,7 +1434,6 @@ TensorMap loss_labels(const OutputLayer& layer,
     FASTLOADER_PROFILE_SCOPE("rfdetr.criterion.loss_labels");
     TensorMap losses;
     const auto src_logits = layer.pred_logits;
-    const auto src_logits_fp32 = src_logits.to(torch::kFloat32);
     const auto device = src_logits.device();
     const auto idx = src_permutation_idx(indices, device);
     const auto target_classes_o = concat_target_labels(targets, indices, device);
@@ -1105,65 +1442,82 @@ TensorMap loss_labels(const OutputLayer& layer,
     if (config.ia_bce_loss) {
         const double alpha = config.focal_alpha;
         const double gamma = 2.0;
-        const auto src_boxes = layer.pred_boxes.index({idx.first, idx.second}).to(torch::kFloat32);
-        const auto target_boxes = concat_target_boxes(targets, indices, device).to(torch::kFloat32);
+        const auto src_boxes = layer.pred_boxes.index({idx.first, idx.second});
+        const auto target_boxes = concat_target_boxes(targets, indices, device);
         const auto pos_ious = aligned_box_iou(
                                   box_cxcywh_to_xyxy(src_boxes.detach()),
                                   box_cxcywh_to_xyxy(target_boxes))
                                   .detach();
-        const auto prob = src_logits_fp32.sigmoid();
-        auto pos_weights = torch::zeros_like(src_logits_fp32);
+        const auto prob = src_logits.sigmoid();
+        auto pos_weights = torch::zeros_like(src_logits);
         auto neg_weights = torch::pow(prob, gamma);
         auto t = torch::pow(prob.index({idx.first, idx.second, target_classes_o}), alpha) *
                  torch::pow(pos_ious, 1 - alpha);
         t = torch::clamp(t, 0.01).detach();
         const auto t_cast = t.to(pos_weights.dtype());
         pos_weights.index_put_({idx.first, idx.second, target_classes_o}, t_cast);
+        const auto neg_update = (torch::ones_like(t_cast) - t_cast).to(neg_weights.dtype());
         neg_weights.index_put_(
             {idx.first, idx.second, target_classes_o},
-            torch::ones_like(t_cast) - t_cast
+            neg_update
         );
-        loss_ce = neg_weights * src_logits_fp32 - (-stable_softplus(-src_logits_fp32)) * (pos_weights + neg_weights);
-        loss_ce = loss_ce.sum() / num_boxes;
+        loss_ce = ia_bce_loss(
+            src_logits,
+            pos_weights,
+            neg_weights,
+            num_boxes,
+            config.use_jit_traced_loss_ops);
     } else if (config.use_position_supervised_loss) {
-        const auto src_boxes = layer.pred_boxes.index({idx.first, idx.second}).to(torch::kFloat32);
-        const auto target_boxes = concat_target_boxes(targets, indices, device).to(torch::kFloat32);
+        const auto src_boxes = layer.pred_boxes.index({idx.first, idx.second});
+        const auto target_boxes = concat_target_boxes(targets, indices, device);
         const auto pos_ious = aligned_box_iou(
                                   box_cxcywh_to_xyxy(src_boxes.detach()),
                                   box_cxcywh_to_xyxy(target_boxes))
                                   .detach();
         auto cls_targets = torch::zeros(
-            {src_logits_fp32.size(0), src_logits_fp32.size(1), config.num_classes},
-            src_logits_fp32.options()
+            {src_logits.size(0), src_logits.size(1), config.num_classes},
+            src_logits.options()
         );
         cls_targets.index_put_({idx.first, idx.second, target_classes_o}, pos_ious.to(cls_targets.dtype()));
         cls_targets = cls_targets / (cls_targets.view({cls_targets.size(0), -1, 1}).amax(1, true) + 1e-8f);
-        loss_ce = position_supervised_loss(src_logits_fp32, cls_targets, num_boxes, config.focal_alpha, 2.0) *
-                  src_logits_fp32.size(1);
+        loss_ce = position_supervised_loss(
+                      src_logits,
+                      cls_targets,
+                      num_boxes,
+                      config.focal_alpha,
+                      2.0,
+                      config.use_jit_traced_loss_ops) *
+                  src_logits.size(1);
     } else if (config.use_varifocal_loss) {
-        const auto src_boxes = layer.pred_boxes.index({idx.first, idx.second}).to(torch::kFloat32);
-        const auto target_boxes = concat_target_boxes(targets, indices, device).to(torch::kFloat32);
+        const auto src_boxes = layer.pred_boxes.index({idx.first, idx.second});
+        const auto target_boxes = concat_target_boxes(targets, indices, device);
         const auto pos_ious = aligned_box_iou(
                                   box_cxcywh_to_xyxy(src_boxes.detach()),
                                   box_cxcywh_to_xyxy(target_boxes))
                                   .detach();
         auto cls_targets = torch::zeros(
-            {src_logits_fp32.size(0), src_logits_fp32.size(1), config.num_classes},
-            src_logits_fp32.options()
+            {src_logits.size(0), src_logits.size(1), config.num_classes},
+            src_logits.options()
         );
         cls_targets.index_put_({idx.first, idx.second, target_classes_o}, pos_ious.to(cls_targets.dtype()));
-        loss_ce = sigmoid_varifocal_loss(src_logits_fp32, cls_targets, num_boxes, config.focal_alpha, 2.0) *
-                  src_logits_fp32.size(1);
+        loss_ce = sigmoid_varifocal_loss(
+                      src_logits,
+                      cls_targets,
+                      num_boxes,
+                      config.focal_alpha,
+                      2.0,
+                      config.use_jit_traced_loss_ops) *
+                  src_logits.size(1);
     } else {
         auto target_classes = torch::full(
-            {src_logits_fp32.size(0), src_logits_fp32.size(1)},
+            {src_logits.size(0), src_logits.size(1)},
             config.num_classes,
             torch::TensorOptions().dtype(torch::kInt64).device(device)
         );
         target_classes.index_put_({idx.first, idx.second}, target_classes_o);
         auto target_classes_onehot = torch::zeros(
-            {src_logits_fp32.size(0), src_logits_fp32.size(1), src_logits_fp32.size(2) + 1},
-            src_logits_fp32.options()
+            {src_logits.size(0), src_logits.size(1), src_logits.size(2) + 1},
+            src_logits.options()
         );
         target_classes_onehot.scatter_(
             2,
@@ -1171,8 +1525,14 @@ TensorMap loss_labels(const OutputLayer& layer,
             torch::ones(target_classes.unsqueeze(-1).sizes(), target_classes_onehot.options())
         );
         target_classes_onehot = target_classes_onehot.index({Slice(), Slice(), Slice(None, -1)});
-        loss_ce = sigmoid_focal_loss(src_logits_fp32, target_classes_onehot, num_boxes, config.focal_alpha, 2.0) *
-                  src_logits_fp32.size(1);
+        loss_ce = sigmoid_focal_loss(
+                      src_logits,
+                      target_classes_onehot,
+                      num_boxes,
+                      config.focal_alpha,
+                      2.0,
+                      config.use_jit_traced_loss_ops) *
+                  src_logits.size(1);
     }
 
     losses["loss_ce"] = loss_ce;
@@ -1273,15 +1633,16 @@ TensorMap loss_masks(const OutputLayer& layer,
                            .to(point_logits.dtype());
     }
 
-    if (point_logits.device().is_cuda() && point_labels.device().is_cuda() &&
-        point_logits.scalar_type() == torch::kFloat32 && point_labels.scalar_type() == torch::kFloat32) {
-        const auto [loss_ce, loss_dice] = fused_dice_ce_loss_cuda(point_logits, point_labels, num_boxes);
-        losses["loss_mask_ce"] = loss_ce;
-        losses["loss_mask_dice"] = loss_dice;
-    } else {
-        losses["loss_mask_ce"] = sigmoid_ce_loss(point_logits, point_labels, num_boxes);
-        losses["loss_mask_dice"] = dice_loss(point_logits, point_labels, num_boxes);
-    }
+    losses["loss_mask_ce"] = sigmoid_ce_loss(
+        point_logits,
+        point_labels,
+        num_boxes,
+        config.use_jit_traced_loss_ops);
+    losses["loss_mask_dice"] = dice_loss(
+        point_logits,
+        point_labels,
+        num_boxes,
+        config.use_jit_traced_loss_ops);
     return losses;
 }
 

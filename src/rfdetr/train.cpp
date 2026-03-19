@@ -924,7 +924,9 @@ ResumeState load_resume_checkpoint_state(const std::filesystem::path& checkpoint
     return state;
 }
 
-DetectionConfig make_detection_config(const NativeRfDetrConfig& config, int64_t world_size) {
+DetectionConfig make_detection_config(const NativeRfDetrConfig& config,
+                                      int64_t world_size,
+                                      CompilationMode compilation_mode) {
     DetectionConfig detection_config;
     detection_config.num_classes = config.num_classes;
     detection_config.group_detr = config.group_detr;
@@ -938,6 +940,7 @@ DetectionConfig make_detection_config(const NativeRfDetrConfig& config, int64_t 
     detection_config.aux_loss = config.aux_loss;
     detection_config.two_stage = config.two_stage;
     detection_config.include_masks = config.segmentation;
+    detection_config.use_jit_traced_loss_ops = (compilation_mode == CompilationMode::kSelective);
     detection_config.mask_point_sample_ratio = config.mask_point_sample_ratio;
     detection_config.focal_alpha = config.focal_alpha;
     detection_config.cls_loss_coef = config.cls_loss_coef;
@@ -1584,7 +1587,8 @@ TrainRunResult run_training(const TrainOptions& options) {
     const int64_t steps_per_epoch =
         static_cast<int64_t>(usable_full_batches / batches_per_step);
     const int64_t total_training_steps = std::max<int64_t>(1, steps_per_epoch * options.epochs);
-    DetectionConfig detection_config = make_detection_config(artifacts.config, distributed.world_size);
+    DetectionConfig detection_config =
+        make_detection_config(artifacts.config, distributed.world_size, options.compilation_mode);
     const auto [mean, std] = make_normalization_tensors(options.device_id);
     TargetScratch target_scratch;
 
