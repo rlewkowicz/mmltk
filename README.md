@@ -5,7 +5,7 @@ Zero-copy C++/CUDA dataset loader for segmentation datasets. The compiled `.bin`
 ## How it works
 
 ```text
-PNG + JSONL dataset
+PNG dataset + JSON annotations + categories.json
         |
         v  (compile - one time)
    .bin file on disk
@@ -23,6 +23,73 @@ PNG + JSONL dataset
 ```
 
 Sequential batches can read directly from the mmap span. Shuffled batches gather once into pinned host memory and submit a single async copy to device memory.
+
+## Source Dataset Format
+
+The source dataset is organized like a YOLO-style split tree, but annotations are JSON-based instead of `.txt` files:
+
+```text
+dataset/
+  categories.json
+  train/
+    000001.png
+    000001.jsonl
+    000002.png
+    000002.jsonl
+    ...
+  val/
+    000001.png
+    000001.jsonl
+    ...
+```
+
+The compiler expects:
+
+- a repo-level `categories.json`
+- one split directory per dataset split, such as `train/` or `val/`
+- six-digit sequential filenames starting at `000001`
+- one `.png` image and one matching `.jsonl` annotation file per image
+
+`categories.json` carries dataset metadata, the category table, and optional split counts. Keep category names agnostic to your problem domain; the compiler only requires unique names and dense ids starting at `0` or `1`.
+
+Example shape:
+
+```json
+{
+  "meta": {
+    "dataset_name": "example-dataset",
+    "version": "1.0",
+    "image_format": "png",
+    "image_size_wh": [432, 432],
+    "bbox_format": "xyxy_absolute_pixels",
+    "mask_format": "rle_row_major_start_length",
+    "background_annotation_policy": "dataset_defined"
+  },
+  "classes": [
+    { "id": 1, "name": "category_1" },
+    { "id": 2, "name": "category_2" }
+  ],
+  "splits": {
+    "train": { "total": 1000, "background": 0, "annotated": 1000 },
+    "val": { "total": 100, "background": 0, "annotated": 100 }
+  }
+}
+```
+
+Each `.jsonl` file is line-delimited JSON, with one object per instance. The supported fields are:
+
+- `class`: category name matching an entry in `categories.json`
+- `bbox_xyxy`: `[x1, y1, x2, y2]` in absolute pixel coordinates
+- `mask_rle`: row-major `start:length` runs separated by spaces
+- `image_size_wh`: optional `[width, height]` validation field
+
+Example instance line:
+
+```json
+{"class":"category_1","bbox_xyxy":[10,20,100,140],"mask_rle":"8650:24 9082:24 9514:24","image_size_wh":[432,432]}
+```
+
+Background-only images are supported as long as the matching `.jsonl` file still exists and contains no instance lines.
 
 ## Build
 
