@@ -1,0 +1,668 @@
+#include "rfdetr/native_optimizer.h"
+
+#include "rfdetr/checkpoint_internal.h"
+
+#include <ATen/cuda/CUDAContext.h>
+#include <ATen/ops/_fused_adamw.h>
+
+#include <c10/util/Exception.h>
+
+#include <cmath>
+#include <iomanip>
+#include <map>
+#include <sstream>
+#include <stdexcept>
+#include <string_view>
+#include <utility>
+
+namespace fastloader::rfdetr {
+
+namespace {
+
+constexpr const char* kNativeAdamWFormat = "fastloader.rfdetr.native_adamw";
+constexpr int64_t kNativeAdamWFormatVersion = 1;
+constexpr double kAdamBeta1 = 0.9;
+constexpr double kAdamBeta2 = 0.999;
+constexpr double kAdamEps = 1.0e-8;
+
+std::string archive_entry_name(const char* prefix, size_t index) {
+    std::ostringstream stream;
+    stream << prefix << '_' << std::setw(6) << std::setfill('0') << index;
+    return stream.str();
+}
+
+void write_string(torch::serialize::OutputArchive& archive, const char* key, const std::string_view value) {
+    archive.write(key, c10::IValue(std::string(value)));
+}
+
+void write_int(torch::serialize::OutputArchive& archive, const char* key, int64_t value) {
+    archive.write(key, c10::IValue(value));
+}
+
+void write_double(torch::serialize::OutputArchive& archive, const char* key, double value) {
+    archive.write(key, c10::IValue(value));
+}
+
+std::string require_string(torch::serialize::InputArchive& archive, const char* key) {
+    c10::IValue value;
+    archive.read(key, value);
+    if (!value.isString()) {
+        throw std::runtime_error(std::string("native AdamW archive key is not a string: ") + key);
+    }
+    return value.toStringRef();
+}
+
+int64_t require_int(torch::serialize::InputArchive& archive, const char* key) {
+    c10::IValue value;
+    archive.read(key, value);
+    if (!value.isInt()) {
+        throw std::runtime_error(std::string("native AdamW archive key is not an int: ") + key);
+    }
+    return value.toInt();
+}
+
+double require_double(torch::serialize::InputArchive& archive, const char* key) {
+    c10::IValue value;
+    archive.read(key, value);
+    if (value.isDouble()) {
+        return value.toDouble();
+    }
+    if (value.isInt()) {
+        return static_cast<double>(value.toInt());
+    }
+    throw std::runtime_error(std::string("native AdamW archive key is not a number: ") + key);
+}
+
+torch::Tensor require_tensor(torch::serialize::InputArchive& archive, const char* key) {
+    torch::Tensor tensor;
+    archive.read(key, tensor);
+    if (!tensor.defined()) {
+        throw std::runtime_error(std::string("native AdamW archive tensor is undefined: ") + key);
+    }
+    return tensor;
+}
+
+NativeOptimizerBackend parse_backend_name(const std::string& name) {
+    if (name == "eager") {
+        return NativeOptimizerBackend::eager;
+    }
+    if (name == "foreach") {
+        return NativeOptimizerBackend::foreach;
+    }
+    if (name == "fused") {
+        return NativeOptimizerBackend::fused;
+    }
+    throw std::runtime_error("unknown native AdamW backend in archive: " + name);
+}
+
+std::string tensor_signature(const torch::Tensor& tensor) {
+    std::ostringstream stream;
+    stream << "dtype=" << tensor.scalar_type()
+           << " device=" << tensor.device()
+           << " layout=" << tensor.layout()
+           << " sizes=" << tensor.sizes()
+           << " strides=" << tensor.strides();
+    return stream.str();
+}
+
+torch::Tensor align_tensor_like_param(const torch::Tensor& source, const torch::Tensor& param) {
+    auto aligned = torch::zeros_like(param);
+    if (source.defined()) {
+        aligned.copy_(source.to(param.device(), param.scalar_type(), false, false));
+    }
+    return aligned;
+}
+
+torch::Device step_device_for_backend(const torch::Tensor& param, NativeOptimizerBackend backend) {
+    if (backend == NativeOptimizerBackend::fused || backend == NativeOptimizerBackend::foreach) {
+        return param.device();
+    }
+    return torch::Device(torch::kCPU);
+}
+
+torch::Tensor make_step_tensor(const torch::Tensor& param, NativeOptimizerBackend backend) {
+    return torch::zeros({}, torch::TensorOptions().dtype(torch::kFloat32).device(step_device_for_backend(param, backend)));
+}
+
+void validate_group_indices(const NativeAdamW::Group& group, size_t param_count) {
+    for (const size_t index : group.param_indices) {
+        if (index >= param_count) {
+            throw std::runtime_error("native AdamW parameter group index is out of range");
+        }
+    }
+}
+
+} // namespace
+
+const char* native_optimizer_backend_name(const NativeOptimizerBackend backend) {
+    switch (backend) {
+    case NativeOptimizerBackend::eager:
+        return "eager";
+    case NativeOptimizerBackend::foreach:
+        return "foreach";
+    case NativeOptimizerBackend::fused:
+        return "fused";
+    }
+    return "unknown";
+}
+
+bool native_optimizer_supports_foreach(const std::vector<torch::Tensor>& params) {
+    if (params.empty()) {
+        return false;
+    }
+    for (const auto& param : params) {
+        if (!param.defined() || !param.is_floating_point() || torch::is_complex(param)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool native_optimizer_supports_fused(const std::vector<torch::Tensor>& params) {
+    if (!native_optimizer_supports_foreach(params)) {
+        return false;
+    }
+    for (const auto& param : params) {
+        if (!param.device().is_cuda()) {
+            return false;
+        }
+        const auto device_index = static_cast<int>(param.device().index());
+        if (device_index < 0) {
+            return false;
+        }
+        const auto* properties = at::cuda::getDeviceProperties(static_cast<c10::DeviceIndex>(device_index));
+        if (properties == nullptr || properties->major < 8) {
+            return false;
+        }
+    }
+    return true;
+}
+
+NativeAdamW::NativeAdamW(std::vector<Group> groups,
+                         std::vector<NamedParameter> params,
+                         const NativeOptimizerBackend backend)
+    : groups_(std::move(groups)), params_(std::move(params)), backend_(backend) {
+    all_params_.reserve(params_.size());
+    all_param_names_.reserve(params_.size());
+    for (const auto& param : params_) {
+        if (!param.tensor.defined()) {
+            throw std::runtime_error("native AdamW received an undefined parameter tensor");
+        }
+        all_params_.push_back(param.tensor);
+        all_param_names_.push_back(param.name);
+    }
+    for (const auto& group : groups_) {
+        validate_group_indices(group, params_.size());
+    }
+    initialize_state();
+}
+
+std::vector<torch::Tensor>& NativeAdamW::parameters() {
+    return all_params_;
+}
+
+const std::vector<torch::Tensor>& NativeAdamW::parameters() const {
+    return all_params_;
+}
+
+const std::vector<std::string>& NativeAdamW::parameter_names() const {
+    return all_param_names_;
+}
+
+const std::vector<NativeAdamW::Group>& NativeAdamW::groups() const {
+    return groups_;
+}
+
+NativeOptimizerBackend NativeAdamW::backend() const {
+    return backend_;
+}
+
+const char* NativeAdamW::backend_name() const {
+    return native_optimizer_backend_name(backend_);
+}
+
+void NativeAdamW::initialize_state() {
+    state_.clear();
+    state_.reserve(params_.size());
+
+    std::vector<bool> needs_amsgrad(params_.size(), false);
+    for (const auto& group : groups_) {
+        for (const auto index : group.param_indices) {
+            needs_amsgrad[index] = group.config.amsgrad;
+        }
+    }
+
+    for (size_t index = 0; index < params_.size(); ++index) {
+        const auto& param = params_[index].tensor;
+        ParamState state;
+        state.step = make_step_tensor(param, backend_);
+        state.exp_avg = torch::zeros_like(param);
+        state.exp_avg_sq = torch::zeros_like(param);
+        if (needs_amsgrad[index]) {
+            state.max_exp_avg_sq = torch::zeros_like(param);
+        }
+        state_.push_back(std::move(state));
+    }
+}
+
+void NativeAdamW::zero_grad(const bool set_to_none) {
+    torch::NoGradGuard no_grad;
+    for (auto& param : all_params_) {
+        if (!param.grad().defined()) {
+            continue;
+        }
+        if (set_to_none) {
+            param.mutable_grad() = torch::Tensor();
+            continue;
+        }
+        auto& grad = param.mutable_grad();
+        grad.detach_();
+        grad.zero_();
+    }
+}
+
+void NativeAdamW::set_lrs(const std::vector<double>& base_lrs, const double scale) {
+    if (base_lrs.size() != groups_.size()) {
+        throw std::runtime_error("native AdamW base LR count does not match param group count");
+    }
+    for (size_t index = 0; index < groups_.size(); ++index) {
+        groups_[index].config.lr = base_lrs[index] * scale;
+    }
+}
+
+void NativeAdamW::step() {
+    torch::NoGradGuard no_grad;
+    for (const auto& group : groups_) {
+        if (backend_ == NativeOptimizerBackend::fused) {
+            step_group_fused(group);
+        } else if (backend_ == NativeOptimizerBackend::foreach) {
+            step_group_foreach(group);
+        } else {
+            step_group_eager(group);
+        }
+    }
+}
+
+void NativeAdamW::step_group_eager(const Group& group) {
+    for (const auto index : group.param_indices) {
+        auto& param = params_[index].tensor;
+        if (!param.grad().defined()) {
+            continue;
+        }
+        auto grad = param.grad();
+        if (grad.is_sparse()) {
+            throw std::runtime_error("native AdamW does not support sparse gradients");
+        }
+        if (torch::is_complex(param)) {
+            throw std::runtime_error("native AdamW does not support complex parameters");
+        }
+
+        auto& state = state_[index];
+        state.step.add_(1.0);
+        const double step_value = state.step.item<double>();
+
+        if (group.config.weight_decay != 0.0) {
+            param.mul_(1.0 - group.config.lr * group.config.weight_decay);
+        }
+
+        state.exp_avg.lerp_(grad, 1.0 - kAdamBeta1);
+        state.exp_avg_sq.mul_(kAdamBeta2).addcmul_(grad, grad, 1.0 - kAdamBeta2);
+
+        const double bias_correction1 = 1.0 - std::pow(kAdamBeta1, step_value);
+        const double bias_correction2 = 1.0 - std::pow(kAdamBeta2, step_value);
+        torch::Tensor denom;
+        if (group.config.amsgrad) {
+            if (!state.max_exp_avg_sq.defined()) {
+                state.max_exp_avg_sq = torch::zeros_like(param);
+            }
+            state.max_exp_avg_sq = torch::maximum(state.max_exp_avg_sq, state.exp_avg_sq);
+            denom = state.max_exp_avg_sq.sqrt();
+        } else {
+            denom = state.exp_avg_sq.sqrt();
+        }
+        denom.div_(std::sqrt(bias_correction2)).add_(kAdamEps);
+        param.addcdiv_(state.exp_avg, denom, -group.config.lr / bias_correction1);
+    }
+}
+
+void NativeAdamW::step_group_foreach(const Group& group) {
+    struct ForeachBatch {
+        std::vector<torch::Tensor> params;
+        std::vector<torch::Tensor> grads;
+        std::vector<torch::Tensor> exp_avgs;
+        std::vector<torch::Tensor> exp_avg_sqs;
+        std::vector<torch::Tensor> max_exp_avg_sqs;
+        std::vector<torch::Tensor> steps;
+    };
+
+    std::map<std::pair<int, int>, ForeachBatch> batches;
+    for (const auto index : group.param_indices) {
+        auto& param = params_[index].tensor;
+        if (!param.grad().defined()) {
+            continue;
+        }
+        auto grad = param.grad();
+        if (grad.is_sparse()) {
+            throw std::runtime_error("native AdamW does not support sparse gradients");
+        }
+        if (torch::is_complex(param)) {
+            throw std::runtime_error("native AdamW does not support complex parameters");
+        }
+
+        auto& state = state_[index];
+        if (!state.step.defined() || state.step.device() != param.device()) {
+            state.step = state.step.to(param.device(), torch::kFloat32).contiguous();
+        }
+        if (state.step.scalar_type() != torch::kFloat32) {
+            state.step = state.step.to(param.device(), torch::kFloat32).contiguous();
+        }
+        if (!state.exp_avg.defined() || state.exp_avg.sizes() != param.sizes()) {
+            state.exp_avg = torch::zeros_like(param);
+        }
+        if (!state.exp_avg_sq.defined() || state.exp_avg_sq.sizes() != param.sizes()) {
+            state.exp_avg_sq = torch::zeros_like(param);
+        }
+        if (state.exp_avg.device() != param.device() ||
+            state.exp_avg.scalar_type() != param.scalar_type()) {
+            state.exp_avg = align_tensor_like_param(state.exp_avg, param);
+        }
+        if (state.exp_avg_sq.device() != param.device() ||
+            state.exp_avg_sq.scalar_type() != param.scalar_type()) {
+            state.exp_avg_sq = align_tensor_like_param(state.exp_avg_sq, param);
+        }
+        if (grad.device() != param.device() ||
+            grad.scalar_type() != param.scalar_type()) {
+            grad = align_tensor_like_param(grad, param);
+        }
+
+        const auto device_index = static_cast<int>(param.device().index());
+        const auto key = std::make_pair(device_index, static_cast<int>(param.scalar_type()));
+        auto& batch = batches[key];
+        batch.params.push_back(param);
+        batch.grads.push_back(grad);
+        batch.exp_avgs.push_back(state.exp_avg);
+        batch.exp_avg_sqs.push_back(state.exp_avg_sq);
+        if (group.config.amsgrad) {
+            if (!state.max_exp_avg_sq.defined()) {
+                state.max_exp_avg_sq = torch::zeros_like(param);
+            }
+            if (state.max_exp_avg_sq.device() != param.device() ||
+                state.max_exp_avg_sq.scalar_type() != param.scalar_type()) {
+                state.max_exp_avg_sq = align_tensor_like_param(state.max_exp_avg_sq, param);
+            }
+            batch.max_exp_avg_sqs.push_back(state.max_exp_avg_sq);
+        }
+        batch.steps.push_back(state.step);
+    }
+
+    for (auto& [_, batch] : batches) {
+        if (batch.params.empty()) {
+            continue;
+        }
+
+        torch::_foreach_add_(batch.steps, 1.0);
+
+        if (group.config.weight_decay != 0.0) {
+            torch::_foreach_mul_(batch.params, 1.0 - group.config.lr * group.config.weight_decay);
+        }
+
+        torch::_foreach_lerp_(batch.exp_avgs, batch.grads, 1.0 - kAdamBeta1);
+        torch::_foreach_mul_(batch.exp_avg_sqs, kAdamBeta2);
+        torch::_foreach_addcmul_(batch.exp_avg_sqs, batch.grads, batch.grads, 1.0 - kAdamBeta2);
+
+        const double step_val = batch.steps[0].item<double>();
+        const double bias_correction1 = 1.0 - std::pow(kAdamBeta1, step_val);
+        const double bias_correction2 = 1.0 - std::pow(kAdamBeta2, step_val);
+        const double step_size = group.config.lr / bias_correction1;
+        const double bias_correction2_sqrt = std::sqrt(bias_correction2);
+
+        if (group.config.amsgrad) {
+            torch::_foreach_maximum_(batch.max_exp_avg_sqs, batch.exp_avg_sqs);
+            auto denoms = torch::_foreach_sqrt(batch.max_exp_avg_sqs);
+            torch::_foreach_div_(denoms, bias_correction2_sqrt);
+            torch::_foreach_add_(denoms, kAdamEps);
+            torch::_foreach_addcdiv_(batch.params, batch.exp_avgs, denoms, -step_size);
+        } else {
+            auto denoms = torch::_foreach_sqrt(batch.exp_avg_sqs);
+            torch::_foreach_div_(denoms, bias_correction2_sqrt);
+            torch::_foreach_add_(denoms, kAdamEps);
+            torch::_foreach_addcdiv_(batch.params, batch.exp_avgs, denoms, -step_size);
+        }
+    }
+}
+
+void NativeAdamW::step_group_fused(const Group& group) {
+    struct FusedBatch {
+        std::vector<torch::Tensor> params;
+        std::vector<torch::Tensor> grads;
+        std::vector<torch::Tensor> exp_avgs;
+        std::vector<torch::Tensor> exp_avg_sqs;
+        std::vector<torch::Tensor> max_exp_avg_sqs;
+        std::vector<torch::Tensor> steps;
+    };
+
+    std::map<std::pair<int, int>, FusedBatch> batches;
+    for (const auto index : group.param_indices) {
+        auto& param = params_[index].tensor;
+        if (!param.grad().defined()) {
+            continue;
+        }
+        auto grad = param.grad();
+        if (grad.is_sparse()) {
+            throw std::runtime_error("native AdamW does not support sparse gradients");
+        }
+        if (!param.device().is_cuda()) {
+            throw std::runtime_error("fused native AdamW requires CUDA parameters");
+        }
+        if (!param.is_floating_point() || torch::is_complex(param)) {
+            throw std::runtime_error("fused native AdamW requires real floating-point parameters");
+        }
+
+        auto& state = state_[index];
+        if (!state.step.defined() || !state.step.device().is_cuda()) {
+            state.step = state.step.to(param.device(), torch::kFloat32).contiguous();
+        }
+        if (state.step.scalar_type() != torch::kFloat32) {
+            state.step = state.step.to(param.device(), torch::kFloat32).contiguous();
+        }
+        if (!state.exp_avg.defined() || state.exp_avg.sizes() != param.sizes()) {
+            state.exp_avg = torch::zeros_like(param);
+        }
+        if (!state.exp_avg_sq.defined() || state.exp_avg_sq.sizes() != param.sizes()) {
+            state.exp_avg_sq = torch::zeros_like(param);
+        }
+        if (state.exp_avg.device() != param.device() ||
+            state.exp_avg.scalar_type() != param.scalar_type() ||
+            state.exp_avg.layout() != param.layout() ||
+            state.exp_avg.strides() != param.strides()) {
+            state.exp_avg = align_tensor_like_param(state.exp_avg, param);
+        }
+        if (state.exp_avg_sq.device() != param.device() ||
+            state.exp_avg_sq.scalar_type() != param.scalar_type() ||
+            state.exp_avg_sq.layout() != param.layout() ||
+            state.exp_avg_sq.strides() != param.strides()) {
+            state.exp_avg_sq = align_tensor_like_param(state.exp_avg_sq, param);
+        }
+        if (grad.device() != param.device() ||
+            grad.scalar_type() != param.scalar_type() ||
+            grad.layout() != param.layout() ||
+            grad.strides() != param.strides()) {
+            grad = align_tensor_like_param(grad, param);
+        }
+        if (grad.layout() != param.layout() ||
+            state.exp_avg.layout() != param.layout() ||
+            state.exp_avg_sq.layout() != param.layout() ||
+            grad.strides() != param.strides() ||
+            state.exp_avg.strides() != param.strides() ||
+            state.exp_avg_sq.strides() != param.strides()) {
+            throw std::runtime_error(
+                "fused native AdamW tensor format mismatch for parameter " + params_[index].name +
+                " param={" + tensor_signature(param) +
+                "} grad={" + tensor_signature(grad) +
+                "} exp_avg={" + tensor_signature(state.exp_avg) +
+                "} exp_avg_sq={" + tensor_signature(state.exp_avg_sq) + "}");
+        }
+
+        const auto device_index = static_cast<int>(param.device().index());
+        const auto key = std::make_pair(device_index, static_cast<int>(param.scalar_type()));
+        auto& batch = batches[key];
+        batch.params.push_back(param);
+        batch.grads.push_back(grad);
+        batch.exp_avgs.push_back(state.exp_avg);
+        batch.exp_avg_sqs.push_back(state.exp_avg_sq);
+        if (group.config.amsgrad) {
+            if (!state.max_exp_avg_sq.defined()) {
+                state.max_exp_avg_sq = torch::zeros_like(param);
+            }
+            if (state.max_exp_avg_sq.device() != param.device() ||
+                state.max_exp_avg_sq.scalar_type() != param.scalar_type() ||
+                state.max_exp_avg_sq.layout() != param.layout() ||
+                state.max_exp_avg_sq.strides() != param.strides()) {
+                state.max_exp_avg_sq = align_tensor_like_param(state.max_exp_avg_sq, param);
+            }
+            batch.max_exp_avg_sqs.push_back(state.max_exp_avg_sq);
+        }
+        batch.steps.push_back(state.step);
+    }
+
+    for (auto& [_, batch] : batches) {
+        if (batch.params.empty()) {
+            continue;
+        }
+        torch::_foreach_add_(batch.steps, 1);
+        at::_fused_adamw_(batch.params,
+                          batch.grads,
+                          batch.exp_avgs,
+                          batch.exp_avg_sqs,
+                          batch.max_exp_avg_sqs,
+                          batch.steps,
+                          group.config.lr,
+                          kAdamBeta1,
+                          kAdamBeta2,
+                          group.config.weight_decay,
+                          kAdamEps,
+                          group.config.amsgrad,
+                          false,
+                          std::nullopt,
+                          std::nullopt);
+    }
+}
+
+void NativeAdamW::save(torch::serialize::OutputArchive& archive) const {
+    write_string(archive, "format", kNativeAdamWFormat);
+    write_int(archive, "format_version", kNativeAdamWFormatVersion);
+    write_string(archive, "backend", backend_name());
+    write_double(archive, "beta1", kAdamBeta1);
+    write_double(archive, "beta2", kAdamBeta2);
+    write_double(archive, "eps", kAdamEps);
+    write_int(archive, "group_count", static_cast<int64_t>(groups_.size()));
+    write_int(archive, "param_count", static_cast<int64_t>(params_.size()));
+
+    for (size_t index = 0; index < groups_.size(); ++index) {
+        torch::serialize::OutputArchive group_archive;
+        write_double(group_archive, "lr", groups_[index].config.lr);
+        write_double(group_archive, "weight_decay", groups_[index].config.weight_decay);
+        write_int(group_archive, "amsgrad", groups_[index].config.amsgrad ? 1 : 0);
+        write_int(group_archive, "param_index_count", static_cast<int64_t>(groups_[index].param_indices.size()));
+        for (size_t param_index = 0; param_index < groups_[index].param_indices.size(); ++param_index) {
+            write_int(group_archive,
+                      archive_entry_name("param_index", param_index).c_str(),
+                      static_cast<int64_t>(groups_[index].param_indices[param_index]));
+        }
+        archive.write(archive_entry_name("group", index), group_archive);
+    }
+
+    for (size_t index = 0; index < params_.size(); ++index) {
+        torch::serialize::OutputArchive param_archive;
+        write_string(param_archive, "name", params_[index].name);
+        param_archive.write("step", detail::prepare_tensor_for_checkpoint_write(state_[index].step));
+        param_archive.write("exp_avg", detail::prepare_tensor_for_checkpoint_write(state_[index].exp_avg));
+        param_archive.write("exp_avg_sq", detail::prepare_tensor_for_checkpoint_write(state_[index].exp_avg_sq));
+        write_int(param_archive, "has_max_exp_avg_sq", state_[index].max_exp_avg_sq.defined() ? 1 : 0);
+        if (state_[index].max_exp_avg_sq.defined()) {
+            param_archive.write("max_exp_avg_sq", detail::prepare_tensor_for_checkpoint_write(state_[index].max_exp_avg_sq));
+        }
+        archive.write(archive_entry_name("param", index), param_archive);
+    }
+}
+
+void NativeAdamW::load(torch::serialize::InputArchive& archive) {
+    c10::IValue format_value;
+    if (!archive.try_read("format", format_value) || !format_value.isString() ||
+        format_value.toStringRef() != kNativeAdamWFormat) {
+        throw std::runtime_error(
+            "native RF-DETR resume checkpoint uses a legacy optimizer archive; rebuild the checkpoint with the current fastloader");
+    }
+    const auto version = require_int(archive, "format_version");
+    if (version != kNativeAdamWFormatVersion) {
+        throw std::runtime_error("unsupported native AdamW archive version: " + std::to_string(version));
+    }
+
+    const auto stored_backend = parse_backend_name(require_string(archive, "backend"));
+    (void)stored_backend;
+    const auto stored_beta1 = require_double(archive, "beta1");
+    const auto stored_beta2 = require_double(archive, "beta2");
+    const auto stored_eps = require_double(archive, "eps");
+    if (std::abs(stored_beta1 - kAdamBeta1) > 1.0e-12 || std::abs(stored_beta2 - kAdamBeta2) > 1.0e-12 ||
+        std::abs(stored_eps - kAdamEps) > 1.0e-12) {
+        throw std::runtime_error("native AdamW archive hyperparameters do not match the compiled optimizer");
+    }
+
+    const auto group_count = require_int(archive, "group_count");
+    const auto param_count = require_int(archive, "param_count");
+    if (group_count != static_cast<int64_t>(groups_.size()) || param_count != static_cast<int64_t>(params_.size())) {
+        throw std::runtime_error("native AdamW archive layout does not match the current optimizer");
+    }
+
+    for (size_t index = 0; index < groups_.size(); ++index) {
+        torch::serialize::InputArchive group_archive;
+        archive.read(archive_entry_name("group", index), group_archive);
+        groups_[index].config.lr = require_double(group_archive, "lr");
+        groups_[index].config.weight_decay = require_double(group_archive, "weight_decay");
+        groups_[index].config.amsgrad = require_int(group_archive, "amsgrad") != 0;
+        const auto param_index_count = require_int(group_archive, "param_index_count");
+        if (param_index_count != static_cast<int64_t>(groups_[index].param_indices.size())) {
+            throw std::runtime_error("native AdamW archive parameter group size does not match the current optimizer");
+        }
+        for (size_t param_index = 0; param_index < groups_[index].param_indices.size(); ++param_index) {
+            const auto stored_param_index = require_int(group_archive, archive_entry_name("param_index", param_index).c_str());
+            if (stored_param_index != static_cast<int64_t>(groups_[index].param_indices[param_index])) {
+                throw std::runtime_error("native AdamW archive parameter group order does not match the current optimizer");
+            }
+        }
+    }
+
+    for (size_t index = 0; index < params_.size(); ++index) {
+        torch::serialize::InputArchive param_archive;
+        archive.read(archive_entry_name("param", index), param_archive);
+        const auto stored_name = require_string(param_archive, "name");
+        if (stored_name != params_[index].name) {
+            throw std::runtime_error("native AdamW archive parameter order does not match the current model");
+        }
+
+        const auto& param = params_[index].tensor;
+        auto loaded_step = require_tensor(param_archive, "step");
+        auto loaded_exp_avg = require_tensor(param_archive, "exp_avg");
+        auto loaded_exp_avg_sq = require_tensor(param_archive, "exp_avg_sq");
+        const bool has_max_exp_avg_sq = require_int(param_archive, "has_max_exp_avg_sq") != 0;
+
+        if (loaded_exp_avg.sizes() != param.sizes() || loaded_exp_avg_sq.sizes() != param.sizes()) {
+            throw std::runtime_error("native AdamW archive tensor shape does not match the current model");
+        }
+
+        state_[index].step = loaded_step.to(step_device_for_backend(param, backend_), torch::kFloat32).contiguous();
+        state_[index].exp_avg = loaded_exp_avg.to(param.device(), param.scalar_type()).contiguous();
+        state_[index].exp_avg_sq = loaded_exp_avg_sq.to(param.device(), param.scalar_type()).contiguous();
+        if (has_max_exp_avg_sq) {
+            auto loaded_max = require_tensor(param_archive, "max_exp_avg_sq");
+            if (loaded_max.sizes() != param.sizes()) {
+                throw std::runtime_error("native AdamW archive AMSGrad tensor shape does not match the current model");
+            }
+            state_[index].max_exp_avg_sq = loaded_max.to(param.device(), param.scalar_type()).contiguous();
+        } else {
+            state_[index].max_exp_avg_sq = torch::Tensor();
+        }
+    }
+}
+
+} // namespace fastloader::rfdetr
