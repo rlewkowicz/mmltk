@@ -9,6 +9,7 @@
 #include <torch/torch.h>
 
 #include <chrono>
+#include <filesystem>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -42,17 +43,32 @@ inline torch::Tensor normalize_batch(const Batch& batch,
            std;
 }
 
+inline DatasetLoader::Config make_inference_loader_config(const std::string& compiled_path,
+                                                          size_t batch_size,
+                                                          const std::string& cpu_affinity,
+                                                          int device_id,
+                                                          int prefetch_factor) {
+    DatasetLoader::Config config;
+    config.compiled_path = std::filesystem::absolute(std::filesystem::path(compiled_path)).string();
+    config.batch_size = batch_size;
+    config.shuffle = false;
+    config.prefetch_factor = checked_prefetch_factor(static_cast<size_t>(prefetch_factor));
+    config.gather_workers = 0;
+    config.cpu_affinity = cpu_affinity;
+    config.device_id = device_id;
+    config.seed = 42;
+    config.drop_last = true;
+    return config;
+}
+
 inline DatasetLoader::Config make_loader_config(const ValidationOptions& options,
                                                 const RuntimeContext& runtime) {
-    DatasetLoader::Config config;
-    config.compiled_path = options.compiled_path.string();
-    config.batch_size = 1;
-    config.shuffle = false;
-    config.prefetch_factor = checked_prefetch_factor(options.prefetch_factor);
-    config.gather_workers = 0;
-    config.cpu_affinity = runtime.loader_affinity_string();
-    config.device_id = options.device_id;
-    return config;
+    return make_inference_loader_config(
+        options.compiled_path.string(),
+        1,
+        runtime.loader_affinity_string(),
+        options.device_id,
+        checked_prefetch_factor(options.prefetch_factor));
 }
 
 inline c10::cuda::CUDAStream backend_cuda_stream(const InferenceBackend& backend, int device_id) {

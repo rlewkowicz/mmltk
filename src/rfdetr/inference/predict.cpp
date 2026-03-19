@@ -11,6 +11,9 @@
 #include "rfdetr/validate_internal.h"
 #include "worker_pool.h"
 
+#include "rfdetr/common/dataset_utils.h"
+#include "rfdetr/common/tensor_utils.h"
+
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_runtime.h>
@@ -29,6 +32,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -56,19 +60,6 @@ const std::filesystem::path& model_input_path(const ResolvedModelArtifacts& arti
         return artifacts.input_path;
     }
     return artifacts.weights_path;
-}
-
-std::pair<torch::Tensor, torch::Tensor> make_normalization_tensors(int device_id) {
-    return {
-        torch::tensor(
-            {0.485f, 0.456f, 0.406f},
-            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, device_id))
-            .view({1, 3, 1, 1}),
-        torch::tensor(
-            {0.229f, 0.224f, 0.225f},
-            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, device_id))
-            .view({1, 3, 1, 1}),
-    };
 }
 
 std::string choose_backend_name(const std::string& requested_backend,
@@ -153,24 +144,8 @@ std::vector<std::unique_ptr<InferenceBackend>> make_backend_lanes(
     throw std::runtime_error("unsupported RF-DETR backend: " + backend_name);
 }
 
-std::vector<std::string> loader_class_names(const DatasetLoader& loader) {
-    std::vector<std::string> names;
-    names.reserve(loader.num_classes());
-    for (uint32_t index = 0; index < loader.num_classes(); ++index) {
-        names.emplace_back(loader.class_name(index));
-    }
-    return names;
-}
-
 std::vector<int> load_image_ids(const std::filesystem::path& compiled_path) {
     return CocoDataset::load_from_binary(compiled_path).image_ids();
-}
-
-int64_t image_id_for_dataset_index(const std::vector<int>& image_ids, int64_t dataset_index) {
-    if (dataset_index >= 0 && static_cast<size_t>(dataset_index) < image_ids.size()) {
-        return image_ids[static_cast<size_t>(dataset_index)];
-    }
-    return dataset_index + 1;
 }
 
 std::shared_ptr<NativeRfDetrModel> load_native_model(const ResolvedModelArtifacts& artifacts, int device_id) {
@@ -186,6 +161,40 @@ std::shared_ptr<NativeRfDetrModel> load_native_model(const ResolvedModelArtifact
     model->eval();
     model->to(cuda_device(device_id));
     return model;
+}
+
+PredictionRunResult make_prediction_result(const ResolvedModelArtifacts& artifacts,
+                                           std::string backend_name,
+                                           const DatasetLoader& loader) {
+    PredictionRunResult result;
+    result.artifacts = artifacts;
+    result.backend_name = std::move(backend_name);
+    result.class_names = loader_class_names(loader);
+    return result;
+}
+
+size_t prediction_total_images(const DatasetLoader& loader, size_t limit_images) {
+    return limit_images > 0 ? std::min(limit_images, loader.num_images()) : loader.num_images();
+}
+
+std::optional<ProgressBar> make_prediction_bar(bool enabled,
+                                               const std::string& label,
+                                               const DatasetLoader& loader,
+                                               size_t limit_images = 0) {
+    if (!enabled) {
+        return std::nullopt;
+    }
+    return ProgressBar(label, prediction_total_images(loader, limit_images), "img");
+}
+
+std::pair<torch::Tensor, torch::Tensor> initialize_normalization_tensors(
+    int device_id,
+    const std::optional<c10::cuda::CUDAStream>& stream = std::nullopt) {
+    if (!stream.has_value()) {
+        return make_normalization_tensors(device_id);
+    }
+    c10::cuda::CUDAStreamGuard stream_guard(*stream);
+    return make_normalization_tensors(device_id);
 }
 
 ModelInfo native_model_info(const ResolvedModelArtifacts& artifacts, size_t batch_size = 1) {
@@ -236,6 +245,43 @@ std::vector<Prediction> filter_threshold(std::vector<Prediction>&& predictions, 
     return std::move(predictions);
 }
 
+std::future<PredictionRecord> enqueue_prediction_record(WorkerPool& cpu_pool,
+                                                        StagedPredictionRecord&& staged,
+                                                        float threshold) {
+    return cpu_pool.enqueue([staged = std::move(staged), threshold]() mutable {
+        PredictionRecord record;
+        record.dataset_index = staged.dataset_index;
+        record.image_id = staged.image_id;
+        record.detections = filter_threshold(
+            encode_staged_predictions(std::move(staged.staged)),
+            threshold);
+        return record;
+    });
+}
+
+void drain_prediction_records(std::deque<std::future<PredictionRecord>>& cpu_futures,
+                              PredictionRunResult& result,
+                              std::optional<ProgressBar>& bar) {
+    result.records.push_back(cpu_futures.front().get());
+    cpu_futures.pop_front();
+    if (bar.has_value()) {
+        bar->add(1);
+    }
+}
+
+void finalize_prediction_result(PredictionRunResult& result,
+                                const std::chrono::steady_clock::time_point& started_at,
+                                bool sort_records = false) {
+    if (sort_records) {
+        std::sort(result.records.begin(),
+                  result.records.end(),
+                  [](const PredictionRecord& lhs, const PredictionRecord& rhs) {
+                      return lhs.dataset_index < rhs.dataset_index;
+                  });
+    }
+    result.timing = elapsed_timing(started_at, result.records.size());
+}
+
 std::string encode_mask_rle(const EncodedMask& mask) {
     std::string encoded;
     for (size_t index = 0; index < mask.runs.size(); ++index) {
@@ -282,19 +328,14 @@ PredictionRunResult run_prediction_native(const PredictOptions& options,
         options.workers,
         1,
         options.cpu_affinity));
-    DatasetLoader loader(make_loader_config(options.compiled_path.string(),
-                                            std::max<size_t>(1, options.batch_size),
-                                            false,
-                                            static_cast<int>(kDefaultPrefetchFactor),
-                                            0,
-                                            runtime.loader_affinity_string(),
-                                            options.device_id,
-                                            42));
+    DatasetLoader loader(make_inference_loader_config(
+        options.compiled_path.string(),
+        std::max<size_t>(1, options.batch_size),
+        runtime.loader_affinity_string(),
+        options.device_id,
+        static_cast<int>(kDefaultPrefetchFactor)));
 
-    PredictionRunResult result;
-    result.artifacts = artifacts;
-    result.backend_name = "weights";
-    result.class_names = loader_class_names(loader);
+    PredictionRunResult result = make_prediction_result(artifacts, "weights", loader);
     const std::vector<int> image_ids = load_image_ids(options.compiled_path);
     auto model = load_native_model(artifacts, options.device_id);
     const size_t effective_batch_size = std::max<size_t>(1, options.batch_size);
@@ -306,12 +347,7 @@ PredictionRunResult run_prediction_native(const PredictOptions& options,
         false,
         options.compilation_mode);
 
-    std::optional<ProgressBar> bar;
-    if (options.progress_bar) {
-        const size_t total_images =
-            limit_images > 0 ? std::min(limit_images, loader.num_images()) : loader.num_images();
-        bar.emplace("weights.predict", total_images, "img");
-    }
+    std::optional<ProgressBar> bar = make_prediction_bar(options.progress_bar, "weights.predict", loader, limit_images);
 
     torch::NoGradGuard no_grad;
     c10::cuda::CUDAGuard device_guard(checked_device_index(options.device_id));
@@ -326,8 +362,7 @@ PredictionRunResult run_prediction_native(const PredictOptions& options,
     const int64_t image_width = static_cast<int64_t>(loader.image_width());
     torch::Tensor nested_mask;
     {
-        c10::cuda::CUDAStreamGuard stream_guard(inference_stream);
-        auto normalization = make_normalization_tensors(options.device_id);
+        auto normalization = initialize_normalization_tensors(options.device_id, inference_stream);
         mean = std::move(normalization.first);
         std = std::move(normalization.second);
         nested_mask = torch::zeros(
@@ -337,24 +372,6 @@ PredictionRunResult run_prediction_native(const PredictOptions& options,
 
     loader.begin_epoch();
     std::deque<std::future<PredictionRecord>> cpu_futures;
-    const auto make_record = [&](StagedPredictionRecord&& staged) {
-        return cpu_pool.enqueue([staged = std::move(staged), threshold = options.threshold]() mutable {
-            PredictionRecord record;
-            record.dataset_index = staged.dataset_index;
-            record.image_id = staged.image_id;
-            record.detections = filter_threshold(
-                encode_staged_predictions(std::move(staged.staged)),
-                threshold);
-            return record;
-        });
-    };
-    const auto drain_cpu = [&]() {
-        result.records.push_back(cpu_futures.front().get());
-        cpu_futures.pop_front();
-        if (bar.has_value()) {
-            bar->add(1);
-        }
-    };
     Batch batch{};
     size_t submitted_records = 0;
     while (loader.next_batch(batch)) {
@@ -397,10 +414,10 @@ PredictionRunResult run_prediction_native(const PredictOptions& options,
                 slot_pool->acquire(),
                 options.device_id,
                 consumer_stream);
-            cpu_futures.push_back(make_record(std::move(staged)));
+            cpu_futures.push_back(enqueue_prediction_record(cpu_pool, std::move(staged), options.threshold));
             ++submitted_records;
             if (static_cast<int>(cpu_futures.size()) >= runtime.split().cpu_threads) {
-                drain_cpu();
+                drain_prediction_records(cpu_futures, result, bar);
             }
         }
         if (limit_images > 0 && submitted_records >= limit_images) {
@@ -408,16 +425,12 @@ PredictionRunResult run_prediction_native(const PredictOptions& options,
         }
     }
     while (!cpu_futures.empty()) {
-        drain_cpu();
+        drain_prediction_records(cpu_futures, result, bar);
     }
     if (bar.has_value()) {
         bar->close();
     }
-
-    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count();
-    result.timing.seconds = elapsed;
-    result.timing.images = result.records.size();
-    result.timing.img_per_s = elapsed > 0.0 ? static_cast<double>(result.records.size()) / elapsed : 0.0;
+    finalize_prediction_result(result, started_at);
     return result;
 }
 
@@ -428,40 +441,26 @@ PredictionRunResult run_prediction_native_parallel(const PredictOptions& options
         options.workers,
         options.lanes,
         options.cpu_affinity));
-    DatasetLoader loader(make_loader_config(options.compiled_path.string(),
-                                            1,
-                                            false,
-                                            static_cast<int>(kDefaultPrefetchFactor),
-                                            0,
-                                            runtime.loader_affinity_string(),
-                                            options.device_id,
-                                            42));
+    DatasetLoader loader(make_inference_loader_config(
+        options.compiled_path.string(),
+        1,
+        runtime.loader_affinity_string(),
+        options.device_id,
+        static_cast<int>(kDefaultPrefetchFactor)));
 
-    PredictionRunResult result;
-    result.artifacts = artifacts;
-    result.backend_name = "weights";
-    result.class_names = loader_class_names(loader);
+    PredictionRunResult result = make_prediction_result(artifacts, "weights", loader);
     const std::vector<int> image_ids = load_image_ids(options.compiled_path);
 
     auto model = load_native_model(artifacts, options.device_id);
     model->optimize_for_inference(1, false, options.compilation_mode);
-    std::optional<ProgressBar> bar;
-    if (options.progress_bar) {
-        const size_t total_images =
-            limit_images > 0 ? std::min(limit_images, loader.num_images()) : loader.num_images();
-        bar.emplace("weights.predict", total_images, "img");
-    }
+    std::optional<ProgressBar> bar = make_prediction_bar(options.progress_bar, "weights.predict", loader, limit_images);
     const auto started_at = std::chrono::steady_clock::now();
 
     torch::NoGradGuard no_grad;
     c10::cuda::CUDAGuard device_guard(checked_device_index(options.device_id));
     torch::Tensor mean;
     torch::Tensor std;
-    {
-        auto normalization = make_normalization_tensors(options.device_id);
-        mean = std::move(normalization.first);
-        std = std::move(normalization.second);
-    }
+    std::tie(mean, std) = initialize_normalization_tensors(options.device_id);
 
     const int64_t image_height = static_cast<int64_t>(loader.image_height());
     const int64_t image_width = static_cast<int64_t>(loader.image_width());
@@ -499,23 +498,11 @@ PredictionRunResult run_prediction_native_parallel(const PredictOptions& options
                           std::deque<std::future<PredictionRecord>>& cpu_futures) {
         StagedPredictionRecord staged = lane_futures.front().get();
         lane_futures.pop_front();
-        cpu_futures.push_back(cpu_pool.enqueue([staged = std::move(staged), threshold = options.threshold]() mutable {
-            PredictionRecord record;
-            record.dataset_index = staged.dataset_index;
-            record.image_id = staged.image_id;
-            record.detections = filter_threshold(
-                encode_staged_predictions(std::move(staged.staged)),
-                threshold);
-            return record;
-        }));
+        cpu_futures.push_back(enqueue_prediction_record(cpu_pool, std::move(staged), options.threshold));
     };
 
     auto drain_cpu = [&](std::deque<std::future<PredictionRecord>>& cpu_futures) {
-        result.records.push_back(cpu_futures.front().get());
-        cpu_futures.pop_front();
-        if (bar.has_value()) {
-            bar->add(1);
-        }
+        drain_prediction_records(cpu_futures, result, bar);
     };
 
     loader.begin_epoch();
@@ -610,16 +597,7 @@ PredictionRunResult run_prediction_native_parallel(const PredictOptions& options
     if (bar.has_value()) {
         bar->close();
     }
-    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count();
-    result.timing.seconds = elapsed;
-    result.timing.images = result.records.size();
-    result.timing.img_per_s = elapsed > 0.0 ? static_cast<double>(result.records.size()) / elapsed : 0.0;
-
-    std::sort(result.records.begin(),
-              result.records.end(),
-              [](const PredictionRecord& lhs, const PredictionRecord& rhs) {
-                  return lhs.dataset_index < rhs.dataset_index;
-              });
+    finalize_prediction_result(result, started_at, true);
     return result;
 }
 
@@ -643,26 +621,19 @@ PredictionRunResult run_prediction_sequential(const PredictOptions& options,
         options.workers,
         effective_lane_count(options.batch_size, options.lanes),
         options.cpu_affinity));
-    DatasetLoader loader(make_loader_config(options.compiled_path.string(),
-                                            1,
-                                            false,
-                                            static_cast<int>(kDefaultPrefetchFactor),
-                                            0,
-                                            runtime.loader_affinity_string(),
-                                            options.device_id,
-                                            42));
+    DatasetLoader loader(make_inference_loader_config(
+        options.compiled_path.string(),
+        1,
+        runtime.loader_affinity_string(),
+        options.device_id,
+        static_cast<int>(kDefaultPrefetchFactor)));
 
-    PredictionRunResult result;
-    result.artifacts = artifacts;
-    result.backend_name = backend_name;
-    result.class_names = loader_class_names(loader);
+    PredictionRunResult result = make_prediction_result(artifacts, backend_name, loader);
     const std::vector<int> image_ids = load_image_ids(options.compiled_path);
 
     auto backend = make_backend(artifacts, backend_name, options.device_id, options.allow_fp16);
-    std::optional<ProgressBar> bar;
-    if (options.progress_bar) {
-        bar.emplace(backend_name + ".predict", loader.num_images(), "img");
-    }
+    std::optional<ProgressBar> bar =
+        make_prediction_bar(options.progress_bar, backend_name + ".predict", loader);
     const auto started_at = std::chrono::steady_clock::now();
 
     torch::NoGradGuard no_grad;
@@ -671,8 +642,7 @@ PredictionRunResult run_prediction_sequential(const PredictOptions& options,
     torch::Tensor mean;
     torch::Tensor std;
     {
-        c10::cuda::CUDAStreamGuard stream_guard(backend_stream);
-        auto normalization = make_normalization_tensors(options.device_id);
+        auto normalization = initialize_normalization_tensors(options.device_id, backend_stream);
         mean = std::move(normalization.first);
         std = std::move(normalization.second);
     }
@@ -713,10 +683,7 @@ PredictionRunResult run_prediction_sequential(const PredictOptions& options,
     if (bar.has_value()) {
         bar->close();
     }
-    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count();
-    result.timing.seconds = elapsed;
-    result.timing.images = result.records.size();
-    result.timing.img_per_s = elapsed > 0.0 ? static_cast<double>(result.records.size()) / elapsed : 0.0;
+    finalize_prediction_result(result, started_at);
     return result;
 }
 
@@ -727,36 +694,25 @@ PredictionRunResult run_prediction_parallel(const PredictOptions& options,
         options.workers,
         effective_lane_count(options.batch_size, options.lanes),
         options.cpu_affinity));
-    DatasetLoader loader(make_loader_config(options.compiled_path.string(),
-                                            1,
-                                            false,
-                                            static_cast<int>(kDefaultPrefetchFactor),
-                                            0,
-                                            runtime.loader_affinity_string(),
-                                            options.device_id,
-                                            42));
+    DatasetLoader loader(make_inference_loader_config(
+        options.compiled_path.string(),
+        1,
+        runtime.loader_affinity_string(),
+        options.device_id,
+        static_cast<int>(kDefaultPrefetchFactor)));
 
-    PredictionRunResult result;
-    result.artifacts = artifacts;
-    result.backend_name = backend_name;
-    result.class_names = loader_class_names(loader);
+    PredictionRunResult result = make_prediction_result(artifacts, backend_name, loader);
     const std::vector<int> image_ids = load_image_ids(options.compiled_path);
 
-    std::optional<ProgressBar> bar;
-    if (options.progress_bar) {
-        bar.emplace(backend_name + ".predict", loader.num_images(), "img");
-    }
+    std::optional<ProgressBar> bar =
+        make_prediction_bar(options.progress_bar, backend_name + ".predict", loader);
     const auto started_at = std::chrono::steady_clock::now();
 
     torch::NoGradGuard no_grad;
     c10::cuda::CUDAGuard device_guard(checked_device_index(options.device_id));
     torch::Tensor mean;
     torch::Tensor std;
-    {
-        auto normalization = make_normalization_tensors(options.device_id);
-        mean = std::move(normalization.first);
-        std = std::move(normalization.second);
-    }
+    std::tie(mean, std) = initialize_normalization_tensors(options.device_id);
 
     auto lane_backends = make_backend_lanes(
         artifacts,
@@ -785,23 +741,11 @@ PredictionRunResult run_prediction_parallel(const PredictOptions& options,
                           std::deque<std::future<PredictionRecord>>& cpu_futures) {
         StagedPredictionRecord staged = lane_futures.front().get();
         lane_futures.pop_front();
-        cpu_futures.push_back(cpu_pool.enqueue([staged = std::move(staged), threshold = options.threshold]() mutable {
-            PredictionRecord record;
-            record.dataset_index = staged.dataset_index;
-            record.image_id = staged.image_id;
-            record.detections = filter_threshold(
-                encode_staged_predictions(std::move(staged.staged)),
-                threshold);
-            return record;
-        }));
+        cpu_futures.push_back(enqueue_prediction_record(cpu_pool, std::move(staged), options.threshold));
     };
 
     auto drain_cpu = [&](std::deque<std::future<PredictionRecord>>& cpu_futures) {
-        result.records.push_back(cpu_futures.front().get());
-        cpu_futures.pop_front();
-        if (bar.has_value()) {
-            bar->add(1);
-        }
+        drain_prediction_records(cpu_futures, result, bar);
     };
 
     loader.begin_epoch();
@@ -886,16 +830,7 @@ PredictionRunResult run_prediction_parallel(const PredictOptions& options,
     if (bar.has_value()) {
         bar->close();
     }
-    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - started_at).count();
-    result.timing.seconds = elapsed;
-    result.timing.images = result.records.size();
-    result.timing.img_per_s = elapsed > 0.0 ? static_cast<double>(result.records.size()) / elapsed : 0.0;
-
-    std::sort(result.records.begin(),
-              result.records.end(),
-              [](const PredictionRecord& lhs, const PredictionRecord& rhs) {
-                  return lhs.dataset_index < rhs.dataset_index;
-              });
+    finalize_prediction_result(result, started_at, true);
     return result;
 }
 
