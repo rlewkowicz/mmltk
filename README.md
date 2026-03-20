@@ -1,5 +1,7 @@
 # fastloader
 
+This was half python for a while, this is still correct, there's just no python anymore. I gotta update this.
+
 Zero-copy C++/CUDA dataset loader for segmentation datasets. The compiled `.bin` file **is** the tensor: `float32 NCHW [0,1]` on disk, mmap'd directly into your process, handed to Python as numpy views with no copies.
 
 ## How it works
