@@ -1,4 +1,4 @@
-#include "rfdetr/validate.h"
+#include "fastloader/rfdetr/validate.h"
 #include "rfdetr/validate_internal.h"
 
 #include "dataset_compiler.h"
@@ -104,27 +104,23 @@ void compile_dataset(const ValidationOptions& options) {
     config.split = options.split;
     config.target_width = options.resolution;
     config.target_height = options.resolution;
+    config.num_workers = options.compile_workers;
+    config.cuda_mask_batch_size = options.compile_cuda_mask_batch_size;
+    config.cuda_device_id = options.compile_cuda_device_id;
     if (bar.has_value()) {
+        size_t progress_pulse = 0;
         DatasetCompiler::compile(
             config,
-            [&bar, &last_done, &total](size_t done, size_t current_total) {
-                if (current_total != total) {
-                    total = current_total;
+            [&bar, &last_done, &total, &progress_pulse](const CompileProgress& progress) {
+                if (progress.total != total) {
+                    total = progress.total;
                     bar->set_total(total);
                 }
-                if (done > last_done) {
-                    bar->add(done - last_done);
-                    last_done = done;
+                if (progress.done > last_done) {
+                    bar->add(progress.done - last_done);
+                    last_done = progress.done;
                 }
-                
-                const size_t num_images = (current_total - 1) / 2;
-                if (done < num_images) {
-                    bar->set_postfix("labels");
-                } else if (done < 2 * num_images) {
-                    bar->set_postfix("pixels");
-                } else {
-                    bar->set_postfix("syncing");
-                }
+                bar->set_postfix(format_compile_postfix(progress, progress_pulse++));
             });
         bar->close();
         return;

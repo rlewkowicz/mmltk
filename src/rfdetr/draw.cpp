@@ -138,6 +138,50 @@ static void hsv2rgb(float h, float s, float v, uint8_t& r, uint8_t& g, uint8_t& 
     b = static_cast<uint8_t>((bf + m) * 255.0f);
 }
 
+void build_instance_colors_from_zero_based_labels(const int* labels,
+                                                  std::size_t count,
+                                                  int num_classes,
+                                                  std::vector<std::uint8_t>* colors_rgb) {
+    if (colors_rgb == nullptr) {
+        throw std::runtime_error("build_instance_colors_from_zero_based_labels requires colors_rgb");
+    }
+
+    const int safe_class_count = std::max(1, num_classes);
+    colors_rgb->assign(count * 3U, 0U);
+    std::vector<int> class_counts(static_cast<std::size_t>(safe_class_count), 0);
+
+    for (std::size_t index = 0; index < count; ++index) {
+        int label = labels[index];
+        if (label < 0 || label >= safe_class_count) {
+            label = 0;
+        }
+
+        const int rank = class_counts[static_cast<std::size_t>(label)]++;
+        const float hue_step = 360.0f / static_cast<float>(safe_class_count);
+        const float base_h = static_cast<float>(label) * hue_step;
+
+        float h = base_h;
+        float s = 1.0f;
+        const float v = 1.0f;
+        if (rank > 0) {
+            const int ring = (rank - 1) / 10 + 1;
+            const int sv_idx = ((rank - 1) % 10) / 2;
+            const int sign = ((rank - 1) % 2 == 0) ? 1 : -1;
+            s = std::fmax(0.0f, 1.0f - (static_cast<float>(sv_idx) * 0.05f));
+            h = std::fmod(base_h + (static_cast<float>(sign) * static_cast<float>(ring) * 3.6f) + 360.0f,
+                          360.0f);
+        }
+
+        const std::size_t color_offset = index * 3U;
+        hsv2rgb(h,
+                s,
+                v,
+                (*colors_rgb)[color_offset],
+                (*colors_rgb)[color_offset + 1U],
+                (*colors_rgb)[color_offset + 2U]);
+    }
+}
+
 void draw_eval_sample_async_gpu(
     const torch::Tensor& image_chw,
     const torch::Tensor& result_boxes,
@@ -151,51 +195,24 @@ void draw_eval_sample_async_gpu(
 
     const auto device = image_chw.device();
     c10::cuda::CUDAGuard guard(device.index());
-    const auto draw_stream = c10::cuda::getStreamFromPool(false, checked_device_index(device.index()));
+    const auto draw_stream = get_high_priority_cuda_stream(device.index());
 
     const int height = static_cast<int>(image_chw.size(1));
     const int width = static_cast<int>(image_chw.size(2));
     const auto labels_t = result_labels.to(torch::kCPU, torch::kInt64).contiguous();
     const int num_instances = static_cast<int>(labels_t.size(0));
 
-    std::vector<uint8_t> colors(static_cast<std::size_t>(num_instances) * 3U);
-    std::vector<int> class_counts(std::max(1, options.num_classes), 0);
     const int64_t* label_data = labels_t.data_ptr<int64_t>();
     std::vector<int> labels_int(num_instances);
-
     for (int i = 0; i < num_instances; ++i) {
-        int lbl = static_cast<int>(label_data[i]);
-        labels_int[i] = lbl;
-
-        if (lbl < 0 || lbl >= options.num_classes) lbl = 0;
-        const int rank = class_counts[lbl]++;
-        const float hue_step = 360.0f / static_cast<float>(std::max(1, options.num_classes));
-
-        float base_h = static_cast<float>(lbl) * hue_step;
-
-        float h = base_h;
-        float s = 1.0f;
-        float v = 1.0f;
-
-        if (rank > 0) {
-            const int ring = (rank - 1) / 10 + 1;
-            const int sv_idx = ((rank - 1) % 10) / 2;
-            const int sign = ((rank - 1) % 2 == 0) ? 1 : -1;
-
-            s = std::fmax(0.0f, 1.0f - (static_cast<float>(sv_idx) * 0.05f));
-            h = std::fmod(
-                base_h + (static_cast<float>(sign) * static_cast<float>(ring) * 3.6f) + 360.0f,
-                360.0f);
-        }
-
-        const std::size_t color_offset = static_cast<std::size_t>(i) * 3U;
-        hsv2rgb(h,
-                s,
-                v,
-                colors[color_offset],
-                colors[color_offset + 1U],
-                colors[color_offset + 2U]);
+        labels_int[static_cast<std::size_t>(i)] = static_cast<int>(label_data[i]);
     }
+    std::vector<uint8_t> colors;
+    build_instance_colors_from_zero_based_labels(
+        labels_int.data(),
+        static_cast<std::size_t>(num_instances),
+        options.num_classes,
+        &colors);
 
     std::filesystem::create_directories(options.output_path.parent_path());
 

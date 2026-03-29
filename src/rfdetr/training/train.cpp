@@ -1,4 +1,4 @@
-#include "rfdetr/train.h"
+#include "fastloader/rfdetr/train.h"
 
 #include "dataset_loader.h"
 #include "fastloader/rfdetr/checkpoint.h"
@@ -45,6 +45,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <system_error>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -57,7 +58,7 @@ using namespace validate_detail;
 namespace {
 
 struct OptimizerBuildResult {
-    NativeAdamW optimizer;
+    NativeOptimizer optimizer;
     std::vector<double> base_lrs;
 };
 
@@ -135,11 +136,7 @@ int effective_train_lanes(const TrainOptions& options) {
     if (options.lanes < 0) {
         throw std::runtime_error("RF-DETR train --lanes must be non-negative");
     }
-    const int lanes = std::max(1, options.lanes);
-    if (lanes > 3) {
-        throw std::runtime_error("RF-DETR train --lanes supports only 0, 1, 2, or 3 in native training");
-    }
-    return lanes;
+    return std::max(1, options.lanes);
 }
 
 size_t micro_batches_per_optimizer_step(const TrainOptions& options, int train_lane_count) {
@@ -272,6 +269,10 @@ bool is_rank_zero(const DistributedContext& distributed) {
 std::string train_progress_postfix(double average_class_loss,
                                    double average_box_loss,
                                    double average_loss,
+                                   double step_class_loss,
+                                   double step_box_loss,
+                                   double step_loss,
+                                   double images_per_second,
                                    int64_t optimizer_steps,
                                    int64_t steps_per_epoch) {
     std::ostringstream stream;
@@ -279,7 +280,12 @@ std::string train_progress_postfix(double average_class_loss,
     stream.precision(4);
     stream << "cl=" << average_class_loss
            << ", bl=" << average_box_loss
-           << ", l=" << average_loss;
+           << ", l=" << average_loss
+           << ", scl=" << step_class_loss
+           << ", sbl=" << step_box_loss
+           << ", sl=" << step_loss;
+    stream.precision(2);
+    stream << ", img/s=" << images_per_second;
     stream.precision(0);
     stream << ", step=" << optimizer_steps << "/" << steps_per_epoch;
     return stream.str();
@@ -352,11 +358,17 @@ void append_json_line(const std::filesystem::path& path, const json& payload) {
 }
 
 void write_json_file(const std::filesystem::path& path, const json& payload) {
-    std::ofstream stream(path);
+    const std::filesystem::path temporary_path = path.string() + ".tmp";
+    std::ofstream stream(temporary_path);
     if (!stream.is_open()) {
-        throw std::runtime_error("failed to write RF-DETR JSON file: " + path.string());
+        throw std::runtime_error("failed to write RF-DETR JSON file: " + temporary_path.string());
     }
     stream << payload.dump(2) << '\n';
+    stream.close();
+    if (!stream) {
+        throw std::runtime_error("failed to flush RF-DETR JSON file: " + temporary_path.string());
+    }
+    std::filesystem::rename(temporary_path, path);
 }
 
 json metric_summary_json(const MetricSummary& summary) {
@@ -503,16 +515,35 @@ double parameter_weight_decay(std::string_view name, const TrainOptions& options
     return options.weight_decay;
 }
 
+bool is_muon_hidden_weight(std::string_view name, const torch::Tensor& param) {
+    if ((param.dim() != 2 && param.dim() != 4) || name.find(".weight") == std::string_view::npos) {
+        return false;
+    }
+    if (name.find("embeddings") != std::string_view::npos ||
+        name.find("position_embeddings") != std::string_view::npos ||
+        name.find("cls_token") != std::string_view::npos ||
+        name.find("mask_token") != std::string_view::npos ||
+        name.find("query_feat") != std::string_view::npos ||
+        name.find("refpoint_embed") != std::string_view::npos ||
+        name.find("class_embed") != std::string_view::npos ||
+        name.find("bbox_embed") != std::string_view::npos ||
+        name.find("segmentation_head") != std::string_view::npos) {
+        return false;
+    }
+    return true;
+}
+
 OptimizerBuildResult build_optimizer(NativeRfDetrModel& model, const TrainOptions& options) {
     struct GroupSpec {
         double lr = 0.0;
         double weight_decay = 0.0;
+        bool use_muon = false;
         std::vector<size_t> param_indices;
     };
 
     std::unordered_map<std::string, size_t> group_index;
     std::vector<GroupSpec> groups;
-    std::vector<NativeAdamW::NamedParameter> named_params;
+    std::vector<std::pair<std::string, torch::Tensor>> named_params;
 
     for (const auto& item : model.named_parameters(true)) {
         const auto& param = item.value();
@@ -522,13 +553,15 @@ OptimizerBuildResult build_optimizer(NativeRfDetrModel& model, const TrainOption
 
         const double lr = parameter_lr(item.key(), options);
         const double weight_decay = parameter_weight_decay(item.key(), options);
-        const std::string key = std::to_string(lr) + ":" + std::to_string(weight_decay);
+        const bool use_muon = options.optimizer == TrainOptimizerKind::Muon && is_muon_hidden_weight(item.key(), param);
+        const std::string key = std::string(use_muon ? "muon:" : "aux:") +
+                                std::to_string(lr) + ":" + std::to_string(weight_decay);
         auto found = group_index.find(key);
         if (found == group_index.end()) {
             found = group_index.emplace(key, groups.size()).first;
-            groups.push_back(GroupSpec{lr, weight_decay, {}});
+            groups.push_back(GroupSpec{lr, weight_decay, use_muon, {}});
         }
-        named_params.push_back(NativeAdamW::NamedParameter{item.key(), param});
+        named_params.push_back({item.key(), param});
         groups[found->second].param_indices.push_back(named_params.size() - 1);
     }
 
@@ -536,10 +569,35 @@ OptimizerBuildResult build_optimizer(NativeRfDetrModel& model, const TrainOption
         throw std::runtime_error("RF-DETR runtime found no trainable parameters");
     }
 
-    std::vector<NativeAdamW::Group> optimizer_groups;
     std::vector<double> base_lrs;
-    optimizer_groups.reserve(groups.size());
     base_lrs.reserve(groups.size());
+    if (options.optimizer == TrainOptimizerKind::Muon) {
+        std::vector<NativeMuonWithAuxAdam::Group> optimizer_groups;
+        std::vector<NativeMuonWithAuxAdam::NamedParameter> optimizer_params;
+        optimizer_groups.reserve(groups.size());
+        optimizer_params.reserve(named_params.size());
+        for (const auto& named_param : named_params) {
+            optimizer_params.push_back(NativeMuonWithAuxAdam::NamedParameter{named_param.first, named_param.second});
+        }
+        for (auto& group : groups) {
+            base_lrs.push_back(group.lr);
+            optimizer_groups.push_back(NativeMuonWithAuxAdam::Group{
+                NativeMuonGroupConfig{group.lr, group.weight_decay, options.momentum, group.use_muon, true},
+                std::move(group.param_indices)});
+        }
+        return OptimizerBuildResult{
+            NativeOptimizer(NativeMuonWithAuxAdam(std::move(optimizer_groups), std::move(optimizer_params))),
+            std::move(base_lrs),
+        };
+    }
+
+    std::vector<NativeAdamW::Group> optimizer_groups;
+    std::vector<NativeAdamW::NamedParameter> optimizer_params;
+    optimizer_groups.reserve(groups.size());
+    optimizer_params.reserve(named_params.size());
+    for (const auto& named_param : named_params) {
+        optimizer_params.push_back(NativeAdamW::NamedParameter{named_param.first, named_param.second});
+    }
     for (auto& group : groups) {
         base_lrs.push_back(group.lr);
         optimizer_groups.push_back(
@@ -547,8 +605,8 @@ OptimizerBuildResult build_optimizer(NativeRfDetrModel& model, const TrainOption
     }
 
     std::vector<torch::Tensor> trainable_params;
-    trainable_params.reserve(named_params.size());
-    for (const auto& named_param : named_params) {
+    trainable_params.reserve(optimizer_params.size());
+    for (const auto& named_param : optimizer_params) {
         trainable_params.push_back(named_param.tensor);
     }
     const auto backend = (options.fused_optimizer && native_optimizer_supports_fused(trainable_params))
@@ -557,7 +615,7 @@ OptimizerBuildResult build_optimizer(NativeRfDetrModel& model, const TrainOption
                                                                                NativeOptimizerBackend::eager;
 
     return OptimizerBuildResult{
-        NativeAdamW(std::move(optimizer_groups), std::move(named_params), backend),
+        NativeOptimizer(NativeAdamW(std::move(optimizer_groups), std::move(optimizer_params), backend)),
         std::move(base_lrs),
     };
 }
@@ -739,7 +797,7 @@ std::vector<StateDictEntry> ema_state_entries(const std::vector<std::string>& pa
 void save_resume_checkpoint(const std::filesystem::path& checkpoint_path,
                             NativeRfDetrModel& model,
                             const NativeCheckpointMetadata& metadata,
-                            const NativeAdamW& optimizer,
+                            const NativeOptimizer& optimizer,
                             const GradScaler& grad_scaler,
                             const TrainOptions& options,
                             int epoch,
@@ -817,6 +875,7 @@ void save_resume_checkpoint(const std::filesystem::path& checkpoint_path,
         FASTLOADER_PROFILE_SCOPE("rfdetr.train.save.resume.optimizer_state");
         optimizer.save(optimizer_archive);
     }
+    write_string(archive, "optimizer_kind", optimizer.kind_name());
     archive.write("optimizer", optimizer_archive);
 
     if (ema.has_value()) {
@@ -835,6 +894,7 @@ void save_resume_checkpoint(const std::filesystem::path& checkpoint_path,
     write_string(archive, "lr_scheduler", options.lr_scheduler);
     write_int(archive, "lr_drop", options.lr_drop);
     write_double(archive, "warmup_epochs", options.warmup_epochs);
+    write_double(archive, "warmup_momentum", options.warmup_momentum);
     write_double(archive, "lr_min_factor", options.lr_min_factor);
     write_double(archive, "best_regular_metric", best_regular);
     write_double(archive, "best_ema_metric", best_ema);
@@ -847,7 +907,7 @@ void save_resume_checkpoint(const std::filesystem::path& checkpoint_path,
 }
 
 ResumeState load_resume_checkpoint_state(const std::filesystem::path& checkpoint_path,
-                                         NativeAdamW& optimizer,
+                                         NativeOptimizer& optimizer,
                                          GradScaler& grad_scaler,
                                          const TrainOptions& options) {
     if (!is_native_checkpoint_file(checkpoint_path)) {
@@ -869,9 +929,21 @@ ResumeState load_resume_checkpoint_state(const std::filesystem::path& checkpoint
         warmup_epochs.has_value() && *warmup_epochs != options.warmup_epochs) {
         throw std::runtime_error("native RF-DETR resume checkpoint warmup_epochs does not match current training options");
     }
+    if (const auto warmup_momentum = read_optional_double(archive, "warmup_momentum");
+        warmup_momentum.has_value() && *warmup_momentum != options.warmup_momentum) {
+        throw std::runtime_error("native RF-DETR resume checkpoint warmup_momentum does not match current training options");
+    }
     if (const auto lr_min_factor = read_optional_double(archive, "lr_min_factor");
         lr_min_factor.has_value() && *lr_min_factor != options.lr_min_factor) {
         throw std::runtime_error("native RF-DETR resume checkpoint lr_min_factor does not match current training options");
+    }
+    const auto optimizer_kind = read_optional_string(archive, "optimizer_kind");
+    if (!optimizer_kind.has_value()) {
+        throw std::runtime_error("native RF-DETR resume checkpoint is missing optimizer_kind: " +
+                                 checkpoint_path.string());
+    }
+    if (*optimizer_kind != optimizer.kind_name()) {
+        throw std::runtime_error("native RF-DETR resume checkpoint optimizer_kind does not match current training options");
     }
 
     torch::serialize::InputArchive optimizer_archive;
@@ -1139,10 +1211,11 @@ EvalPassResult evaluate_model(const TrainOptions& options,
                               std::optional<int> current_epoch,
                               std::string progress_label) {
     FASTLOADER_PROFILE_SCOPE("rfdetr.train.eval.total");
+    const size_t eval_batch_size = options.val_batch_size > 0 ? options.val_batch_size : options.batch_size;
     CocoDataset dataset = CocoDataset::load_from_binary(compiled_path);
     const std::vector<int> image_ids = dataset.image_ids();
     DatasetLoader loader(make_loader_config(compiled_path.string(),
-                                            options.batch_size,
+                                            eval_batch_size,
                                             false,
                                             1,
                                             runtime.split().gather_threads,
@@ -1188,7 +1261,7 @@ EvalPassResult evaluate_model(const TrainOptions& options,
     const size_t slot_count = eval_prediction_slot_count(runtime.split());
     for (int lane_index = 0; lane_index < runtime.split().lane_threads; ++lane_index) {
         lanes.push_back(EvalPredictionLane{
-            c10::cuda::getStreamFromPool(false, checked_device_index(options.device_id)),
+            get_high_priority_cuda_stream(options.device_id),
             std::make_shared<PredictionBufferSlotPool>(slot_count),
         });
     }
@@ -1421,9 +1494,6 @@ TrainRunResult run_training(const TrainOptions& options) {
     const int requested_train_lanes = effective_train_lanes(options);
     RuntimeContext train_runtime(resolve_runtime_config(options.workers, requested_train_lanes, options.cpu_affinity));
     const int train_lane_count = train_runtime.split().lane_threads;
-    const RuntimeConfig eval_runtime_config =
-        resolve_runtime_config(options.workers, train_lane_count, options.cpu_affinity);
-    const RuntimeSplit eval_runtime_split = split_runtime_workers(eval_runtime_config);
     ScopedWorkerPool worker_scope(&train_runtime.cpu_pool());
 
     auto make_loader_config_for = [&](const std::filesystem::path& compiled_path,
@@ -1527,6 +1597,14 @@ TrainRunResult run_training(const TrainOptions& options) {
     ensure_train_lane_model_supported(model, train_lane_count);
     model.train();
 
+    if (options.freeze_encoder) {
+        for (auto& item : model.named_parameters(true)) {
+            if (is_encoder_param(item.key())) {
+                item.value().set_requires_grad(false);
+            }
+        }
+    }
+
     auto optimizer_build = build_optimizer(model, options);
     auto& optimizer = optimizer_build.optimizer;
     auto& all_params = optimizer.parameters();
@@ -1564,21 +1642,27 @@ TrainRunResult run_training(const TrainOptions& options) {
 
     LrScheduleConfig lr_config;
     lr_config.warmup_epochs = options.warmup_epochs;
+    lr_config.warmup_momentum = options.warmup_momentum;
     lr_config.lr_scheduler = options.lr_scheduler;
     lr_config.lr_drop = options.lr_drop;
     lr_config.lr_min_factor = options.lr_min_factor;
 
     if (main_process) {
         std::fprintf(stderr,
-                     "rfdetr train runtime: torch=%s autocast=%s optimizer_backend=%s scaler=%s train_lanes=%d eval_lanes=%d effective_batch_per_rank=%zu effective_batch_global=%zu\n",
+                     "rfdetr train runtime: torch=%s autocast=%s optimizer=%s optimizer_backend=%s scaler=%s train_lanes=%d eval_lanes=%d effective_batch_per_rank=%zu effective_batch_global=%zu\n",
                      TORCH_VERSION,
                      scalar_type_name(autocast_dtype),
+                     optimizer.kind_name(),
                      optimizer.backend_name(),
                      grad_scaler.enabled() ? "on" : "off",
                      train_lane_count,
-                     eval_runtime_split.lane_threads,
+                     train_runtime.split().lane_threads,
                      effective_batch_per_rank(options, train_lane_count),
                      effective_batch_global(options, distributed, train_lane_count));
+        if (options.optimizer == TrainOptimizerKind::Muon && options.fused_optimizer) {
+            std::fprintf(stderr,
+                         "rfdetr train runtime: optimizer=muon ignores --fused-optimizer and runs with the eager backend only\n");
+        }
     }
 
     const size_t usable_full_batches = full_batches_per_rank(
@@ -1604,6 +1688,9 @@ TrainRunResult run_training(const TrainOptions& options) {
     if (main_process) {
         std::filesystem::create_directories(options.output_dir);
     }
+    const auto progress_path = options.output_dir / "progress.json";
+    const auto log_path = options.output_dir / "log.txt";
+    const auto results_path = options.output_dir / "results.json";
     const auto checkpoint_path = options.output_dir / "checkpoint.pt";
     const auto best_regular_checkpoint_path = options.output_dir / "checkpoint_best_regular.pt";
     const auto best_ema_checkpoint_path = options.output_dir / "checkpoint_best_ema.pt";
@@ -1623,6 +1710,37 @@ TrainRunResult run_training(const TrainOptions& options) {
         result.best_checkpoint_path = best_ema_checkpoint_path;
         result.best_is_ema = true;
     }
+    if (main_process) {
+        std::error_code ignored_error;
+        std::filesystem::remove(progress_path, ignored_error);
+        std::filesystem::remove(log_path, ignored_error);
+        std::filesystem::remove(results_path, ignored_error);
+        write_json_file(
+            progress_path,
+            json{
+                {"phase", "starting"},
+                {"epoch", start_epoch},
+                {"total_epochs", options.epochs},
+                {"completed_batches", 0},
+                {"total_batches", usable_full_batches},
+                {"completed_waves", 0},
+                {"optimizer_steps", 0},
+                {"steps_per_epoch", steps_per_epoch},
+                {"train_lanes", train_lane_count},
+                {"train_loss", 0.0},
+                {"class_loss", 0.0},
+                {"box_loss", 0.0},
+                {"step_loss", 0.0},
+                {"step_class_loss", 0.0},
+                {"step_box_loss", 0.0},
+                {"batches_per_second", 0.0},
+                {"images_per_second", 0.0},
+                {"elapsed_seconds", 0.0},
+                {"checkpoint_path", std::string{}},
+                {"val_loss", 0.0},
+                {"val", json()},
+            });
+    }
 
     c10::cuda::CUDAGuard device_guard(cuda_device_index(options.device_id));
     std::unique_ptr<WorkerPool> train_lane_pool;
@@ -1635,7 +1753,7 @@ TrainRunResult run_training(const TrainOptions& options) {
         train_lanes.reserve(static_cast<size_t>(train_lane_count));
         for (int lane_index = 0; lane_index < train_lane_count; ++lane_index) {
             train_lanes.push_back(TrainLaneContext{
-                c10::cuda::getStreamFromPool(false, checked_device_index(options.device_id)),
+                get_high_priority_cuda_stream(options.device_id),
                 {},
                 model.clone_segmentation_head(),
             });
@@ -1658,30 +1776,121 @@ TrainRunResult run_training(const TrainOptions& options) {
         auto box_loss_sum_device = torch::zeros(
             {},
             torch::TensorOptions().dtype(torch::kFloat32).device(cuda_device(options.device_id)));
+        const auto epoch_started = std::chrono::steady_clock::now();
         int64_t local_micro_batches = 0;
         int64_t local_waves = 0;
         int64_t optimizer_steps = 0;
         size_t local_full_batches = 0;
+        double host_loss_sum = 0.0;
+        double host_class_loss_sum = 0.0;
+        double host_box_loss_sum = 0.0;
+        double current_step_loss = 0.0;
+        double current_step_class_loss = 0.0;
+        double current_step_box_loss = 0.0;
 
         std::optional<ProgressBar> progress;
         if (main_process && options.progress_bar) {
-            progress.emplace(phase_progress_label("train", epoch, options.epochs), usable_full_batches, "batch");
+            progress.emplace(phase_progress_label("train", epoch, options.epochs), static_cast<size_t>(usable_full_batches) * static_cast<size_t>(options.batch_size), "img");
             progress->set_postfix("cl=warming, bl=warming, l=warming");
         }
 
+        auto write_progress_snapshot = [&](std::string_view phase,
+                                           double val_loss,
+                                           const json& val_summary,
+                                           const std::filesystem::path& checkpoint_override) {
+            if (!main_process) {
+                return;
+            }
+            const double elapsed_seconds = std::chrono::duration<double>(
+                                               std::chrono::steady_clock::now() - epoch_started)
+                                               .count();
+            const double average_class_loss =
+                local_micro_batches > 0
+                    ? host_class_loss_sum / static_cast<double>(local_micro_batches)
+                    : 0.0;
+            const double average_box_loss =
+                local_micro_batches > 0
+                    ? host_box_loss_sum / static_cast<double>(local_micro_batches)
+                    : 0.0;
+            const double average_loss =
+                local_micro_batches > 0
+                    ? host_loss_sum / static_cast<double>(local_micro_batches)
+                    : 0.0;
+            const double batches_per_second =
+                elapsed_seconds > 0.0 ? static_cast<double>(local_micro_batches) / elapsed_seconds : 0.0;
+            const double images_per_second =
+                elapsed_seconds > 0.0
+                    ? static_cast<double>(local_micro_batches) * static_cast<double>(options.batch_size) / elapsed_seconds
+                    : 0.0;
+            write_json_file(
+                progress_path,
+                json{
+                    {"phase", std::string(phase)},
+                    {"epoch", epoch},
+                    {"total_epochs", options.epochs},
+                    {"completed_batches", local_micro_batches},
+                    {"total_batches", usable_full_batches},
+                    {"completed_waves", local_waves},
+                    {"optimizer_steps", optimizer_steps},
+                    {"steps_per_epoch", steps_per_epoch},
+                    {"train_lanes", train_lane_count},
+                    {"train_loss", average_loss},
+                    {"class_loss", average_class_loss},
+                    {"box_loss", average_box_loss},
+                    {"step_loss", current_step_loss},
+                    {"step_class_loss", current_step_class_loss},
+                    {"step_box_loss", current_step_box_loss},
+                    {"batches_per_second", batches_per_second},
+                    {"images_per_second", images_per_second},
+                    {"elapsed_seconds", elapsed_seconds},
+                    {"checkpoint_path",
+                     checkpoint_override.empty() ? std::string{} : checkpoint_override.string()},
+                    {"val_loss", val_loss},
+                    {"val", val_summary},
+                });
+        };
+
         auto flush_progress = [&](bool force) {
-            if (!progress.has_value() || local_micro_batches == 0) {
+            if (local_micro_batches == 0) {
                 return;
             }
-            if (!force && local_micro_batches % std::max(1, options.print_freq) != 0) {
-                return;
+            const double average_class_loss = host_class_loss_sum / static_cast<double>(local_micro_batches);
+            const double average_box_loss = host_box_loss_sum / static_cast<double>(local_micro_batches);
+            const double average_loss = host_loss_sum / static_cast<double>(local_micro_batches);
+            const double elapsed_seconds = std::chrono::duration<double>(
+                                               std::chrono::steady_clock::now() - epoch_started)
+                                               .count();
+            const double images_per_second =
+                elapsed_seconds > 0.0
+                    ? static_cast<double>(local_micro_batches) * static_cast<double>(options.batch_size) / elapsed_seconds
+                    : 0.0;
+            const bool should_update_bar =
+                progress.has_value() &&
+                (force || local_micro_batches % std::max(1, options.print_freq) == 0);
+            if (should_update_bar) {
+                progress->set_postfix(train_progress_postfix(
+                    average_class_loss,
+                    average_box_loss,
+                    average_loss,
+                    current_step_class_loss,
+                    current_step_box_loss,
+                    current_step_loss,
+                    images_per_second,
+                    optimizer_steps,
+                    steps_per_epoch));
             }
-            progress->set_postfix(train_progress_postfix(
-                class_loss_sum_device.item<double>() / static_cast<double>(local_micro_batches),
-                box_loss_sum_device.item<double>() / static_cast<double>(local_micro_batches),
-                loss_sum_device.item<double>() / static_cast<double>(local_micro_batches),
-                optimizer_steps,
-                steps_per_epoch));
+            write_progress_snapshot("train", 0.0, json{}, std::filesystem::path{});
+        };
+
+        write_progress_snapshot("train", 0.0, json{}, std::filesystem::path{});
+
+        const auto apply_optimizer_schedule = [&](int64_t current_step) {
+            const double lr_scale = compute_lr_scale(lr_config, current_step, steps_per_epoch, total_training_steps);
+            set_optimizer_lrs(optimizer, optimizer_build.base_lrs, lr_scale);
+            if (options.optimizer == TrainOptimizerKind::Muon) {
+                optimizer.set_muon_momentum(
+                    compute_warmup_momentum(lr_config, current_step, steps_per_epoch, options.momentum));
+            }
         };
 
         auto next_train_full_batch = [&](bool wait_now = true) -> std::optional<Batch> {
@@ -1796,9 +2005,18 @@ TrainRunResult run_training(const TrainOptions& options) {
                         format_nonfinite_loss_report(loss_dict, all_params, all_param_names));
                 }
 
+                const double loss_value = loss.detach().item<double>();
+                const double class_loss_value = class_loss.detach().item<double>();
+                const double box_loss_value = box_loss.detach().item<double>();
                 loss_sum_device.add_(loss.detach());
                 class_loss_sum_device.add_(class_loss.detach());
                 box_loss_sum_device.add_(box_loss.detach());
+                host_loss_sum += loss_value;
+                host_class_loss_sum += class_loss_value;
+                host_box_loss_sum += box_loss_value;
+                current_step_loss = loss_value;
+                current_step_class_loss = class_loss_value;
+                current_step_box_loss = box_loss_value;
                 ++local_micro_batches;
                 ++local_waves;
                 const auto scaled_loss = grad_scaler.scale(loss / static_cast<double>(options.grad_accum_steps));
@@ -1810,10 +2028,7 @@ TrainRunResult run_training(const TrainOptions& options) {
                 if (local_waves % options.grad_accum_steps == 0) {
                     FASTLOADER_PROFILE_SCOPE("rfdetr.train.optimizer");
                     const int64_t current_step = static_cast<int64_t>(epoch) * steps_per_epoch + optimizer_steps;
-                    set_optimizer_lrs(
-                        optimizer,
-                        optimizer_build.base_lrs,
-                        compute_lr_scale(lr_config, current_step, steps_per_epoch, total_training_steps));
+                    apply_optimizer_schedule(current_step);
                     average_gradients(distributed, all_params);
                     if (options.clip_max_norm > 0.0) {
                         grad_scaler.unscale_(optimizer);
@@ -1829,7 +2044,7 @@ TrainRunResult run_training(const TrainOptions& options) {
                 }
 
                 if (progress.has_value()) {
-                    progress->add(1);
+                    progress->add(static_cast<size_t>(options.batch_size));
                 }
                 flush_progress(false);
             }
@@ -1842,6 +2057,9 @@ TrainRunResult run_training(const TrainOptions& options) {
                     current_scale / static_cast<double>(micro_batches_per_optimizer_step(options, train_lane_count));
                 std::vector<std::future<TrainLaneResult>> lane_futures;
                 lane_futures.reserve(static_cast<size_t>(train_lane_count));
+                double wave_loss_sum = 0.0;
+                double wave_class_loss_sum = 0.0;
+                double wave_box_loss_sum = 0.0;
 
                 for (int lane_index = 0; lane_index < train_lane_count; ++lane_index) {
                     auto batch = next_train_full_batch(false);
@@ -1882,24 +2100,32 @@ TrainRunResult run_training(const TrainOptions& options) {
                 for (auto& lane_future : lane_futures) {
                     TrainLaneResult lane_result = lane_future.get();
                     merge_lane_gradients(lane_result, all_params, options.device_id);
+                    const double lane_loss_value = lane_result.loss.item<double>();
+                    const double lane_class_loss_value = lane_result.class_loss.item<double>();
+                    const double lane_box_loss_value = lane_result.box_loss.item<double>();
                     loss_sum_device.add_(lane_result.loss);
                     class_loss_sum_device.add_(lane_result.class_loss);
                     box_loss_sum_device.add_(lane_result.box_loss);
+                    host_loss_sum += lane_loss_value;
+                    host_class_loss_sum += lane_class_loss_value;
+                    host_box_loss_sum += lane_box_loss_value;
+                    wave_loss_sum += lane_loss_value;
+                    wave_class_loss_sum += lane_class_loss_value;
+                    wave_box_loss_sum += lane_box_loss_value;
                     ++local_micro_batches;
                     if (progress.has_value()) {
-                        progress->add(1);
+                        progress->add(static_cast<size_t>(options.batch_size));
                     }
-                    flush_progress(false);
                 }
 
+                current_step_loss = wave_loss_sum / static_cast<double>(lane_futures.size());
+                current_step_class_loss = wave_class_loss_sum / static_cast<double>(lane_futures.size());
+                current_step_box_loss = wave_box_loss_sum / static_cast<double>(lane_futures.size());
                 ++local_waves;
                 if (local_waves % options.grad_accum_steps == 0) {
                     FASTLOADER_PROFILE_SCOPE("rfdetr.train.optimizer");
                     const int64_t current_step = static_cast<int64_t>(epoch) * steps_per_epoch + optimizer_steps;
-                    set_optimizer_lrs(
-                        optimizer,
-                        optimizer_build.base_lrs,
-                        compute_lr_scale(lr_config, current_step, steps_per_epoch, total_training_steps));
+                    apply_optimizer_schedule(current_step);
                     average_gradients(distributed, all_params);
                     if (options.clip_max_norm > 0.0) {
                         grad_scaler.unscale_(optimizer);
@@ -1916,6 +2142,7 @@ TrainRunResult run_training(const TrainOptions& options) {
                         options.device_id,
                         "parallel train parameter readiness event");
                 }
+                flush_progress(false);
             }
         }
 
@@ -1959,13 +2186,16 @@ TrainRunResult run_training(const TrainOptions& options) {
         distributed_barrier(distributed);
 
         if (main_process) {
-            RuntimeContext eval_runtime(eval_runtime_config);
+            write_progress_snapshot("validate", 0.0, json{}, std::filesystem::path{});
             auto val_result = evaluate_model(
-                options, eval_runtime, model, options.val_compiled_path, detection_config, epoch, phase_progress_label("val", epoch, options.epochs));
+                options, train_runtime, model, options.val_compiled_path, detection_config, epoch, phase_progress_label("val", epoch, options.epochs));
 
             std::fprintf(stderr,
-                         "\n[Rank 0] Epoch %d validation mAP: bbox=%.4f mask=%.4f\n\n",
+                         "\n[Rank 0] Epoch %d stats: optimizer=%s train_loss=%.6f val_loss=%.6f bbox_ap=%.4f mask_ap=%.4f\n\n",
                          epoch + 1,
+                         optimizer.kind_name(),
+                         train_loss,
+                         val_result.loss,
                          val_result.summary.bbox.ap,
                          detection_config.include_masks ? val_result.summary.mask.ap : 0.0);
                          
@@ -2014,7 +2244,7 @@ TrainRunResult run_training(const TrainOptions& options) {
                 }
                 auto ema_result = evaluate_model(
                     options,
-                    eval_runtime,
+                    train_runtime,
                     model,
                     options.val_compiled_path,
                     detection_config,
@@ -2068,11 +2298,11 @@ TrainRunResult run_training(const TrainOptions& options) {
             {
                 FASTLOADER_PROFILE_SCOPE("rfdetr.train.save.log_json");
                 append_json_line(
-                    options.output_dir / "log.txt",
+                    log_path,
                     json{
                         {"epoch", epoch},
                         {"train_lanes", train_lane_count},
-                        {"eval_lanes", eval_runtime_split.lane_threads},
+                        {"eval_lanes", train_runtime.split().lane_threads},
                         {"effective_batch_per_rank", effective_batch_per_rank(options, train_lane_count)},
                         {"effective_batch_global", effective_batch_global(options, distributed, train_lane_count)},
                         {"train_loss", train_loss},
@@ -2084,6 +2314,11 @@ TrainRunResult run_training(const TrainOptions& options) {
                                         : json()},
                     });
             }
+            write_progress_snapshot(
+                "epoch_complete",
+                val_result.loss,
+                eval_summary_json(val_result.summary),
+                result.best_checkpoint_path.has_value() ? *result.best_checkpoint_path : checkpoint_path);
         }
         distributed_barrier(distributed);
     }
@@ -2093,18 +2328,17 @@ TrainRunResult run_training(const TrainOptions& options) {
     }
 
     if (main_process && test_loader) {
-        RuntimeContext eval_runtime(eval_runtime_config);
         NativeRfDetrModel best_model(artifacts.config);
         best_model.to(cuda_device(options.device_id));
         best_model.load_weights(*result.best_checkpoint_path, false);
         result.test_summary =
-            evaluate_model(options, eval_runtime, best_model, options.test_compiled_path, detection_config, std::nullopt, "test").summary;
+            evaluate_model(options, train_runtime, best_model, options.test_compiled_path, detection_config, std::nullopt, "test").summary;
     }
 
     if (main_process) {
         FASTLOADER_PROFILE_SCOPE("rfdetr.train.save.results_json");
         write_json_file(
-            options.output_dir / "results.json",
+            results_path,
             json{
                 {"preset_name", artifacts.config.preset_name},
                 {"output_dir", options.output_dir.string()},
@@ -2116,7 +2350,7 @@ TrainRunResult run_training(const TrainOptions& options) {
                 {"last_epoch", result.last_epoch},
                 {"history_size", result.history.size()},
                 {"train_lanes", train_lane_count},
-                {"eval_lanes", eval_runtime_split.lane_threads},
+                {"eval_lanes", train_runtime.split().lane_threads},
                 {"effective_batch_per_rank", effective_batch_per_rank(options, train_lane_count)},
                 {"effective_batch_global", effective_batch_global(options, distributed, train_lane_count)},
                 {"test", result.test_summary.has_value() ? eval_summary_json(*result.test_summary) : json()},
@@ -2139,11 +2373,20 @@ void print_training_summary(const TrainOptions& options, const TrainRunResult& r
     }
     const char* source_label = options.resume_path.empty() ? "weights" : "resume";
     const auto best_path = result.best_checkpoint_path.has_value() ? result.best_checkpoint_path->string() : "";
+    const double train_loss = result.history.empty() ? 0.0 : result.history.back().train_loss;
+    const double val_loss = result.history.empty() ? 0.0 : result.history.back().val_loss;
+    const double val_bbox_ap = result.history.empty() ? 0.0 : result.history.back().val_summary.bbox.ap;
+    const double val_mask_ap = result.history.empty() ? 0.0 : result.history.back().val_summary.mask.ap;
     std::fprintf(stderr,
-                 "rfdetr train[%s]: preset=%s epochs=%d best=%s checkpoint=%s\n",
+                 "rfdetr train[%s]: preset=%s optimizer=%s epochs=%d train_loss=%.6f val_loss=%.6f val_bbox_ap=%.4f val_mask_ap=%.4f best=%s checkpoint=%s\n",
                  source_label,
                  result.artifacts.config.preset_name.c_str(),
+                 train_optimizer_kind_name(options.optimizer),
                  result.last_epoch + 1,
+                 train_loss,
+                 val_loss,
+                 val_bbox_ap,
+                 val_mask_ap,
                  best_path.c_str(),
                  result.checkpoint_path.c_str());
 }

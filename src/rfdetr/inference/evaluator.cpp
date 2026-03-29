@@ -1,6 +1,7 @@
 #include "rfdetr/evaluator.h"
 
 #include "common_utils.h"
+#include "cpu_affinity.h"
 #include "dataset_loader.h"
 #include "profile_utils.h"
 #include "rfdetr/cuda_utils.h"
@@ -301,8 +302,7 @@ MetricSummary compute_metric_summary(const std::vector<GroundTruthAnnotation>& g
         category_count_values.fill(0);
     }
 
-    const unsigned hardware_threads = std::thread::hardware_concurrency();
-    const int worker_count = static_cast<int>(std::max(1u, hardware_threads == 0 ? 1u : hardware_threads));
+    const int worker_count = static_cast<int>(fastloader::allowed_cpu_set().size());
     parallel_for_range<size_t>(0, category_count, worker_count, [&](size_t begin, size_t end) {
         FASTLOADER_NVTX_RANGE("compute_metric_summary_worker", NVTX_COLOR_CYAN);
         for (size_t category_index = begin; category_index < end; ++category_index) {

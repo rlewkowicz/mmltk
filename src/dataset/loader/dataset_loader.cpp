@@ -1,4 +1,5 @@
 #include "dataset_loader_internal.h"
+#include "execution_policy.h"
 #include "profile_utils.h"
 #include "worker_pool.h"
 
@@ -106,10 +107,21 @@ DatasetLoader::DatasetLoader(const Config& config) : impl_(std::make_unique<Impl
     impl_->prescan();
     impl_->slots.resize(impl_->num_buffers);
     impl_->worker_cpus = resolve_cpu_affinity(config.cpu_affinity);
-    impl_->gather_worker_count = impl_->use_gather_path
-                                     ? static_cast<size_t>(config.gather_workers > 0 ? config.gather_workers
-                                                                                    : config.prefetch_factor)
-                                     : 0;
+    if (impl_->use_gather_path) {
+        const int requested_gather_workers =
+            config.gather_workers > 0 ? config.gather_workers : config.prefetch_factor;
+        const int clamped_gather_workers =
+            clamp_worker_count_to_cpus(requested_gather_workers, impl_->worker_cpus.size(), 1, 1);
+        log_worker_budget_clamp("loader.gather",
+                                requested_gather_workers,
+                                clamped_gather_workers,
+                                impl_->worker_cpus,
+                                1,
+                                1);
+        impl_->gather_worker_count = static_cast<size_t>(clamped_gather_workers);
+    } else {
+        impl_->gather_worker_count = 0;
+    }
     FASTLOADER_PROFILE_SET("loader.worker_cpu_count", impl_->worker_cpus.size());
     FASTLOADER_PROFILE_SET("loader.gather.worker_budget", impl_->gather_worker_count);
     FASTLOADER_PROFILE_SET("loader.worker_thread_count",

@@ -181,6 +181,56 @@ fastloader::rfdetr::NativeAdamW make_optimizer(torch::nn::Module& module) {
         fastloader::rfdetr::NativeOptimizerBackend::eager);
 }
 
+bool muon_trainability_param(std::string_view name, const torch::Tensor& param) {
+    if ((param.dim() != 2 && param.dim() != 4) || name.find(".weight") == std::string_view::npos) {
+        return false;
+    }
+    if (name.find("embeddings") != std::string_view::npos ||
+        name.find("position_embeddings") != std::string_view::npos ||
+        name.find("cls_token") != std::string_view::npos ||
+        name.find("mask_token") != std::string_view::npos ||
+        name.find("query_feat") != std::string_view::npos ||
+        name.find("refpoint_embed") != std::string_view::npos ||
+        name.find("class_embed") != std::string_view::npos ||
+        name.find("bbox_embed") != std::string_view::npos ||
+        name.find("segmentation_head") != std::string_view::npos) {
+        return false;
+    }
+    return true;
+}
+
+fastloader::rfdetr::NativeMuonWithAuxAdam make_muon_optimizer(torch::nn::Module& module) {
+    std::vector<fastloader::rfdetr::NativeMuonWithAuxAdam::NamedParameter> params;
+    params.reserve(module.named_parameters(true).size());
+    std::vector<size_t> muon_indices;
+    std::vector<size_t> aux_indices;
+    for (const auto& item : module.named_parameters(true)) {
+        if (!item.value().requires_grad()) {
+            continue;
+        }
+        params.push_back({item.key(), item.value()});
+        const size_t index = params.size() - 1;
+        if (muon_trainability_param(item.key(), item.value())) {
+            muon_indices.push_back(index);
+        } else {
+            aux_indices.push_back(index);
+        }
+    }
+
+    std::vector<fastloader::rfdetr::NativeMuonWithAuxAdam::Group> groups;
+    if (!muon_indices.empty()) {
+        groups.push_back(fastloader::rfdetr::NativeMuonWithAuxAdam::Group{
+            fastloader::rfdetr::NativeMuonGroupConfig{1.0e-4, 1.0e-2, 0.95, true, true},
+            std::move(muon_indices)});
+    }
+    if (!aux_indices.empty()) {
+        groups.push_back(fastloader::rfdetr::NativeMuonWithAuxAdam::Group{
+            fastloader::rfdetr::NativeMuonGroupConfig{1.0e-4, 1.0e-2, 0.95, false, true},
+            std::move(aux_indices)});
+    }
+    return fastloader::rfdetr::NativeMuonWithAuxAdam(std::move(groups), std::move(params));
+}
+
 torch::Tensor compute_cpu_train_loss(fastloader::rfdetr::NativeRfDetrModel& model,
                                      const fastloader::rfdetr::NestedTensor& batch,
                                      const fastloader::rfdetr::NativeRfDetrConfig& config) {
@@ -207,6 +257,16 @@ void run_cpu_train_step(fastloader::rfdetr::NativeRfDetrModel& model,
                         const fastloader::rfdetr::NativeRfDetrConfig& config) {
     auto loss = compute_cpu_train_loss(model, batch, config);
     auto optimizer = make_optimizer(model);
+    loss.backward();
+    optimizer.step();
+    optimizer.zero_grad(true);
+}
+
+void run_cpu_muon_train_step(fastloader::rfdetr::NativeRfDetrModel& model,
+                             const fastloader::rfdetr::NestedTensor& batch,
+                             const fastloader::rfdetr::NativeRfDetrConfig& config) {
+    auto loss = compute_cpu_train_loss(model, batch, config);
+    auto optimizer = make_muon_optimizer(model);
     loss.backward();
     optimizer.step();
     optimizer.zero_grad(true);
@@ -300,6 +360,13 @@ void test_train_step_only() {
     auto model = fastloader::rfdetr::NativeRfDetrModel(config);
     auto batch = make_cpu_batch();
     run_cpu_train_step(model, batch, config);
+}
+
+void test_muon_train_step_only() {
+    const auto config = make_trainability_config(/*num_classes=*/3);
+    auto model = fastloader::rfdetr::NativeRfDetrModel(config);
+    auto batch = make_cpu_batch();
+    run_cpu_muon_train_step(model, batch, config);
 }
 
 void test_train_forward_loss_only() {
@@ -407,6 +474,34 @@ void test_cuda_train_step_smoke() {
     const auto detection_config = make_detection_config(config);
 
     auto optimizer = make_optimizer(model);
+    auto outputs = model.forward(batch);
+    auto loss_dict = fastloader::rfdetr::detection_loss_dict(outputs, targets, detection_config, true, false);
+    auto loss = fastloader::rfdetr::weighted_detection_loss(loss_dict, detection_config, device);
+    assert(torch::isfinite(loss).item<bool>());
+    loss.backward();
+    optimizer.step();
+    optimizer.zero_grad(true);
+}
+
+void test_cuda_muon_train_step_smoke() {
+    if (!torch::cuda::is_available()) {
+        return;
+    }
+
+    const auto device = torch::Device(torch::kCUDA, 0);
+    const auto config = make_trainability_config(/*num_classes=*/3);
+    auto model = fastloader::rfdetr::NativeRfDetrModel(config);
+    model.to(device);
+    model.train();
+
+    auto batch = fastloader::rfdetr::NestedTensor{
+        torch::rand({2, 3, 32, 32}, torch::TensorOptions().dtype(torch::kFloat32).device(device)),
+        torch::zeros({2, 32, 32}, torch::TensorOptions().dtype(torch::kBool).device(device)),
+    };
+    const auto targets = make_targets(2, 32);
+    const auto detection_config = make_detection_config(config);
+
+    auto optimizer = make_muon_optimizer(model);
     auto outputs = model.forward(batch);
     auto loss_dict = fastloader::rfdetr::detection_loss_dict(outputs, targets, detection_config, true, false);
     auto loss = fastloader::rfdetr::weighted_detection_loss(loss_dict, detection_config, device);
@@ -637,6 +732,9 @@ int main() {
     if (mode_selected("train-step")) {
         test_train_step_only();
     }
+    if (mode_selected("muon-train-step")) {
+        test_muon_train_step_only();
+    }
     if (mode_selected("checkpoint-roundtrip")) {
         test_checkpoint_roundtrip_only();
     }
@@ -651,6 +749,9 @@ int main() {
     }
     if (run_default || mode_selected("cuda")) {
         test_cuda_train_step_smoke();
+    }
+    if (run_default || mode_selected("muon-cuda")) {
+        test_cuda_muon_train_step_smoke();
     }
     if (run_default || mode_selected("cuda-parallel")) {
         test_cuda_parallel_wave_matches_sequential_accumulation();

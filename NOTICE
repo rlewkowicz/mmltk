@@ -1,0 +1,7 @@
+mmltk
+Copyright 2026 Ryan Michael Lewkowicz
+
+This repository is licensed under the Apache License, Version 2.0.
+
+Vendored third-party code under third_party/ and bundled font assets under
+src/gui/res/fonts/ retain their respective upstream licenses and notices.

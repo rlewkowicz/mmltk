@@ -104,6 +104,11 @@ void test_model_presets() {
     assert(seg_nano->num_windows == 1);
     assert(seg_nano->positional_encoding_size == 26);
 
+    const auto* seg_medium_upstream =
+        fastloader::rfdetr::find_model_preset_by_weight_filename("rf-detr-seg-m-ft.pth");
+    assert(seg_medium_upstream != nullptr);
+    assert(seg_medium_upstream->preset_name == "rf-detr-seg-medium");
+
     assert(fastloader::rfdetr::find_model_preset("rf-detr-base") == nullptr);
     assert(fastloader::rfdetr::find_model_preset("rf-detr-base-o365") == nullptr);
     assert(fastloader::rfdetr::find_model_preset("rf-detr-base-2") == nullptr);
@@ -114,6 +119,7 @@ void test_model_presets() {
     assert(fastloader::rfdetr::find_model_preset_by_weight_filename("rf-detr-base-2.pth") == nullptr);
     assert(fastloader::rfdetr::find_model_preset_by_weight_filename("rf-detr-large.pth") == nullptr);
     assert(fastloader::rfdetr::find_model_preset_by_weight_filename("rf-detr-seg-preview.pt") == nullptr);
+    assert(fastloader::rfdetr::find_model_preset_by_weight_filename("checkpoint_best_regular.pth") == nullptr);
 
     assert(fastloader::rfdetr::find_model_preset("unknown-preset") == nullptr);
     assert(fastloader::rfdetr::find_model_preset_by_weight_filename("unknown-file.pth") == nullptr);
@@ -144,6 +150,13 @@ void test_weight_artifact_resolution() {
     assert(resolved.artifact_root == root);
     assert(resolved.onnx_path.empty());
     assert(resolved.tensorrt_path.empty());
+
+    write_upstream_checkpoint(root / "rf-detr-seg-m-ft.pth");
+    const auto upstream_named =
+        fastloader::rfdetr::resolve_upstream_weight_artifacts(root / "rf-detr-seg-m-ft.pth");
+    assert(upstream_named.config.preset_name == "rf-detr-seg-medium");
+    assert(upstream_named.input_kind == "upstream-python");
+    assert(upstream_named.input_path.filename() == "rf-detr-seg-m-ft.pth");
 
     fastloader::rfdetr::ModelArtifactRequest onnx_request;
     fs::create_directories(root / "engines" / "output-seg-medium");

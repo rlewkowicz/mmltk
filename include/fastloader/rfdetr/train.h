@@ -1,16 +1,21 @@
 #pragma once
 
+#include "fastloader/rfdetr/evaluation.h"
 #include "fastloader/rfdetr/model.h"
-#include "fastloader/rfdetr/model_config.h"
 
-#include "rfdetr/evaluator.h"
-
+#include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <optional>
 #include <string>
 #include <vector>
 
 namespace fastloader::rfdetr {
+
+enum class TrainOptimizerKind : std::uint8_t {
+    AdamW = 0,
+    Muon = 1,
+};
 
 struct TrainOptions {
     size_t batch_size = 1;
@@ -19,8 +24,10 @@ struct TrainOptions {
     double lr_encoder = 1.5e-4;
     double lr_component_decay = 0.7;
     double encoder_layer_decay = 0.8;
+    double momentum = 0.95;
     double weight_decay = 1.0e-4;
     double warmup_epochs = 0.0;
+    double warmup_momentum = 0.0;
     double lr_min_factor = 0.0;
     double clip_max_norm = 0.1;
     double ema_decay = 0.993;
@@ -52,6 +59,8 @@ struct TrainOptions {
     bool progress_bar = true;
     bool fused_optimizer = true;
     bool distributed_worker = false;
+    bool freeze_encoder = false;
+    TrainOptimizerKind optimizer = TrainOptimizerKind::AdamW;
     CompilationMode compilation_mode = CompilationMode::kSelective;
 };
 

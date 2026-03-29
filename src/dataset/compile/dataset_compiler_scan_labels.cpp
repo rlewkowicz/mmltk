@@ -12,8 +12,8 @@
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <immintrin.h>
 #include <limits>
-#include <mutex>
 #include <stdexcept>
 #include <utility>
 
@@ -37,6 +37,11 @@ struct WorkerResult {
 struct ImageDimensions {
     uint32_t width = 0;
     uint32_t height = 0;
+};
+
+struct ResizeObservation {
+    bool needs_resize = false;
+    bool needs_downscale = false;
 };
 
 struct ResizedMask {
@@ -197,26 +202,14 @@ void scale_bbox_in_place(ParsedInstance& instance,
     instance.bbox[3] = scale_box_max(instance.bbox[3], source_dims.height, target_height);
 }
 
-ResizedMask resize_mask_row_major(const std::vector<RLEPair>& input_pairs,
-                                  const ImageDimensions& source_dims,
-                                  uint32_t target_width,
-                                  uint32_t target_height,
-                                  std::vector<uint8_t>& source_mask_scratch,
-                                  std::vector<uint8_t>& target_mask_scratch) {
-    ResizedMask resized;
-    if (input_pairs.empty()) {
-        return resized;
-    }
-
+void materialize_mask_row_major(const std::vector<RLEPair>& input_pairs,
+                                const ImageDimensions& source_dims,
+                                std::vector<uint8_t>& source_mask_scratch) {
     const size_t source_pixels = static_cast<size_t>(source_dims.width) * source_dims.height;
-    const size_t target_pixels = static_cast<size_t>(target_width) * target_height;
     if (source_mask_scratch.size() != source_pixels) {
         source_mask_scratch.resize(source_pixels);
     }
     std::fill(source_mask_scratch.begin(), source_mask_scratch.end(), uint8_t{0});
-    if (target_mask_scratch.size() != target_pixels) {
-        target_mask_scratch.resize(target_pixels);
-    }
 
     for (const RLEPair& pair : input_pairs) {
         const size_t start = pair.start;
@@ -226,54 +219,83 @@ ResizedMask resize_mask_row_major(const std::vector<RLEPair>& input_pairs,
         }
         std::fill_n(source_mask_scratch.data() + start, length, uint8_t{1});
     }
+}
 
+ResizedMask encode_dense_mask_row_major(const uint8_t* dense_mask,
+                                        uint32_t target_width,
+                                        uint32_t target_height) {
+    ResizedMask resized;
+    const size_t target_pixels = static_cast<size_t>(target_width) * target_height;
+    if (target_pixels == 0 || dense_mask == nullptr) {
+        return resized;
+    }
+
+    // Fused single-pass: RLE encode + bounding box using AVX2-accelerated scanning.
+    const __m256i zero = _mm256_setzero_si256();
     uint32_t min_x = target_width;
     uint32_t min_y = target_height;
     uint32_t max_x = 0;
     uint32_t max_y = 0;
 
-    for (uint32_t y = 0; y < target_height; ++y) {
-        const uint32_t src_y = std::min<uint32_t>(
-            source_dims.height - 1,
-            checked_cast<uint32_t>(((static_cast<std::uint64_t>(2) * y + 1) * source_dims.height) /
-                                       (static_cast<std::uint64_t>(2) * target_height),
-                                   "scaled mask y overflow"));
-        for (uint32_t x = 0; x < target_width; ++x) {
-            const uint32_t src_x = std::min<uint32_t>(
-                source_dims.width - 1,
-                checked_cast<uint32_t>(((static_cast<std::uint64_t>(2) * x + 1) * source_dims.width) /
-                                           (static_cast<std::uint64_t>(2) * target_width),
-                                       "scaled mask x overflow"));
-            const bool value =
-                source_mask_scratch[static_cast<size_t>(src_y) * source_dims.width + src_x] != 0;
-            target_mask_scratch[static_cast<size_t>(y) * target_width + x] = value ? 1u : 0u;
-            if (!value) {
-                continue;
-            }
-            resized.has_foreground = true;
-            min_x = std::min(min_x, x);
-            min_y = std::min(min_y, y);
-            max_x = std::max(max_x, x + 1);
-            max_y = std::max(max_y, y + 1);
-        }
-    }
-
     size_t cursor = 0;
     while (cursor < target_pixels) {
-        while (cursor < target_pixels && target_mask_scratch[cursor] == 0) {
+        // Skip zeros: scan 32 bytes at a time
+        while (cursor + 32 <= target_pixels) {
+            const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dense_mask + cursor));
+            const uint32_t nonzero_mask = static_cast<uint32_t>(~_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, zero)));
+            if (nonzero_mask != 0) {
+                cursor += static_cast<uint32_t>(__builtin_ctz(nonzero_mask));
+                goto found_start;
+            }
+            cursor += 32;
+        }
+        while (cursor < target_pixels && dense_mask[cursor] == 0) {
             ++cursor;
         }
-        if (cursor == target_pixels) {
+        if (cursor >= target_pixels) {
             break;
         }
+
+    found_start:;
         const size_t run_start = cursor;
-        while (cursor < target_pixels && target_mask_scratch[cursor] != 0) {
+
+        // Scan nonzeros: 32 bytes at a time
+        while (cursor + 32 <= target_pixels) {
+            const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dense_mask + cursor));
+            const uint32_t zero_mask = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, zero)));
+            if (zero_mask != 0) {
+                cursor += static_cast<uint32_t>(__builtin_ctz(zero_mask));
+                goto found_end;
+            }
+            cursor += 32;
+        }
+        while (cursor < target_pixels && dense_mask[cursor] != 0) {
             ++cursor;
         }
+
+    found_end:;
         resized.rle_pairs.push_back({
             checked_cast<uint32_t>(run_start, "resized mask run start overflow"),
             checked_cast<uint32_t>(cursor - run_start, "resized mask run length overflow"),
         });
+
+        // Derive bounding box from this run
+        resized.has_foreground = true;
+        const uint32_t start_y = static_cast<uint32_t>(run_start / target_width);
+        const uint32_t start_x = static_cast<uint32_t>(run_start % target_width);
+        const uint32_t end_pos = static_cast<uint32_t>(cursor - 1);
+        const uint32_t end_y = end_pos / target_width;
+        const uint32_t end_x = end_pos % target_width;
+        min_y = std::min(min_y, start_y);
+        max_y = std::max(max_y, end_y + 1);
+        if (start_y == end_y) {
+            min_x = std::min(min_x, start_x);
+            max_x = std::max(max_x, end_x + 1);
+        } else {
+            // Run spans multiple rows — x covers full width
+            min_x = 0;
+            max_x = target_width;
+        }
     }
 
     if (resized.has_foreground) {
@@ -285,11 +307,56 @@ ResizedMask resize_mask_row_major(const std::vector<RLEPair>& input_pairs,
     return resized;
 }
 
+ResizedMask resize_mask_row_major(const std::vector<RLEPair>& input_pairs,
+                                  const ImageDimensions& source_dims,
+                                  uint32_t target_width,
+                                  uint32_t target_height,
+                                  std::vector<uint8_t>& source_mask_scratch,
+                                  std::vector<uint8_t>& target_mask_scratch) {
+    ResizedMask resized;
+    if (input_pairs.empty()) {
+        return resized;
+    }
+
+    const size_t target_pixels = static_cast<size_t>(target_width) * target_height;
+    materialize_mask_row_major(input_pairs, source_dims, source_mask_scratch);
+    if (target_mask_scratch.size() != target_pixels) {
+        target_mask_scratch.resize(target_pixels);
+    }
+
+    // Precompute src_x LUT — hoists the 64-bit divide out of the row loop.
+    std::vector<uint32_t> src_x_lut(target_width);
+    const std::uint64_t tw2 = static_cast<std::uint64_t>(2) * target_width;
+    for (uint32_t x = 0; x < target_width; ++x) {
+        src_x_lut[x] = std::min<uint32_t>(
+            source_dims.width - 1,
+            checked_cast<uint32_t>(((static_cast<std::uint64_t>(2) * x + 1) * source_dims.width) / tw2,
+                                   "scaled mask x overflow"));
+    }
+
+    for (uint32_t y = 0; y < target_height; ++y) {
+        const uint32_t src_y = std::min<uint32_t>(
+            source_dims.height - 1,
+            checked_cast<uint32_t>(((static_cast<std::uint64_t>(2) * y + 1) * source_dims.height) /
+                                       (static_cast<std::uint64_t>(2) * target_height),
+                                   "scaled mask y overflow"));
+        const uint8_t* src_row = source_mask_scratch.data() + static_cast<size_t>(src_y) * source_dims.width;
+        uint8_t* dst_row = target_mask_scratch.data() + static_cast<size_t>(y) * target_width;
+        for (uint32_t x = 0; x < target_width; ++x) {
+            dst_row[x] = src_row[src_x_lut[x]] != 0 ? 1u : 0u;
+        }
+    }
+
+    return encode_dense_mask_row_major(target_mask_scratch.data(), target_width, target_height);
+}
+
 std::vector<ParsedInstance> parse_jsonl(const std::filesystem::path& annotation_file,
                                         const std::filesystem::path& image_file,
                                         const std::unordered_map<std::string, uint8_t>& class_map,
                                         uint32_t target_width,
                                         uint32_t target_height,
+                                        ResizeObservation* resize_observation,
+                                        DroppedAnnotationTracker* dropped_annotations,
                                         std::vector<uint8_t>& source_mask_scratch,
                                         std::vector<uint8_t>& target_mask_scratch) {
     FASTLOADER_PROFILE_SCOPE("compiler.labels.parse_jsonl");
@@ -301,21 +368,34 @@ std::vector<ParsedInstance> parse_jsonl(const std::filesystem::path& annotation_
 
     const ImageDimensions source_dims = load_image_dimensions(image_file);
     const bool needs_resize = source_dims.width != target_width || source_dims.height != target_height;
+    const bool needs_downscale = source_dims.width > target_width || source_dims.height > target_height;
+    if (resize_observation != nullptr) {
+        resize_observation->needs_resize = needs_resize;
+        resize_observation->needs_downscale = needs_downscale;
+    }
     std::string line;
+    size_t line_number = 0;
     while (std::getline(file, line)) {
+        ++line_number;
         if (line.empty()) {
             continue;
         }
 
         json record = json::parse(line, nullptr, false);
         if (record.is_discarded()) {
-            continue;
+            throw std::runtime_error("invalid JSON annotation record in " +
+                                     annotation_file.string() +
+                                     " at line " + std::to_string(line_number));
         }
         validate_record_image_dimensions(record, annotation_file, source_dims);
 
-        auto class_it = class_map.find(record["class"].get<std::string>());
+        const std::string class_name = record["class"].get<std::string>();
+        auto class_it = class_map.find(class_name);
         if (class_it == class_map.end()) {
-            continue;
+            throw std::runtime_error("annotation class '" + class_name +
+                                     "' is not declared in categories.json: " +
+                                     annotation_file.string() +
+                                     " at line " + std::to_string(line_number));
         }
 
         ParsedInstance instance{};
@@ -334,12 +414,21 @@ std::vector<ParsedInstance> parse_jsonl(const std::filesystem::path& annotation_
                                                             target_height,
                                                             source_mask_scratch,
                                                             target_mask_scratch);
-                instance.rle_pairs = std::move(resized.rle_pairs);
-                if (resized.has_foreground) {
-                    std::copy(std::begin(resized.bbox), std::end(resized.bbox), std::begin(instance.bbox));
-                } else {
-                    scale_bbox_in_place(instance, source_dims, target_width, target_height);
+                if (!resized.has_foreground) {
+                    if (dropped_annotations != nullptr) {
+                        dropped_annotations->increment(
+                            annotation_file.string() +
+                            ":" + std::to_string(line_number) +
+                            " (" + std::to_string(source_dims.width) + "x" +
+                            std::to_string(source_dims.height) + " -> " +
+                            std::to_string(target_width) + "x" +
+                            std::to_string(target_height) + ")");
+                    }
+                    FASTLOADER_PROFILE_ADD("compiler.labels.instances_dropped", 1);
+                    continue;
                 }
+                instance.rle_pairs = std::move(resized.rle_pairs);
+                std::copy(std::begin(resized.bbox), std::end(resized.bbox), std::begin(instance.bbox));
             } else {
                 scale_bbox_in_place(instance, source_dims, target_width, target_height);
             }
@@ -468,20 +557,50 @@ DatasetScan scan_dataset(const CompilerConfig& config) {
 
 LabelBlocks build_label_blocks(const std::filesystem::path& split_dir,
                                uint32_t num_images,
-                               uint32_t target_width,
-                               uint32_t target_height,
+                               const CompilerConfig& config,
                                const std::unordered_map<std::string, uint8_t>& class_map,
                                int num_workers,
-                               const std::function<void(size_t, size_t)>& progress_cb) {
+                               ProgressCounter* completed_images,
+                               DroppedAnnotationTracker* dropped_annotations) {
     FASTLOADER_PROFILE_SCOPE("compiler.labels.build_blocks");
+    const uint32_t target_width = config.target_width;
+    const uint32_t target_height = config.target_height;
+
+    auto record_worker_stats = [&](const std::vector<LabelWorkerStats>& worker_stats) {
+        std::uint64_t active_workers = 0;
+        std::uint64_t total_active_ns = 0;
+        std::uint64_t max_active_ns = 0;
+        std::uint64_t total_instances = 0;
+        std::uint64_t max_instances = 0;
+        for (const LabelWorkerStats& stats : worker_stats) {
+            if (stats.images == 0) {
+                continue;
+            }
+            ++active_workers;
+            FASTLOADER_PROFILE_RECORD_DURATION_NS("compiler.labels.worker.active", stats.active_ns);
+            FASTLOADER_PROFILE_ADD("compiler.labels.worker.images", stats.images);
+            FASTLOADER_PROFILE_ADD("compiler.labels.worker.instances", stats.instances);
+            FASTLOADER_PROFILE_ADD("compiler.labels.worker.rle_pairs", stats.rle_pairs);
+            total_active_ns += stats.active_ns;
+            max_active_ns = std::max(max_active_ns, stats.active_ns);
+            total_instances += stats.instances;
+            max_instances = std::max(max_instances, stats.instances);
+        }
+        FASTLOADER_PROFILE_SET("compiler.labels.worker.count", active_workers);
+        FASTLOADER_PROFILE_SET("compiler.labels.worker.active_skew_x1000",
+                               compute_skew_x1000(total_active_ns, max_active_ns, active_workers));
+        FASTLOADER_PROFILE_SET("compiler.labels.worker.instances_skew_x1000",
+                               compute_skew_x1000(total_instances, max_instances, active_workers));
+    };
+
+    std::atomic<bool> any_image_resize{false};
+    std::atomic<bool> any_image_downscale{false};
+
     std::vector<WorkerResult> worker_results(num_images);
     const int worker_count = std::max(
         1,
         std::min(num_workers, checked_cast<int>(num_images, "label worker count overflow")));
     std::vector<LabelWorkerStats> worker_stats(static_cast<size_t>(worker_count));
-
-    std::atomic<size_t> completed_images{0};
-    std::mutex progress_mtx;
 
     parallel_for_range_indexed<uint32_t>(0, num_images, num_workers, [&](int worker_id, uint32_t start, uint32_t end) {
         LabelWorkerStats& stats = worker_stats[static_cast<size_t>(worker_id)];
@@ -489,14 +608,23 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir,
         std::vector<uint8_t> source_mask_scratch;
         std::vector<uint8_t> target_mask_scratch;
         for (uint32_t image_index = start; image_index < end; ++image_index) {
+            ResizeObservation resize_observation;
             std::vector<ParsedInstance> instances =
                 parse_jsonl(annotation_path(split_dir, image_index),
-                           image_path(split_dir, image_index),
-                           class_map,
-                           target_width,
-                           target_height,
-                           source_mask_scratch,
-                           target_mask_scratch);
+                            image_path(split_dir, image_index),
+                            class_map,
+                            target_width,
+                            target_height,
+                            &resize_observation,
+                            dropped_annotations,
+                            source_mask_scratch,
+                            target_mask_scratch);
+            if (resize_observation.needs_resize) {
+                any_image_resize.store(true, std::memory_order_relaxed);
+            }
+            if (resize_observation.needs_downscale) {
+                any_image_downscale.store(true, std::memory_order_relaxed);
+            }
             WorkerResult& result = worker_results[image_index];
             result.labels.reserve(instances.size());
             const size_t instance_rle_pairs = parsed_rle_pair_count(instances);
@@ -512,13 +640,8 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir,
             ++stats.images;
             stats.instances += instances.size();
             stats.rle_pairs += instance_rle_pairs;
-
-            if (progress_cb) {
-                const size_t done = completed_images.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (done % 100 == 0 || done == num_images) {
-                    std::lock_guard<std::mutex> lock(progress_mtx);
-                    progress_cb(done, num_images);
-                }
+            if (completed_images != nullptr) {
+                completed_images->increment();
             }
         }
         stats.active_ns = checked_cast<std::uint64_t>(
@@ -526,39 +649,22 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir,
                 std::chrono::steady_clock::now() - worker_start).count(),
             "worker active time overflow");
     });
-
-    std::uint64_t active_workers = 0;
-    std::uint64_t total_active_ns = 0;
-    std::uint64_t max_active_ns = 0;
-    std::uint64_t total_instances = 0;
-    std::uint64_t max_instances = 0;
-    for (const LabelWorkerStats& stats : worker_stats) {
-        if (stats.images == 0) {
-            continue;
-        }
-        ++active_workers;
-        FASTLOADER_PROFILE_RECORD_DURATION_NS("compiler.labels.worker.active", stats.active_ns);
-        FASTLOADER_PROFILE_ADD("compiler.labels.worker.images", stats.images);
-        FASTLOADER_PROFILE_ADD("compiler.labels.worker.instances", stats.instances);
-        FASTLOADER_PROFILE_ADD("compiler.labels.worker.rle_pairs", stats.rle_pairs);
-        total_active_ns += stats.active_ns;
-        max_active_ns = std::max(max_active_ns, stats.active_ns);
-        total_instances += stats.instances;
-        max_instances = std::max(max_instances, stats.instances);
-    }
-    FASTLOADER_PROFILE_SET("compiler.labels.worker.count", active_workers);
-    FASTLOADER_PROFILE_SET("compiler.labels.worker.active_skew_x1000",
-                           compute_skew_x1000(total_active_ns, max_active_ns, active_workers));
-    FASTLOADER_PROFILE_SET("compiler.labels.worker.instances_skew_x1000",
-                           compute_skew_x1000(total_instances, max_instances, active_workers));
+    record_worker_stats(worker_stats);
 
     const auto [total_labels, total_rle_pairs] = aggregate_worker_sizes(worker_results);
     LabelBlocks blocks;
     blocks.index.resize(num_images);
     blocks.labels.resize(total_labels);
     blocks.rle_pairs.resize(total_rle_pairs);
+    blocks.any_image_resize = any_image_resize.load(std::memory_order_relaxed);
+    blocks.any_image_downscale = any_image_downscale.load(std::memory_order_relaxed);
+    if (dropped_annotations != nullptr) {
+        blocks.dropped_annotations = dropped_annotations->load();
+        blocks.dropped_annotation_examples = dropped_annotations->sample_snapshot();
+    }
     FASTLOADER_PROFILE_SET("compiler.labels.total_labels", total_labels);
     FASTLOADER_PROFILE_SET("compiler.labels.total_rle_pairs", total_rle_pairs);
+    FASTLOADER_PROFILE_SET("compiler.labels.total_dropped_annotations", blocks.dropped_annotations);
 
     size_t label_cursor = 0;
     size_t rle_cursor = 0;

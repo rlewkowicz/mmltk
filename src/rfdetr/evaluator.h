@@ -1,11 +1,12 @@
 #pragma once
 
+#include "fastloader/rfdetr/evaluation.h"
+
 #include "rfdetr/postprocess.h"
 
 #include <cuda_runtime.h>
 #include <torch/torch.h>
 
-#include <array>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -18,39 +19,12 @@
 
 namespace fastloader::rfdetr {
 
-struct EncodedMask {
-    uint32_t height = 0;
-    uint32_t width = 0;
-    uint32_t area = 0;
-    std::vector<std::pair<uint32_t, uint32_t>> runs;
-};
-
 struct GroundTruthAnnotation {
     int image_id = 0;
     int category_id = 0;
     std::array<float, 4> bbox_xyxy{};
     EncodedMask mask;
     bool has_mask = false;
-};
-
-struct Prediction {
-    int image_id = 0;
-    int category_id = 0;
-    float score = 0.0f;
-    std::array<float, 4> bbox_xyxy{};
-    EncodedMask mask;
-    bool has_mask = false;
-};
-
-struct MetricSummary {
-    double ap = 0.0;
-    double ap50 = 0.0;
-    double ap75 = 0.0;
-};
-
-struct EvalSummary {
-    MetricSummary bbox;
-    MetricSummary mask;
 };
 
 struct PinnedPredictionBuffers {
@@ -151,16 +125,6 @@ StagedPredictionBatch stage_result_to_predictions(int image_id,
                                                   int device_id,
                                                   void* stream_handle);
 std::vector<Prediction> encode_staged_predictions(StagedPredictionBatch&& staged);
-
-struct AlignmentStats {
-    size_t images_compared = 0;
-    double top1_score_abs_diff_mean = 0.0;
-    double top1_score_abs_diff_max = 0.0;
-    double top1_box_abs_diff_px_mean = 0.0;
-    double top1_box_abs_diff_px_max = 0.0;
-    double top1_mask_xor_pixels_mean = 0.0;
-    double top1_mask_xor_pixels_max = 0.0;
-};
 
 AlignmentStats compare_top1(const TensorMap& lhs, const TensorMap& rhs, size_t category_count);
 

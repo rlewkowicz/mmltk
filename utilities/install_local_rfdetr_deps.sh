@@ -81,6 +81,7 @@ install_parser_venv() {
     "${PARSER_VENV}/bin/pip" install \
         --index-url "${PARSER_TORCH_INDEX_URL}" \
         "torch==${PYTORCH_VERSION}"
+    "${PARSER_VENV}/bin/pip" install "vastai-sdk"
 }
 
 ensure_pytorch_source() {

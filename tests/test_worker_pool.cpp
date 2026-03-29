@@ -1,8 +1,12 @@
+#include "common_utils.h"
 #include "cpu_affinity.h"
+#include "execution_policy.h"
 #include "worker_pool.h"
 
 #include <atomic>
 #include <cassert>
+#include <mutex>
+#include <set>
 #include <vector>
 
 using namespace fastloader;
@@ -62,6 +66,70 @@ void test_nested_parallel_for_falls_back_inline() {
     assert(completed.load(std::memory_order_relaxed) == 8);
 }
 
+void test_worker_count_clamp_helper() {
+    assert(clamp_worker_count_to_cpus(32, 8, 0, 1) == 8);
+    assert(clamp_worker_count_to_cpus(8, 8, 1, 1) == 7);
+    assert(clamp_worker_count_to_cpus(1, 1, 1, 1) == 1);
+    assert(clamp_worker_count_to_cpus(16, 2, 0, 3) == 3);
+}
+
+void test_worker_pool_clamps_and_pins_threads() {
+    const std::vector<int> allowed = allowed_cpu_set();
+    assert(!allowed.empty());
+
+    const size_t cpu_count = std::min<size_t>(allowed.size(), 3);
+    std::vector<int> subset(allowed.begin(), allowed.begin() + static_cast<std::ptrdiff_t>(cpu_count));
+    WorkerPool pool(subset.size() + 4, subset, "twp");
+    assert(pool.size() == subset.size());
+
+    std::atomic<int> ready{0};
+    std::atomic<bool> release{false};
+    std::vector<std::future<std::vector<int>>> futures;
+    futures.reserve(pool.size());
+    for (size_t index = 0; index < pool.size(); ++index) {
+        futures.push_back(pool.enqueue([&] {
+            std::vector<int> mask = allowed_cpu_set();
+            ready.fetch_add(1, std::memory_order_release);
+            while (!release.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            return mask;
+        }));
+    }
+
+    while (ready.load(std::memory_order_acquire) != static_cast<int>(pool.size())) {
+        std::this_thread::yield();
+    }
+    release.store(true, std::memory_order_release);
+
+    std::set<int> observed;
+    for (auto& future : futures) {
+        const std::vector<int> mask = future.get();
+        assert(mask.size() == 1);
+        assert(std::find(subset.begin(), subset.end(), mask.front()) != subset.end());
+        observed.insert(mask.front());
+    }
+    assert(observed.size() == pool.size());
+}
+
+void test_parallel_for_range_threads_are_pinned() {
+    const std::vector<int> allowed = allowed_cpu_set();
+    const int requested_workers = std::min<int>(4, static_cast<int>(allowed.size()));
+    assert(requested_workers >= 1);
+
+    std::vector<std::vector<int>> masks(static_cast<size_t>(requested_workers));
+    parallel_for_range_indexed<int>(0, requested_workers, requested_workers, [&](int worker, int, int) {
+        masks[static_cast<size_t>(worker)] = allowed_cpu_set();
+    });
+
+    std::set<int> observed;
+    for (const auto& mask : masks) {
+        assert(mask.size() == 1);
+        observed.insert(mask.front());
+    }
+    assert(observed.size() == masks.size());
+}
+
 } // namespace
 
 int main() {
@@ -69,5 +137,8 @@ int main() {
     test_enqueue_and_wait();
     test_parallel_for();
     test_nested_parallel_for_falls_back_inline();
+    test_worker_count_clamp_helper();
+    test_worker_pool_clamps_and_pins_threads();
+    test_parallel_for_range_threads_are_pinned();
     return 0;
 }

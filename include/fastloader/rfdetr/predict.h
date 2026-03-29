@@ -1,19 +1,31 @@
 #pragma once
 
+#include "fastloader/rfdetr/evaluation.h"
 #include "fastloader/rfdetr/model.h"
-#include "fastloader/rfdetr/model_config.h"
+#include "fastloader/rfdetr/validate.h"
 
-#include "rfdetr/evaluator.h"
-#include "rfdetr/validate.h"
-
+#include <cstddef>
 #include <filesystem>
 #include <string>
 #include <vector>
 
 namespace fastloader::rfdetr {
 
+enum class PredictSourceKind : int {
+    CompiledDataset = 0,
+    ImageFiles = 1,
+};
+
+struct PredictImageInput {
+    std::filesystem::path image_path;
+    std::string source_name;
+    int64_t image_id = 0;
+};
+
 struct PredictOptions : ModelArtifactRequest {
+    PredictSourceKind source_kind = PredictSourceKind::CompiledDataset;
     std::filesystem::path compiled_path;
+    std::vector<PredictImageInput> image_inputs;
     std::filesystem::path output_path;
     std::string backend = "auto";
     size_t batch_size = 1;
@@ -46,6 +58,7 @@ struct EvaluateOptions : ModelArtifactRequest {
 struct PredictionRecord {
     int64_t dataset_index = 0;
     int64_t image_id = 0;
+    std::string source_name;
     std::vector<Prediction> detections;
 };
 

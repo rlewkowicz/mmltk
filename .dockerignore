@@ -1,0 +1,68 @@
+.git
+.docker-cache/
+.claude
+
+# Build outputs
+# /build/
+/compiled/
+/profiles/
+/artifacts/
+*synth*
+
+# Python/cache noise
+__pycache__/
+*.py[cod]
+
+# Logs and transient diagnostics
+*.log
+*.log.*
+*.out
+*.err
+*.tmp
+
+# Large dataset and model artifacts
+*.bin
+*.npy
+*.npz
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.engine
+*.plan
+*.safetensors
+
+# Images and ad hoc dataset metadata
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.bmp
+*.gif
+*.tif
+*.tiff
+*.svg
+*.ico
+*.avif
+*.json
+*.jsonl
+!CMakePresets.json
+
+# Large archives
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.7z
+
+rf-detr
+scipy
+pytorch
+Deformable-DETR
+grid_sample1d
+engines
+
+# Local scratch files
+a.out
+imgui.ini
+gltests/

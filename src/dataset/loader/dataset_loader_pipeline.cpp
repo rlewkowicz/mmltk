@@ -1,4 +1,5 @@
 #include "dataset_loader_internal.h"
+#include "execution_policy.h"
 #include "profile_utils.h"
 #include "worker_pool.h"
 
@@ -266,8 +267,13 @@ void DatasetLoader::Impl::start_workers() {
         workers.reserve(gather_worker_count);
         for (size_t i = 0; i < gather_worker_count; ++i) {
             workers.emplace_back([this, i] {
-                set_thread_name("fl_gthr" + std::to_string(i));
-                pin_thread_to_cpu(worker_cpus, i);
+                apply_worker_execution_policy(ExecutionPolicyRequest{
+                    worker_cpus,
+                    "fl_gthr" + std::to_string(i),
+                    i,
+                    true,
+                    true,
+                });
                 prefetch_worker();
             });
         }
@@ -275,8 +281,13 @@ void DatasetLoader::Impl::start_workers() {
         FASTLOADER_PROFILE_SET("loader.gather.worker_count", 0);
     }
     transfer_worker_thread = std::thread([this] {
-        set_thread_name("fl_h2d");
-        pin_thread_to_cpu(worker_cpus, gather_worker_count);
+        apply_worker_execution_policy(ExecutionPolicyRequest{
+            worker_cpus,
+            "fl_h2d",
+            gather_worker_count,
+            true,
+            true,
+        });
         transfer_worker();
     });
 }

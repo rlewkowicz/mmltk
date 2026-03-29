@@ -67,8 +67,12 @@ option(FASTLOADER_DEV_ENABLE_UBSAN
     "Enable UndefinedBehaviorSanitizer for host-side Dev C++ builds"
     OFF)
 
+set(FASTLOADER_X86_SIMD_FLAGS "")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|X86_64|amd64|AMD64)$")
+    set(FASTLOADER_X86_SIMD_FLAGS "-mssse3 -msse4.2 -mavx2 -mfma")
+endif()
 set(FASTLOADER_COMMON_MACHINE_FLAGS
-    "-march=native -mtune=native -fno-semantic-interposition -ffunction-sections -fdata-sections")
+    "-march=native -mtune=native ${FASTLOADER_X86_SIMD_FLAGS} -fno-semantic-interposition -ffunction-sections -fdata-sections")
 set(FASTLOADER_COMMON_WARNING_FLAGS "-Wall -Wextra -Wpedantic")
 set(FASTLOADER_STRICT_WARNING_FLAGS "")
 if(FASTLOADER_DEV_STRICT_WARNINGS)
@@ -131,6 +135,16 @@ target_include_directories(nlohmann_json SYSTEM INTERFACE ${CMAKE_SOURCE_DIR}/th
 add_library(cli11 INTERFACE)
 target_include_directories(cli11 SYSTEM INTERFACE ${CMAKE_SOURCE_DIR}/third_party)
 
+set(FASTLOADER_AVIR_SOURCE_DIR "${CMAKE_SOURCE_DIR}/third_party/avir")
+if(NOT EXISTS "${FASTLOADER_AVIR_SOURCE_DIR}/avir.h")
+    message(FATAL_ERROR
+        "Missing vendored AVIR checkout at ${FASTLOADER_AVIR_SOURCE_DIR}. "
+        "CPU image resize is implemented via AVIR only; there is no fallback.")
+endif()
+
+add_library(avir INTERFACE)
+target_include_directories(avir SYSTEM INTERFACE ${FASTLOADER_AVIR_SOURCE_DIR})
+
 add_library(fastloader_build_options INTERFACE)
 target_compile_definitions(fastloader_build_options INTERFACE
     FASTLOADER_ENABLE_PROFILING=$<IF:$<CONFIG:Dev>,1,0>
@@ -143,10 +157,12 @@ add_library(fastloader_core SHARED
     src/dataset/compile/dataset_compiler_scan_labels.cpp
     src/dataset/compile/dataset_compiler_pixels.cpp
     src/dataset/compile/dataset_compiler_layout.cpp
+    src/image_resize.cpp
     src/dataset/loader/dataset_loader.cpp
     src/dataset/loader/dataset_loader_runtime.cpp
     src/dataset/loader/dataset_loader_pipeline.cpp
     src/cpu_affinity.cpp
+    src/execution_policy.cpp
     src/cuda_stream_manager.cpp
     src/profile_utils.cpp
     src/worker_pool.cpp
@@ -163,6 +179,22 @@ target_link_libraries(fastloader_core PUBLIC
     stb
     nlohmann_json
     fastloader_build_options
+PRIVATE
+    avir
+)
+
+add_library(fastloader_runtime STATIC
+    src/runtime/async_runtime.cpp
+    src/runtime/model_registry.cpp
+)
+target_include_directories(fastloader_runtime PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(fastloader_runtime PUBLIC
+    fastloader_core
+    fastloader_build_options
 )
 
 # ---- CLI tool ----
@@ -174,6 +206,12 @@ option(BUILD_RFDETR_NATIVE "Build native RF-DETR validation backends" ON)
 option(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER
     "Enable embedded Python parsing of upstream RF-DETR .pth checkpoints"
     ${BUILD_RFDETR_NATIVE})
+option(BUILD_FASTLOADER_GUI "Build the standalone ImGui RF-DETR desktop GUI" OFF)
+set(FASTLOADER_IMGUI_SOURCE_DIR "" CACHE PATH
+    "Optional local Dear ImGui checkout for BUILD_FASTLOADER_GUI")
+target_compile_definitions(fastloader_core PRIVATE
+    FASTLOADER_DATASET_COMPILER_CUDA=$<IF:$<BOOL:${BUILD_RFDETR_NATIVE}>,1,0>
+)
 
 add_library(fastloader_rfdetr_lsap STATIC
     src/rfdetr/utils/scipy_rectangular_lsap.cpp
@@ -205,6 +243,10 @@ endif()
 
 set(FASTLOADER_TORCH_ROOT "" CACHE PATH
     "Optional LibTorch installation prefix containing share/cmake/Torch")
+set(FASTLOADER_TORCH_SOURCE_ROOT "/opt/src/pytorch-v2.10.0" CACHE PATH
+    "PyTorch source tree matching the LibTorch build, used for vendored ONNX headers")
+set(FASTLOADER_TORCH_BUILD_ROOT "/opt/src/pytorch-build-2.10.0-cu132" CACHE PATH
+    "PyTorch build tree matching the LibTorch build, used for generated vendored ONNX protobuf headers")
 set(FASTLOADER_TORCH_CUDA_ARCH_LIST "" CACHE STRING
     "Optional TORCH_CUDA_ARCH_LIST override for LibTorch/Caffe2 consumers")
 
@@ -318,6 +360,31 @@ if(FASTLOADER_NEEDS_PYTHON)
 endif()
 
 if(BUILD_RFDETR_NATIVE)
+    if(NOT EXISTS "${FASTLOADER_TORCH_SOURCE_ROOT}/third_party/onnx/onnx/checker.h"
+       OR NOT EXISTS "${FASTLOADER_TORCH_SOURCE_ROOT}/third_party/onnx/onnx/shape_inference/implementation.h")
+        message(FATAL_ERROR
+            "Missing PyTorch-matching vendored ONNX headers under ${FASTLOADER_TORCH_SOURCE_ROOT}/third_party/onnx. "
+            "Set FASTLOADER_TORCH_SOURCE_ROOT to the matching PyTorch source tree before building.")
+    endif()
+    if(NOT EXISTS "${FASTLOADER_TORCH_BUILD_ROOT}/third_party/onnx/onnx/onnx-ml.pb.h"
+       OR NOT EXISTS "${FASTLOADER_TORCH_BUILD_ROOT}/third_party/onnx/onnx/onnx-data.pb.h")
+        message(FATAL_ERROR
+            "Missing PyTorch-matching generated ONNX protobuf headers under ${FASTLOADER_TORCH_BUILD_ROOT}/third_party/onnx. "
+            "Set FASTLOADER_TORCH_BUILD_ROOT to the matching PyTorch build tree before building.")
+    endif()
+    set(FASTLOADER_PYTORCH_ONNX_LIBRARY "${FASTLOADER_TORCH_BUILD_ROOT}/lib/libonnx.a")
+    set(FASTLOADER_PYTORCH_ONNX_PROTO_LIBRARY "${FASTLOADER_TORCH_BUILD_ROOT}/lib/libonnx_proto.a")
+    set(FASTLOADER_PYTORCH_PROTOBUF_LIBRARY "${FASTLOADER_TORCH_BUILD_ROOT}/lib/libprotobuf.a")
+    if(NOT EXISTS "${FASTLOADER_PYTORCH_ONNX_LIBRARY}"
+       OR NOT EXISTS "${FASTLOADER_PYTORCH_ONNX_PROTO_LIBRARY}"
+       OR NOT EXISTS "${FASTLOADER_PYTORCH_PROTOBUF_LIBRARY}")
+        message(FATAL_ERROR
+            "Missing PyTorch-matching ONNX/protobuf static libraries under ${FASTLOADER_TORCH_BUILD_ROOT}/lib. "
+            "Set FASTLOADER_TORCH_BUILD_ROOT to the matching PyTorch build tree before building.")
+    endif()
+    set(FASTLOADER_PYTORCH_ONNX_INCLUDE_DIR "${FASTLOADER_TORCH_SOURCE_ROOT}/third_party/onnx")
+    set(FASTLOADER_PYTORCH_ONNX_BUILD_INCLUDE_DIR "${FASTLOADER_TORCH_BUILD_ROOT}/third_party/onnx")
+
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
         set(_fastloader_cuda_architectures "${FASTLOADER_CUDA_ARCHITECTURES}")
         if(_fastloader_cuda_architectures STREQUAL "" AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
@@ -329,6 +396,14 @@ if(BUILD_RFDETR_NATIVE)
             "CUDA architectures" FORCE)
     endif()
     enable_language(CUDA)
+    target_sources(fastloader_core PRIVATE
+        src/dataset/compile/dataset_compiler_cuda.cu
+    )
+    set_target_properties(fastloader_core PROPERTIES
+        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    )
 
     find_path(ONNXRUNTIME_INCLUDE_DIR
         NAMES onnxruntime_cxx_api.h
@@ -377,6 +452,8 @@ if(BUILD_RFDETR_NATIVE)
         message(FATAL_ERROR "TensorRT shared libraries and headers were not found. Install libnvinfer10, libnvinfer-headers-dev, and libnvonnxparsers-dev before building.")
     endif()
 
+    set(FASTLOADER_RFDETR_LIVE_CAPTURE_ENABLED ON)
+
     add_library(fastloader_rfdetr_cuda_ops STATIC
         src/rfdetr/layers/ms_deform_attn_op.cpp
         src/rfdetr/layers/ms_deform_attn_cuda_wrapper.cpp
@@ -385,6 +462,7 @@ if(BUILD_RFDETR_NATIVE)
         src/rfdetr/cuda/training_mask_ops_cuda.cu
         src/rfdetr/cuda/detr_ops_cuda.cu
         src/rfdetr/cuda/draw_cuda.cu
+        src/rfdetr/cuda/live_preprocess.cu
     )
     file(MAKE_DIRECTORY
         "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/fastloader_rfdetr_cuda_ops.dir/src/rfdetr"
@@ -419,6 +497,34 @@ if(BUILD_RFDETR_NATIVE)
         POSITION_INDEPENDENT_CODE ON
     )
 
+    add_library(fastloader_live_capture STATIC
+        src/frameshow/capture_session_core.cpp
+        src/frameshow/capture_session_device.cpp
+        src/frameshow/capture_session_internal.cpp
+        src/frameshow/capture_session_preview.cpp
+    )
+    target_include_directories(fastloader_live_capture
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/include
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(fastloader_live_capture
+        PUBLIC
+            fastloader_build_options
+            fastloader_rfdetr_cuda_ops
+            CUDA::cudart
+    )
+    target_compile_options(fastloader_live_capture
+        PRIVATE
+            -Wall -Wextra -Wpedantic
+    )
+    set_target_properties(fastloader_live_capture PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
+    )
+
     add_library(fastloader_rfdetr_native STATIC
         src/rfdetr/inference/backend_onnx.cpp
         src/rfdetr/inference/backend_tensorrt.cpp
@@ -426,7 +532,10 @@ if(BUILD_RFDETR_NATIVE)
         src/rfdetr/cli/cli.cpp
         src/rfdetr/detection_ops.cpp
         src/rfdetr/inference/evaluator.cpp
+        src/rfdetr/inference/live_predict.cpp
+        src/rfdetr/onnx_lowering.cpp
         src/rfdetr/layers/model.cpp
+        src/rfdetr/onnx_simplify.cpp
         src/rfdetr/layers/model_components.cpp
         src/rfdetr/layers/model_config.cpp
         src/rfdetr/layers/modules.cpp
@@ -450,6 +559,8 @@ if(BUILD_RFDETR_NATIVE)
     )
     target_include_directories(fastloader_rfdetr_native
         SYSTEM PRIVATE
+            ${FASTLOADER_PYTORCH_ONNX_INCLUDE_DIR}
+            ${FASTLOADER_PYTORCH_ONNX_BUILD_INCLUDE_DIR}
             ${ONNXRUNTIME_INCLUDE_DIR}
             ${TENSORRT_INCLUDE_DIR}
     )
@@ -462,19 +573,28 @@ if(BUILD_RFDETR_NATIVE)
             fastloader_rfdetr_cuda_ops
             cli11
         PRIVATE
+            ${FASTLOADER_PYTORCH_ONNX_LIBRARY}
+            ${FASTLOADER_PYTORCH_ONNX_PROTO_LIBRARY}
+            ${FASTLOADER_PYTORCH_PROTOBUF_LIBRARY}
             ${ONNXRUNTIME_LIBRARY}
             ${TENSORRT_NVINFER_LIBRARY}
             ${TENSORRT_NVONNXPARSER_LIBRARY}
     )
+    if(FASTLOADER_RFDETR_LIVE_CAPTURE_ENABLED)
+        target_link_libraries(fastloader_rfdetr_native PRIVATE fastloader_live_capture)
+    endif()
     if(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER)
         fastloader_enable_python_checkpoint_loader(fastloader_rfdetr_native PRIVATE)
     endif()
     target_compile_definitions(fastloader_rfdetr_native PUBLIC
         FASTLOADER_RFDETR_PYTHON_CHECKPOINT_LOADER=$<IF:$<BOOL:${BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER}>,1,0>
+        FASTLOADER_RFDETR_LIVE_CAPTURE=$<IF:$<BOOL:${FASTLOADER_RFDETR_LIVE_CAPTURE_ENABLED}>,1,0>
     )
+    target_compile_definitions(fastloader_rfdetr_native PRIVATE ONNX_ML=1)
     set_target_properties(fastloader_rfdetr_native PROPERTIES
         CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     )
+    add_library(fastloader_rfdetr ALIAS fastloader_rfdetr_native)
     target_compile_definitions(fastloader_cli PRIVATE FASTLOADER_BUILD_RFDETR_NATIVE=1)
     target_link_libraries(fastloader_cli PRIVATE fastloader_rfdetr_native)
     set_target_properties(fastloader_cli PROPERTIES
@@ -483,6 +603,171 @@ if(BUILD_RFDETR_NATIVE)
     fastloader_enable_native_runtime_rpath(fastloader_cli)
 else()
     target_compile_definitions(fastloader_cli PRIVATE FASTLOADER_BUILD_RFDETR_NATIVE=0)
+endif()
+
+if(BUILD_FASTLOADER_GUI)
+    if(NOT BUILD_RFDETR_NATIVE)
+        message(FATAL_ERROR "BUILD_FASTLOADER_GUI requires BUILD_RFDETR_NATIVE=ON.")
+    endif()
+    if(NOT FASTLOADER_NEEDS_PYTHON)
+        find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    endif()
+    set(FASTLOADER_GUI_VAST_BRIDGE "${CMAKE_SOURCE_DIR}/utilities/vast_bridge.py")
+    if(NOT EXISTS "${FASTLOADER_GUI_VAST_BRIDGE}")
+        message(FATAL_ERROR
+            "Missing Vast GUI bridge script: ${FASTLOADER_GUI_VAST_BRIDGE}")
+    endif()
+
+    include(FetchContent)
+    find_package(OpenGL REQUIRED)
+    find_package(glfw3 QUIET)
+
+    if(NOT TARGET glfw)
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(FASTLOADER_GUI_WAYLAND QUIET
+            wayland-client
+            wayland-cursor
+            wayland-egl
+            xkbcommon
+        )
+        pkg_check_modules(FASTLOADER_GUI_X11 QUIET
+            x11
+            xrandr
+            xinerama
+            xcursor
+            xi
+        )
+        if(NOT FASTLOADER_GUI_WAYLAND_FOUND AND NOT FASTLOADER_GUI_X11_FOUND)
+            message(FATAL_ERROR
+                "BUILD_FASTLOADER_GUI could not find either a complete Wayland or X11 GLFW dependency set. "
+                "Install Fedora's glfw-devel package or the matching Wayland/X11 development packages.")
+        endif()
+        if(FASTLOADER_GUI_X11_FOUND)
+            set(_fastloader_gui_glfw_x11 ON)
+        else()
+            set(_fastloader_gui_glfw_x11 OFF)
+        endif()
+        if(FASTLOADER_GUI_WAYLAND_FOUND)
+            set(_fastloader_gui_glfw_wayland ON)
+        else()
+            set(_fastloader_gui_glfw_wayland OFF)
+        endif()
+
+        set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+        set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+        set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+        set(GLFW_BUILD_X11 ${FASTLOADER_GUI_X11_FOUND} CACHE BOOL "" FORCE)
+        set(GLFW_BUILD_WAYLAND ${FASTLOADER_GUI_WAYLAND_FOUND} CACHE BOOL "" FORCE)
+        message(STATUS
+            "fastloader GUI GLFW fallback backends: "
+            "X11=${_fastloader_gui_glfw_x11} Wayland=${_fastloader_gui_glfw_wayland}")
+
+        FetchContent_Declare(
+            glfw
+            GIT_REPOSITORY https://github.com/glfw/glfw.git
+            GIT_TAG 3.4
+        )
+        FetchContent_MakeAvailable(glfw)
+    endif()
+
+    if(FASTLOADER_IMGUI_SOURCE_DIR)
+        get_filename_component(_fastloader_imgui_source_dir "${FASTLOADER_IMGUI_SOURCE_DIR}" REALPATH)
+        if(NOT EXISTS "${_fastloader_imgui_source_dir}/imgui.cpp")
+            message(FATAL_ERROR
+                "FASTLOADER_IMGUI_SOURCE_DIR must point at a Dear ImGui checkout containing imgui.cpp.")
+        endif()
+    else()
+        FetchContent_Declare(
+            imgui_src
+            GIT_REPOSITORY https://github.com/ocornut/imgui.git
+            GIT_TAG v1.91.8
+        )
+        FetchContent_MakeAvailable(imgui_src)
+        set(_fastloader_imgui_source_dir "${imgui_src_SOURCE_DIR}")
+    endif()
+
+    add_library(fastloader_imgui STATIC
+        ${_fastloader_imgui_source_dir}/imgui.cpp
+        ${_fastloader_imgui_source_dir}/imgui_draw.cpp
+        ${_fastloader_imgui_source_dir}/imgui_tables.cpp
+        ${_fastloader_imgui_source_dir}/imgui_widgets.cpp
+        ${_fastloader_imgui_source_dir}/misc/cpp/imgui_stdlib.cpp
+        ${_fastloader_imgui_source_dir}/backends/imgui_impl_glfw.cpp
+        ${_fastloader_imgui_source_dir}/backends/imgui_impl_opengl3.cpp
+    )
+    target_include_directories(fastloader_imgui
+        PUBLIC
+            ${_fastloader_imgui_source_dir}
+            ${_fastloader_imgui_source_dir}/backends
+    )
+    target_link_libraries(fastloader_imgui
+        PUBLIC
+            fastloader_build_options
+            glfw
+            OpenGL::GL
+    )
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(fastloader_imgui PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:-Wno-conversion -Wno-null-dereference>
+        )
+    endif()
+
+    add_library(fastloader_gui_module STATIC
+        src/gui/annotation_core.cpp
+        src/gui/annotation_geometry.cpp
+        src/gui/annotation_live_capture.cpp
+        src/gui/app.cpp
+        src/gui/app_options.cpp
+        src/gui/canvas_layers.cpp
+        src/gui/file_picker.cpp
+        src/gui/gui_settings.cpp
+        src/gui/live_preview_texture.cpp
+        src/gui/rfdetr_module.cpp
+        src/gui/rfdetr_workflows.cpp
+        src/gui/source_runtime.cpp
+        src/gui/source_selection.cpp
+        src/gui/still_image_preview.cpp
+        src/gui/train_command.cpp
+        src/gui/train_process_runtime.cpp
+        src/gui/ui_style.cpp
+        src/gui/vast_runtime.cpp
+    )
+    target_include_directories(fastloader_gui_module PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(fastloader_gui_module
+        PUBLIC
+            fastloader_build_options
+            fastloader_imgui
+            fastloader_core
+            fastloader_runtime
+            fastloader_rfdetr_native
+        PRIVATE
+            cli11
+            nlohmann_json
+    )
+    target_compile_definitions(fastloader_gui_module PRIVATE
+        FASTLOADER_GUI_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
+        FASTLOADER_GUI_VAST_BRIDGE_SCRIPT="${FASTLOADER_GUI_VAST_BRIDGE}"
+        FASTLOADER_GUI_ASSET_ROOT="${CMAKE_SOURCE_DIR}/src/gui/res"
+    )
+    fastloader_enable_torch(fastloader_gui_module PRIVATE)
+    if(FASTLOADER_RFDETR_LIVE_CAPTURE_ENABLED)
+        target_link_libraries(fastloader_gui_module PRIVATE fastloader_live_capture)
+    endif()
+    set_target_properties(fastloader_gui_module PROPERTIES
+        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+    )
+
+    add_executable(fastloader_gui
+        src/gui/main.cpp
+    )
+    target_link_libraries(fastloader_gui PRIVATE fastloader_gui_module)
+    fastloader_enable_torch(fastloader_gui PRIVATE)
+    set_target_properties(fastloader_gui PROPERTIES
+        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+    )
+    fastloader_enable_native_runtime_rpath(fastloader_gui)
+
 endif()
 
 # ---- Tests ----
@@ -502,6 +787,128 @@ if(BUILD_TESTS)
     )
     target_link_libraries(test_worker_pool PRIVATE fastloader_core fastloader_build_options)
     add_test(NAME worker_pool COMMAND test_worker_pool)
+
+    add_executable(test_image_resize
+        tests/test_image_resize.cpp
+    )
+    target_link_libraries(test_image_resize PRIVATE fastloader_core fastloader_build_options)
+    target_include_directories(test_image_resize PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME image_resize COMMAND test_image_resize)
+
+    add_executable(test_compile_progress
+        tests/test_compile_progress.cpp
+        tests/test_fixture.cpp
+    )
+    target_link_libraries(test_compile_progress PRIVATE fastloader_core fastloader_build_options)
+    target_include_directories(test_compile_progress PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    add_test(NAME compile_progress COMMAND test_compile_progress)
+
+    add_executable(test_gui_train_command
+        tests/test_gui_train_command.cpp
+        src/gui/train_command.cpp
+    )
+    target_include_directories(test_gui_train_command PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_gui_train_command PRIVATE
+        fastloader_build_options
+        CUDA::cudart
+    )
+    fastloader_enable_torch(test_gui_train_command PRIVATE)
+    add_test(NAME gui_train_command COMMAND test_gui_train_command)
+
+    add_executable(test_gui_annotation_core
+        tests/test_gui_annotation_core.cpp
+        src/gui/annotation_core.cpp
+    )
+    target_include_directories(test_gui_annotation_core PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(test_gui_annotation_core PRIVATE
+        fastloader_build_options
+        fastloader_core
+        nlohmann_json
+    )
+    fastloader_enable_torch(test_gui_annotation_core PRIVATE)
+    add_test(NAME gui_annotation_core COMMAND test_gui_annotation_core)
+
+    add_executable(test_gui_annotation_geometry
+        tests/test_gui_annotation_geometry.cpp
+        src/gui/annotation_core.cpp
+        src/gui/annotation_geometry.cpp
+    )
+    target_include_directories(test_gui_annotation_geometry PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(test_gui_annotation_geometry PRIVATE
+        fastloader_build_options
+        fastloader_core
+        nlohmann_json
+    )
+    fastloader_enable_torch(test_gui_annotation_geometry PRIVATE)
+    add_test(NAME gui_annotation_geometry COMMAND test_gui_annotation_geometry)
+
+    add_executable(test_gui_vast_runtime
+        tests/test_gui_vast_runtime.cpp
+        src/gui/vast_runtime.cpp
+    )
+    target_include_directories(test_gui_vast_runtime PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(test_gui_vast_runtime PRIVATE
+        fastloader_build_options
+        nlohmann_json
+    )
+    add_test(NAME gui_vast_runtime COMMAND test_gui_vast_runtime)
+
+    add_executable(test_gui_app_options
+        tests/test_gui_app_options.cpp
+        src/gui/app_options.cpp
+    )
+    target_include_directories(test_gui_app_options PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(test_gui_app_options PRIVATE
+        fastloader_build_options
+        cli11
+    )
+    add_test(NAME gui_app_options COMMAND test_gui_app_options)
+
+    add_executable(test_gui_settings
+        tests/test_gui_settings.cpp
+        src/gui/gui_settings.cpp
+    )
+    target_include_directories(test_gui_settings PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(test_gui_settings PRIVATE
+        fastloader_build_options
+        nlohmann_json
+    )
+    add_test(NAME gui_settings COMMAND test_gui_settings)
+
+    add_executable(test_gui_canvas_layers
+        tests/test_gui_canvas_layers.cpp
+        src/gui/canvas_layers.cpp
+    )
+    target_include_directories(test_gui_canvas_layers PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/include
+    )
+    target_link_libraries(test_gui_canvas_layers PRIVATE
+        fastloader_build_options
+    )
+    fastloader_enable_torch(test_gui_canvas_layers PRIVATE)
+    add_test(NAME gui_canvas_layers COMMAND test_gui_canvas_layers)
+
+    add_executable(test_async_runtime
+        tests/test_async_runtime.cpp
+    )
+    target_link_libraries(test_async_runtime PRIVATE
+        fastloader_build_options
+        fastloader_runtime
+    )
+    add_test(NAME async_runtime COMMAND test_async_runtime)
+
+    add_executable(test_model_registry
+        tests/test_model_registry.cpp
+    )
+    target_link_libraries(test_model_registry PRIVATE
+        fastloader_build_options
+        fastloader_runtime
+    )
+    add_test(NAME model_registry COMMAND test_model_registry)
 
     add_executable(fastloader_profile_runner
         tests/profile_runner.cpp
@@ -598,6 +1005,20 @@ if(BUILD_TESTS)
         fastloader_enable_native_runtime_rpath(test_rfdetr_native_ops)
         add_test(NAME rfdetr_native_ops COMMAND test_rfdetr_native_ops)
 
+        add_executable(test_rfdetr_onnx_lowering
+            tests/test_rfdetr_onnx_lowering.cpp
+        )
+        target_link_libraries(test_rfdetr_onnx_lowering PRIVATE
+            fastloader_core
+            fastloader_build_options
+            fastloader_rfdetr_native
+        )
+        target_include_directories(test_rfdetr_onnx_lowering PRIVATE ${CMAKE_SOURCE_DIR}/src)
+        fastloader_enable_torch(test_rfdetr_onnx_lowering PRIVATE)
+        set_target_properties(test_rfdetr_onnx_lowering PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
+        fastloader_enable_native_runtime_rpath(test_rfdetr_onnx_lowering)
+        add_test(NAME rfdetr_onnx_lowering COMMAND test_rfdetr_onnx_lowering)
+
         add_executable(test_rfdetr_target_builder
             tests/test_rfdetr_target_builder.cpp
             tests/test_fixture.cpp
@@ -675,6 +1096,53 @@ if(BUILD_TESTS)
         )
         fastloader_enable_native_runtime_rpath(test_rfdetr_eval_sample_writer)
         add_test(NAME rfdetr_eval_sample_writer COMMAND test_rfdetr_eval_sample_writer)
+
+        add_executable(test_rfdetr_public_headers
+            tests/test_rfdetr_public_headers.cpp
+        )
+        target_link_libraries(test_rfdetr_public_headers PRIVATE
+            fastloader_core
+            fastloader_build_options
+            fastloader_rfdetr_native
+        )
+        fastloader_enable_torch(test_rfdetr_public_headers PRIVATE)
+        set_target_properties(test_rfdetr_public_headers PROPERTIES
+            CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+        )
+        fastloader_enable_native_runtime_rpath(test_rfdetr_public_headers)
+        add_test(NAME rfdetr_public_headers COMMAND test_rfdetr_public_headers)
+
+        add_executable(test_rfdetr_live_preprocess
+            tests/test_rfdetr_live_preprocess.cpp
+            src/rfdetr/cuda/live_preprocess.cu
+        )
+        target_include_directories(test_rfdetr_live_preprocess PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/include
+        )
+        target_link_libraries(test_rfdetr_live_preprocess PRIVATE
+            fastloader_build_options
+            CUDA::cudart
+        )
+        set_target_properties(test_rfdetr_live_preprocess PROPERTIES
+            CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+        )
+        add_test(NAME rfdetr_live_preprocess COMMAND test_rfdetr_live_preprocess)
+
+        add_executable(test_rfdetr_prediction_json
+            tests/test_rfdetr_prediction_json.cpp
+        )
+        target_link_libraries(test_rfdetr_prediction_json PRIVATE
+            fastloader_core
+            fastloader_build_options
+            fastloader_rfdetr_native
+        )
+        fastloader_enable_torch(test_rfdetr_prediction_json PRIVATE)
+        set_target_properties(test_rfdetr_prediction_json PROPERTIES
+            CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+        )
+        fastloader_enable_native_runtime_rpath(test_rfdetr_prediction_json)
+        add_test(NAME rfdetr_prediction_json COMMAND test_rfdetr_prediction_json)
 
         if(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER)
             add_executable(test_rfdetr_native_integration

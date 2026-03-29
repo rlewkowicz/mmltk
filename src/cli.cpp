@@ -3,6 +3,7 @@
 #include "compiled_format.h"
 #include "dataset_compiler.h"
 #include "dataset_loader.h"
+#include "execution_policy.h"
 #include "profile_utils.h"
 #include "rfdetr/progress_bar.h"
 #include "CLI11.hpp"
@@ -44,22 +45,23 @@ void cmd_compile(const CompilerConfig& cfg) {
     auto t0 = std::chrono::steady_clock::now();
     size_t last_done = 0;
     size_t total = 0;
+    size_t progress_pulse = 0;
     fastloader::rfdetr::ProgressBar bar("compile", 0, "img");
     bar.set_postfix("scanning");
-    DatasetCompiler::compile(cfg, [&bar, &last_done, &total](size_t done, size_t current_total) {
-        if (current_total != total) {
-            total = current_total;
+    DatasetCompiler::compile(cfg, [&](const CompileProgress& progress) {
+        if (progress.total != total) {
+            total = progress.total;
             bar.set_total(total);
-            if (done == 0 && total > 0) {
+            if (progress.done == 0 && total > 0) {
                 bar.set_postfix("preparing");
             }
         }
-        if (done > last_done) {
-            const size_t delta = done - last_done;
-            last_done = done;
+        if (progress.done > last_done) {
+            const size_t delta = progress.done - last_done;
+            last_done = progress.done;
             bar.add(delta);
-            bar.set_postfix("");
         }
+        bar.set_postfix(fastloader::rfdetr::format_compile_postfix(progress, progress_pulse++));
     });
     bar.close();
     auto t1 = std::chrono::steady_clock::now();
@@ -111,6 +113,8 @@ void cmd_bench(const DatasetLoader::Config& cfg, int num_epochs) {
 
 int main(int argc, char** argv) {
     try {
+        const ExecutionPolicySnapshot execution_snapshot = apply_process_execution_policy();
+        log_process_execution_policy("fastloader_cli", execution_snapshot, false, true);
 #if FASTLOADER_BUILD_RFDETR_NATIVE
         if (argc > 1 && std::strcmp(argv[1], "rfdetr") == 0) {
             return fastloader::rfdetr::handle_cli(argc, argv);
@@ -140,8 +144,23 @@ int main(int argc, char** argv) {
             "--height,height",
             compile_config.target_height,
             "Target image height in pixels");
+        auto* compile_cuda_mask_batch = compile_cmd->add_option(
+            "--cuda-mask-batch-size",
+            compile_config.cuda_mask_batch_size,
+            "Batched CUDA mask-resize task count; 0 disables GPU mask resizing");
+        auto* compile_cuda_device = compile_cmd->add_option(
+            "--cuda-device-id",
+            compile_config.cuda_device_id,
+            "CUDA device id used for batched mask resizing");
+        auto* compile_workers = compile_cmd->add_option(
+            "--workers",
+            compile_config.num_workers,
+            "Total CPU worker budget for compile; 0 or negative selects all available CPUs");
         compile_width->type_name("INT");
         compile_height->type_name("INT");
+        compile_cuda_mask_batch->type_name("INT");
+        compile_cuda_device->type_name("INT");
+        compile_workers->type_name("INT");
 
         DatasetLoader::Config bench_config;
         bench_config.shuffle = true;

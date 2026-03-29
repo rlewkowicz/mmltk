@@ -250,6 +250,7 @@ private:
 // ---------------------------------------------------------------------------
 struct LrScheduleConfig {
     double warmup_epochs = 0.0;
+    double warmup_momentum = 0.0;
     std::string lr_scheduler = "cosine";
     int64_t lr_drop = 1;
     double lr_min_factor = 0.0;
@@ -275,6 +276,19 @@ inline double compute_lr_scale(const LrScheduleConfig& config,
         return 1.0;
     }
     return 0.1;
+}
+
+inline double compute_warmup_momentum(const LrScheduleConfig& config,
+                                      int64_t current_step,
+                                      int64_t steps_per_epoch,
+                                      double target_momentum) {
+    const double warmup_steps = static_cast<double>(steps_per_epoch) * config.warmup_epochs;
+    if (warmup_steps <= 0.0 || config.warmup_momentum <= 0.0 ||
+        static_cast<double>(current_step) >= warmup_steps) {
+        return target_momentum;
+    }
+    const double alpha = static_cast<double>(current_step) / std::max(1.0, warmup_steps);
+    return config.warmup_momentum + (target_momentum - config.warmup_momentum) * alpha;
 }
 
 template <typename OptimizerLike>

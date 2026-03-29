@@ -5,6 +5,8 @@
 #include "fastloader/rfdetr/modules.h"
 #include "fastloader/rfdetr/weight_catalog.h"
 #include "profile_utils.h"
+#include "rfdetr/onnx_lowering.h"
+#include "rfdetr/onnx_simplify.h"
 #include "rfdetr/ms_deform_attn_op.h"
 #include "common_utils.h"
 
@@ -14,8 +16,11 @@
 #include <torch/script.h>
 #include <torch/csrc/jit/frontend/tracer.h>
 #include <torch/csrc/jit/api/function_impl.h>
+#include <torch/csrc/jit/serialization/export.h>
+#include <torch/csrc/onnx/onnx.h>
 
 #include <algorithm>
+#include <fstream>
 #include <array>
 #include <cmath>
 #include <limits>
@@ -41,6 +46,23 @@ constexpr int64_t kDinoNumLayers = 12;
 constexpr int64_t kDinoNumHeads = 6;
 constexpr int64_t kProjectorBlocks = 3;
 constexpr std::array<int64_t, 4> kOutFeatureStages = {3, 6, 9, 12};
+
+void erase_unused_module_self_input(const std::shared_ptr<torch::jit::Graph>& graph) {
+    if (!graph || graph->inputs().empty()) {
+        return;
+    }
+    auto* self_input = graph->inputs().front();
+    const auto class_type = self_input->type()->cast<c10::ClassType>();
+    if (!class_type) {
+        return;
+    }
+    if (self_input->hasUses()) {
+        throw std::runtime_error(
+            "native ONNX export left the module self input live after lowering: " +
+            self_input->debugName());
+    }
+    graph->eraseInput(0);
+}
 
 struct LinearOutputState {
     torch::Tensor weight;
@@ -777,7 +799,7 @@ public:
 
         value = value.view({batch, len_in, n_heads_, d_model_ / n_heads_});
         torch::Tensor attended;
-        if (value.is_cuda()) {
+        if (value.is_cuda() && !force_pytorch_deformable_attn_) {
             attended = ms_deform_attn_cuda_autograd(
                 value,
                 input_spatial_shapes,
@@ -826,6 +848,9 @@ private:
     torch::nn::Linear attention_weights{nullptr};
     torch::nn::Linear value_proj{nullptr};
     torch::nn::Linear output_proj{nullptr};
+
+public:
+    bool force_pytorch_deformable_attn_ = false;
 };
 TORCH_MODULE(MSDeformAttn);
 
@@ -1536,11 +1561,28 @@ ResolvedModelArtifacts resolve_model_artifacts(const ModelArtifactRequest& reque
         return resolve_upstream_weight_artifacts(request.weights_path);
     }
 
+    auto resolve_non_weight_config = [&](const std::filesystem::path& input_path) {
+        if (!request.preset_name.empty()) {
+            if (const auto* preset = find_model_preset(request.preset_name)) {
+                return make_config_from_preset(*preset);
+            }
+            throw std::runtime_error("unknown RF-DETR preset override: " + request.preset_name);
+        }
+
+        NativeRfDetrConfig config = make_config_from_path(input_path);
+        if (config.resolution <= 0 || config.num_queries <= 0) {
+            throw std::runtime_error(
+                "unable to infer RF-DETR preset from backend artifact path; provide a preset name or use a "
+                "canonical preset filename: " + input_path.string());
+        }
+        return config;
+    };
+
     ResolvedModelArtifacts artifacts;
     if (!request.onnx_path.empty()) {
         artifacts.input_kind = "onnx";
         artifacts.input_path = canonical_existing_path(request.onnx_path, "RF-DETR ONNX");
-        artifacts.config = make_config_from_path(artifacts.input_path);
+        artifacts.config = resolve_non_weight_config(artifacts.input_path);
         artifacts.artifact_root = artifacts.input_path.parent_path();
         artifacts.onnx_path = artifacts.input_path;
         return artifacts;
@@ -1548,7 +1590,7 @@ ResolvedModelArtifacts resolve_model_artifacts(const ModelArtifactRequest& reque
 
     artifacts.input_kind = "tensorrt";
     artifacts.input_path = canonical_existing_path(request.tensorrt_path, "RF-DETR TensorRT engine");
-    artifacts.config = make_config_from_path(artifacts.input_path);
+    artifacts.config = resolve_non_weight_config(artifacts.input_path);
     artifacts.artifact_root = artifacts.input_path.parent_path();
     artifacts.tensorrt_path = artifacts.input_path;
     return artifacts;
@@ -1659,7 +1701,9 @@ void NativeRfDetrModel::reinitialize_detection_head(int64_t output_classes) {
     transformer->resize_output_classes(output_classes);
 }
 
-ModelOutputs NativeRfDetrModel::forward(const NestedTensor& batch, SegmentationHeadImpl* seg_override) {
+ModelOutputs NativeRfDetrModel::forward(const NestedTensor& batch,
+                                        SegmentationHeadImpl* seg_override,
+                                        bool include_masks) {
     const bool is_train = is_training();
     if ((is_train && is_compiled_train_) || (!is_train && is_compiled_eval_)) {
         std::vector<torch::jit::IValue> inputs;
@@ -1678,7 +1722,7 @@ ModelOutputs NativeRfDetrModel::forward(const NestedTensor& batch, SegmentationH
         
         outputs.main.pred_logits = out_dict.at("pred_logits").toTensor();
         outputs.main.pred_boxes = out_dict.at("pred_boxes").toTensor();
-        if (out_dict.contains("pred_masks")) {
+        if (include_masks && out_dict.contains("pred_masks")) {
             outputs.main.pred_masks = out_dict.at("pred_masks").toTensor();
         }
         if (out_dict.contains("sparse_spatial")) {
@@ -1693,7 +1737,7 @@ ModelOutputs NativeRfDetrModel::forward(const NestedTensor& batch, SegmentationH
             OutputLayer enc_out;
             enc_out.pred_logits = out_dict.at("enc_logits").toTensor();
             enc_out.pred_boxes = out_dict.at("enc_boxes").toTensor();
-            if (out_dict.contains("enc_masks")) {
+            if (include_masks && out_dict.contains("enc_masks")) {
                 enc_out.pred_masks = out_dict.at("enc_masks").toTensor();
             }
             if (out_dict.contains("enc_sparse_spatial")) {
@@ -1714,7 +1758,7 @@ ModelOutputs NativeRfDetrModel::forward(const NestedTensor& batch, SegmentationH
             OutputLayer aux_out;
             aux_out.pred_logits = out_dict.at(key_logits).toTensor();
             aux_out.pred_boxes = out_dict.at("aux_boxes_" + std::to_string(i)).toTensor();
-            if (out_dict.contains("aux_masks_" + std::to_string(i))) {
+            if (include_masks && out_dict.contains("aux_masks_" + std::to_string(i))) {
                 aux_out.pred_masks = out_dict.at("aux_masks_" + std::to_string(i)).toTensor();
             }
             if (out_dict.contains("aux_sparse_spatial_" + std::to_string(i))) {
@@ -1806,7 +1850,7 @@ ModelOutputs NativeRfDetrModel::forward(const NestedTensor& batch, SegmentationH
 
     std::vector<torch::Tensor> dense_masks;
     std::vector<OutputLayer::SparsePredMasks> sparse_masks;
-    if (segmentation_head_ && !decoder_query_features.empty()) {
+    if (include_masks && segmentation_head_ && !decoder_query_features.empty()) {
         FASTLOADER_PROFILE_SCOPE("rfdetr.model.forward.segmentation");
         auto* seg = seg_override ? seg_override
                                  : std::dynamic_pointer_cast<SegmentationHeadImpl>(segmentation_head_).get();
@@ -1851,7 +1895,7 @@ ModelOutputs NativeRfDetrModel::forward(const NestedTensor& batch, SegmentationH
             OutputLayer layer;
             layer.pred_logits = class_embed->forward(hs);
             layer.pred_boxes = boxes;
-            if (segmentation_head_) {
+            if (include_masks && segmentation_head_) {
                 if (is_training()) {
                     layer.sparse_pred_masks = sparse_masks[index];
                 } else {
@@ -1872,7 +1916,7 @@ ModelOutputs NativeRfDetrModel::forward(const NestedTensor& batch, SegmentationH
         OutputLayer enc_output;
         enc_output.pred_logits = transformer->encoder_class_logits(transformed.enc_memory, is_training());
         enc_output.pred_boxes = transformed.enc_boxes;
-        if (segmentation_head_) {
+        if (include_masks && segmentation_head_) {
             auto* enc_seg = seg_override ? seg_override
                                          : std::dynamic_pointer_cast<SegmentationHeadImpl>(segmentation_head_).get();
             if (is_training()) {
@@ -2115,6 +2159,143 @@ void NativeRfDetrModel::optimize_for_inference(int batch_size, bool for_training
     } else {
         is_compiled_eval_ = true;
     }
+}
+
+void NativeRfDetrModel::set_force_pytorch_deformable_attn(bool value) {
+    for (auto& module : this->modules(false)) {
+        if (auto* deform = dynamic_cast<MSDeformAttnImpl*>(module.get())) {
+            deform->force_pytorch_deformable_attn_ = value;
+        }
+    }
+}
+
+void NativeRfDetrModel::export_onnx(const std::filesystem::path& output_path,
+                                     int opset_version,
+                                     int batch_size,
+                                     bool simplify) {
+    validate_supported_onnx_export_opset(opset_version);
+    this->eval();
+    set_force_pytorch_deformable_attn(true);
+
+    auto device = this->parameters().front().device();
+    auto dtype = this->parameters().front().dtype();
+    auto dummy_pixel_values = torch::zeros(
+        {batch_size, 3, config_.resolution, config_.resolution},
+        torch::TensorOptions().dtype(dtype).device(device));
+
+    auto cu = std::make_shared<torch::jit::CompilationUnit>();
+    auto cls = torch::jit::ClassType::create("__torch__.NativeRfDetrOnnxExport", cu, true);
+    torch::jit::Module export_module(cu, cls);
+
+    for (const auto& kv : this->named_parameters(true)) {
+        std::string name = kv.key();
+        std::replace(name.begin(), name.end(), '.', '_');
+        export_module.register_parameter(name, kv.value(), false);
+    }
+    for (const auto& kv : this->named_buffers(true)) {
+        std::string name = kv.key();
+        std::replace(name.begin(), name.end(), '.', '_');
+        export_module.register_buffer(name, kv.value());
+    }
+
+    const bool has_masks = config_.segmentation;
+    auto dummy_mask = torch::zeros(
+        {batch_size, config_.resolution, config_.resolution},
+        torch::TensorOptions().dtype(torch::kBool).device(device));
+    auto trace_res = torch::jit::tracer::trace(
+        {dummy_pixel_values},
+        [&](torch::jit::Stack args) -> torch::jit::Stack {
+            auto pixel_values = args[0].toTensor();
+            auto outputs = this->forward(NestedTensor{pixel_values, dummy_mask});
+            if (has_masks && outputs.main.pred_masks) {
+                return {outputs.main.pred_logits, outputs.main.pred_boxes, *outputs.main.pred_masks};
+            }
+            return {outputs.main.pred_logits, outputs.main.pred_boxes};
+        },
+        [](const torch::autograd::Variable&) { return ""; },
+        false, false, &export_module);
+
+    export_module.type()->addMethod(cu->create_function("forward", trace_res.first->graph, true));
+
+    std::map<std::string, at::Tensor> initializers;
+    OnnxInitializerMap lowering_initializers;
+    for (const auto& kv : this->named_parameters(true)) {
+        initializers[kv.key()] = kv.value();
+        lowering_initializers.emplace(kv.key(), kv.value());
+        std::string flattened_name = kv.key();
+        std::replace(flattened_name.begin(), flattened_name.end(), '.', '_');
+        lowering_initializers.emplace(std::move(flattened_name), kv.value());
+    }
+    for (const auto& kv : this->named_buffers(true)) {
+        initializers[kv.key()] = kv.value();
+        lowering_initializers.emplace(kv.key(), kv.value());
+        std::string flattened_name = kv.key();
+        std::replace(flattened_name.begin(), flattened_name.end(), '.', '_');
+        lowering_initializers.emplace(std::move(flattened_name), kv.value());
+    }
+
+    auto graph = trace_res.first->graph;
+    lower_graph_for_onnx_export(graph, &lowering_initializers);
+    erase_unused_module_self_input(graph);
+
+    std::map<std::string, at::Tensor> export_initializers;
+    for (auto* input : graph->inputs()) {
+        const std::string input_name = input->debugName();
+        if (const auto it = initializers.find(input_name); it != initializers.end()) {
+            export_initializers.emplace(it->first, it->second);
+            continue;
+        }
+        if (const auto it = lowering_initializers.find(input_name); it != lowering_initializers.end()) {
+            export_initializers.emplace(input_name, it->second);
+        }
+    }
+
+    std::unordered_map<std::string, std::unordered_map<int64_t, std::string>> dynamic_axes;
+
+    auto [model_proto, raw_data, sym_dim_map, use_external_data_format, node_names] =
+        torch::jit::export_onnx(
+            graph,
+            export_initializers,
+            static_cast<int64_t>(opset_version),
+            dynamic_axes,
+            false,
+            ::torch::onnx::OperatorExportTypes::ONNX,
+            true,
+            false,
+            {},
+            true,
+            false,
+            output_path.string());
+
+    if (simplify) {
+        run_onnx_simplify(*model_proto);
+    }
+
+    std::string serialized = torch::jit::serialize_model_proto_to_string(model_proto);
+    std::filesystem::create_directories(output_path.parent_path());
+    std::ofstream out(output_path, std::ios::binary);
+    if (!out.is_open()) {
+        set_force_pytorch_deformable_attn(false);
+        throw std::runtime_error("failed to open ONNX output file: " + output_path.string());
+    }
+    out.write(serialized.data(), static_cast<std::streamsize>(serialized.size()));
+    out.close();
+
+    set_force_pytorch_deformable_attn(false);
+    std::fprintf(stderr, "onnx: exported model to %s\n", output_path.c_str());
+}
+
+void export_weights_to_onnx(const std::filesystem::path& weights_path,
+                            const std::filesystem::path& output_path,
+                            int device_id,
+                            int opset_version,
+                            bool simplify) {
+    auto artifacts = resolve_upstream_weight_artifacts(weights_path);
+    auto device = torch::Device(torch::kCUDA, static_cast<c10::DeviceIndex>(device_id));
+    NativeRfDetrModel model(artifacts.config);
+    model.to(device);
+    model.load_weights(weights_path);
+    model.export_onnx(output_path, opset_version, 1, simplify);
 }
 
 } // namespace fastloader::rfdetr

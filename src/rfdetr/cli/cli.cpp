@@ -1,11 +1,14 @@
 #include "rfdetr/cli.h"
 
 #include "cpu_affinity.h"
+#include "execution_policy.h"
+#include "fastloader/rfdetr/predict.h"
+#include "fastloader/rfdetr/train.h"
+#include "fastloader/rfdetr/validate.h"
 #include "rfdetr/backends.h"
+#include "fastloader/rfdetr/model.h"
 #include "fastloader/rfdetr/checkpoint.h"
-#include "rfdetr/predict.h"
-#include "rfdetr/train.h"
-#include "rfdetr/validate.h"
+#include "rfdetr/train_recipe.h"
 #include "dataset_compiler.h"
 #include "rfdetr/progress_bar.h"
 #include "CLI11.hpp"
@@ -44,6 +47,14 @@ struct BuildEngineOptions {
     bool allow_fp16 = true;
 };
 
+struct ExportOnnxOptions {
+    std::filesystem::path weights_path;
+    std::filesystem::path output_path;
+    int device_id = 0;
+    int opset_version = 19;
+    bool simplify = false;
+};
+
 struct InfoOptions {
     std::filesystem::path onnx_path;
     std::filesystem::path tensorrt_path;
@@ -68,6 +79,8 @@ struct TrainCliState {
     TrainCliOptions options;
     std::string device_ids;
     std::string compile_mode = "selective";
+    std::string optimizer = "adamw";
+    TrainRecipeFieldOverrides recipe_overrides;
 };
 
 struct NormalizeWeightsOptions {
@@ -79,6 +92,9 @@ struct CompileCliOptions {
     std::filesystem::path source_dir;
     std::filesystem::path output_dir;
     int resolution = 432;
+    int num_workers = -1;
+    int cuda_mask_batch_size = 0;
+    int cuda_device_id = 0;
 };
 
 int handle_parse_error(CLI::App& app, const CLI::ParseError& error) {
@@ -91,6 +107,19 @@ CompilationMode parse_compilation_mode(const std::string& value) {
     if (value == "selective") return CompilationMode::kSelective;
     if (value == "full") return CompilationMode::kFullTrace;
     throw std::runtime_error("--compile-mode must be 'none', 'selective', or 'full', got: " + value);
+}
+
+TrainOptimizerKind parse_train_optimizer_kind(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    if (value == "adamw") {
+        return TrainOptimizerKind::AdamW;
+    }
+    if (value == "muon") {
+        return TrainOptimizerKind::Muon;
+    }
+    throw std::runtime_error("--optimizer must be 'adamw' or 'muon', got: " + value);
 }
 
 template <typename Options>
@@ -237,9 +266,22 @@ int spawn_distributed_training_workers(const TrainCliOptions& options, int argc,
         std::vector<std::string> worker_args = base_args;
         worker_args.push_back("--device-id");
         worker_args.push_back(std::to_string(options.device_ids[static_cast<size_t>(rank)]));
-        worker_args.push_back("--workers");
-        worker_args.push_back(std::to_string(shard_worker_budget(options.workers, rank, world_size)));
         const auto shard_cpus = shard_cpu_list(all_cpus, rank, world_size);
+        int rank_workers = shard_worker_budget(options.workers, rank, world_size);
+        if (!shard_cpus.empty() && static_cast<int>(shard_cpus.size()) >= 3) {
+            const int clamped_workers =
+                fastloader::clamp_worker_count_to_cpus(rank_workers, shard_cpus.size(), 0, 3);
+            const std::string subsystem = "rfdetr.distributed.rank" + std::to_string(rank);
+            fastloader::log_worker_budget_clamp(subsystem.c_str(),
+                                                rank_workers,
+                                                clamped_workers,
+                                                shard_cpus,
+                                                0,
+                                                3);
+            rank_workers = clamped_workers;
+        }
+        worker_args.push_back("--workers");
+        worker_args.push_back(std::to_string(rank_workers));
         if (!shard_cpus.empty()) {
             worker_args.push_back("--cpu-affinity");
             worker_args.push_back(fastloader::format_cpu_list(shard_cpus));
@@ -326,6 +368,9 @@ void finalize_compile_options(const CompileCliOptions& options) {
     if (options.source_dir.empty() || options.output_dir.empty()) {
         throw std::runtime_error("rfdetr compile requires --source-dir and --output-dir");
     }
+    if (options.cuda_mask_batch_size < 0) {
+        throw std::runtime_error("rfdetr compile --cuda-mask-batch-size must be non-negative");
+    }
 }
 
 void finalize_info_options(const InfoOptions& options) {
@@ -362,8 +407,22 @@ void finalize_normalize_options(const NormalizeWeightsOptions& options) {
     }
 }
 
+std::string infer_train_recipe_preset_name(const TrainCliOptions& options) {
+    const auto source_checkpoint = !options.resume_path.empty() ? options.resume_path : options.weights_path;
+    std::string preset_name = infer_train_recipe_preset_name_from_path(source_checkpoint);
+    if (!preset_name.empty()) {
+        return preset_name;
+    }
+    if (!is_native_checkpoint_file(source_checkpoint)) {
+        return {};
+    }
+    const auto checkpoint = load_checkpoint(source_checkpoint);
+    return checkpoint.metadata.preset_name;
+}
+
 void finalize_train_options(TrainCliState& state, bool saw_device_id, bool saw_device_ids) {
     state.options.compilation_mode = parse_compilation_mode(state.compile_mode);
+    state.options.optimizer = parse_train_optimizer_kind(state.optimizer);
     if (state.options.train_compiled_path.empty() ||
         state.options.val_compiled_path.empty() ||
         state.options.output_dir.empty()) {
@@ -375,6 +434,10 @@ void finalize_train_options(TrainCliState& state, bool saw_device_id, bool saw_d
     if (selected_input_count != 1) {
         throw std::runtime_error("rfdetr train requires exactly one of --weights or --resume");
     }
+    apply_train_recipe(
+        state.options,
+        resolve_train_recipe(infer_train_recipe_preset_name(state.options), state.options.optimizer),
+        state.recipe_overrides);
     if (state.options.lr_scheduler != "step" && state.options.lr_scheduler != "cosine") {
         throw std::runtime_error("rfdetr train --lr-scheduler must be 'step' or 'cosine'");
     }
@@ -411,6 +474,9 @@ void finalize_validate_options(ValidationOptions& options) {
     if (options.recompile && options.source_dir.empty()) {
         throw std::runtime_error("rfdetr validate --recompile requires --source");
     }
+    if (options.compile_cuda_mask_batch_size < 0) {
+        throw std::runtime_error("rfdetr validate --compile-cuda-mask-batch-size must be non-negative");
+    }
     if (options.split.empty()) {
         options.split = options.compiled_path.stem().string();
     }
@@ -429,34 +495,26 @@ void run_compile(const CompileCliOptions& options) {
         config.split = split;
         config.target_width = static_cast<uint32_t>(options.resolution);
         config.target_height = static_cast<uint32_t>(options.resolution);
+        config.num_workers = options.num_workers;
+        config.cuda_mask_batch_size = options.cuda_mask_batch_size;
+        config.cuda_device_id = options.cuda_device_id;
 
         size_t last_done = 0;
         size_t total = 0;
+        size_t progress_pulse = 0;
         ProgressBar bar("compile " + split, 0, "img");
         DatasetCompiler::compile(
             config,
-            [&bar, &last_done, &total](size_t done, size_t current_total) {
-                if (current_total != total) {
-                    total = current_total;
+            [&bar, &last_done, &total, &progress_pulse](const CompileProgress& progress) {
+                if (progress.total != total) {
+                    total = progress.total;
                     bar.set_total(total);
                 }
-                if (done > last_done) {
-                    bar.add(done - last_done);
-                    last_done = done;
+                if (progress.done > last_done) {
+                    bar.add(progress.done - last_done);
+                    last_done = progress.done;
                 }
-
-                const size_t num_images = (current_total - 2) / 2;
-                if (done < num_images) {
-                    bar.set_postfix("labels");
-                } else if (done < 2 * num_images) {
-                    bar.set_postfix("pixels");
-                } else if (done == 2 * num_images + 1) {
-                    bar.set_postfix("syncing");
-                } else if (done == 2 * num_images + 2) {
-                    bar.set_postfix("sidecar");
-                } else {
-                    bar.set_postfix("done");
-                }
+                bar.set_postfix(format_compile_postfix(progress, progress_pulse++));
             });
         bar.close();
     }
@@ -476,7 +534,7 @@ int handle_cli(int argc, char** argv) {
         app.footer(
             "notes:\n"
             "  weights overlap mode requires --batch-size 1 when predict/evaluate --weights uses --lanes > 1\n"
-            "  native train --lanes supports 0, 1, 2, or 3; with --lanes > 1, effective batch per rank is "
+            "  native train --lanes accepts any non-negative value; with --lanes > 1, effective batch per rank is "
             "batch_size * lanes * grad_accum_steps");
 
         CompileCliOptions compile_options;
@@ -490,6 +548,15 @@ int handle_cli(int argc, char** argv) {
                         "Output directory for compiled train/val binaries");
         compile_dataset->add_option("--resolution", compile_options.resolution,
                                     "Square image resolution for both splits")
+            ->type_name("INT");
+        compile_dataset->add_option("--workers", compile_options.num_workers,
+                                    "Total CPU worker budget for compile; 0 or negative selects all available CPUs")
+            ->type_name("INT");
+        compile_dataset->add_option("--cuda-mask-batch-size", compile_options.cuda_mask_batch_size,
+                                    "Batched CUDA mask-resize task count; 0 disables GPU mask resizing")
+            ->type_name("INT");
+        compile_dataset->add_option("--cuda-device-id", compile_options.cuda_device_id,
+                                    "CUDA device id used for batched mask resizing")
             ->type_name("INT");
 
         InfoOptions info_options;
@@ -516,6 +583,24 @@ int handle_cli(int argc, char** argv) {
             ->type_name("INT");
         build_engine_exec->add_flag("--fp16,!--no-fp16", build_engine_options.allow_fp16,
                                     "Enable FP16 TensorRT kernels when supported");
+
+        ExportOnnxOptions export_onnx_options;
+        auto* export_onnx_cmd = app.add_subcommand(
+            "export-onnx",
+            "Export .pt weights to ONNX format");
+        auto* export_onnx_io = export_onnx_cmd->add_option_group("Input and output");
+        add_path_option(export_onnx_io, "--weights", export_onnx_options.weights_path,
+                        "RF-DETR checkpoint path");
+        add_path_option(export_onnx_io, "--output", export_onnx_options.output_path,
+                        "Output ONNX model path");
+        auto* export_onnx_exec = export_onnx_cmd->add_option_group("Execution");
+        export_onnx_exec->add_option("--device-id", export_onnx_options.device_id, "CUDA device id")
+            ->type_name("INT");
+        export_onnx_exec->add_option("--opset-version", export_onnx_options.opset_version,
+                                     "ONNX opset version (native exporter currently supports 19 only)")
+            ->type_name("INT");
+        export_onnx_exec->add_flag("--simplify", export_onnx_options.simplify,
+                                   "Run ONNX checker and shape inference on the exported model");
 
         PredictCliState predict_state;
         auto* predict_cmd = app.add_subcommand(
@@ -629,37 +714,60 @@ int handle_cli(int argc, char** argv) {
         train_optimization->add_option("--grad-accum-steps", train_state.options.grad_accum_steps,
                                        "Gradient accumulation steps")
             ->type_name("INT");
-        train_optimization->add_option("--lr", train_state.options.lr, "Decoder/base learning rate")
-            ->type_name("FLOAT");
-        train_optimization->add_option("--lr-encoder", train_state.options.lr_encoder,
-                                       "Encoder learning rate")
-            ->type_name("FLOAT");
-        train_optimization->add_option("--lr-component-decay", train_state.options.lr_component_decay,
-                                       "Component-wise learning rate decay")
-            ->type_name("FLOAT");
-        train_optimization->add_option("--encoder-layer-decay", train_state.options.encoder_layer_decay,
-                                       "Per-layer encoder learning rate decay")
-            ->type_name("FLOAT");
-        train_optimization->add_option("--weight-decay", train_state.options.weight_decay,
-                                       "AdamW weight decay")
-            ->type_name("FLOAT");
-        train_optimization->add_option("--lr-drop", train_state.options.lr_drop,
-                                       "Step scheduler drop epoch")
-            ->type_name("INT");
-        train_optimization->add_option("--lr-scheduler", train_state.options.lr_scheduler,
-                                       "Learning rate scheduler: step or cosine");
-        train_optimization->add_option("--lr-min-factor", train_state.options.lr_min_factor,
-                                       "Minimum LR multiplier for cosine decay")
-            ->type_name("FLOAT");
-        train_optimization->add_option("--warmup-epochs", train_state.options.warmup_epochs,
-                                       "Warmup duration in epochs")
-            ->type_name("FLOAT");
+        train_optimization->add_option("--optimizer", train_state.optimizer,
+                                       "Training optimizer: adamw or muon");
+        auto* train_lr = train_optimization->add_option("--lr", train_state.options.lr, "Decoder/base learning rate");
+        train_lr->type_name("FLOAT");
+        auto* train_lr_encoder = train_optimization->add_option("--lr-encoder",
+                                                                train_state.options.lr_encoder,
+                                                                "Encoder learning rate");
+        train_lr_encoder->type_name("FLOAT");
+        auto* train_momentum = train_optimization->add_option("--momentum",
+                                                              train_state.options.momentum,
+                                                              "Muon momentum");
+        train_momentum->type_name("FLOAT");
+        train_optimization->add_flag("--freeze-encoder,!--no-freeze-encoder",
+                                     train_state.options.freeze_encoder,
+                                     "Freeze encoder/backbone parameters");
+        auto* train_lr_component_decay = train_optimization->add_option(
+            "--lr-component-decay",
+            train_state.options.lr_component_decay,
+            "Component-wise learning rate decay");
+        train_lr_component_decay->type_name("FLOAT");
+        auto* train_encoder_layer_decay = train_optimization->add_option(
+            "--encoder-layer-decay",
+            train_state.options.encoder_layer_decay,
+            "Per-layer encoder learning rate decay");
+        train_encoder_layer_decay->type_name("FLOAT");
+        auto* train_weight_decay = train_optimization->add_option("--weight-decay",
+                                                                  train_state.options.weight_decay,
+                                                                  "Optimizer weight decay");
+        train_weight_decay->type_name("FLOAT");
+        auto* train_lr_drop = train_optimization->add_option("--lr-drop",
+                                                             train_state.options.lr_drop,
+                                                             "Step scheduler drop epoch");
+        train_lr_drop->type_name("INT");
+        auto* train_lr_scheduler = train_optimization->add_option("--lr-scheduler",
+                                                                  train_state.options.lr_scheduler,
+                                                                  "Learning rate scheduler: step or cosine");
+        auto* train_lr_min_factor = train_optimization->add_option("--lr-min-factor",
+                                                                   train_state.options.lr_min_factor,
+                                                                   "Minimum LR multiplier for cosine decay");
+        train_lr_min_factor->type_name("FLOAT");
+        auto* train_warmup_epochs = train_optimization->add_option("--warmup-epochs",
+                                                                   train_state.options.warmup_epochs,
+                                                                   "Warmup duration in epochs");
+        train_warmup_epochs->type_name("FLOAT");
+        auto* train_warmup_momentum = train_optimization->add_option("--warmup-momentum",
+                                                                     train_state.options.warmup_momentum,
+                                                                     "Muon warmup momentum start value");
+        train_warmup_momentum->type_name("FLOAT");
         train_optimization->add_option("--clip-max-norm", train_state.options.clip_max_norm,
                                        "Gradient clipping max norm")
             ->type_name("FLOAT");
         train_optimization->add_flag("--fused-optimizer,!--no-fused-optimizer",
                                      train_state.options.fused_optimizer,
-                                     "Use the native fused optimizer when available");
+                                     "Use the native fused AdamW backend when available (AdamW only)");
         train_optimization->add_flag("--use-ema,!--no-ema", train_state.options.use_ema,
                                      "Maintain an EMA shadow model");
         train_optimization->add_option("--ema-decay", train_state.options.ema_decay,
@@ -739,6 +847,17 @@ int handle_cli(int argc, char** argv) {
             ->type_name("INT");
         validate_dataset->add_flag("--recompile", validate_options.recompile,
                                    "Recompile the source dataset before validation");
+        validate_dataset->add_option("--compile-workers", validate_options.compile_workers,
+                                     "Total CPU worker budget for recompiles; 0 or negative selects all available CPUs")
+            ->type_name("INT");
+        validate_dataset->add_option("--compile-cuda-mask-batch-size",
+                                     validate_options.compile_cuda_mask_batch_size,
+                                     "Batched CUDA mask-resize task count for recompiles; 0 disables GPU mask resizing")
+            ->type_name("INT");
+        validate_dataset->add_option("--compile-cuda-device-id",
+                                     validate_options.compile_cuda_device_id,
+                                     "CUDA device id used for batched mask resizing during recompiles")
+            ->type_name("INT");
         auto* validate_model = validate_cmd->add_option_group("Model input");
         add_path_option(validate_model, "--onnx", validate_options.onnx_path, "ONNX model path");
         add_path_option(validate_model, "--tensorrt", validate_options.tensorrt_path,
@@ -820,6 +939,19 @@ int handle_cli(int argc, char** argv) {
             return 0;
         }
 
+        if (export_onnx_cmd->parsed()) {
+            if (export_onnx_options.weights_path.empty() || export_onnx_options.output_path.empty()) {
+                throw std::runtime_error("rfdetr export-onnx requires --weights and --output");
+            }
+            export_weights_to_onnx(
+                export_onnx_options.weights_path,
+                export_onnx_options.output_path,
+                export_onnx_options.device_id,
+                export_onnx_options.opset_version,
+                export_onnx_options.simplify);
+            return 0;
+        }
+
         if (predict_cmd->parsed()) {
             finalize_predict_options(predict_state);
             const PredictionRunResult result = run_prediction(predict_state.options);
@@ -836,6 +968,17 @@ int handle_cli(int argc, char** argv) {
         }
 
         if (train_cmd->parsed()) {
+            train_state.recipe_overrides.lr = train_lr->count() > 0;
+            train_state.recipe_overrides.lr_encoder = train_lr_encoder->count() > 0;
+            train_state.recipe_overrides.lr_component_decay = train_lr_component_decay->count() > 0;
+            train_state.recipe_overrides.encoder_layer_decay = train_encoder_layer_decay->count() > 0;
+            train_state.recipe_overrides.momentum = train_momentum->count() > 0;
+            train_state.recipe_overrides.weight_decay = train_weight_decay->count() > 0;
+            train_state.recipe_overrides.lr_drop = train_lr_drop->count() > 0;
+            train_state.recipe_overrides.lr_scheduler = train_lr_scheduler->count() > 0;
+            train_state.recipe_overrides.lr_min_factor = train_lr_min_factor->count() > 0;
+            train_state.recipe_overrides.warmup_epochs = train_warmup_epochs->count() > 0;
+            train_state.recipe_overrides.warmup_momentum = train_warmup_momentum->count() > 0;
             finalize_train_options(
                 train_state,
                 train_device_id->count() > 0,

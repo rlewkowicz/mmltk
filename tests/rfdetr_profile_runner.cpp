@@ -1,5 +1,6 @@
 #include "profile_utils.h"
-#include "rfdetr/predict.h"
+#include "execution_policy.h"
+#include "fastloader/rfdetr/predict.h"
 
 #include <algorithm>
 #include <chrono>
@@ -166,6 +167,13 @@ int main(int argc, char** argv) {
     FASTLOADER_PROFILE_RUN_LABEL("rfdetr.evaluate.checkpoint");
 
     try {
+        const fastloader::ExecutionPolicySnapshot execution_snapshot =
+            fastloader::apply_process_execution_policy();
+        fastloader::log_process_execution_policy(
+            "fastloader_rfdetr_profile_runner",
+            execution_snapshot,
+            false,
+            true);
         const Options options = parse_options(argc, argv);
         ensure_file_exists("compiled dataset", options.compiled_path);
         ensure_file_exists("checkpoint", options.checkpoint_path);

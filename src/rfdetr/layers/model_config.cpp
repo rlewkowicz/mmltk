@@ -1,8 +1,16 @@
 #include "fastloader/rfdetr/model_config.h"
+#include "fastloader/rfdetr/weight_catalog.h"
+
+#include <string_view>
 
 namespace fastloader::rfdetr {
 
 namespace {
+
+std::string_view url_basename(std::string_view url) {
+    const size_t slash = url.find_last_of('/');
+    return slash == std::string_view::npos ? url : url.substr(slash + 1);
+}
 
 const std::vector<ModelPresetConfig>& preset_table() {
     static const std::vector<ModelPresetConfig> kPresets = {
@@ -42,6 +50,20 @@ const ModelPresetConfig* find_model_preset_by_weight_filename(std::string_view f
         if (preset.canonical_weight_filename == filename) {
             return &preset;
         }
+    }
+    const ModelPresetConfig* matched = nullptr;
+    for (const auto& preset : preset_table()) {
+        const auto* asset = find_weight_asset(preset.canonical_weight_filename);
+        if (asset == nullptr || url_basename(asset->download_url) != filename) {
+            continue;
+        }
+        if (matched != nullptr) {
+            return nullptr;
+        }
+        matched = &preset;
+    }
+    if (matched != nullptr) {
+        return matched;
     }
     return nullptr;
 }

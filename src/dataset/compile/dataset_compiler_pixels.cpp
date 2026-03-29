@@ -1,16 +1,15 @@
 #include "dataset_compiler_internal.h"
+#include "image_resize.h"
 #include "profile_utils.h"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
-#define STB_IMAGE_RESIZE_IMPLEMENTATION
-#include "stb_image_resize2.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <cstring>
-#include <mutex>
+#include <immintrin.h>
 #include <vector>
 
 namespace fastloader::compiler_internal {
@@ -82,119 +81,186 @@ private:
     size_t bytes_ = 0;
 };
 
-void hwc_uint8_to_nchw_float_scalar(const uint8_t* FASTLOADER_RESTRICT src,
-                                    float* FASTLOADER_RESTRICT dst,
-                                    int height,
-                                    int width) {
+// SSSE3 deinterleave + AVX2 uint8→float conversion, 16 pixels per iteration.
+// Input: interleaved RGB uint8 (48 bytes per 16 pixels).
+// Output: 3 planar float32 channels scaled to [0,1].
+void hwc_uint8_to_nchw_float_avx2(const uint8_t* FASTLOADER_RESTRICT src,
+                                   float* FASTLOADER_RESTRICT dst,
+                                   int height,
+                                   int width) {
     const int hw = height * width;
-    const float scale = 1.0f / 255.0f;
+    const __m256 scale = _mm256_set1_ps(1.0f / 255.0f);
     float* FASTLOADER_RESTRICT dst_r = dst;
     float* FASTLOADER_RESTRICT dst_g = dst + hw;
     float* FASTLOADER_RESTRICT dst_b = dst + static_cast<ptrdiff_t>(hw) * 2;
+
+    // SSSE3 shuffle masks for 3-channel deinterleave of 16 pixels from 48 bytes.
+    // Input layout across three 16-byte registers a, b, c:
+    //   a = [R0 G0 B0 R1 G1 B1 R2 G2 B2 R3 G3 B3 R4 G4 B4 R5]
+    //   b = [G5 B5 R6 G6 B6 R7 G7 B7 R8 G8 B8 R9 G9 B9 R10 G10]
+    //   c = [B10 R11 G11 B11 R12 G12 B12 R13 G13 B13 R14 G14 B14 R15 G15 B15]
+    //
+    // Extract R channel: bytes at positions 0,3,6,9,12,15 from a, 2,5,8,11,14 from b, 1,4,7,10,13 from c
+    // We use pshufb to select wanted bytes within each register (0x80 = zero),
+    // then OR the results.
+    static const __m128i shuf_r_a = _mm_setr_epi8( 0, 3, 6, 9,12,15,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1);
+    static const __m128i shuf_r_b = _mm_setr_epi8(-1,-1,-1,-1,-1,-1, 2, 5, 8,11,14,-1,-1,-1,-1,-1);
+    static const __m128i shuf_r_c = _mm_setr_epi8(-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 1, 4, 7,10,13);
+
+    static const __m128i shuf_g_a = _mm_setr_epi8( 1, 4, 7,10,13,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1);
+    static const __m128i shuf_g_b = _mm_setr_epi8(-1,-1,-1,-1,-1, 0, 3, 6, 9,12,15,-1,-1,-1,-1,-1);
+    static const __m128i shuf_g_c = _mm_setr_epi8(-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 2, 5, 8,11,14);
+
+    static const __m128i shuf_b_a = _mm_setr_epi8( 2, 5, 8,11,14,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1);
+    static const __m128i shuf_b_b = _mm_setr_epi8(-1,-1,-1,-1,-1, 1, 4, 7,10,13,-1,-1,-1,-1,-1,-1);
+    static const __m128i shuf_b_c = _mm_setr_epi8(-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 0, 3, 6, 9,12,15);
+
     int i = 0;
-    for (; i + 3 < hw; i += 4) {
-        dst_r[0] = static_cast<float>(src[0]) * scale;
-        dst_g[0] = static_cast<float>(src[1]) * scale;
-        dst_b[0] = static_cast<float>(src[2]) * scale;
-        dst_r[1] = static_cast<float>(src[3]) * scale;
-        dst_g[1] = static_cast<float>(src[4]) * scale;
-        dst_b[1] = static_cast<float>(src[5]) * scale;
-        dst_r[2] = static_cast<float>(src[6]) * scale;
-        dst_g[2] = static_cast<float>(src[7]) * scale;
-        dst_b[2] = static_cast<float>(src[8]) * scale;
-        dst_r[3] = static_cast<float>(src[9]) * scale;
-        dst_g[3] = static_cast<float>(src[10]) * scale;
-        dst_b[3] = static_cast<float>(src[11]) * scale;
-        src += 12;
-        dst_r += 4;
-        dst_g += 4;
-        dst_b += 4;
+    for (; i + 15 < hw; i += 16) {
+        // Load 48 bytes (16 RGB pixels) as three 128-bit registers
+        const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src));
+        const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 16));
+        const __m128i c = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 32));
+
+        // Deinterleave: collect R, G, B bytes from a, b, c using pshufb + OR
+        const __m128i r16 = _mm_or_si128(_mm_shuffle_epi8(a, shuf_r_a),
+                            _mm_or_si128(_mm_shuffle_epi8(b, shuf_r_b),
+                                         _mm_shuffle_epi8(c, shuf_r_c)));
+        const __m128i g16 = _mm_or_si128(_mm_shuffle_epi8(a, shuf_g_a),
+                            _mm_or_si128(_mm_shuffle_epi8(b, shuf_g_b),
+                                         _mm_shuffle_epi8(c, shuf_g_c)));
+        const __m128i b16 = _mm_or_si128(_mm_shuffle_epi8(a, shuf_b_a),
+                            _mm_or_si128(_mm_shuffle_epi8(b, shuf_b_b),
+                                         _mm_shuffle_epi8(c, shuf_b_c)));
+
+        // Convert R channel: 16 bytes → 2×8 floats
+        const __m256 r_lo = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(r16)), scale);
+        const __m256 r_hi = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(r16, 8))), scale);
+        _mm256_storeu_ps(dst_r, r_lo);
+        _mm256_storeu_ps(dst_r + 8, r_hi);
+
+        // Convert G channel
+        const __m256 g_lo = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(g16)), scale);
+        const __m256 g_hi = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(g16, 8))), scale);
+        _mm256_storeu_ps(dst_g, g_lo);
+        _mm256_storeu_ps(dst_g + 8, g_hi);
+
+        // Convert B channel
+        const __m256 b_lo = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(b16)), scale);
+        const __m256 b_hi = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(b16, 8))), scale);
+        _mm256_storeu_ps(dst_b, b_lo);
+        _mm256_storeu_ps(dst_b + 8, b_hi);
+
+        src += 48;
+        dst_r += 16;
+        dst_g += 16;
+        dst_b += 16;
     }
+    // Scalar tail
     for (; i < hw; ++i) {
-        dst_r[0] = static_cast<float>(src[0]) * scale;
-        dst_g[0] = static_cast<float>(src[1]) * scale;
-        dst_b[0] = static_cast<float>(src[2]) * scale;
+        *dst_r++ = static_cast<float>(src[0]) * (1.0f / 255.0f);
+        *dst_g++ = static_cast<float>(src[1]) * (1.0f / 255.0f);
+        *dst_b++ = static_cast<float>(src[2]) * (1.0f / 255.0f);
         src += 3;
-        ++dst_r;
-        ++dst_g;
-        ++dst_b;
     }
 }
 
 void hwc_uint8_to_nchw_float(const uint8_t* src, float* dst, int height, int width) {
-    FASTLOADER_PROFILE_SCOPE("compiler.pixels.convert.scalar");
-    hwc_uint8_to_nchw_float_scalar(src, dst, height, width);
+    FASTLOADER_PROFILE_SCOPE("compiler.pixels.convert.avx2");
+    hwc_uint8_to_nchw_float_avx2(src, dst, height, width);
 }
 
-void decode_pixel_range(const std::filesystem::path& split_dir,
+void decode_pixel_image(const std::filesystem::path& split_dir,
                         const WritablePixelRange& pixel_blob,
-                        uint32_t image_start,
-                        uint32_t image_end,
+                        uint32_t image_index,
                         uint32_t target_width,
                         uint32_t target_height,
+                        RgbImageResizer& image_resizer,
                         size_t image_stride,
-                        std::vector<uint8_t>& resize_scratch,
-                        uint32_t num_images_total,
-                        std::atomic<size_t>& completed_images,
-                        std::mutex& progress_mtx,
-                        const std::function<void(size_t, size_t)>& progress_cb) {
-    FASTLOADER_PROFILE_SCOPE("compiler.pixels.decode_range");
+                        std::vector<uint8_t>& resize_scratch) {
     const int width = checked_cast<int>(target_width, "image width too large");
     const int height = checked_cast<int>(target_height, "image height too large");
 
-    for (uint32_t image_index = image_start; image_index < image_end; ++image_index) {
-        const std::filesystem::path img_path = image_path(split_dir, image_index);
-        float* dst = pixel_blob.image(image_index, image_stride);
+    const std::filesystem::path img_path = image_path(split_dir, image_index);
+    float* dst = pixel_blob.image(image_index, image_stride);
 
-        int raw_width = 0;
-        int raw_height = 0;
-        int raw_channels = 0;
-        uint8_t* raw_pixels = nullptr;
+    int raw_width = 0;
+    int raw_height = 0;
+    int raw_channels = 0;
+    uint8_t* raw_pixels = nullptr;
+    {
+        FASTLOADER_PROFILE_SCOPE("compiler.pixels.load_png");
+        raw_pixels = stbi_load(img_path.c_str(), &raw_width, &raw_height, &raw_channels, 3);
+    }
+    if (!raw_pixels) {
+        throw std::runtime_error("failed to load image file: " + img_path.string());
+    }
+
+    const uint8_t* src_pixels = raw_pixels;
+    if (static_cast<uint32_t>(raw_width) != target_width ||
+        static_cast<uint32_t>(raw_height) != target_height) {
+        const size_t resized_bytes = static_cast<size_t>(target_width) * target_height * 3;
+        if (resize_scratch.capacity() < resized_bytes) {
+            FASTLOADER_PROFILE_ADD("compiler.pixels.resize_scratch_grows", 1);
+            FASTLOADER_PROFILE_ADD("compiler.pixels.resize_scratch_bytes", resized_bytes);
+        }
         {
-            FASTLOADER_PROFILE_SCOPE("compiler.pixels.load_png");
-            raw_pixels = stbi_load(img_path.c_str(), &raw_width, &raw_height, &raw_channels, 3);
+            FASTLOADER_PROFILE_SCOPE("compiler.pixels.resize");
+            resize_scratch.resize(resized_bytes);
+            image_resizer.resize(raw_pixels,
+                                 raw_width,
+                                 raw_height,
+                                 resize_scratch.data(),
+                                 width,
+                                 height);
         }
-        if (!raw_pixels) {
-            throw std::runtime_error("failed to load image file: " + img_path.string());
+        FASTLOADER_PROFILE_ADD("compiler.pixels.resize_count", 1);
+        src_pixels = resize_scratch.data();
+    }
+
+    FASTLOADER_PROFILE_ADD("compiler.pixels.convert_bytes",
+                           static_cast<size_t>(width) * height * 3);
+    hwc_uint8_to_nchw_float(src_pixels, dst, height, width);
+    stbi_image_free(raw_pixels);
+}
+
+void decode_pixel_worker(const std::filesystem::path& split_dir,
+                         const WritablePixelRange& pixel_blob,
+                         std::atomic<uint32_t>& next_image,
+                         uint32_t num_images,
+                         uint32_t target_width,
+                         uint32_t target_height,
+                         size_t image_stride,
+                         int resize_threads_per_image,
+                         ProgressCounter* completed_images) {
+    FASTLOADER_PROFILE_SCOPE("compiler.pixels.decode_worker");
+    RgbImageResizer image_resizer(resize_threads_per_image);
+    std::vector<uint8_t> resize_scratch;
+    while (true) {
+        const uint32_t image_index = next_image.fetch_add(1, std::memory_order_relaxed);
+        if (image_index >= num_images) {
+            break;
         }
-
-        const uint8_t* src_pixels = raw_pixels;
-        if (static_cast<uint32_t>(raw_width) != target_width ||
-            static_cast<uint32_t>(raw_height) != target_height) {
-            const size_t resized_bytes = static_cast<size_t>(target_width) * target_height * 3;
-            if (resize_scratch.capacity() < resized_bytes) {
-                FASTLOADER_PROFILE_ADD("compiler.pixels.resize_scratch_grows", 1);
-                FASTLOADER_PROFILE_ADD("compiler.pixels.resize_scratch_bytes", resized_bytes);
-            }
-            {
-                FASTLOADER_PROFILE_SCOPE("compiler.pixels.resize");
-                resize_scratch.resize(resized_bytes);
-                stbir_resize_uint8_linear(
-                    raw_pixels,
-                    raw_width,
-                    raw_height,
-                    0,
-                    resize_scratch.data(),
-                    width,
-                    height,
-                    0,
-                    static_cast<stbir_pixel_layout>(3));
-            }
-            FASTLOADER_PROFILE_ADD("compiler.pixels.resize_count", 1);
-            src_pixels = resize_scratch.data();
+        if (completed_images != nullptr) {
+            completed_images->begin_work();
         }
-
-        FASTLOADER_PROFILE_ADD("compiler.pixels.convert_bytes",
-                               static_cast<size_t>(width) * height * 3);
-        hwc_uint8_to_nchw_float(src_pixels, dst, height, width);
-        stbi_image_free(raw_pixels);
-
-        if (progress_cb) {
-            const size_t done = completed_images.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (done % 100 == 0 || done == num_images_total) {
-                std::lock_guard<std::mutex> lock(progress_mtx);
-                progress_cb(done, num_images_total);
+        try {
+            decode_pixel_image(split_dir,
+                               pixel_blob,
+                               image_index,
+                               target_width,
+                               target_height,
+                               image_resizer,
+                               image_stride,
+                               resize_scratch);
+            if (completed_images != nullptr) {
+                completed_images->finish_work();
             }
+        } catch (...) {
+            if (completed_images != nullptr) {
+                completed_images->end_work();
+            }
+            throw;
         }
     }
 }
@@ -210,40 +276,36 @@ void write_pixel_blob(const FileHandle& fd,
                       uint32_t height,
                       size_t image_stride,
                       int num_workers,
-                      size_t pixel_offset,
-                      const std::function<void(size_t, size_t)>& progress_cb) {
+                      bool any_resize,
+                      bool any_downscale,
+                      ProgressCounter* completed_images,
+                      size_t pixel_offset) {
     FASTLOADER_PROFILE_SCOPE("compiler.pixels.write_blob");
     const size_t pixel_bytes = static_cast<size_t>(num_images) * image_stride;
     FASTLOADER_PROFILE_SET("compiler.pixels.total_bytes", pixel_bytes);
     WritablePixelRange pixel_blob(fd, pixel_offset, pixel_bytes);
 
     if (num_images == 0) {
-        if (progress_cb) {
-            progress_cb(0, 0);
-        }
         return;
     }
 
-    FASTLOADER_PROFILE_SET("compiler.pixels.chunk_size", num_images);
+    const ResizeWorkerPlan resize_plan = plan_rgb_resize_workers(num_workers, any_resize, any_downscale);
+    FASTLOADER_PROFILE_SET("compiler.pixels.worker.count", static_cast<size_t>(resize_plan.image_workers));
+    FASTLOADER_PROFILE_SET("compiler.pixels.image_workers", static_cast<size_t>(resize_plan.image_workers));
+    FASTLOADER_PROFILE_SET("compiler.pixels.resize_threads_per_image",
+                           static_cast<size_t>(resize_plan.resize_threads_per_image));
+    std::atomic<uint32_t> next_image{0};
 
-    std::atomic<size_t> completed_images{0};
-    std::mutex progress_mtx;
-    parallel_for_range<uint32_t>(0, num_images, num_workers, [&](uint32_t local_start,
-                                                                 uint32_t local_end) {
-        FASTLOADER_PROFILE_ADD("compiler.pixels.chunk_count", 1);
-        std::vector<uint8_t> resize_scratch;
-        decode_pixel_range(split_dir,
-                           pixel_blob,
-                           local_start,
-                           local_end,
-                           width,
-                           height,
-                           image_stride,
-                           resize_scratch,
-                           num_images,
-                           completed_images,
-                           progress_mtx,
-                           progress_cb);
+    parallel_for_range_indexed<int>(0, resize_plan.image_workers, resize_plan.image_workers, [&](int, int, int) {
+        decode_pixel_worker(split_dir,
+                            pixel_blob,
+                            next_image,
+                            num_images,
+                            width,
+                            height,
+                            image_stride,
+                            resize_plan.resize_threads_per_image,
+                            completed_images);
     });
 }
 

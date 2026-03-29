@@ -42,8 +42,8 @@ public:
           allocator_() {
         FASTLOADER_PROFILE_SCOPE("rfdetr.native.onnx.construct");
         ensure_cuda_ok(cudaSetDevice(device_id_), "cudaSetDevice for ONNX backend");
-        ensure_cuda_ok(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking),
-                       "cudaStreamCreateWithFlags for ONNX backend");
+        ensure_cuda_ok(fastloader::cuda_stream_create_with_highest_priority(&stream_, cudaStreamNonBlocking),
+                       "cudaStreamCreateWithPriority for ONNX backend");
         session_options_.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
         session_options_.SetIntraOpNumThreads(1);
         session_options_.SetInterOpNumThreads(1);

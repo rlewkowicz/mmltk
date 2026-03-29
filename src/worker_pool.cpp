@@ -1,4 +1,5 @@
 #include "worker_pool.h"
+#include "execution_policy.h"
 
 #include <condition_variable>
 #include <deque>
@@ -93,12 +94,23 @@ WorkerPool::WorkerPool(size_t worker_count,
     }
     impl_->cpu_affinity = cpu_affinity.empty() ? allowed_cpu_set() : std::move(cpu_affinity);
     impl_->thread_name_prefix = std::move(thread_name_prefix);
-    impl_->workers.reserve(worker_count);
-    for (size_t worker_index = 0; worker_index < worker_count; ++worker_index) {
+    const size_t actual_worker_count = static_cast<size_t>(
+        clamp_worker_count_to_cpus(static_cast<int>(worker_count), impl_->cpu_affinity.size(), 0, 1));
+    log_worker_budget_clamp("worker_pool",
+                            static_cast<int>(worker_count),
+                            static_cast<int>(actual_worker_count),
+                            impl_->cpu_affinity);
+    impl_->workers.reserve(actual_worker_count);
+    for (size_t worker_index = 0; worker_index < actual_worker_count; ++worker_index) {
         impl_->workers.emplace_back([this, worker_index] {
             try {
-                pin_thread_to_cpu(impl_->cpu_affinity, worker_index);
-                set_thread_name(worker_name_for_index(impl_->thread_name_prefix, worker_index));
+                apply_worker_execution_policy(ExecutionPolicyRequest{
+                    impl_->cpu_affinity,
+                    worker_name_for_index(impl_->thread_name_prefix, worker_index),
+                    worker_index,
+                    true,
+                    true,
+                });
             } catch (...) {
                 std::lock_guard<std::mutex> lock(impl_->mutex);
                 if (impl_->startup_error == nullptr) {
@@ -166,7 +178,7 @@ WorkerPool::WorkerPool(size_t worker_count,
         });
     }
     try {
-        impl_->wait_for_startup(worker_count);
+        impl_->wait_for_startup(actual_worker_count);
     } catch (...) {
         impl_->request_shutdown();
         impl_->join_all();

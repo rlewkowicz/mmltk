@@ -1,9 +1,12 @@
 #include "rfdetr/runtime.h"
 
+#include "execution_policy.h"
+
 #include <ATen/Context.h>
 #include <torch/script.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <stdexcept>
 
 namespace fastloader::rfdetr {
@@ -48,8 +51,24 @@ RuntimeConfig resolve_runtime_config(int requested_workers,
     config.cpu_affinity =
         cpu_affinity_value.empty() ? fastloader::allowed_cpu_set()
                                    : fastloader::resolve_cpu_affinity(cpu_affinity_value);
-    const int default_workers = static_cast<int>(config.cpu_affinity.size());
-    config.workers = std::max(3, clamp_positive(requested_workers, std::max(1, default_workers)));
+    const int available_workers = static_cast<int>(std::max<size_t>(config.cpu_affinity.size(), 1));
+    const int default_workers = available_workers;
+    const int requested_total = clamp_positive(requested_workers, std::max(1, default_workers));
+    if (available_workers >= 3) {
+        config.workers =
+            fastloader::clamp_worker_count_to_cpus(requested_total, config.cpu_affinity.size(), 0, 3);
+        fastloader::log_worker_budget_clamp("rfdetr.runtime",
+                                            requested_total,
+                                            config.workers,
+                                            config.cpu_affinity,
+                                            0,
+                                            3);
+    } else {
+        config.workers = std::max(3, requested_total);
+        std::fprintf(stderr,
+                     "[exec] rfdetr.runtime cpuset=%s has fewer than 3 CPUs; runtime helper threads will overlap\n",
+                     fastloader::format_cpu_list(config.cpu_affinity).c_str());
+    }
     config.lanes = clamp_positive(requested_lanes, 1);
     return config;
 }

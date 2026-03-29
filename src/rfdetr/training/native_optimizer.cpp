@@ -13,6 +13,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 
 namespace fastloader::rfdetr {
@@ -24,6 +25,16 @@ constexpr int64_t kNativeAdamWFormatVersion = 1;
 constexpr double kAdamBeta1 = 0.9;
 constexpr double kAdamBeta2 = 0.999;
 constexpr double kAdamEps = 1.0e-8;
+constexpr const char* kNativeMuonFormat = "fastloader.rfdetr.native_muon_aux_adam";
+constexpr int64_t kNativeMuonFormatVersion = 1;
+constexpr double kMuonCoeffA = 3.4445;
+constexpr double kMuonCoeffB = -4.7750;
+constexpr double kMuonCoeffC = 2.0315;
+constexpr double kMuonNormEps = 1.0e-7;
+constexpr int64_t kMuonNsSteps = 5;
+constexpr double kAuxAdamBeta1 = 0.9;
+constexpr double kAuxAdamBeta2 = 0.95;
+constexpr double kAuxAdamEps = 1.0e-10;
 
 std::string archive_entry_name(const char* prefix, size_t index) {
     std::ostringstream stream;
@@ -47,7 +58,7 @@ std::string require_string(torch::serialize::InputArchive& archive, const char* 
     c10::IValue value;
     archive.read(key, value);
     if (!value.isString()) {
-        throw std::runtime_error(std::string("native AdamW archive key is not a string: ") + key);
+        throw std::runtime_error(std::string("optimizer archive key is not a string: ") + key);
     }
     return value.toStringRef();
 }
@@ -56,7 +67,7 @@ int64_t require_int(torch::serialize::InputArchive& archive, const char* key) {
     c10::IValue value;
     archive.read(key, value);
     if (!value.isInt()) {
-        throw std::runtime_error(std::string("native AdamW archive key is not an int: ") + key);
+        throw std::runtime_error(std::string("optimizer archive key is not an int: ") + key);
     }
     return value.toInt();
 }
@@ -70,14 +81,14 @@ double require_double(torch::serialize::InputArchive& archive, const char* key) 
     if (value.isInt()) {
         return static_cast<double>(value.toInt());
     }
-    throw std::runtime_error(std::string("native AdamW archive key is not a number: ") + key);
+    throw std::runtime_error(std::string("optimizer archive key is not a number: ") + key);
 }
 
 torch::Tensor require_tensor(torch::serialize::InputArchive& archive, const char* key) {
     torch::Tensor tensor;
     archive.read(key, tensor);
     if (!tensor.defined()) {
-        throw std::runtime_error(std::string("native AdamW archive tensor is undefined: ") + key);
+        throw std::runtime_error(std::string("optimizer archive tensor is undefined: ") + key);
     }
     return tensor;
 }
@@ -132,7 +143,75 @@ void validate_group_indices(const NativeAdamW::Group& group, size_t param_count)
     }
 }
 
+void validate_group_indices(const NativeMuonWithAuxAdam::Group& group, size_t param_count) {
+    for (const size_t index : group.param_indices) {
+        if (index >= param_count) {
+            throw std::runtime_error("native Muon parameter group index is out of range");
+        }
+    }
+}
+
+torch::Tensor muon_zeropower_via_newtonschulz5(const torch::Tensor& grad, const int64_t steps = kMuonNsSteps) {
+    if (grad.dim() < 2) {
+        throw std::runtime_error("native Muon zeropower requires tensors with rank >= 2");
+    }
+
+    auto update = grad.to(torch::kBFloat16);
+    const bool transpose = update.size(-2) > update.size(-1);
+    if (transpose) {
+        update = update.transpose(-2, -1);
+    }
+    const auto denom = update.flatten(-2).norm(2, -1, true).unsqueeze(-1).add(kMuonNormEps);
+    update = update / denom;
+    for (int64_t step = 0; step < steps; ++step) {
+        auto gram = torch::matmul(update, update.transpose(-2, -1));
+        auto poly = gram.mul(kMuonCoeffB).add(torch::matmul(gram, gram), kMuonCoeffC);
+        update = update.mul(kMuonCoeffA).add_(torch::matmul(poly, update));
+    }
+    if (transpose) {
+        update = update.transpose(-2, -1);
+    }
+    return update;
+}
+
+torch::Tensor muon_update(torch::Tensor grad,
+                          torch::Tensor& momentum,
+                          const double beta,
+                          const bool nesterov) {
+    momentum.lerp_(grad, 1.0 - beta);
+    auto update = nesterov ? grad.lerp_(momentum, beta) : momentum;
+    if (update.dim() == 4) {
+        update = update.view({update.size(0), -1});
+    }
+    update = muon_zeropower_via_newtonschulz5(update);
+    update.mul_(std::sqrt(std::max(1.0, static_cast<double>(update.size(-2)) / static_cast<double>(update.size(-1)))));
+    return update;
+}
+
+torch::Tensor adam_update(torch::Tensor grad,
+                          torch::Tensor& exp_avg,
+                          torch::Tensor& exp_avg_sq,
+                          const int64_t step) {
+    exp_avg.lerp_(grad, 1.0 - kAuxAdamBeta1);
+    exp_avg_sq.lerp_(grad.square(), 1.0 - kAuxAdamBeta2);
+    const double bias_correction1 = 1.0 - std::pow(kAuxAdamBeta1, static_cast<double>(step));
+    const double bias_correction2 = 1.0 - std::pow(kAuxAdamBeta2, static_cast<double>(step));
+    auto exp_avg_corrected = exp_avg / bias_correction1;
+    auto exp_avg_sq_corrected = exp_avg_sq / bias_correction2;
+    return exp_avg_corrected / (exp_avg_sq_corrected.sqrt() + kAuxAdamEps);
+}
+
 } // namespace
+
+const char* train_optimizer_kind_name(const TrainOptimizerKind kind) {
+    switch (kind) {
+    case TrainOptimizerKind::AdamW:
+        return "adamw";
+    case TrainOptimizerKind::Muon:
+        return "muon";
+    }
+    return "unknown";
+}
 
 const char* native_optimizer_backend_name(const NativeOptimizerBackend backend) {
     switch (backend) {
@@ -663,6 +742,376 @@ void NativeAdamW::load(torch::serialize::InputArchive& archive) {
             state_[index].max_exp_avg_sq = torch::Tensor();
         }
     }
+}
+
+NativeMuonWithAuxAdam::NativeMuonWithAuxAdam(std::vector<Group> groups,
+                                             std::vector<NamedParameter> params)
+    : groups_(std::move(groups)), params_(std::move(params)) {
+    all_params_.reserve(params_.size());
+    all_param_names_.reserve(params_.size());
+    for (const auto& param : params_) {
+        if (!param.tensor.defined()) {
+            throw std::runtime_error("native Muon received an undefined parameter tensor");
+        }
+        all_params_.push_back(param.tensor);
+        all_param_names_.push_back(param.name);
+    }
+    for (const auto& group : groups_) {
+        validate_group_indices(group, params_.size());
+    }
+    initialize_state();
+}
+
+std::vector<torch::Tensor>& NativeMuonWithAuxAdam::parameters() {
+    return all_params_;
+}
+
+const std::vector<torch::Tensor>& NativeMuonWithAuxAdam::parameters() const {
+    return all_params_;
+}
+
+const std::vector<std::string>& NativeMuonWithAuxAdam::parameter_names() const {
+    return all_param_names_;
+}
+
+const std::vector<NativeMuonWithAuxAdam::Group>& NativeMuonWithAuxAdam::groups() const {
+    return groups_;
+}
+
+const char* NativeMuonWithAuxAdam::backend_name() const {
+    return "eager";
+}
+
+void NativeMuonWithAuxAdam::initialize_state() {
+    state_.clear();
+    state_.resize(params_.size());
+
+    std::vector<bool> use_muon(params_.size(), false);
+    for (const auto& group : groups_) {
+        for (const auto index : group.param_indices) {
+            use_muon[index] = group.config.use_muon;
+        }
+    }
+
+    for (size_t index = 0; index < params_.size(); ++index) {
+        const auto& param = params_[index].tensor;
+        auto& state = state_[index];
+        if (use_muon[index]) {
+            state.momentum_buffer = torch::zeros_like(param);
+        } else {
+            state.exp_avg = torch::zeros_like(param);
+            state.exp_avg_sq = torch::zeros_like(param);
+        }
+    }
+}
+
+void NativeMuonWithAuxAdam::zero_grad(const bool set_to_none) {
+    torch::NoGradGuard no_grad;
+    for (auto& param : all_params_) {
+        if (!param.grad().defined()) {
+            continue;
+        }
+        if (set_to_none) {
+            param.mutable_grad() = torch::Tensor();
+            continue;
+        }
+        auto& grad = param.mutable_grad();
+        grad.detach_();
+        grad.zero_();
+    }
+}
+
+void NativeMuonWithAuxAdam::set_lrs(const std::vector<double>& base_lrs, const double scale) {
+    if (base_lrs.size() != groups_.size()) {
+        throw std::runtime_error("native Muon base LR count does not match param group count");
+    }
+    for (size_t index = 0; index < groups_.size(); ++index) {
+        groups_[index].config.lr = base_lrs[index] * scale;
+    }
+}
+
+void NativeMuonWithAuxAdam::set_muon_momentum(const double momentum) {
+    for (auto& group : groups_) {
+        if (!group.config.use_muon) {
+            continue;
+        }
+        group.config.momentum = momentum;
+    }
+}
+
+void NativeMuonWithAuxAdam::step() {
+    torch::NoGradGuard no_grad;
+    for (const auto& group : groups_) {
+        for (const auto index : group.param_indices) {
+            auto& param = params_[index].tensor;
+            if (!param.is_floating_point() || torch::is_complex(param)) {
+                throw std::runtime_error("native Muon requires real floating-point parameters");
+            }
+
+            auto grad = param.grad().defined() ? param.grad() : torch::zeros_like(param);
+            if (grad.is_sparse()) {
+                throw std::runtime_error("native Muon does not support sparse gradients");
+            }
+            if (grad.device() != param.device() || grad.scalar_type() != param.scalar_type()) {
+                grad = align_tensor_like_param(grad, param);
+            }
+
+            auto& state = state_[index];
+            if (group.config.use_muon) {
+                if (!state.momentum_buffer.defined() || state.momentum_buffer.sizes() != param.sizes()) {
+                    state.momentum_buffer = torch::zeros_like(param);
+                }
+                if (state.momentum_buffer.device() != param.device() ||
+                    state.momentum_buffer.scalar_type() != param.scalar_type()) {
+                    state.momentum_buffer = align_tensor_like_param(state.momentum_buffer, param);
+                }
+                auto update = muon_update(grad, state.momentum_buffer, group.config.momentum, group.config.nesterov);
+                if (group.config.weight_decay != 0.0) {
+                    param.mul_(1.0 - group.config.lr * group.config.weight_decay);
+                }
+                param.add_(update.reshape_as(param), -group.config.lr);
+                continue;
+            }
+
+            if (!state.exp_avg.defined() || state.exp_avg.sizes() != param.sizes()) {
+                state.exp_avg = torch::zeros_like(param);
+            }
+            if (!state.exp_avg_sq.defined() || state.exp_avg_sq.sizes() != param.sizes()) {
+                state.exp_avg_sq = torch::zeros_like(param);
+            }
+            if (state.exp_avg.device() != param.device() ||
+                state.exp_avg.scalar_type() != param.scalar_type()) {
+                state.exp_avg = align_tensor_like_param(state.exp_avg, param);
+            }
+            if (state.exp_avg_sq.device() != param.device() ||
+                state.exp_avg_sq.scalar_type() != param.scalar_type()) {
+                state.exp_avg_sq = align_tensor_like_param(state.exp_avg_sq, param);
+            }
+            ++state.step;
+            auto update = adam_update(grad, state.exp_avg, state.exp_avg_sq, state.step);
+            if (group.config.weight_decay != 0.0) {
+                param.mul_(1.0 - group.config.lr * group.config.weight_decay);
+            }
+            param.add_(update, -group.config.lr);
+        }
+    }
+}
+
+void NativeMuonWithAuxAdam::save(torch::serialize::OutputArchive& archive) const {
+    write_string(archive, "format", kNativeMuonFormat);
+    write_int(archive, "format_version", kNativeMuonFormatVersion);
+    write_int(archive, "ns_steps", kMuonNsSteps);
+    write_double(archive, "muon_coeff_a", kMuonCoeffA);
+    write_double(archive, "muon_coeff_b", kMuonCoeffB);
+    write_double(archive, "muon_coeff_c", kMuonCoeffC);
+    write_double(archive, "muon_eps", kMuonNormEps);
+    write_double(archive, "aux_adam_beta1", kAuxAdamBeta1);
+    write_double(archive, "aux_adam_beta2", kAuxAdamBeta2);
+    write_double(archive, "aux_adam_eps", kAuxAdamEps);
+    write_int(archive, "group_count", static_cast<int64_t>(groups_.size()));
+    write_int(archive, "param_count", static_cast<int64_t>(params_.size()));
+
+    for (size_t index = 0; index < groups_.size(); ++index) {
+        torch::serialize::OutputArchive group_archive;
+        write_double(group_archive, "lr", groups_[index].config.lr);
+        write_double(group_archive, "weight_decay", groups_[index].config.weight_decay);
+        write_double(group_archive, "momentum", groups_[index].config.momentum);
+        write_int(group_archive, "use_muon", groups_[index].config.use_muon ? 1 : 0);
+        write_int(group_archive, "nesterov", groups_[index].config.nesterov ? 1 : 0);
+        write_int(group_archive, "param_index_count", static_cast<int64_t>(groups_[index].param_indices.size()));
+        for (size_t param_index = 0; param_index < groups_[index].param_indices.size(); ++param_index) {
+            write_int(group_archive,
+                      archive_entry_name("param_index", param_index).c_str(),
+                      static_cast<int64_t>(groups_[index].param_indices[param_index]));
+        }
+        archive.write(archive_entry_name("group", index), group_archive);
+    }
+
+    for (size_t index = 0; index < params_.size(); ++index) {
+        const auto use_muon = [&]() {
+            for (const auto& group : groups_) {
+                if (std::find(group.param_indices.begin(), group.param_indices.end(), index) != group.param_indices.end()) {
+                    return group.config.use_muon;
+                }
+            }
+            return false;
+        }();
+
+        torch::serialize::OutputArchive param_archive;
+        write_string(param_archive, "name", params_[index].name);
+        write_int(param_archive, "use_muon", use_muon ? 1 : 0);
+        if (use_muon) {
+            param_archive.write(
+                "momentum_buffer",
+                detail::prepare_tensor_for_checkpoint_write(state_[index].momentum_buffer));
+        } else {
+            write_int(param_archive, "step", state_[index].step);
+            param_archive.write("exp_avg", detail::prepare_tensor_for_checkpoint_write(state_[index].exp_avg));
+            param_archive.write("exp_avg_sq", detail::prepare_tensor_for_checkpoint_write(state_[index].exp_avg_sq));
+        }
+        archive.write(archive_entry_name("param", index), param_archive);
+    }
+}
+
+void NativeMuonWithAuxAdam::load(torch::serialize::InputArchive& archive) {
+    c10::IValue format_value;
+    if (!archive.try_read("format", format_value) || !format_value.isString() ||
+        format_value.toStringRef() != kNativeMuonFormat) {
+        throw std::runtime_error(
+            "native RF-DETR resume checkpoint uses a legacy Muon archive; rebuild the checkpoint with the current fastloader");
+    }
+    const auto version = require_int(archive, "format_version");
+    if (version != kNativeMuonFormatVersion) {
+        throw std::runtime_error("unsupported native Muon archive version: " + std::to_string(version));
+    }
+    if (require_int(archive, "ns_steps") != kMuonNsSteps ||
+        std::abs(require_double(archive, "muon_coeff_a") - kMuonCoeffA) > 1.0e-12 ||
+        std::abs(require_double(archive, "muon_coeff_b") - kMuonCoeffB) > 1.0e-12 ||
+        std::abs(require_double(archive, "muon_coeff_c") - kMuonCoeffC) > 1.0e-12 ||
+        std::abs(require_double(archive, "muon_eps") - kMuonNormEps) > 1.0e-12 ||
+        std::abs(require_double(archive, "aux_adam_beta1") - kAuxAdamBeta1) > 1.0e-12 ||
+        std::abs(require_double(archive, "aux_adam_beta2") - kAuxAdamBeta2) > 1.0e-12 ||
+        std::abs(require_double(archive, "aux_adam_eps") - kAuxAdamEps) > 1.0e-12) {
+        throw std::runtime_error("native Muon archive hyperparameters do not match the compiled optimizer");
+    }
+
+    const auto group_count = require_int(archive, "group_count");
+    const auto param_count = require_int(archive, "param_count");
+    if (group_count != static_cast<int64_t>(groups_.size()) || param_count != static_cast<int64_t>(params_.size())) {
+        throw std::runtime_error("native Muon archive layout does not match the current optimizer");
+    }
+
+    for (size_t index = 0; index < groups_.size(); ++index) {
+        torch::serialize::InputArchive group_archive;
+        archive.read(archive_entry_name("group", index), group_archive);
+        groups_[index].config.lr = require_double(group_archive, "lr");
+        groups_[index].config.weight_decay = require_double(group_archive, "weight_decay");
+        groups_[index].config.momentum = require_double(group_archive, "momentum");
+        groups_[index].config.use_muon = require_int(group_archive, "use_muon") != 0;
+        groups_[index].config.nesterov = require_int(group_archive, "nesterov") != 0;
+        const auto param_index_count = require_int(group_archive, "param_index_count");
+        if (param_index_count != static_cast<int64_t>(groups_[index].param_indices.size())) {
+            throw std::runtime_error("native Muon archive parameter group size does not match the current optimizer");
+        }
+        for (size_t param_index = 0; param_index < groups_[index].param_indices.size(); ++param_index) {
+            const auto stored_param_index =
+                require_int(group_archive, archive_entry_name("param_index", param_index).c_str());
+            if (stored_param_index != static_cast<int64_t>(groups_[index].param_indices[param_index])) {
+                throw std::runtime_error("native Muon archive parameter group order does not match the current optimizer");
+            }
+        }
+    }
+
+    std::vector<bool> use_muon(params_.size(), false);
+    for (const auto& group : groups_) {
+        for (const auto index : group.param_indices) {
+            use_muon[index] = group.config.use_muon;
+        }
+    }
+
+    for (size_t index = 0; index < params_.size(); ++index) {
+        torch::serialize::InputArchive param_archive;
+        archive.read(archive_entry_name("param", index), param_archive);
+        if (require_string(param_archive, "name") != params_[index].name) {
+            throw std::runtime_error("native Muon archive parameter order does not match the current model");
+        }
+        const bool stored_use_muon = require_int(param_archive, "use_muon") != 0;
+        if (stored_use_muon != use_muon[index]) {
+            throw std::runtime_error("native Muon archive parameter routing does not match the current optimizer");
+        }
+
+        const auto& param = params_[index].tensor;
+        auto& state = state_[index];
+        if (stored_use_muon) {
+            auto momentum_buffer = require_tensor(param_archive, "momentum_buffer");
+            if (momentum_buffer.sizes() != param.sizes()) {
+                throw std::runtime_error("native Muon archive momentum tensor shape does not match the current model");
+            }
+            state.step = 0;
+            state.exp_avg = torch::Tensor();
+            state.exp_avg_sq = torch::Tensor();
+            state.momentum_buffer = momentum_buffer.to(param.device(), param.scalar_type()).contiguous();
+            continue;
+        }
+
+        const auto step = require_int(param_archive, "step");
+        auto exp_avg = require_tensor(param_archive, "exp_avg");
+        auto exp_avg_sq = require_tensor(param_archive, "exp_avg_sq");
+        if (exp_avg.sizes() != param.sizes() || exp_avg_sq.sizes() != param.sizes()) {
+            throw std::runtime_error("native Muon archive AuxAdam tensor shape does not match the current model");
+        }
+        state.step = step;
+        state.momentum_buffer = torch::Tensor();
+        state.exp_avg = exp_avg.to(param.device(), param.scalar_type()).contiguous();
+        state.exp_avg_sq = exp_avg_sq.to(param.device(), param.scalar_type()).contiguous();
+    }
+}
+
+NativeOptimizer::NativeOptimizer(NativeAdamW optimizer)
+    : storage_(std::move(optimizer)) {}
+
+NativeOptimizer::NativeOptimizer(NativeMuonWithAuxAdam optimizer)
+    : storage_(std::move(optimizer)) {}
+
+TrainOptimizerKind NativeOptimizer::kind() const {
+    return std::holds_alternative<NativeAdamW>(storage_) ? TrainOptimizerKind::AdamW : TrainOptimizerKind::Muon;
+}
+
+const char* NativeOptimizer::kind_name() const {
+    return train_optimizer_kind_name(kind());
+}
+
+const char* NativeOptimizer::backend_name() const {
+    return std::visit([](const auto& optimizer) { return optimizer.backend_name(); }, storage_);
+}
+
+std::vector<torch::Tensor>& NativeOptimizer::parameters() {
+    return std::visit([](auto& optimizer) -> std::vector<torch::Tensor>& { return optimizer.parameters(); }, storage_);
+}
+
+const std::vector<torch::Tensor>& NativeOptimizer::parameters() const {
+    return std::visit(
+        [](const auto& optimizer) -> const std::vector<torch::Tensor>& { return optimizer.parameters(); },
+        storage_);
+}
+
+const std::vector<std::string>& NativeOptimizer::parameter_names() const {
+    return std::visit(
+        [](const auto& optimizer) -> const std::vector<std::string>& { return optimizer.parameter_names(); },
+        storage_);
+}
+
+void NativeOptimizer::zero_grad(const bool set_to_none) {
+    std::visit([&](auto& optimizer) { optimizer.zero_grad(set_to_none); }, storage_);
+}
+
+void NativeOptimizer::set_lrs(const std::vector<double>& base_lrs, const double scale) {
+    std::visit([&](auto& optimizer) { optimizer.set_lrs(base_lrs, scale); }, storage_);
+}
+
+void NativeOptimizer::set_muon_momentum(const double momentum) {
+    std::visit(
+        [&](auto& optimizer) {
+            using Optimizer = std::decay_t<decltype(optimizer)>;
+            if constexpr (std::is_same_v<Optimizer, NativeMuonWithAuxAdam>) {
+                optimizer.set_muon_momentum(momentum);
+            } else {
+                (void)momentum;
+            }
+        },
+        storage_);
+}
+
+void NativeOptimizer::step() {
+    std::visit([](auto& optimizer) { optimizer.step(); }, storage_);
+}
+
+void NativeOptimizer::save(torch::serialize::OutputArchive& archive) const {
+    std::visit([&](const auto& optimizer) { optimizer.save(archive); }, storage_);
+}
+
+void NativeOptimizer::load(torch::serialize::InputArchive& archive) {
+    std::visit([&](auto& optimizer) { optimizer.load(archive); }, storage_);
 }
 
 } // namespace fastloader::rfdetr

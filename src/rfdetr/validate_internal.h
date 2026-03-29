@@ -1,8 +1,11 @@
 #pragma once
 
-#include "rfdetr/validate.h"
+#include "fastloader/rfdetr/validate.h"
 
 #include "rfdetr/cuda_utils.h"
+#include "rfdetr/backends.h"
+#include "rfdetr/evaluator.h"
+#include "rfdetr/runtime.h"
 #include "dataset_loader.h"
 
 #include <c10/cuda/CUDAStream.h>
@@ -96,5 +99,9 @@ ValidationBackendResult run_backend_eval_parallel_impl(
     const ModelInfo& model_info,
     const torch::Tensor& mean,
     const torch::Tensor& std);
+
+ValidationBackendResult run_validation_backend(const ValidationOptions& options,
+                                               const CocoDataset& source_dataset,
+                                               InferenceBackend& backend);
 
 } // namespace fastloader::rfdetr

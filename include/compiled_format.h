@@ -9,9 +9,10 @@
 // File layout:
 //   [FileHeader]
 //   [ImageIndex entries]  — immediately after header
+//   [huge_page_pad]       — padding to align pixel blob
+//   [PixelBlob]           — float32 NCHW [0,1] contiguous, page-aligned start
 //   [LabelBlock]          — flat packed labels
 //   [RLE Block]           — mask RLE pairs
-//   [PixelBlob]           — float32 NCHW [0,1] contiguous, page-aligned start
 //
 // The pixel blob IS the tensor. mmap it, pointer-cast, done.
 // Python gets numpy views directly into the mmap. No copies.
@@ -23,7 +24,7 @@
 namespace fastloader {
 
 static constexpr uint64_t MAGIC = 0x46415354'4C445232ULL; // "FASTLDR2"
-static constexpr uint32_t FORMAT_VERSION = 3;
+static constexpr uint32_t FORMAT_VERSION = 4;
 static constexpr uint32_t MAX_CLASSES = 256;
 static constexpr size_t   PAGE_SIZE = 4096;
 static constexpr size_t   HUGE_PAGE_SIZE = size_t{2} * 1024 * 1024; // 2MB THP

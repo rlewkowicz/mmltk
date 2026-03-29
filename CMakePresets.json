@@ -32,6 +32,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "BUILD_TESTS": "OFF",
+        "BUILD_FASTLOADER_GUI": "ON",
         "BUILD_RFDETR_NATIVE": "ON",
         "BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER": "ON"
       }

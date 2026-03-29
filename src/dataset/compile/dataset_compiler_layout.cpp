@@ -1,4 +1,6 @@
 #include "dataset_compiler_internal.h"
+#include "cpu_affinity.h"
+#include "execution_policy.h"
 #include "profile_utils.h"
 
 #include <algorithm>
@@ -8,26 +10,45 @@
 namespace fastloader::compiler_internal {
 
 int resolve_num_workers(int configured_workers) {
+    std::vector<int> allowed;
     if (configured_workers > 0) {
-        return configured_workers;
+        try {
+            allowed = allowed_cpu_set();
+            const int clamped =
+                clamp_worker_count_to_cpus(configured_workers, allowed.size(), 0, 1);
+            log_worker_budget_clamp("compile",
+                                    configured_workers,
+                                    clamped,
+                                    allowed);
+            return clamped;
+        } catch (...) {
+            return configured_workers;
+        }
     }
-    return std::max(1, static_cast<int>(std::thread::hardware_concurrency()) - 2);
+    int available = 0;
+    try {
+        allowed = allowed_cpu_set();
+        available = static_cast<int>(allowed.size());
+    } catch (...) {
+        available = static_cast<int>(std::thread::hardware_concurrency());
+    }
+    return std::max(1, available);
 }
 
-FileLayout compute_layout(uint32_t num_images,
-                          size_t image_stride,
-                          size_t label_count,
-                          size_t rle_count) {
+FileLayout compute_pixel_layout(uint32_t num_images, size_t image_stride) {
     FileLayout layout;
     layout.index_size = static_cast<size_t>(num_images) * sizeof(ImageEntry);
+    layout.pixel_offset = align_up(layout.index_offset + layout.index_size, HUGE_PAGE_SIZE);
+    layout.pixel_blob_size = static_cast<size_t>(num_images) * image_stride;
+    return layout;
+}
+
+void finalize_layout(FileLayout& layout, size_t label_count, size_t rle_count) {
     layout.label_block_size = label_count * sizeof(PackedInstance);
     layout.rle_block_size = rle_count * sizeof(RLEPair);
-    layout.label_offset = layout.index_offset + layout.index_size;
+    layout.label_offset = layout.pixel_offset + layout.pixel_blob_size;
     layout.rle_offset = layout.label_offset + layout.label_block_size;
-    layout.pixel_offset = align_up(layout.rle_offset + layout.rle_block_size, HUGE_PAGE_SIZE);
-    layout.pixel_blob_size = static_cast<size_t>(num_images) * image_stride;
-    layout.total_size = layout.pixel_offset + layout.pixel_blob_size;
-    return layout;
+    layout.total_size = layout.rle_offset + layout.rle_block_size;
 }
 
 void assign_pixel_offsets(std::vector<ImageEntry>& index, size_t pixel_offset, size_t image_stride) {

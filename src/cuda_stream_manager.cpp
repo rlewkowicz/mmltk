@@ -1,4 +1,5 @@
 #include "cuda_stream_manager.h"
+#include "cuda_priority.h"
 #include "profile_utils.h"
 
 #include <cuda_runtime.h>
@@ -159,7 +160,7 @@ std::unique_ptr<SlotPool> create_pool(const PoolKey& key) {
     pool->device_slots.resize(key.num_buffers);
     pool->host_slots.resize(key.num_buffers);
 
-    CUDA_CHECK(cudaStreamCreateWithFlags(&pool->copy_stream, cudaStreamNonBlocking));
+    CUDA_CHECK(fastloader::cuda_stream_create_with_highest_priority(&pool->copy_stream, cudaStreamNonBlocking));
     for (auto& slot : pool->device_slots) {
         CUDA_CHECK(cudaMalloc(&slot.device, pool->buf_bytes));
 #if FASTLOADER_ENABLE_PROFILING

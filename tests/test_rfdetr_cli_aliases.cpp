@@ -115,6 +115,20 @@ void test_validate_still_routes_to_validate() {
     assert(result.output_text.find("rfdetr validate requires --compiled") != std::string::npos);
 }
 
+void test_validate_help_lists_recompile_compile_options() {
+    const SubprocessResult result = run_subprocess_capture_output({
+        fastloader_cli_path(),
+        "rfdetr",
+        "validate",
+        "--help",
+    });
+    assert(result.exit_code == 0);
+    assert(result.output_text.find("--recompile") != std::string::npos);
+    assert(result.output_text.find("--compile-workers") != std::string::npos);
+    assert(result.output_text.find("--compile-cuda-mask-batch-size") != std::string::npos);
+    assert(result.output_text.find("--compile-cuda-device-id") != std::string::npos);
+}
+
 void test_top_level_help_lists_primary_commands() {
     const SubprocessResult result = run_subprocess_capture_output({
         fastloader_cli_path(),
@@ -142,14 +156,32 @@ void test_predict_help_lists_model_inputs() {
     assert(result.output_text.find("--tensorrt") != std::string::npos);
 }
 
+void test_train_help_lists_optimizer_controls() {
+    const SubprocessResult result = run_subprocess_capture_output({
+        fastloader_cli_path(),
+        "rfdetr",
+        "train",
+        "--help",
+    });
+    assert(result.exit_code == 0);
+    assert(result.output_text.find("--optimizer") != std::string::npos);
+    assert(result.output_text.find("--momentum") != std::string::npos);
+    assert(result.output_text.find("--warmup-momentum") != std::string::npos);
+    assert(result.output_text.find("adamw or muon") != std::string::npos);
+    assert(result.output_text.find("fused AdamW backend") != std::string::npos);
+    assert(result.output_text.find("AdamW only") != std::string::npos);
+}
+
 } // namespace
 
 int main() {
     try {
         test_evaluate_aliases_require_compiled();
         test_validate_still_routes_to_validate();
+        test_validate_help_lists_recompile_compile_options();
         test_top_level_help_lists_primary_commands();
         test_predict_help_lists_model_inputs();
+        test_train_help_lists_optimizer_controls();
         return 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "test_rfdetr_cli_aliases error: %s\n", error.what());

@@ -130,6 +130,7 @@ struct ModelArtifactRequest {
     std::filesystem::path weights_path;
     std::filesystem::path onnx_path;
     std::filesystem::path tensorrt_path;
+    std::string preset_name;
 };
 
 struct ResolvedModelArtifacts {
@@ -149,7 +150,9 @@ class NativeRfDetrModel : public torch::nn::Module {
 public:
     explicit NativeRfDetrModel(const NativeRfDetrConfig& config = {});
 
-    ModelOutputs forward(const NestedTensor& batch, SegmentationHeadImpl* seg_override = nullptr);
+    ModelOutputs forward(const NestedTensor& batch,
+                         SegmentationHeadImpl* seg_override = nullptr,
+                         bool include_masks = true);
     StateDictLoadSummary load_weights(const std::filesystem::path& weights_path, bool strict = false);
 
     std::shared_ptr<SegmentationHeadImpl> clone_segmentation_head() const;
@@ -158,6 +161,11 @@ public:
     void optimize_for_inference(int batch_size = 1, bool for_training = false,
                                 CompilationMode mode = CompilationMode::kSelective);
     bool is_compiled(bool for_training) const { return for_training ? is_compiled_train_ : is_compiled_eval_; }
+
+    void export_onnx(const std::filesystem::path& output_path,
+                     int opset_version = 19, int batch_size = 1,
+                     bool simplify = false);
+    void set_force_pytorch_deformable_attn(bool value);
 
     const NativeRfDetrConfig& config() const { return config_; }
     const ResolvedModelArtifacts& artifacts() const { return artifacts_; }
@@ -183,5 +191,11 @@ private:
     torch::jit::Module traced_backbone_eval_;
     torch::jit::Module traced_backbone_train_;
 };
+
+void export_weights_to_onnx(const std::filesystem::path& weights_path,
+                            const std::filesystem::path& output_path,
+                            int device_id = 0,
+                            int opset_version = 19,
+                            bool simplify = false);
 
 } // namespace fastloader::rfdetr

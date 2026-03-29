@@ -1,5 +1,7 @@
 #pragma once
 
+#include "dataset_compiler.h"
+
 #include <algorithm>
 #include <cmath>
 #include <chrono>
@@ -13,6 +15,36 @@
 #include <unistd.h>
 
 namespace fastloader::rfdetr {
+
+inline const char* compile_phase_label(CompileProgressPhase phase) {
+    switch (phase) {
+    case CompileProgressPhase::kLabels:
+        return "labels";
+    case CompileProgressPhase::kPixels:
+        return "pixels";
+    case CompileProgressPhase::kSyncing:
+        return "syncing";
+    }
+    return "";
+}
+
+inline std::string format_compile_postfix(const CompileProgress& progress, size_t pulse) {
+    static constexpr const char* kSpinnerFrames[] = {"|", "/", "-", "\\"};
+    const char* const spinner = kSpinnerFrames[pulse % (sizeof(kSpinnerFrames) / sizeof(kSpinnerFrames[0]))];
+    std::string postfix = compile_phase_label(progress.phase);
+    if (progress.active > 0) {
+        postfix += " ";
+        postfix += std::to_string(progress.active);
+        postfix += " active";
+    }
+    if (progress.dropped_annotations > 0) {
+        postfix += " drop=";
+        postfix += std::to_string(progress.dropped_annotations);
+    }
+    postfix += " ";
+    postfix += spinner;
+    return postfix;
+}
 
 class ProgressBar {
 public:
@@ -35,13 +67,23 @@ public:
     }
 
     void set_total(size_t total) {
+        if (total_ == total) {
+            return;
+        }
         total_ = total;
         render(true);
     }
 
     void set_postfix(std::string postfix) {
+        if (postfix_ == postfix) {
+            return;
+        }
         postfix_ = std::move(postfix);
         render(true);
+    }
+
+    void set_min_render_interval(std::chrono::steady_clock::duration interval) {
+        min_render_interval_ = interval;
     }
 
     void close() {
@@ -69,7 +111,7 @@ private:
 
     void render(bool force) {
         const auto now = std::chrono::steady_clock::now();
-        if (!force && (now - last_render_) < std::chrono::milliseconds(100)) {
+        if (!force && (now - last_render_) < min_render_interval_) {
             return;
         }
         last_render_ = now;
@@ -146,8 +188,7 @@ private:
         } else {
             stream.precision(2);
         }
-        const std::string_view rendered_unit = unit == "batch" ? std::string_view("b") : std::string_view(unit);
-        stream << rate << " " << rendered_unit << "/s";
+        stream << rate << " " << unit << "/s";
         return stream.str();
     }
 
@@ -225,6 +266,7 @@ private:
     std::string postfix_;
     std::chrono::steady_clock::time_point started_;
     std::chrono::steady_clock::time_point last_render_;
+    std::chrono::steady_clock::duration min_render_interval_{std::chrono::milliseconds(100)};
     bool closed_ = false;
 };
 

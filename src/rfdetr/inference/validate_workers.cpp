@@ -102,7 +102,7 @@ ValidationBackendResult run_backend_eval_parallel_impl(const ValidationOptions& 
     torch::NoGradGuard no_grad;
     c10::cuda::CUDAGuard device_guard(checked_device_index(options.device_id));
     const auto preprocess_stream =
-        c10::cuda::getStreamFromPool(false, checked_device_index(options.device_id));
+        get_high_priority_cuda_stream(options.device_id);
 
     auto lane_backends =
         make_backend_lanes_for_name(options, backend_name, runtime.split().lane_threads);

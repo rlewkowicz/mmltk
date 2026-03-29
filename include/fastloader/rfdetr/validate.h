@@ -1,9 +1,9 @@
 #pragma once
 
-#include "rfdetr/backends.h"
-#include "rfdetr/evaluator.h"
-#include "rfdetr/runtime.h"
+#include "fastloader/rfdetr/evaluation.h"
+#include "fastloader/rfdetr/model_info.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <optional>
@@ -35,6 +35,9 @@ struct ValidationOptions {
     size_t prefetch_factor = 2;
     int device_id = 0;
     int workers = 0;
+    int compile_workers = -1;
+    int compile_cuda_mask_batch_size = 0;
+    int compile_cuda_device_id = 0;
     std::string cpu_affinity;
     bool recompile = false;
     bool profile = false;
@@ -73,9 +76,6 @@ struct ValidationRunResult {
 };
 
 ValidationRunResult run_validation(const ValidationOptions& options);
-ValidationBackendResult run_validation_backend(const ValidationOptions& options,
-                                               const CocoDataset& source_dataset,
-                                               InferenceBackend& backend);
 void write_validation_report(const ValidationOptions& options, const ValidationRunResult& result);
 void print_model_metadata(const ModelInfo& info, size_t images, size_t categories, ValidationLogMode log_mode);
 void print_validation_run_summary(const ValidationOptions& options, const ValidationRunResult& result);

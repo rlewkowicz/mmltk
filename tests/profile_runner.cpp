@@ -1,6 +1,7 @@
 #include "cuda_test_utils.h"
 #include "dataset_compiler.h"
 #include "dataset_loader.h"
+#include "execution_policy.h"
 #include "profile_utils.h"
 #include "test_fixture.h"
 
@@ -200,6 +201,9 @@ void run_profile_iteration(const FixtureSpec& fixture, const Options& opts) {
 int main(int argc, char** argv) {
     FASTLOADER_PROFILE_PROCESS_LABEL("profile.core");
     FASTLOADER_PROFILE_RUN_LABEL("core");
+    const fastloader::ExecutionPolicySnapshot execution_snapshot =
+        fastloader::apply_process_execution_policy();
+    fastloader::log_process_execution_policy("fastloader_profile_runner", execution_snapshot, false, true);
     const Options opts = parse_options(argc, argv);
 
     const FixtureSpec fixture{

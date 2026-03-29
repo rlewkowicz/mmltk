@@ -1,5 +1,7 @@
 #pragma once
 
+#include "cpu_affinity.h"
+#include "execution_policy.h"
 #include "profile_utils.h"
 
 #include <algorithm>
@@ -380,9 +382,13 @@ void parallel_for_range_indexed(Index begin, Index end, int num_workers, Func&& 
     }
 
     const Index total = end - begin;
-    const int worker_count = std::max(
+    const int requested_workers = std::max(
         1,
         std::min(num_workers, checked_cast<int>(total, "parallel range too large for worker count")));
+    const std::vector<int> worker_cpus = allowed_cpu_set();
+    const int worker_count =
+        clamp_worker_count_to_cpus(requested_workers, worker_cpus.size(), 0, 1);
+    log_worker_budget_clamp("parallel_for_range", requested_workers, worker_count, worker_cpus);
     FASTLOADER_PROFILE_ADD("parallel_for_range.calls", 1);
     FASTLOADER_PROFILE_ADD("parallel_for_range.total_items",
                            checked_cast<std::uint64_t>(total, "parallel range size overflow"));
@@ -408,6 +414,13 @@ void parallel_for_range_indexed(Index begin, Index end, int num_workers, Func&& 
         const Index chunk_end = std::min(end, chunk_begin + chunk);
         threads.emplace_back([&, worker, chunk_begin, chunk_end] {
             try {
+                apply_worker_execution_policy(ExecutionPolicyRequest{
+                    worker_cpus,
+                    "fl_par" + std::to_string(worker),
+                    static_cast<size_t>(worker),
+                    true,
+                    true,
+                });
                 func(worker, chunk_begin, chunk_end);
             } catch (...) {
                 std::lock_guard<std::mutex> lock(error_mtx);

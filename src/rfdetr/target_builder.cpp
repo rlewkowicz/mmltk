@@ -178,7 +178,7 @@ void TargetScratch::ensure_copy_resources(int target_device_id) {
     }
     const auto device_index = cuda_device_index(target_device_id);
     c10::cuda::CUDAGuard device_guard(device_index);
-    copy_stream = c10::cuda::getStreamFromPool(false, device_index);
+    copy_stream = get_high_priority_cuda_stream(device_index);
     copy_stream_device_id = target_device_id;
     check_cuda_status(cudaEventCreateWithFlags(&copy_complete_event, cudaEventDisableTiming),
                       "cudaEventCreateWithFlags for target copy");

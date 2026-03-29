@@ -1,29 +1,16 @@
 #pragma once
 
+#include "fastloader/rfdetr/model_info.h"
+
 #include "rfdetr/postprocess.h"
 
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace fastloader::rfdetr {
-
-struct TensorInfo {
-    std::string name;
-    std::vector<int64_t> shape;
-    std::string dtype;
-};
-
-struct ModelInfo {
-    std::string backend;
-    std::string model_path;
-    TensorInfo input;
-    std::vector<TensorInfo> outputs;
-    int64_t num_queries = 0;
-    int64_t num_classes = 0;
-    bool has_masks = false;
-};
 
 class InferenceBackend {
 public:
@@ -33,6 +20,20 @@ public:
     virtual OutputTensors run(const torch::Tensor& normalized_input) = 0;
     virtual void* stream() const = 0;
     virtual void save_engine(const std::filesystem::path& path);
+};
+
+using TensorRtLogSink = std::function<void(const std::string&)>;
+
+class ScopedTensorRtLogSink {
+public:
+    explicit ScopedTensorRtLogSink(TensorRtLogSink sink);
+    ~ScopedTensorRtLogSink();
+
+    ScopedTensorRtLogSink(const ScopedTensorRtLogSink&) = delete;
+    ScopedTensorRtLogSink& operator=(const ScopedTensorRtLogSink&) = delete;
+
+private:
+    TensorRtLogSink previous_sink_;
 };
 
 std::unique_ptr<InferenceBackend> make_onnx_backend(const std::filesystem::path& model_path,

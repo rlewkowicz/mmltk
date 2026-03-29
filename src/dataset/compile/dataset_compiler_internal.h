@@ -4,10 +4,11 @@
 #include "common_utils.h"
 #include "dataset_compiler.h"
 
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
-#include <functional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -23,6 +24,86 @@ struct LabelBlocks {
     std::vector<ImageEntry> index;
     std::vector<PackedInstance> labels;
     std::vector<RLEPair> rle_pairs;
+    bool any_image_resize = false;
+    bool any_image_downscale = false;
+    size_t dropped_annotations = 0;
+    std::vector<std::string> dropped_annotation_examples;
+};
+
+struct ProgressCounter {
+    std::atomic<size_t> done{0};
+    std::atomic<size_t> active{0};
+    std::condition_variable* wake_cv = nullptr;
+
+    void increment() noexcept {
+        done.fetch_add(1, std::memory_order_release);
+        wake();
+    }
+
+    void begin_work() noexcept {
+        active.fetch_add(1, std::memory_order_release);
+        wake();
+    }
+
+    void end_work() noexcept {
+        active.fetch_sub(1, std::memory_order_release);
+        wake();
+    }
+
+    void finish_work() noexcept {
+        done.fetch_add(1, std::memory_order_release);
+        active.fetch_sub(1, std::memory_order_release);
+        wake();
+    }
+
+    size_t load() const noexcept {
+        return done.load(std::memory_order_acquire);
+    }
+
+    size_t active_load() const noexcept {
+        return active.load(std::memory_order_acquire);
+    }
+
+private:
+    void wake() noexcept {
+        if (wake_cv != nullptr) {
+            wake_cv->notify_one();
+        }
+    }
+};
+
+struct DroppedAnnotationTracker {
+    std::atomic<size_t> count{0};
+    std::condition_variable* wake_cv = nullptr;
+    mutable std::mutex samples_mutex;
+    std::vector<std::string> samples;
+
+    void increment(std::string sample) {
+        count.fetch_add(1, std::memory_order_release);
+        if (!sample.empty()) {
+            std::lock_guard<std::mutex> lock(samples_mutex);
+            if (samples.size() < 8) {
+                samples.push_back(std::move(sample));
+            }
+        }
+        wake();
+    }
+
+    size_t load() const noexcept {
+        return count.load(std::memory_order_acquire);
+    }
+
+    std::vector<std::string> sample_snapshot() const {
+        std::lock_guard<std::mutex> lock(samples_mutex);
+        return samples;
+    }
+
+private:
+    void wake() noexcept {
+        if (wake_cv != nullptr) {
+            wake_cv->notify_one();
+        }
+    }
 };
 
 struct FileLayout {
@@ -45,16 +126,14 @@ std::filesystem::path annotation_path(const std::filesystem::path& split_dir, ui
 DatasetScan scan_dataset(const CompilerConfig& config);
 LabelBlocks build_label_blocks(const std::filesystem::path& split_dir,
                                uint32_t num_images,
-                               uint32_t target_width,
-                               uint32_t target_height,
+                               const CompilerConfig& config,
                                const std::unordered_map<std::string, uint8_t>& class_map,
                                int num_workers,
-                               const std::function<void(size_t, size_t)>& progress_cb = nullptr);
+                               ProgressCounter* completed_images = nullptr,
+                               DroppedAnnotationTracker* dropped_annotations = nullptr);
 
-FileLayout compute_layout(uint32_t num_images,
-                          size_t image_stride,
-                          size_t label_count,
-                          size_t rle_count);
+FileLayout compute_pixel_layout(uint32_t num_images, size_t image_stride);
+void finalize_layout(FileLayout& layout, size_t label_count, size_t rle_count);
 void assign_pixel_offsets(std::vector<ImageEntry>& index,
                           size_t pixel_offset,
                           size_t image_stride);
@@ -77,7 +156,9 @@ void write_pixel_blob(const FileHandle& fd,
                       uint32_t height,
                       size_t image_stride,
                       int num_workers,
-                      size_t pixel_offset,
-                      const std::function<void(size_t, size_t)>& progress_cb);
+                      bool any_resize,
+                      bool any_downscale,
+                      ProgressCounter* completed_images,
+                      size_t pixel_offset);
 
 } // namespace fastloader::compiler_internal

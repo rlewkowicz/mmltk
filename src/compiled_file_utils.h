@@ -56,18 +56,19 @@ inline CompiledFileSections validate_compiled_file_sections(const FileHeader& he
     if (pixel_offset % PAGE_SIZE != 0) {
         throw std::runtime_error("pixel blob offset must be page aligned");
     }
+    // v4 layout: index < pixel < label < rle < total
     if (index_offset < sizeof(FileHeader) ||
-        label_offset < index_offset ||
+        pixel_offset < index_offset ||
+        label_offset < pixel_offset ||
         rle_offset < label_offset ||
-        pixel_offset < rle_offset ||
-        total_file_size < pixel_offset) {
+        total_file_size < rle_offset) {
         throw std::runtime_error("compiled file layout is invalid");
     }
 
     const size_t expected_index_bytes =
         checked_cast<size_t>(static_cast<uint64_t>(header.num_images) * sizeof(ImageEntry),
                              "index size overflow");
-    if (label_offset - index_offset != expected_index_bytes) {
+    if (pixel_offset < index_offset + expected_index_bytes) {
         throw std::runtime_error("compiled file index block size mismatch");
     }
 
@@ -76,13 +77,15 @@ inline CompiledFileSections validate_compiled_file_sections(const FileHeader& he
         throw std::runtime_error("label block is not aligned to PackedInstance");
     }
 
-    const size_t pixel_blob_size = total_file_size - pixel_offset;
+    const size_t pixel_blob_size = label_offset - pixel_offset;
     const size_t expected_pixel_blob_size =
         checked_cast<size_t>(static_cast<uint64_t>(header.num_images) * header.image_stride,
                              "pixel blob size overflow");
     if (pixel_blob_size != expected_pixel_blob_size) {
         throw std::runtime_error("compiled pixel blob size mismatch");
     }
+
+    const size_t rle_region_bytes = total_file_size - rle_offset;
 
     return CompiledFileSections{
         index_offset,
@@ -92,7 +95,7 @@ inline CompiledFileSections validate_compiled_file_sections(const FileHeader& he
         expected_index_bytes,
         label_bytes,
         label_bytes / sizeof(PackedInstance),
-        pixel_offset - rle_offset,
+        rle_region_bytes,
         pixel_blob_size,
     };
 }

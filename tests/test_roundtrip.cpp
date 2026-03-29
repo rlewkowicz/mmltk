@@ -54,6 +54,28 @@ static TestOptions parse_options(int argc, char** argv) {
     return opts;
 }
 
+void assert_files_equal(const fs::path& lhs_path, const fs::path& rhs_path) {
+    assert(fs::file_size(lhs_path) == fs::file_size(rhs_path));
+    std::ifstream lhs(lhs_path, std::ios::binary);
+    std::ifstream rhs(rhs_path, std::ios::binary);
+    assert(lhs.is_open());
+    assert(rhs.is_open());
+
+    std::vector<char> lhs_buffer(1 << 16);
+    std::vector<char> rhs_buffer(1 << 16);
+    while (lhs && rhs) {
+        lhs.read(lhs_buffer.data(), static_cast<std::streamsize>(lhs_buffer.size()));
+        rhs.read(rhs_buffer.data(), static_cast<std::streamsize>(rhs_buffer.size()));
+        const std::streamsize lhs_read = lhs.gcount();
+        const std::streamsize rhs_read = rhs.gcount();
+        assert(lhs_read == rhs_read);
+        assert(std::memcmp(lhs_buffer.data(), rhs_buffer.data(), static_cast<size_t>(lhs_read)) == 0);
+        if (lhs_read == 0) {
+            break;
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     FASTLOADER_PROFILE_RUN_LABEL("test_roundtrip");
     const TestOptions opts = parse_options(argc, argv);
@@ -91,6 +113,21 @@ int main(int argc, char** argv) {
     ccfg.num_workers = 2;
     DatasetCompiler::compile(ccfg);
     printf("=== Compiled ===\n");
+
+    CompilerConfig resized_cpu_cfg = ccfg;
+    resized_cpu_cfg.output_dir = test_dir + "/compiled_resized_cpu";
+    resized_cpu_cfg.target_width = std::max(32, W - 13);
+    resized_cpu_cfg.target_height = std::max(32, H - 9);
+    std::vector<size_t> resized_progress_steps;
+    DatasetCompiler::compile(resized_cpu_cfg, [&](const CompileProgress& progress) {
+        resized_progress_steps.push_back(progress.done);
+    });
+    const bool saw_intermediate_pixel_progress =
+        std::any_of(resized_progress_steps.begin(),
+                    resized_progress_steps.end(),
+                    [&](size_t done) { return done > static_cast<size_t>(NUM_IMAGES) &&
+                                              done < static_cast<size_t>(NUM_IMAGES * 2); });
+    assert(saw_intermediate_pixel_progress);
 
     const std::string bin_path = compiled_bin_path(fixture);
     const bool bin_exists = fs::exists(bin_path);

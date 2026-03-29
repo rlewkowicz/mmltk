@@ -1,6 +1,7 @@
 #include "dataset_compiler.h"
+#include "execution_policy.h"
 #include "profile_utils.h"
-#include "rfdetr/train.h"
+#include "fastloader/rfdetr/train.h"
 #include "test_fixture.h"
 
 #include <chrono>
@@ -231,6 +232,13 @@ int main(int argc, char** argv) {
     FASTLOADER_PROFILE_RUN_LABEL("rfdetr.train");
 
     try {
+        const fastloader::ExecutionPolicySnapshot execution_snapshot =
+            fastloader::apply_process_execution_policy();
+        fastloader::log_process_execution_policy(
+            "fastloader_rfdetr_train_profile_runner",
+            execution_snapshot,
+            false,
+            true);
         const Options options = parse_options(argc, argv);
         ensure_file_exists("weights checkpoint", options.weights_path);
 

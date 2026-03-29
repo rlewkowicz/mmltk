@@ -11,11 +11,14 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstdio>
 #include <fstream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
+#include <sstream>
 #include <string>
 #include <stdexcept>
 #include <unordered_map>
@@ -24,6 +27,40 @@
 namespace fastloader::rfdetr {
 
 namespace {
+
+std::mutex& tensorrt_log_sink_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+TensorRtLogSink& tensorrt_log_sink() {
+    static TensorRtLogSink sink;
+    return sink;
+}
+
+TensorRtLogSink exchange_tensorrt_log_sink(TensorRtLogSink sink) {
+    std::lock_guard<std::mutex> lock(tensorrt_log_sink_mutex());
+    TensorRtLogSink previous = std::move(tensorrt_log_sink());
+    tensorrt_log_sink() = std::move(sink);
+    return previous;
+}
+
+void emit_tensorrt_log_line(const std::string& line) {
+    if (line.empty()) {
+        return;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+    std::fflush(stderr);
+
+    TensorRtLogSink sink;
+    {
+        std::lock_guard<std::mutex> lock(tensorrt_log_sink_mutex());
+        sink = tensorrt_log_sink();
+    }
+    if (sink) {
+        sink(line);
+    }
+}
 
 std::string trt_dtype_name(nvinfer1::DataType dtype) {
     switch (dtype) {
@@ -105,6 +142,42 @@ std::string join_tensor_names(char const* const* tensor_names, int32_t count) {
     return joined;
 }
 
+std::string format_onnx_parser_errors(const nvonnxparser::IParser& parser) {
+    const int error_count = parser.getNbErrors();
+    if (error_count <= 0) {
+        return {};
+    }
+
+    std::ostringstream message;
+    for (int index = 0; index < error_count; ++index) {
+        const nvonnxparser::IParserError* error = parser.getError(index);
+        if (error == nullptr) {
+            continue;
+        }
+        if (message.tellp() > 0) {
+            message << '\n';
+        }
+        message << "[" << index << "] code=" << static_cast<int>(error->code())
+                << " op=" << (error->nodeOperator() ? error->nodeOperator() : "<unknown>")
+                << " node=" << (error->nodeName() ? error->nodeName() : "<unnamed>")
+                << " desc=" << (error->desc() ? error->desc() : "<no description>");
+    }
+    return message.str();
+}
+
+std::string format_dims(const nvinfer1::Dims& dims) {
+    std::ostringstream message;
+    message << "[";
+    for (int axis = 0; axis < dims.nbDims; ++axis) {
+        if (axis > 0) {
+            message << "x";
+        }
+        message << dims.d[axis];
+    }
+    message << "]";
+    return message.str();
+}
+
 void set_fp16_builder_flag(nvinfer1::IBuilderConfig& config) {
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC diagnostic push
@@ -118,10 +191,18 @@ void set_fp16_builder_flag(nvinfer1::IBuilderConfig& config) {
 
 class TensorRtLogger final : public nvinfer1::ILogger {
 public:
-    explicit TensorRtLogger(Severity threshold) : threshold_(threshold) {}
+    explicit TensorRtLogger(Severity threshold) : threshold_(static_cast<int>(threshold)) {}
+
+    void set_threshold(Severity threshold) noexcept {
+        threshold_.store(static_cast<int>(threshold), std::memory_order_relaxed);
+    }
+
+    Severity threshold() const noexcept {
+        return static_cast<Severity>(threshold_.load(std::memory_order_relaxed));
+    }
 
     void log(Severity severity, const char* message) noexcept override {
-        if (severity > threshold_) {
+        if (severity > threshold()) {
             return;
         }
         const char* prefix = "[trt]";
@@ -141,17 +222,73 @@ public:
         default:
             break;
         }
-        std::fprintf(stderr, "%s %s\n", prefix, message);
+        emit_tensorrt_log_line(std::string(prefix) + " " + (message ? message : ""));
     }
 
 private:
-    Severity threshold_;
+    std::atomic<int> threshold_;
 };
 
 TensorRtLogger& tensor_rt_logger() {
     static TensorRtLogger logger(nvinfer1::ILogger::Severity::kWARNING);
     return logger;
 }
+
+class TensorRtLoggerThresholdScope {
+public:
+    explicit TensorRtLoggerThresholdScope(nvinfer1::ILogger::Severity threshold)
+        : previous_(tensor_rt_logger().threshold()) {
+        tensor_rt_logger().set_threshold(threshold);
+    }
+
+    ~TensorRtLoggerThresholdScope() {
+        tensor_rt_logger().set_threshold(previous_);
+    }
+
+private:
+    nvinfer1::ILogger::Severity previous_;
+};
+
+class TensorRtBuildProgressMonitor final : public nvinfer1::IProgressMonitor {
+public:
+    void phaseStart(char const* phase_name, char const* parent_phase, int32_t nb_steps) noexcept override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const std::string key = phase_name ? phase_name : "<unnamed>";
+        phase_steps_[key] = nb_steps;
+        std::ostringstream message;
+        message << "[trt:build] phase start: ";
+        if (parent_phase != nullptr && parent_phase[0] != '\0') {
+            message << parent_phase << " -> ";
+        }
+        message << key << " steps=" << nb_steps;
+        emit_tensorrt_log_line(message.str());
+    }
+
+    bool stepComplete(char const* phase_name, int32_t step) noexcept override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const std::string key = phase_name ? phase_name : "<unnamed>";
+        const auto found = phase_steps_.find(key);
+        const int32_t total_steps = found == phase_steps_.end() ? 0 : found->second;
+        std::ostringstream message;
+        message << "[trt:build] phase step: " << key << " " << (step + 1);
+        if (total_steps > 0) {
+            message << "/" << total_steps;
+        }
+        emit_tensorrt_log_line(message.str());
+        return true;
+    }
+
+    void phaseFinish(char const* phase_name) noexcept override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const std::string key = phase_name ? phase_name : "<unnamed>";
+        phase_steps_.erase(key);
+        emit_tensorrt_log_line("[trt:build] phase finish: " + key);
+    }
+
+private:
+    std::mutex mutex_;
+    std::unordered_map<std::string, int32_t> phase_steps_;
+};
 
 template <typename T>
 struct TensorRtDestroy {
@@ -230,6 +367,7 @@ private:
     }
 
     void build_engine_from_onnx(const std::filesystem::path& onnx_path) {
+        TensorRtLoggerThresholdScope logger_scope(nvinfer1::ILogger::Severity::kVERBOSE);
         TensorRtUnique<nvinfer1::IBuilder> builder(nvinfer1::createInferBuilder(tensor_rt_logger()));
         if (builder == nullptr) {
             throw std::runtime_error("failed to create TensorRT builder");
@@ -244,12 +382,49 @@ private:
         if (parser == nullptr) {
             throw std::runtime_error("failed to create TensorRT ONNX parser");
         }
+        emit_tensorrt_log_line("[trt:build] parsing ONNX: " + onnx_path.string());
         if (!parser->parseFromFile(
                 onnx_path.string().c_str(),
-                static_cast<int>(nvinfer1::ILogger::Severity::kWARNING))) {
-            throw std::runtime_error("failed to parse RF-DETR ONNX file for TensorRT");
+                static_cast<int>(nvinfer1::ILogger::Severity::kVERBOSE))) {
+            const std::string diagnostics = format_onnx_parser_errors(*parser);
+            throw std::runtime_error(
+                diagnostics.empty()
+                    ? "failed to parse RF-DETR ONNX file for TensorRT"
+                    : "failed to parse RF-DETR ONNX file for TensorRT:\n" + diagnostics);
+        }
+        {
+            std::ostringstream message;
+            message << "[trt:build] parsed network: layers=" << network->getNbLayers()
+                    << " inputs=" << network->getNbInputs()
+                    << " outputs=" << network->getNbOutputs();
+            emit_tensorrt_log_line(message.str());
+        }
+        for (int index = 0; index < network->getNbInputs(); ++index) {
+            const nvinfer1::ITensor* tensor = network->getInput(index);
+            if (tensor == nullptr) {
+                continue;
+            }
+            emit_tensorrt_log_line(
+                std::string("[trt:build] input[") + std::to_string(index) + "] " +
+                (tensor->getName() ? tensor->getName() : "<unnamed>") +
+                " dtype=" + trt_dtype_name(tensor->getType()) +
+                " dims=" + format_dims(tensor->getDimensions()));
+        }
+        for (int index = 0; index < network->getNbOutputs(); ++index) {
+            const nvinfer1::ITensor* tensor = network->getOutput(index);
+            if (tensor == nullptr) {
+                continue;
+            }
+            emit_tensorrt_log_line(
+                std::string("[trt:build] output[") + std::to_string(index) + "] " +
+                (tensor->getName() ? tensor->getName() : "<unnamed>") +
+                " dtype=" + trt_dtype_name(tensor->getType()) +
+                " dims=" + format_dims(tensor->getDimensions()));
         }
         config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 1ULL << 30);
+        config->setProfilingVerbosity(nvinfer1::ProfilingVerbosity::kDETAILED);
+        TensorRtBuildProgressMonitor progress_monitor;
+        config->setProgressMonitor(&progress_monitor);
         if (allow_fp16_) {
             // TensorRT 10.12 deprecates kFP16 in favor of strongly typed networks.
             // Our ONNX parser flow still relies on builder-selected mixed precision,
@@ -257,12 +432,24 @@ private:
             // path is upgraded to emit a strongly typed FP16 network.
             set_fp16_builder_flag(*config);
         }
+        {
+            std::ostringstream message;
+            message << "[trt:build] config: fp16=" << (allow_fp16_ ? "on" : "off")
+                    << " workspace_bytes=" << (1ULL << 30)
+                    << " opt_level=" << config->getBuilderOptimizationLevel()
+                    << " profiling_verbosity=detailed";
+            emit_tensorrt_log_line(message.str());
+        }
 
+        emit_tensorrt_log_line("[trt:build] building serialized engine...");
         serialized_engine_.reset(builder->buildSerializedNetwork(*network, *config));
         if (serialized_engine_ == nullptr) {
             throw std::runtime_error("TensorRT buildSerializedNetwork failed");
         }
+        emit_tensorrt_log_line(
+            "[trt:build] serialized engine bytes=" + std::to_string(serialized_engine_->size()));
         if (!save_engine_path_.empty()) {
+            emit_tensorrt_log_line("[trt:build] writing engine: " + save_engine_path_.string());
             std::ofstream stream(save_engine_path_, std::ios::binary);
             if (!stream.is_open()) {
                 throw std::runtime_error("failed to open TensorRT save path: " + save_engine_path_.string());
@@ -274,10 +461,12 @@ private:
         if (runtime_ == nullptr) {
             throw std::runtime_error("failed to create TensorRT runtime");
         }
+        emit_tensorrt_log_line("[trt:build] deserializing engine...");
         engine_.reset(runtime_->deserializeCudaEngine(serialized_engine_->data(), serialized_engine_->size()));
         if (engine_ == nullptr) {
             throw std::runtime_error("failed to deserialize TensorRT engine");
         }
+        emit_tensorrt_log_line("[trt:build] engine ready");
     }
 
     void initialize_tensor_info() {
@@ -342,8 +531,8 @@ public:
         : shared_state_(std::move(shared_state)) {
         FASTLOADER_PROFILE_SCOPE("rfdetr.native.tensorrt.construct");
         ensure_cuda_ok(cudaSetDevice(shared_state_->device_id()), "cudaSetDevice for TensorRT backend lane");
-        ensure_cuda_ok(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking),
-                       "cudaStreamCreateWithFlags for TensorRT backend lane");
+        ensure_cuda_ok(fastloader::cuda_stream_create_with_highest_priority(&stream_, cudaStreamNonBlocking),
+                       "cudaStreamCreateWithPriority for TensorRT backend lane");
         context_.reset(shared_state_->engine().createExecutionContext());
         if (context_ == nullptr) {
             throw std::runtime_error("failed to create TensorRT execution context");
@@ -450,6 +639,13 @@ private:
 };
 
 } // namespace
+
+ScopedTensorRtLogSink::ScopedTensorRtLogSink(TensorRtLogSink sink)
+    : previous_sink_(exchange_tensorrt_log_sink(std::move(sink))) {}
+
+ScopedTensorRtLogSink::~ScopedTensorRtLogSink() {
+    exchange_tensorrt_log_sink(std::move(previous_sink_));
+}
 
 void InferenceBackend::save_engine(const std::filesystem::path&) {
     throw std::runtime_error("this backend does not support saving TensorRT engines");
