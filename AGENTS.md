@@ -3,3 +3,6 @@ Always optimize (O)n. We always want to reduce loops, reduce cpu/gpu/memory chur
 
 ## Portability
 This is a linux only data system. You never need to worry about compatibility with MACOS or Windows. You always want to optimize maximally for linux systems.
+
+## Testing
+** Always build and test in docker. Always allow `docker build -t mmltk .` to complete in full. Do not interrupt it. Aside from debugging, do not run tests and testing frameworks directly in the container via docker run. Run tests via ./mmltk always. **

@@ -4,6 +4,7 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <memory>
@@ -11,18 +12,28 @@
 #include <stdexcept>
 #include <vector>
 
-#define CUDA_CHECK(call) do { \
-    cudaError_t err = (call); \
-    if (err != cudaSuccess) { \
-        char msg[256]; \
-        snprintf(msg, sizeof(msg), "CUDA error at %s:%d: %s", __FILE__, __LINE__, cudaGetErrorString(err)); \
-        throw std::runtime_error(msg); \
-    } \
-} while(0)
-
-namespace fastloader {
+namespace mmltk {
 
 namespace {
+
+[[noreturn]] void throw_cuda_error(cudaError_t err, const char* file, int line) {
+    std::array<char, 256> msg{};
+    std::snprintf(msg.data(),
+                  msg.size(),
+                  "CUDA error at %s:%d: %s",
+                  file,
+                  line,
+                  cudaGetErrorString(err));
+    throw std::runtime_error(msg.data());
+}
+
+inline void check_cuda(cudaError_t err, const char* file, int line) {
+    if (err != cudaSuccess) {
+        throw_cuda_error(err, file, line);
+    }
+}
+
+#define CUDA_CHECK(call) check_cuda((call), __FILE__, __LINE__)
 
 struct PoolKey {
     size_t batch_capacity = 0;
@@ -42,7 +53,7 @@ struct PoolKey {
 
 struct DeviceSlot {
     float* device = nullptr;
-#if FASTLOADER_ENABLE_PROFILING
+#if MMLTK_ENABLE_PROFILING
     cudaEvent_t transfer_start = nullptr;
 #endif
     cudaEvent_t transfer_done = nullptr;
@@ -61,14 +72,7 @@ std::uint64_t elapsed_ms_to_ns(float elapsed_ms) {
 }
 
 [[noreturn]] void throw_cuda_query_error(cudaError_t err) {
-    char msg[256];
-    std::snprintf(msg,
-                  sizeof(msg),
-                  "CUDA error at %s:%d: %s",
-                  __FILE__,
-                  __LINE__,
-                  cudaGetErrorString(err));
-    throw std::runtime_error(msg);
+    throw_cuda_error(err, __FILE__, __LINE__);
 }
 
 bool query_event_complete(cudaEvent_t event) {
@@ -98,10 +102,10 @@ struct SlotPool {
         if (!stream_already_synchronized) {
             CUDA_CHECK(cudaEventSynchronize(slot.transfer_done));
         }
-#if FASTLOADER_ENABLE_PROFILING
+#if MMLTK_ENABLE_PROFILING
         float elapsed_ms = 0.0f;
         CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, slot.transfer_start, slot.transfer_done));
-        FASTLOADER_PROFILE_RECORD_DURATION_NS("cuda.async_h2d.gpu_active",
+        MMLTK_PROFILE_RECORD_DURATION_NS("cuda.async_h2d.gpu_active",
                                               elapsed_ms_to_ns(elapsed_ms));
 #endif
         slot.transfer_pending = false;
@@ -126,7 +130,7 @@ void destroy_pool(SlotPool& pool) noexcept {
         cudaStreamSynchronize(pool.copy_stream);
     }
     for (auto& slot : pool.device_slots) {
-#if FASTLOADER_ENABLE_PROFILING
+#if MMLTK_ENABLE_PROFILING
         if (slot.transfer_start) {
             cudaEventDestroy(slot.transfer_start);
         }
@@ -160,10 +164,10 @@ std::unique_ptr<SlotPool> create_pool(const PoolKey& key) {
     pool->device_slots.resize(key.num_buffers);
     pool->host_slots.resize(key.num_buffers);
 
-    CUDA_CHECK(fastloader::cuda_stream_create_with_highest_priority(&pool->copy_stream, cudaStreamNonBlocking));
+    CUDA_CHECK(mmltk::cuda_stream_create_with_highest_priority(&pool->copy_stream, cudaStreamNonBlocking));
     for (auto& slot : pool->device_slots) {
         CUDA_CHECK(cudaMalloc(&slot.device, pool->buf_bytes));
-#if FASTLOADER_ENABLE_PROFILING
+#if MMLTK_ENABLE_PROFILING
         CUDA_CHECK(cudaEventCreate(&slot.transfer_start));
         CUDA_CHECK(cudaEventCreate(&slot.transfer_done));
 #else
@@ -230,40 +234,39 @@ struct CudaStreamManager::Impl {
     SlotPool* pool = nullptr;
 };
 
-CudaStreamManager::CudaStreamManager(size_t batch_capacity, size_t image_stride,
-                                     size_t num_buffers, bool enable_gather_buffers, int device_id)
-    : slot_count_(std::max<size_t>(1, num_buffers)) {
-    FASTLOADER_PROFILE_SCOPE("cuda_stream_manager.construct");
-    CUDA_CHECK(cudaSetDevice(device_id));
+CudaStreamManager::CudaStreamManager(CudaStreamManagerConfig config)
+    : slot_count_(std::max<size_t>(1, config.num_buffers)) {
+    MMLTK_PROFILE_SCOPE("cuda_stream_manager.construct");
+    CUDA_CHECK(cudaSetDevice(config.device_id));
 
     impl_ = new Impl();
     const PoolKey key{
-        batch_capacity,
-        image_stride,
+        config.batch_capacity,
+        config.image_stride,
         slot_count_,
-        enable_gather_buffers,
-        device_id,
+        config.enable_gather_buffers,
+        config.device_id,
     };
 
     bool hit = false;
     impl_->pool = slot_pool_cache().acquire(key, hit);
-    FASTLOADER_PROFILE_ADD(hit ? "cuda.slot_pool_hit" : "cuda.slot_pool_miss", 1);
+    MMLTK_PROFILE_ADD(hit ? "cuda.slot_pool_hit" : "cuda.slot_pool_miss", 1);
 
-    FASTLOADER_PROFILE_SET("cuda.buffer_bytes_per_slot", impl_->pool->buf_bytes);
-    FASTLOADER_PROFILE_SET("cuda.num_buffers", slot_count_);
-    FASTLOADER_PROFILE_SET("cuda.device_slots", slot_count_);
-    FASTLOADER_PROFILE_SET("cuda.copy_streams", static_cast<size_t>(1));
-    FASTLOADER_PROFILE_SET("cuda.copy_stream_count", static_cast<size_t>(1));
+    MMLTK_PROFILE_SET("cuda.buffer_bytes_per_slot", impl_->pool->buf_bytes);
+    MMLTK_PROFILE_SET("cuda.num_buffers", slot_count_);
+    MMLTK_PROFILE_SET("cuda.device_slots", slot_count_);
+    MMLTK_PROFILE_SET("cuda.copy_streams", static_cast<size_t>(1));
+    MMLTK_PROFILE_SET("cuda.copy_stream_count", static_cast<size_t>(1));
     for (size_t i = 0; i < slot_count_; ++i) {
-        FASTLOADER_PROFILE_ADD("cuda.device_bytes", impl_->pool->buf_bytes);
-        if (enable_gather_buffers) {
-            FASTLOADER_PROFILE_ADD("cuda.gather_bytes", impl_->pool->buf_bytes);
+        MMLTK_PROFILE_ADD("cuda.device_bytes", impl_->pool->buf_bytes);
+        if (config.enable_gather_buffers) {
+            MMLTK_PROFILE_ADD("cuda.gather_bytes", impl_->pool->buf_bytes);
         }
     }
 }
 
 CudaStreamManager::~CudaStreamManager() {
-    FASTLOADER_PROFILE_SCOPE("cuda_stream_manager.destruct");
+    MMLTK_PROFILE_SCOPE("cuda_stream_manager.destruct");
     if (impl_) {
         slot_pool_cache().release(impl_->pool);
         delete impl_;
@@ -287,14 +290,14 @@ float* CudaStreamManager::gather_buffer(int buf_idx) const {
 }
 
 void CudaStreamManager::async_h2d(int buf_idx, const void* host_src, size_t bytes) {
-    FASTLOADER_PROFILE_SCOPE("cuda.async_h2d.submit");
-    FASTLOADER_PROFILE_ADD("cuda.async_h2d.bytes", bytes);
+    MMLTK_PROFILE_SCOPE("cuda.async_h2d.submit");
+    MMLTK_PROFILE_ADD("cuda.async_h2d.bytes", bytes);
     const size_t idx = slot_index(buf_idx);
     auto& slot = impl_->pool->device_slots[idx];
     if (slot.transfer_pending || slot.consumer_pending) {
         throw std::runtime_error("cuda async_h2d slot reused before prior work completed");
     }
-#if FASTLOADER_ENABLE_PROFILING
+#if MMLTK_ENABLE_PROFILING
     CUDA_CHECK(cudaEventRecord(slot.transfer_start, impl_->pool->copy_stream));
 #endif
     CUDA_CHECK(cudaMemcpyAsync(
@@ -305,15 +308,15 @@ void CudaStreamManager::async_h2d(int buf_idx, const void* host_src, size_t byte
 }
 
 void CudaStreamManager::wait_for_transfer(int buf_idx) {
-    FASTLOADER_PROFILE_SCOPE("cuda.wait_for_transfer");
+    MMLTK_PROFILE_SCOPE("cuda.wait_for_transfer");
     const size_t idx = slot_index(buf_idx);
     auto& slot = impl_->pool->device_slots[idx];
     impl_->pool->reap_transfer(slot, false);
 }
 
 void CudaStreamManager::handoff_to_stream(int buf_idx, void* consumer_stream) {
-    FASTLOADER_PROFILE_SCOPE("cuda.handoff_to_stream");
-    FASTLOADER_PROFILE_ADD("cuda.handoff.count", 1);
+    MMLTK_PROFILE_SCOPE("cuda.handoff_to_stream");
+    MMLTK_PROFILE_ADD("cuda.handoff.count", 1);
     const size_t idx = slot_index(buf_idx);
     auto& slot = impl_->pool->device_slots[idx];
     auto* stream = reinterpret_cast<cudaStream_t>(consumer_stream);
@@ -321,8 +324,8 @@ void CudaStreamManager::handoff_to_stream(int buf_idx, void* consumer_stream) {
 }
 
 void CudaStreamManager::record_consumer_done(int buf_idx, void* consumer_stream) {
-    FASTLOADER_PROFILE_SCOPE("cuda.record_consumer_done");
-    FASTLOADER_PROFILE_ADD("cuda.consumer_release.count", 1);
+    MMLTK_PROFILE_SCOPE("cuda.record_consumer_done");
+    MMLTK_PROFILE_ADD("cuda.consumer_release.count", 1);
     const size_t idx = slot_index(buf_idx);
     auto& slot = impl_->pool->device_slots[idx];
     auto* stream = reinterpret_cast<cudaStream_t>(consumer_stream);
@@ -336,7 +339,7 @@ bool CudaStreamManager::slot_reusable(int buf_idx) {
 }
 
 void CudaStreamManager::sync() {
-    FASTLOADER_PROFILE_SCOPE("cuda.sync");
+    MMLTK_PROFILE_SCOPE("cuda.sync");
     CUDA_CHECK(cudaStreamSynchronize(impl_->pool->copy_stream));
     for (auto& slot : impl_->pool->device_slots) {
         impl_->pool->reap_transfer(slot, true);
@@ -351,4 +354,4 @@ void* CudaStreamManager::copy_stream() const {
     return impl_->pool->copy_stream;
 }
 
-} // namespace fastloader
+} // namespace mmltk

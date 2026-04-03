@@ -5,7 +5,7 @@
 
 #include <cuda_runtime_api.h>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 cudaError_t launch_bgr_split_to_planar_float(const std::uint8_t* src,
                                              std::size_t src_pitch_bytes,
@@ -29,4 +29,4 @@ const char* validate_bgr_split_to_planar_float_args(std::size_t src_pitch_bytes,
                                                     std::uint32_t dst_height,
                                                     cudaStream_t stream);
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

@@ -7,7 +7,7 @@
 #include <string>
 #include <stdexcept>
 
-namespace fastloader {
+namespace mmltk {
 
 struct CompiledFileSections {
     size_t index_offset = 0;
@@ -44,11 +44,11 @@ inline FileHeader read_compiled_header(const std::string& path) {
 
 inline CompiledFileSections validate_compiled_file_sections(const FileHeader& header,
                                                             size_t file_size) {
-    const size_t index_offset = checked_cast<size_t>(header.index_offset, "index offset overflow");
-    const size_t label_offset = checked_cast<size_t>(header.label_offset, "label offset overflow");
-    const size_t rle_offset = checked_cast<size_t>(header.mask_rle_offset, "RLE offset overflow");
-    const size_t pixel_offset = checked_cast<size_t>(header.pixel_offset, "pixel offset overflow");
-    const size_t total_file_size =
+    const auto index_offset = checked_cast<size_t>(header.index_offset, "index offset overflow");
+    const auto label_offset = checked_cast<size_t>(header.label_offset, "label offset overflow");
+    const auto rle_offset = checked_cast<size_t>(header.mask_rle_offset, "RLE offset overflow");
+    const auto pixel_offset = checked_cast<size_t>(header.pixel_offset, "pixel offset overflow");
+    const auto total_file_size =
         checked_cast<size_t>(header.total_file_size, "file size overflow");
     if (total_file_size != file_size) {
         throw std::runtime_error("compiled file size does not match header");
@@ -65,7 +65,7 @@ inline CompiledFileSections validate_compiled_file_sections(const FileHeader& he
         throw std::runtime_error("compiled file layout is invalid");
     }
 
-    const size_t expected_index_bytes =
+    const auto expected_index_bytes =
         checked_cast<size_t>(static_cast<uint64_t>(header.num_images) * sizeof(ImageEntry),
                              "index size overflow");
     if (pixel_offset < index_offset + expected_index_bytes) {
@@ -78,7 +78,7 @@ inline CompiledFileSections validate_compiled_file_sections(const FileHeader& he
     }
 
     const size_t pixel_blob_size = label_offset - pixel_offset;
-    const size_t expected_pixel_blob_size =
+    const auto expected_pixel_blob_size =
         checked_cast<size_t>(static_cast<uint64_t>(header.num_images) * header.image_stride,
                              "pixel blob size overflow");
     if (pixel_blob_size != expected_pixel_blob_size) {
@@ -100,4 +100,4 @@ inline CompiledFileSections validate_compiled_file_sections(const FileHeader& he
     };
 }
 
-} // namespace fastloader
+} // namespace mmltk

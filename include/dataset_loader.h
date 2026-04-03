@@ -5,7 +5,7 @@
 #include <memory>
 #include <string>
 
-namespace fastloader {
+namespace mmltk {
 
 struct LabelIndexEntry {
     uint32_t label_begin;     // first PackedInstance index for this image
@@ -60,27 +60,27 @@ public:
     void release_batch(const Batch& batch, void* consumer_stream);
 
     // Metadata
-    size_t num_images() const;
-    size_t num_batches() const;
-    uint32_t image_width() const;
-    uint32_t image_height() const;
-    uint32_t num_classes() const;
-    const char* class_name(uint32_t id) const;
-    size_t image_stride() const; // bytes per image
-    size_t num_label_instances() const;
-    size_t num_rle_pairs() const;
+    [[nodiscard]] size_t num_images() const;
+    [[nodiscard]] size_t num_batches() const;
+    [[nodiscard]] uint32_t image_width() const;
+    [[nodiscard]] uint32_t image_height() const;
+    [[nodiscard]] uint32_t num_classes() const;
+    [[nodiscard]] const char* class_name(uint32_t id) const;
+    [[nodiscard]] size_t image_stride() const; // bytes per image
+    [[nodiscard]] size_t num_label_instances() const;
+    [[nodiscard]] size_t num_rle_pairs() const;
 
     // Direct runtime views: pixels are mmap-backed, labels live in process memory.
-    const float* pixel_blob() const;          // entire float32 NCHW blob
-    const LabelIndexEntry* label_index() const;
-    const PackedInstance* label_data() const;
-    const RLEPair* rle_data() const;
+    [[nodiscard]] const float* pixel_blob() const;          // entire float32 NCHW blob
+    [[nodiscard]] const LabelIndexEntry* label_index() const;
+    [[nodiscard]] const PackedInstance* label_data() const;
+    [[nodiscard]] const RLEPair* rle_data() const;
 
-    CudaStreamManager& cuda() const;
+    [[nodiscard]] CudaStreamManager& cuda() const;
 
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace fastloader
+} // namespace mmltk

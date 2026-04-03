@@ -5,6 +5,7 @@
 /compiled/
 /profiles/
 /artifacts/
+.mmltk-data/logs/
 
 *synth*
 

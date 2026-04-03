@@ -1,6 +1,6 @@
 #pragma once
 
-#include "fastloader/rfdetr/model_info.h"
+#include "mmltk/rfdetr/model_info.h"
 
 #include "rfdetr/postprocess.h"
 
@@ -10,15 +10,15 @@
 #include <string>
 #include <vector>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 class InferenceBackend {
 public:
     virtual ~InferenceBackend() = default;
 
-    virtual const ModelInfo& info() const = 0;
+    [[nodiscard]] virtual const ModelInfo& info() const = 0;
     virtual OutputTensors run(const torch::Tensor& normalized_input) = 0;
-    virtual void* stream() const = 0;
+    [[nodiscard]] virtual void* stream() const = 0;
     virtual void save_engine(const std::filesystem::path& path);
 };
 
@@ -54,4 +54,4 @@ std::vector<std::unique_ptr<InferenceBackend>> make_tensorrt_backend_lanes(
     int lane_count,
     const std::filesystem::path& save_engine_path = {});
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

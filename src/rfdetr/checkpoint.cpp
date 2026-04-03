@@ -1,6 +1,6 @@
-#include "fastloader/rfdetr/checkpoint.h"
+#include "mmltk/rfdetr/checkpoint.h"
 
-#include "fastloader/rfdetr/model_config.h"
+#include "mmltk/rfdetr/model_config.h"
 #include "profile_utils.h"
 #include "rfdetr/checkpoint_internal.h"
 #include "rfdetr/python_checkpoint_bridge.h"
@@ -20,13 +20,9 @@
 #include <unordered_set>
 #include <string_view>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 namespace {
-
-std::string canonical_checkpoint_path_string(const std::filesystem::path& checkpoint_path) {
-    return std::filesystem::absolute(checkpoint_path).lexically_normal().string();
-}
 
 std::string archive_entry_name(size_t index) {
     std::ostringstream stream;
@@ -154,25 +150,26 @@ void write_metadata(torch::serialize::OutputArchive& archive, const NativeCheckp
 }
 
 NativeCheckpoint load_native_checkpoint(const std::filesystem::path& checkpoint_path) {
-    const std::string canonical_path = canonical_checkpoint_path_string(checkpoint_path);
+    const std::filesystem::path canonical_path = detail::canonical_checkpoint_path(checkpoint_path);
+    const std::string canonical_path_string = canonical_path.string();
 
     torch::serialize::InputArchive archive;
-    archive.load_from(canonical_path);
-    if (require_string(archive, "format") != kNativeCheckpointFormat) {
-        throw std::runtime_error("RF-DETR checkpoint is not a native checkpoint: " + canonical_path);
+    archive.load_from(canonical_path_string);
+    if (!detail::is_supported_native_checkpoint_format(require_string(archive, "format"))) {
+        throw std::runtime_error("RF-DETR checkpoint is not a native checkpoint: " + canonical_path_string);
     }
 
     const int64_t format_version = require_int(archive, "format_version");
     if (format_version != kNativeCheckpointFormatVersion) {
         throw std::runtime_error(
             "unsupported RF-DETR native checkpoint format version " + std::to_string(format_version) + ": " +
-            canonical_path);
+            canonical_path_string);
     }
 
     NativeCheckpoint checkpoint;
     checkpoint.metadata.preset_name = read_optional_string(archive, "preset_name").value_or("");
     checkpoint.metadata.source_kind = read_optional_string(archive, "source_kind").value_or("native");
-    checkpoint.metadata.source_path = read_optional_string(archive, "source_path").value_or(canonical_path);
+    checkpoint.metadata.source_path = read_optional_string(archive, "source_path").value_or(canonical_path_string);
     checkpoint.metadata.num_classes = read_optional_int(archive, "num_classes").value_or(0);
     checkpoint.metadata.sum_group_losses = read_optional_bool(archive, "sum_group_losses");
     checkpoint.metadata.use_varifocal_loss = read_optional_bool(archive, "use_varifocal_loss");
@@ -194,7 +191,7 @@ NativeCheckpoint load_native_checkpoint(const std::filesystem::path& checkpoint_
     archive.read("state", state_archive);
     const int64_t entry_count = require_int(state_archive, "entry_count");
     if (entry_count < 0) {
-        throw std::runtime_error("RF-DETR checkpoint entry_count is negative: " + canonical_path);
+        throw std::runtime_error("RF-DETR checkpoint entry_count is negative: " + canonical_path_string);
     }
 
     checkpoint.state_dict.reserve(static_cast<size_t>(entry_count));
@@ -211,15 +208,19 @@ NativeCheckpoint load_native_checkpoint(const std::filesystem::path& checkpoint_
     return checkpoint;
 }
 
-#if FASTLOADER_RFDETR_PYTHON_CHECKPOINT_LOADER
+#if MMLTK_RFDETR_PYTHON_CHECKPOINT_LOADER
 NativeCheckpoint load_python_checkpoint_file(const std::filesystem::path& checkpoint_path) {
-    const std::string canonical_path = canonical_checkpoint_path_string(checkpoint_path);
-    NativeCheckpoint checkpoint = load_upstream_python_checkpoint(canonical_path);
+    const std::filesystem::path canonical_path = detail::canonical_checkpoint_path(checkpoint_path);
+    const std::string canonical_path_string = canonical_path.string();
+    NativeCheckpoint checkpoint = load_upstream_python_checkpoint(canonical_path_string);
     checkpoint.metadata.source_kind = "upstream-python";
-    checkpoint.metadata.source_path = canonical_path;
+    checkpoint.metadata.source_path = canonical_path_string;
 
-    const std::string filename = std::filesystem::path(canonical_path).filename().string();
+    const std::string filename = canonical_path.filename().string();
     if (const auto* preset = find_model_preset_by_weight_filename(filename)) {
+        checkpoint.metadata.preset_name = std::string(preset->preset_name);
+        checkpoint.metadata.num_classes = preset->num_classes;
+    } else if (const auto* preset = infer_model_preset_from_path(canonical_path)) {
         checkpoint.metadata.preset_name = std::string(preset->preset_name);
         checkpoint.metadata.num_classes = preset->num_classes;
     }
@@ -257,7 +258,7 @@ torch::Tensor prepare_tensor_for_checkpoint_write(const torch::Tensor& tensor) {
 void write_state_archive(torch::serialize::OutputArchive& archive,
                          const char* key,
                          const std::vector<StateDictEntry>& state_dict) {
-    FASTLOADER_PROFILE_SCOPE("rfdetr.checkpoint.save.write_state_archive");
+    MMLTK_PROFILE_SCOPE("rfdetr.checkpoint.save.write_state_archive");
     torch::serialize::OutputArchive state_archive;
     write_int(state_archive, "entry_count", static_cast<int64_t>(state_dict.size()));
     for (size_t index = 0; index < state_dict.size(); ++index) {
@@ -273,10 +274,10 @@ void write_state_archive(torch::serialize::OutputArchive& archive,
 
 bool is_native_checkpoint_file(const std::filesystem::path& checkpoint_path) {
     try {
-        const std::string canonical_path = canonical_checkpoint_path_string(checkpoint_path);
+        const std::filesystem::path canonical_path = detail::canonical_checkpoint_path(checkpoint_path);
         torch::serialize::InputArchive archive;
-        archive.load_from(canonical_path);
-        return require_string(archive, "format") == kNativeCheckpointFormat;
+        archive.load_from(canonical_path.string());
+        return detail::is_supported_native_checkpoint_format(require_string(archive, "format"));
     } catch (const std::exception&) {
         return false;
     }
@@ -287,19 +288,20 @@ NativeCheckpoint load_checkpoint(const std::filesystem::path& checkpoint_path) {
         throw std::runtime_error("RF-DETR checkpoint path must not be empty");
     }
 
-    const std::string canonical_path = canonical_checkpoint_path_string(checkpoint_path);
+    const std::filesystem::path canonical_path = detail::canonical_checkpoint_path(checkpoint_path);
+    const std::string canonical_path_string = canonical_path.string();
     if (!std::filesystem::exists(canonical_path)) {
-        throw std::runtime_error("missing RF-DETR checkpoint file: " + canonical_path);
+        throw std::runtime_error("missing RF-DETR checkpoint file: " + canonical_path_string);
     }
 
     if (is_native_checkpoint_file(canonical_path)) {
         return load_native_checkpoint(canonical_path);
     }
-#if FASTLOADER_RFDETR_PYTHON_CHECKPOINT_LOADER
+#if MMLTK_RFDETR_PYTHON_CHECKPOINT_LOADER
     return load_python_checkpoint_file(canonical_path);
 #else
     throw std::runtime_error(
-        "RF-DETR upstream Python checkpoint loading is disabled at build time: " + canonical_path);
+        "RF-DETR upstream Python checkpoint loading is disabled at build time: " + canonical_path_string);
 #endif
 }
 
@@ -392,16 +394,17 @@ StateDictLoadSummary apply_checkpoint_to_module(torch::nn::Module& module,
 
 void save_native_checkpoint(const std::filesystem::path& checkpoint_path,
                             const NativeCheckpoint& checkpoint) {
-    FASTLOADER_PROFILE_SCOPE("rfdetr.checkpoint.save.total");
-    const std::string canonical_path = canonical_checkpoint_path_string(checkpoint_path);
-    std::filesystem::create_directories(std::filesystem::path(canonical_path).parent_path());
+    MMLTK_PROFILE_SCOPE("rfdetr.checkpoint.save.total");
+    const std::filesystem::path canonical_path = detail::canonical_checkpoint_path(checkpoint_path);
+    const std::string canonical_path_string = canonical_path.string();
+    std::filesystem::create_directories(canonical_path.parent_path());
 
     torch::serialize::OutputArchive archive;
     write_metadata(archive, checkpoint.metadata);
     detail::write_state_archive(archive, "state", checkpoint.state_dict);
     {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.checkpoint.save.archive_save_to");
-        archive.save_to(canonical_path);
+        MMLTK_PROFILE_SCOPE("rfdetr.checkpoint.save.archive_save_to");
+        archive.save_to(canonical_path_string);
     }
 }
 
@@ -412,4 +415,4 @@ NativeCheckpoint normalize_checkpoint_to_native(const std::filesystem::path& inp
     return checkpoint;
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

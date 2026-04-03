@@ -16,16 +16,16 @@
 #include <type_traits>
 #include <utility>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 namespace {
 
-constexpr const char* kNativeAdamWFormat = "fastloader.rfdetr.native_adamw";
+constexpr const char* kNativeAdamWFormat = "mmltk.rfdetr.native_adamw";
 constexpr int64_t kNativeAdamWFormatVersion = 1;
 constexpr double kAdamBeta1 = 0.9;
 constexpr double kAdamBeta2 = 0.999;
 constexpr double kAdamEps = 1.0e-8;
-constexpr const char* kNativeMuonFormat = "fastloader.rfdetr.native_muon_aux_adam";
+constexpr const char* kNativeMuonFormat = "mmltk.rfdetr.native_muon_aux_adam";
 constexpr int64_t kNativeMuonFormatVersion = 1;
 constexpr double kMuonCoeffA = 3.4445;
 constexpr double kMuonCoeffB = -4.7750;
@@ -128,7 +128,7 @@ torch::Device step_device_for_backend(const torch::Tensor& param, NativeOptimize
     if (backend == NativeOptimizerBackend::fused || backend == NativeOptimizerBackend::foreach) {
         return param.device();
     }
-    return torch::Device(torch::kCPU);
+    return {torch::kCPU};
 }
 
 torch::Tensor make_step_tensor(const torch::Tensor& param, NativeOptimizerBackend backend) {
@@ -174,12 +174,12 @@ torch::Tensor muon_zeropower_via_newtonschulz5(const torch::Tensor& grad, const 
     return update;
 }
 
-torch::Tensor muon_update(torch::Tensor grad,
+torch::Tensor muon_update(const torch::Tensor& grad,
                           torch::Tensor& momentum,
                           const double beta,
                           const bool nesterov) {
     momentum.lerp_(grad, 1.0 - beta);
-    auto update = nesterov ? grad.lerp_(momentum, beta) : momentum;
+    auto update = nesterov ? grad.lerp(momentum, beta) : momentum;
     if (update.dim() == 4) {
         update = update.view({update.size(0), -1});
     }
@@ -188,7 +188,7 @@ torch::Tensor muon_update(torch::Tensor grad,
     return update;
 }
 
-torch::Tensor adam_update(torch::Tensor grad,
+torch::Tensor adam_update(const torch::Tensor& grad,
                           torch::Tensor& exp_avg,
                           torch::Tensor& exp_avg_sq,
                           const int64_t step) {
@@ -378,7 +378,7 @@ void NativeAdamW::step_group_eager(const Group& group) {
 
         auto& state = state_[index];
         state.step.add_(1.0);
-        const double step_value = state.step.item<double>();
+        const auto step_value = state.step.item<double>();
 
         if (group.config.weight_decay != 0.0) {
             param.mul_(1.0 - group.config.lr * group.config.weight_decay);
@@ -489,7 +489,7 @@ void NativeAdamW::step_group_foreach(const Group& group) {
         torch::_foreach_mul_(batch.exp_avg_sqs, kAdamBeta2);
         torch::_foreach_addcmul_(batch.exp_avg_sqs, batch.grads, batch.grads, 1.0 - kAdamBeta2);
 
-        const double step_val = batch.steps[0].item<double>();
+        const auto step_val = batch.steps[0].item<double>();
         const double bias_correction1 = 1.0 - std::pow(kAdamBeta1, step_val);
         const double bias_correction2 = 1.0 - std::pow(kAdamBeta2, step_val);
         const double step_size = group.config.lr / bias_correction1;
@@ -670,7 +670,7 @@ void NativeAdamW::load(torch::serialize::InputArchive& archive) {
     if (!archive.try_read("format", format_value) || !format_value.isString() ||
         format_value.toStringRef() != kNativeAdamWFormat) {
         throw std::runtime_error(
-            "native RF-DETR resume checkpoint uses a legacy optimizer archive; rebuild the checkpoint with the current fastloader");
+            "native RF-DETR resume checkpoint uses a legacy optimizer archive; rebuild the checkpoint with the current mmltk");
     }
     const auto version = require_int(archive, "format_version");
     if (version != kNativeAdamWFormatVersion) {
@@ -958,7 +958,7 @@ void NativeMuonWithAuxAdam::load(torch::serialize::InputArchive& archive) {
     if (!archive.try_read("format", format_value) || !format_value.isString() ||
         format_value.toStringRef() != kNativeMuonFormat) {
         throw std::runtime_error(
-            "native RF-DETR resume checkpoint uses a legacy Muon archive; rebuild the checkpoint with the current fastloader");
+            "native RF-DETR resume checkpoint uses a legacy Muon archive; rebuild the checkpoint with the current mmltk");
     }
     const auto version = require_int(archive, "format_version");
     if (version != kNativeMuonFormatVersion) {
@@ -1114,4 +1114,4 @@ void NativeOptimizer::load(torch::serialize::InputArchive& archive) {
     std::visit([&](auto& optimizer) { optimizer.load(archive); }, storage_);
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

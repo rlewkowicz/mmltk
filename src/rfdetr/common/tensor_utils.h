@@ -4,7 +4,7 @@
 
 #include <utility>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 inline std::pair<torch::Tensor, torch::Tensor> make_normalization_tensors(int device_id) {
     return {
@@ -19,4 +19,4 @@ inline std::pair<torch::Tensor, torch::Tensor> make_normalization_tensors(int de
     };
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

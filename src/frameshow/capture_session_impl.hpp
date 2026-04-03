@@ -26,14 +26,14 @@ constexpr std::uint32_t kBgr3V4l2PixelFormat = V4L2_PIX_FMT_BGR24;
 constexpr std::size_t kBgr3BytesPerPixel = 3;
 constexpr std::uint32_t kPackedRegionFieldLimit = 0xFFFFU;
 
-enum class InferenceState : std::uint32_t {
+enum class InferenceState : std::uint8_t {
   kFree = 0,
   kWriting = 1,
   kPublished = 2,
   kAcquired = 3,
 };
 
-enum class PreviewState : std::uint32_t {
+enum class PreviewState : std::uint8_t {
   kFree = 0,
   kPublished = 1,
   kDisplaying = 2,
@@ -77,7 +77,7 @@ struct CaptureSession::Impl {
 
   struct InferenceSlotRuntime {
     std::uint32_t slot_index = 0;
-    CUdeviceptr device_ptr = 0;
+    std::uint8_t* device_ptr = nullptr;
     std::size_t pitch_bytes = 0;
     cudaStream_t copy_stream = nullptr;
     cudaEvent_t ready_event = nullptr;
@@ -92,7 +92,7 @@ struct CaptureSession::Impl {
 
   struct PreviewSlotRuntime {
     std::uint32_t slot_index = 0;
-    CUdeviceptr device_ptr = 0;
+    std::uint8_t* device_ptr = nullptr;
     std::size_t pitch_bytes = 0;
     cudaStream_t copy_stream = nullptr;
     cudaEvent_t ready_event = nullptr;

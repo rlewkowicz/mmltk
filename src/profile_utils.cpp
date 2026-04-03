@@ -1,5 +1,6 @@
 #include "profile_utils.h"
 
+#include <array>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -19,9 +20,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-namespace fastloader {
+namespace mmltk {
 
-#if FASTLOADER_ENABLE_PROFILING
+#if MMLTK_ENABLE_PROFILING
 
 namespace {
 
@@ -92,12 +93,12 @@ sorted_metric_items(const std::unordered_map<std::string, Metric>& metrics) {
 
 std::string default_log_path() {
     ::mkdir("profiles", 0755);
-    char path[64];
-    std::snprintf(path,
-                  sizeof(path),
+    std::array<char, 64> path{};
+    std::snprintf(path.data(),
+                  path.size(),
                   "profiles/%lld.log",
                   static_cast<long long>(std::time(nullptr)));
-    return path;
+    return path.data();
 }
 
 void write_metric_line(FILE* out, const std::string& name, const Metric& metric) {
@@ -129,8 +130,8 @@ void write_metric_line(FILE* out, const std::string& name, const Metric& metric)
 
 void write_run_block(FILE* out, const RunSnapshot& run) {
     std::fprintf(out,
-                 "=== fastloader profile build=%s pid=%d run=%s iteration=%s total_ms=%.3f ===\n",
-                 FASTLOADER_BUILD_CONFIG,
+                 "=== mmltk profile build=%s pid=%d run=%s iteration=%s total_ms=%.3f ===\n",
+                 MMLTK_BUILD_CONFIG,
                  static_cast<int>(::getpid()),
                  run.run_label.c_str(),
                  run.iteration_label.c_str(),
@@ -183,8 +184,8 @@ void write_aggregate_block(FILE* out,
               [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
 
     std::fprintf(out,
-                 "=== fastloader profile aggregate build=%s pid=%d run=%s runs=%zu process_total_ms=%.3f ===\n",
-                 FASTLOADER_BUILD_CONFIG,
+                 "=== mmltk profile aggregate build=%s pid=%d run=%s runs=%zu process_total_ms=%.3f ===\n",
+                 MMLTK_BUILD_CONFIG,
                  static_cast<int>(::getpid()),
                  run_label.c_str(),
                  runs.size(),
@@ -296,14 +297,14 @@ public:
             return;
         }
 
-        const char* env_path = std::getenv("FASTLOADER_PROFILE_LOG");
+        const char* env_path = std::getenv("MMLTK_PROFILE_LOG");
         std::string fallback_path;
         const char* log_path = env_path;
         if (!log_path || !log_path[0]) {
             fallback_path = default_log_path();
             log_path = fallback_path.c_str();
         }
-        const char* append_env = std::getenv("FASTLOADER_PROFILE_APPEND");
+        const char* append_env = std::getenv("MMLTK_PROFILE_APPEND");
         const bool append = append_env && std::strcmp(append_env, "0") != 0;
 
         FILE* out = std::fopen(log_path, append ? "a" : "w");
@@ -421,4 +422,4 @@ void profile_flush() {
 
 #endif
 
-} // namespace fastloader
+} // namespace mmltk

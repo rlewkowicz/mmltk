@@ -5,6 +5,7 @@
 #include "profile_utils.h"
 #include "test_fixture.h"
 
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -13,13 +14,13 @@
 #include <string>
 
 namespace fs = std::filesystem;
-using namespace fastloader;
-using namespace fastloader::testsupport;
+using namespace mmltk;
+using namespace mmltk::testsupport;
 
 namespace {
 
 struct Options {
-    std::string test_dir = "/tmp/fastloader_profile";
+    std::string test_dir = "/tmp/mmltk_profile";
     bool keep_artifacts = false;
     int width = 384;
     int height = 384;
@@ -199,11 +200,11 @@ void run_profile_iteration(const FixtureSpec& fixture, const Options& opts) {
 } // namespace
 
 int main(int argc, char** argv) {
-    FASTLOADER_PROFILE_PROCESS_LABEL("profile.core");
-    FASTLOADER_PROFILE_RUN_LABEL("core");
-    const fastloader::ExecutionPolicySnapshot execution_snapshot =
-        fastloader::apply_process_execution_policy();
-    fastloader::log_process_execution_policy("fastloader_profile_runner", execution_snapshot, false, true);
+    MMLTK_PROFILE_PROCESS_LABEL("profile.core");
+    MMLTK_PROFILE_RUN_LABEL("core");
+    const mmltk::ExecutionPolicySnapshot execution_snapshot =
+        mmltk::apply_process_execution_policy();
+    mmltk::log_process_execution_policy("mmltk_profile_runner", execution_snapshot, false, true);
     const Options opts = parse_options(argc, argv);
 
     const FixtureSpec fixture{
@@ -217,25 +218,25 @@ int main(int argc, char** argv) {
     create_synthetic_dataset(fixture);
 
     for (int warmup = 0; warmup < opts.warmup_runs; ++warmup) {
-        FASTLOADER_PROFILE_RESET_ITERATION();
+        MMLTK_PROFILE_RESET_ITERATION();
         std::printf("warmup=%d/%d\n", warmup + 1, opts.warmup_runs);
         run_profile_iteration(fixture, opts);
     }
 
     for (int repetition = 0; repetition < opts.repetitions; ++repetition) {
-        FASTLOADER_PROFILE_RESET_ITERATION();
+        MMLTK_PROFILE_RESET_ITERATION();
         std::printf("repetition=%d/%d\n", repetition + 1, opts.repetitions);
         run_profile_iteration(fixture, opts);
 
-        char iteration_label[64];
-        std::snprintf(iteration_label,
-                      sizeof(iteration_label),
+        std::array<char, 64> iteration_label{};
+        std::snprintf(iteration_label.data(),
+                      iteration_label.size(),
                       "core[%02d]",
                       repetition + 1);
-        FASTLOADER_PROFILE_CAPTURE_ITERATION(iteration_label);
+        MMLTK_PROFILE_CAPTURE_ITERATION(iteration_label.data());
     }
 
-    FASTLOADER_PROFILE_FLUSH();
+    MMLTK_PROFILE_FLUSH();
     if (!opts.keep_artifacts) {
         fs::remove_all(fixture.root_dir);
     }

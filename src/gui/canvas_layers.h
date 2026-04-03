@@ -6,9 +6,9 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace fastloader::gui {
+namespace mmltk::gui {
 
-enum class RectDragKind : int {
+enum class RectDragKind : std::uint8_t {
     None = 0,
     Create = 1,
     Move = 2,
@@ -85,6 +85,12 @@ CanvasScreenRect canvas_rect_from_box(const CanvasViewport& viewport, const Anno
 RectDragKind rectangle_hover_kind(const CanvasPointerState& pointer,
                                   const CanvasViewport& viewport,
                                   const AnnotationBox& box);
+RectDragKind rectangle_hover_kind_with_options(const CanvasPointerState& pointer,
+                                               const CanvasViewport& viewport,
+                                               const AnnotationBox& box,
+                                               bool edge_only_move,
+                                               float edge_hit_half_width = 6.0f,
+                                               float corner_hit_size = 18.0f);
 AnnotationBox apply_rect_drag(const RectDragState& state,
                               const CanvasPointerState& pointer,
                               const CanvasViewport& viewport,
@@ -101,4 +107,4 @@ ResolvedVideoCrop resolve_video_crop(const SourceSelectionState& state);
 AnnotationBox resolved_video_crop_box(const SourceSelectionState& state);
 bool assign_video_crop_box(SourceSelectionState& state, const AnnotationBox& box);
 
-} // namespace fastloader::gui
+} // namespace mmltk::gui

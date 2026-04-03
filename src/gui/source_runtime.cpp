@@ -8,10 +8,10 @@
 #include <system_error>
 #include <vector>
 
-namespace fastloader::gui {
+namespace mmltk::gui {
 
 namespace fs = std::filesystem;
-using fastloader::rfdetr::PredictImageInput;
+using mmltk::rfdetr::PredictImageInput;
 
 namespace {
 
@@ -180,4 +180,4 @@ PreparedPredictSource prepare_predict_source(const SourceSelectionState& state) 
     throw std::runtime_error("Unsupported prediction source.");
 }
 
-} // namespace fastloader::gui
+} // namespace mmltk::gui

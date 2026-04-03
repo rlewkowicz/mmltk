@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.18)
 if(POLICY CMP0138)
     cmake_policy(SET CMP0138 NEW)
 endif()
-project(fastloader LANGUAGES CXX)
+project(mmltk LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -10,116 +10,130 @@ set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-set(FASTLOADER_CUDA_VERSION "13.2" CACHE STRING "Pinned CUDA toolkit version for fastloader builds")
-set(FASTLOADER_CUDA_TOOLKIT_ROOT "/usr/local/cuda-${FASTLOADER_CUDA_VERSION}" CACHE PATH
-    "Pinned CUDA toolkit root for fastloader builds")
-set(FASTLOADER_CUDA_ARCHITECTURES "native" CACHE STRING
-    "CUDA architectures for fastloader CUDA targets")
-get_filename_component(FASTLOADER_CUDA_TOOLKIT_ROOT "${FASTLOADER_CUDA_TOOLKIT_ROOT}" REALPATH)
-set(FASTLOADER_CUDA_NVCC "${FASTLOADER_CUDA_TOOLKIT_ROOT}/bin/nvcc")
-if(NOT EXISTS "${FASTLOADER_CUDA_NVCC}")
+include(GNUInstallDirs)
+set(CMAKE_INSTALL_BINDIR "bin" CACHE STRING "Install subdirectory for executables" FORCE)
+set(CMAKE_INSTALL_LIBDIR "lib" CACHE STRING "Install subdirectory for libraries" FORCE)
+set(CMAKE_INSTALL_DATADIR "share" CACHE STRING "Install subdirectory for shared data" FORCE)
+
+set(MMLTK_CUDA_VERSION "13.0" CACHE STRING "Pinned CUDA toolkit version for mmltk builds")
+set(MMLTK_CUDA_TOOLKIT_ROOT "/usr/local/cuda-${MMLTK_CUDA_VERSION}" CACHE PATH
+    "Pinned CUDA toolkit root for mmltk builds")
+set(MMLTK_DEFAULT_CUDA_ARCHITECTURES "86;87;89;90;100;103;110;120;121")
+set(MMLTK_CUDA_ARCHITECTURES "${MMLTK_DEFAULT_CUDA_ARCHITECTURES}" CACHE STRING
+    "CUDA architectures for mmltk CUDA targets")
+set(MMLTK_INSTALL_TORCH_ROOT "/opt/pytorch" CACHE PATH
+    "Runtime Torch root used for installed mmltk RPATHs")
+set(MMLTK_ONNXRUNTIME_ROOT "/opt/onnxruntime" CACHE PATH
+    "ONNX Runtime installation prefix containing include/ and lib/")
+set(MMLTK_INSTALL_PYTHONDIR "${CMAKE_INSTALL_DATADIR}/mmltk/python" CACHE STRING
+    "Install-relative directory for Python bridge scripts")
+set(MMLTK_INSTALL_FONTDIR "${CMAKE_INSTALL_DATADIR}/mmltk/fonts" CACHE STRING
+    "Install-relative directory for GUI font assets")
+get_filename_component(MMLTK_CUDA_TOOLKIT_ROOT "${MMLTK_CUDA_TOOLKIT_ROOT}" REALPATH)
+set(MMLTK_CUDA_NVCC "${MMLTK_CUDA_TOOLKIT_ROOT}/bin/nvcc")
+if(NOT EXISTS "${MMLTK_CUDA_NVCC}")
     message(FATAL_ERROR
-        "fastloader requires CUDA ${FASTLOADER_CUDA_VERSION}.x at ${FASTLOADER_CUDA_TOOLKIT_ROOT}. "
-        "Install the toolkit there or override FASTLOADER_CUDA_TOOLKIT_ROOT.")
+        "mmltk requires CUDA ${MMLTK_CUDA_VERSION}.x at ${MMLTK_CUDA_TOOLKIT_ROOT}. "
+        "Install the toolkit there or override MMLTK_CUDA_TOOLKIT_ROOT.")
 endif()
 
 # Force both FindCUDAToolkit and enable_language(CUDA) to resolve the same toolkit
 # even when the shell PATH still exposes an older nvcc.
-set(CUDAToolkit_ROOT "${FASTLOADER_CUDA_TOOLKIT_ROOT}" CACHE PATH
-    "Pinned CUDA toolkit root for fastloader builds" FORCE)
-set(CMAKE_CUDA_COMPILER "${FASTLOADER_CUDA_NVCC}" CACHE FILEPATH
-    "Pinned CUDA compiler for fastloader builds" FORCE)
-set(CUDA_TOOLKIT_ROOT_DIR "${FASTLOADER_CUDA_TOOLKIT_ROOT}" CACHE PATH
+set(CUDAToolkit_ROOT "${MMLTK_CUDA_TOOLKIT_ROOT}" CACHE PATH
+    "Pinned CUDA toolkit root for mmltk builds" FORCE)
+set(CMAKE_CUDA_COMPILER "${MMLTK_CUDA_NVCC}" CACHE FILEPATH
+    "Pinned CUDA compiler for mmltk builds" FORCE)
+set(CUDA_TOOLKIT_ROOT_DIR "${MMLTK_CUDA_TOOLKIT_ROOT}" CACHE PATH
     "Pinned legacy CUDA toolkit root for Torch/Caffe2 detection" FORCE)
-set(CUDA_BIN_PATH "${FASTLOADER_CUDA_TOOLKIT_ROOT}" CACHE PATH
+set(CUDA_BIN_PATH "${MMLTK_CUDA_TOOLKIT_ROOT}" CACHE PATH
     "Pinned legacy CUDA bin path for Torch/Caffe2 detection" FORCE)
-set(CUDA_NVCC_EXECUTABLE "${FASTLOADER_CUDA_NVCC}" CACHE FILEPATH
+set(CUDA_NVCC_EXECUTABLE "${MMLTK_CUDA_NVCC}" CACHE FILEPATH
     "Pinned legacy CUDA compiler for Torch/Caffe2 detection" FORCE)
-set(ENV{CUDA_HOME} "${FASTLOADER_CUDA_TOOLKIT_ROOT}")
-set(ENV{CUDA_BIN_PATH} "${FASTLOADER_CUDA_TOOLKIT_ROOT}")
-set(ENV{CUDACXX} "${FASTLOADER_CUDA_NVCC}")
-set(ENV{PATH} "${FASTLOADER_CUDA_TOOLKIT_ROOT}/bin:$ENV{PATH}")
+set(ENV{CUDA_HOME} "${MMLTK_CUDA_TOOLKIT_ROOT}")
+set(ENV{CUDA_BIN_PATH} "${MMLTK_CUDA_TOOLKIT_ROOT}")
+set(ENV{CUDACXX} "${MMLTK_CUDA_NVCC}")
+set(ENV{PATH} "${MMLTK_CUDA_TOOLKIT_ROOT}/bin:$ENV{PATH}")
 
-set(FASTLOADER_SUPPORTED_BUILD_TYPES Dev Release)
+set(MMLTK_SUPPORTED_BUILD_TYPES Dev Release)
 if(CMAKE_CONFIGURATION_TYPES)
-    set(CMAKE_CONFIGURATION_TYPES "${FASTLOADER_SUPPORTED_BUILD_TYPES}" CACHE STRING
-        "Supported fastloader build types" FORCE)
+    set(CMAKE_CONFIGURATION_TYPES "${MMLTK_SUPPORTED_BUILD_TYPES}" CACHE STRING
+        "Supported mmltk build types" FORCE)
 else()
     if(NOT CMAKE_BUILD_TYPE)
         set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
     endif()
-    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS ${FASTLOADER_SUPPORTED_BUILD_TYPES})
-    list(FIND FASTLOADER_SUPPORTED_BUILD_TYPES "${CMAKE_BUILD_TYPE}" FASTLOADER_BUILD_TYPE_INDEX)
-    if(FASTLOADER_BUILD_TYPE_INDEX EQUAL -1)
-        string(JOIN ", " FASTLOADER_SUPPORTED_BUILD_TYPES_TEXT ${FASTLOADER_SUPPORTED_BUILD_TYPES})
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS ${MMLTK_SUPPORTED_BUILD_TYPES})
+    list(FIND MMLTK_SUPPORTED_BUILD_TYPES "${CMAKE_BUILD_TYPE}" MMLTK_BUILD_TYPE_INDEX)
+    if(MMLTK_BUILD_TYPE_INDEX EQUAL -1)
+        string(JOIN ", " MMLTK_SUPPORTED_BUILD_TYPES_TEXT ${MMLTK_SUPPORTED_BUILD_TYPES})
         message(FATAL_ERROR
-            "fastloader supports only these build types: ${FASTLOADER_SUPPORTED_BUILD_TYPES_TEXT}")
+            "mmltk supports only these build types: ${MMLTK_SUPPORTED_BUILD_TYPES_TEXT}")
     endif()
 endif()
 
-option(FASTLOADER_DEV_STRICT_WARNINGS
+option(MMLTK_DEV_STRICT_WARNINGS
     "Enable aggressive host-side warnings for the Dev build"
     ON)
-option(FASTLOADER_DEV_ENABLE_ASAN
+option(MMLTK_DEV_ENABLE_ASAN
     "Enable AddressSanitizer for host-side Dev C++ builds"
     OFF)
-option(FASTLOADER_DEV_ENABLE_UBSAN
+option(MMLTK_DEV_ENABLE_UBSAN
     "Enable UndefinedBehaviorSanitizer for host-side Dev C++ builds"
     OFF)
 
-set(FASTLOADER_X86_SIMD_FLAGS "")
+set(MMLTK_X86_SIMD_FLAGS "")
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|X86_64|amd64|AMD64)$")
-    set(FASTLOADER_X86_SIMD_FLAGS "-mssse3 -msse4.2 -mavx2 -mfma")
+    set(MMLTK_X86_SIMD_FLAGS "-mssse3 -msse4.2 -mavx2 -mfma")
 endif()
-set(FASTLOADER_COMMON_MACHINE_FLAGS
-    "-march=native -mtune=native ${FASTLOADER_X86_SIMD_FLAGS} -fno-semantic-interposition -ffunction-sections -fdata-sections")
-set(FASTLOADER_COMMON_WARNING_FLAGS "-Wall -Wextra -Wpedantic")
-set(FASTLOADER_STRICT_WARNING_FLAGS "")
-if(FASTLOADER_DEV_STRICT_WARNINGS)
-    set(FASTLOADER_STRICT_WARNING_FLAGS
+set(MMLTK_COMMON_MACHINE_FLAGS
+    "-march=native -mtune=native ${MMLTK_X86_SIMD_FLAGS} -fno-semantic-interposition -ffunction-sections -fdata-sections")
+set(MMLTK_COMMON_WARNING_FLAGS "-Wall -Wextra -Wpedantic")
+set(MMLTK_STRICT_WARNING_FLAGS "")
+if(MMLTK_DEV_STRICT_WARNINGS)
+    set(MMLTK_STRICT_WARNING_FLAGS
         "-Wshadow -Wnon-virtual-dtor -Wcast-align -Woverloaded-virtual -Wconversion -Wformat=2 -Wnull-dereference -Wimplicit-fallthrough")
 endif()
-set(FASTLOADER_DEV_SANITIZER_FLAGS "")
-if(FASTLOADER_DEV_ENABLE_ASAN)
-    string(APPEND FASTLOADER_DEV_SANITIZER_FLAGS " -fsanitize=address")
+set(MMLTK_DEV_SANITIZER_FLAGS "")
+if(MMLTK_DEV_ENABLE_ASAN)
+    string(APPEND MMLTK_DEV_SANITIZER_FLAGS " -fsanitize=address")
 endif()
-if(FASTLOADER_DEV_ENABLE_UBSAN)
-    string(APPEND FASTLOADER_DEV_SANITIZER_FLAGS " -fsanitize=undefined")
+if(MMLTK_DEV_ENABLE_UBSAN)
+    string(APPEND MMLTK_DEV_SANITIZER_FLAGS " -fsanitize=undefined")
 endif()
-if(NOT FASTLOADER_DEV_SANITIZER_FLAGS STREQUAL "")
-    string(APPEND FASTLOADER_DEV_SANITIZER_FLAGS " -fno-sanitize-recover=all")
+if(NOT MMLTK_DEV_SANITIZER_FLAGS STREQUAL "")
+    string(APPEND MMLTK_DEV_SANITIZER_FLAGS " -fno-sanitize-recover=all")
 endif()
-set(FASTLOADER_RELEASE_FLAGS
-    "-O3 -DNDEBUG -fomit-frame-pointer -fno-plt ${FASTLOADER_COMMON_MACHINE_FLAGS}")
-set(FASTLOADER_DEV_FLAGS
-    "-O2 -g3 -fno-omit-frame-pointer -fno-optimize-sibling-calls -D_GLIBCXX_ASSERTIONS -D_FORTIFY_SOURCE=3 ${FASTLOADER_COMMON_MACHINE_FLAGS} ${FASTLOADER_COMMON_WARNING_FLAGS} ${FASTLOADER_STRICT_WARNING_FLAGS} ${FASTLOADER_DEV_SANITIZER_FLAGS}")
-set(CMAKE_CXX_FLAGS_RELEASE "${FASTLOADER_RELEASE_FLAGS}")
-set(CMAKE_CXX_FLAGS_DEV "${FASTLOADER_DEV_FLAGS}")
+set(MMLTK_RELEASE_FLAGS
+    "-O3 -DNDEBUG -fomit-frame-pointer -fno-plt ${MMLTK_COMMON_MACHINE_FLAGS}")
+set(MMLTK_DEV_FLAGS
+    "-O2 -g3 -fno-omit-frame-pointer -fno-optimize-sibling-calls -D_GLIBCXX_ASSERTIONS -D_FORTIFY_SOURCE=3 ${MMLTK_COMMON_MACHINE_FLAGS} ${MMLTK_COMMON_WARNING_FLAGS} ${MMLTK_STRICT_WARNING_FLAGS} ${MMLTK_DEV_SANITIZER_FLAGS}")
+set(CMAKE_CXX_FLAGS_RELEASE "${MMLTK_RELEASE_FLAGS}")
+set(CMAKE_CXX_FLAGS_DEV "${MMLTK_DEV_FLAGS}")
 
 set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -DNDEBUG")
 set(CMAKE_CUDA_FLAGS_DEV "-O2 -g -lineinfo -Xcompiler=-fno-omit-frame-pointer")
 
-set(FASTLOADER_COMMON_LINK_FLAGS "-Wl,-O2 -Wl,--as-needed")
-set(FASTLOADER_RELEASE_LINK_FLAGS "${FASTLOADER_COMMON_LINK_FLAGS} -Wl,--gc-sections")
-set(FASTLOADER_DEV_LINK_FLAGS
-    "${FASTLOADER_COMMON_LINK_FLAGS} -Wl,--gc-sections ${FASTLOADER_DEV_SANITIZER_FLAGS}")
-set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${FASTLOADER_RELEASE_LINK_FLAGS}")
-set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "${FASTLOADER_RELEASE_LINK_FLAGS}")
-set(CMAKE_EXE_LINKER_FLAGS_DEV "${FASTLOADER_DEV_LINK_FLAGS}")
-set(CMAKE_SHARED_LINKER_FLAGS_DEV "${FASTLOADER_DEV_LINK_FLAGS}")
+set(MMLTK_COMMON_LINK_FLAGS "-Wl,-O2 -Wl,--as-needed")
+set(MMLTK_RELEASE_LINK_FLAGS "${MMLTK_COMMON_LINK_FLAGS} -Wl,--gc-sections")
+set(MMLTK_DEV_LINK_FLAGS
+    "${MMLTK_COMMON_LINK_FLAGS} -Wl,--gc-sections ${MMLTK_DEV_SANITIZER_FLAGS}")
+set(CMAKE_EXE_LINKER_FLAGS_RELEASE "${MMLTK_RELEASE_LINK_FLAGS}")
+set(CMAKE_SHARED_LINKER_FLAGS_RELEASE "${MMLTK_RELEASE_LINK_FLAGS}")
+set(CMAKE_EXE_LINKER_FLAGS_DEV "${MMLTK_DEV_LINK_FLAGS}")
+set(CMAKE_SHARED_LINKER_FLAGS_DEV "${MMLTK_DEV_LINK_FLAGS}")
 
 include(CheckIPOSupported)
-check_ipo_supported(RESULT FASTLOADER_IPO_SUPPORTED OUTPUT FASTLOADER_IPO_OUTPUT LANGUAGES CXX)
-if(FASTLOADER_IPO_SUPPORTED)
+check_ipo_supported(RESULT MMLTK_IPO_SUPPORTED OUTPUT MMLTK_IPO_OUTPUT LANGUAGES CXX)
+if(MMLTK_IPO_SUPPORTED)
     set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
 else()
-    message(STATUS "IPO disabled: ${FASTLOADER_IPO_OUTPUT}")
+    message(STATUS "IPO disabled: ${MMLTK_IPO_OUTPUT}")
 endif()
 
 find_package(CUDAToolkit REQUIRED)
-if(NOT "${CUDAToolkit_VERSION}" MATCHES "^${FASTLOADER_CUDA_VERSION}(\\.|$)")
+if(NOT "${CUDAToolkit_VERSION}" MATCHES "^${MMLTK_CUDA_VERSION}(\\.|$)")
     message(FATAL_ERROR
-        "Expected CUDA ${FASTLOADER_CUDA_VERSION}.x from ${FASTLOADER_CUDA_TOOLKIT_ROOT}, "
+        "Expected CUDA ${MMLTK_CUDA_VERSION}.x from ${MMLTK_CUDA_TOOLKIT_ROOT}, "
         "but CMake resolved CUDA ${CUDAToolkit_VERSION} from ${CUDAToolkit_BIN_DIR}.")
 endif()
 message(STATUS "Using CUDA toolkit ${CUDAToolkit_VERSION} from ${CUDAToolkit_ROOT}")
@@ -135,24 +149,54 @@ target_include_directories(nlohmann_json SYSTEM INTERFACE ${CMAKE_SOURCE_DIR}/th
 add_library(cli11 INTERFACE)
 target_include_directories(cli11 SYSTEM INTERFACE ${CMAKE_SOURCE_DIR}/third_party)
 
-set(FASTLOADER_AVIR_SOURCE_DIR "${CMAKE_SOURCE_DIR}/third_party/avir")
-if(NOT EXISTS "${FASTLOADER_AVIR_SOURCE_DIR}/avir.h")
+set(MMLTK_AVIR_SOURCE_DIR "${CMAKE_SOURCE_DIR}/third_party/avir")
+if(NOT EXISTS "${MMLTK_AVIR_SOURCE_DIR}/avir.h")
     message(FATAL_ERROR
-        "Missing vendored AVIR checkout at ${FASTLOADER_AVIR_SOURCE_DIR}. "
+        "Missing vendored AVIR checkout at ${MMLTK_AVIR_SOURCE_DIR}. "
         "CPU image resize is implemented via AVIR only; there is no fallback.")
 endif()
 
 add_library(avir INTERFACE)
-target_include_directories(avir SYSTEM INTERFACE ${FASTLOADER_AVIR_SOURCE_DIR})
+target_include_directories(avir SYSTEM INTERFACE ${MMLTK_AVIR_SOURCE_DIR})
 
-add_library(fastloader_build_options INTERFACE)
-target_compile_definitions(fastloader_build_options INTERFACE
-    FASTLOADER_ENABLE_PROFILING=$<IF:$<CONFIG:Dev>,1,0>
-    FASTLOADER_BUILD_CONFIG=\"$<CONFIG>\"
+add_library(mmltk_build_options INTERFACE)
+target_compile_definitions(mmltk_build_options INTERFACE
+    MMLTK_ENABLE_PROFILING=$<IF:$<CONFIG:Dev>,1,0>
+    MMLTK_BUILD_CONFIG=\"$<CONFIG>\"
+)
+
+add_library(spdlog STATIC
+    third_party/spdlog/src/async.cpp
+    third_party/spdlog/src/bundled_fmtlib_format.cpp
+    third_party/spdlog/src/cfg.cpp
+    third_party/spdlog/src/color_sinks.cpp
+    third_party/spdlog/src/file_sinks.cpp
+    third_party/spdlog/src/spdlog.cpp
+    third_party/spdlog/src/stdout_sinks.cpp
+)
+target_include_directories(spdlog PUBLIC
+    ${CMAKE_SOURCE_DIR}/third_party/spdlog/include
+)
+target_link_libraries(spdlog PUBLIC Threads::Threads)
+target_compile_definitions(spdlog PUBLIC
+    SPDLOG_COMPILED_LIB
+    SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE
+)
+add_library(spdlog::spdlog ALIAS spdlog)
+
+add_library(mmltk_logging SHARED
+    src/mmltk_logging.cpp
+)
+target_include_directories(mmltk_logging PUBLIC
+    ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(mmltk_logging PUBLIC
+    mmltk_build_options
+    spdlog
 )
 
 # ---- Core library ----
-add_library(fastloader_core SHARED
+add_library(mmltk_core SHARED
     src/dataset/compile/dataset_compiler.cpp
     src/dataset/compile/dataset_compiler_scan_labels.cpp
     src/dataset/compile/dataset_compiler_pixels.cpp
@@ -168,121 +212,160 @@ add_library(fastloader_core SHARED
     src/worker_pool.cpp
     src/stb_image_write.cpp
 )
-target_include_directories(fastloader_core PUBLIC
+target_include_directories(mmltk_core PUBLIC
     ${CMAKE_SOURCE_DIR}/include
 PRIVATE
     ${CMAKE_SOURCE_DIR}/src
 )
-target_link_libraries(fastloader_core PUBLIC
+target_link_libraries(mmltk_core PUBLIC
     CUDA::cudart
     Threads::Threads
     stb
     nlohmann_json
-    fastloader_build_options
+    mmltk_build_options
+    mmltk_logging
 PRIVATE
     avir
 )
 
-add_library(fastloader_runtime STATIC
-    src/runtime/async_runtime.cpp
-    src/runtime/model_registry.cpp
+add_library(mmltk_model_api STATIC
+    src/model/module.cpp
 )
-target_include_directories(fastloader_runtime PUBLIC
+target_include_directories(mmltk_model_api PUBLIC
     ${CMAKE_SOURCE_DIR}/include
 PRIVATE
     ${CMAKE_SOURCE_DIR}/src
 )
-target_link_libraries(fastloader_runtime PUBLIC
-    fastloader_core
-    fastloader_build_options
+target_link_libraries(mmltk_model_api PUBLIC
+    mmltk_core
+    mmltk_build_options
+)
+
+add_library(mmltk_runtime STATIC
+    src/runtime/async_runtime.cpp
+)
+target_include_directories(mmltk_runtime PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(mmltk_runtime PUBLIC
+    mmltk_core
+    mmltk_build_options
+    mmltk_model_api
 )
 
 # ---- CLI tool ----
-add_executable(fastloader_cli src/cli.cpp)
-target_link_libraries(fastloader_cli PRIVATE fastloader_core fastloader_build_options cli11)
-target_include_directories(fastloader_cli PRIVATE ${CMAKE_SOURCE_DIR}/src)
+add_executable(mmltk_cli src/cli.cpp)
+target_link_libraries(mmltk_cli PRIVATE mmltk_core mmltk_build_options cli11 mmltk_logging)
+target_include_directories(mmltk_cli PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/third_party/spdmon/include
+)
 
 option(BUILD_RFDETR_NATIVE "Build native RF-DETR validation backends" ON)
 option(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER
     "Enable embedded Python parsing of upstream RF-DETR .pth checkpoints"
     ${BUILD_RFDETR_NATIVE})
-option(BUILD_FASTLOADER_GUI "Build the standalone ImGui RF-DETR desktop GUI" OFF)
-set(FASTLOADER_IMGUI_SOURCE_DIR "" CACHE PATH
-    "Optional local Dear ImGui checkout for BUILD_FASTLOADER_GUI")
-target_compile_definitions(fastloader_core PRIVATE
-    FASTLOADER_DATASET_COMPILER_CUDA=$<IF:$<BOOL:${BUILD_RFDETR_NATIVE}>,1,0>
+option(BUILD_MMLTK_GUI "Build the standalone ImGui RF-DETR desktop GUI" OFF)
+set(MMLTK_IMGUI_SOURCE_DIR "" CACHE PATH
+    "Optional local Dear ImGui checkout for BUILD_MMLTK_GUI")
+target_compile_definitions(mmltk_core PRIVATE
+    MMLTK_DATASET_COMPILER_CUDA=$<IF:$<BOOL:${BUILD_RFDETR_NATIVE}>,1,0>
 )
 
-add_library(fastloader_rfdetr_lsap STATIC
+add_library(mmltk_rfdetr_lsap STATIC
     src/rfdetr/utils/scipy_rectangular_lsap.cpp
 )
-target_include_directories(fastloader_rfdetr_lsap
+target_include_directories(mmltk_rfdetr_lsap
     PUBLIC
         ${CMAKE_SOURCE_DIR}/include
     PRIVATE
         ${CMAKE_SOURCE_DIR}/src
 )
-target_link_libraries(fastloader_rfdetr_lsap
+target_link_libraries(mmltk_rfdetr_lsap
     PUBLIC
-        fastloader_build_options
+        mmltk_build_options
 )
 
-set(FASTLOADER_NEEDS_TORCH OFF)
+add_library(mmltk_rfdetr_core STATIC
+    src/rfdetr/core/module.cpp
+    src/rfdetr/layers/model_config.cpp
+    src/rfdetr/weight_catalog.cpp
+)
+target_include_directories(mmltk_rfdetr_core
+    PUBLIC
+        ${CMAKE_SOURCE_DIR}/include
+    PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(mmltk_rfdetr_core
+    PUBLIC
+        mmltk_build_options
+        mmltk_model_api
+)
+set_target_properties(mmltk_rfdetr_core PROPERTIES
+    CXX_STANDARD 20
+    CXX_STANDARD_REQUIRED ON
+    CXX_EXTENSIONS OFF
+)
+
+set(MMLTK_NEEDS_TORCH OFF)
 if(BUILD_RFDETR_NATIVE)
-    set(FASTLOADER_NEEDS_TORCH ON)
+    set(MMLTK_NEEDS_TORCH ON)
 endif()
 
-set(FASTLOADER_NEEDS_PYTHON OFF)
+set(MMLTK_NEEDS_PYTHON OFF)
 if(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER)
     if(NOT BUILD_RFDETR_NATIVE)
         message(FATAL_ERROR
             "BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER requires BUILD_RFDETR_NATIVE=ON.")
     endif()
-    set(FASTLOADER_NEEDS_PYTHON ON)
+    set(MMLTK_NEEDS_PYTHON ON)
 endif()
 
-set(FASTLOADER_TORCH_ROOT "" CACHE PATH
-    "Optional LibTorch installation prefix containing share/cmake/Torch")
-set(FASTLOADER_TORCH_SOURCE_ROOT "/opt/src/pytorch-v2.10.0" CACHE PATH
-    "PyTorch source tree matching the LibTorch build, used for vendored ONNX headers")
-set(FASTLOADER_TORCH_BUILD_ROOT "/opt/src/pytorch-build-2.10.0-cu132" CACHE PATH
-    "PyTorch build tree matching the LibTorch build, used for generated vendored ONNX protobuf headers")
-set(FASTLOADER_TORCH_CUDA_ARCH_LIST "" CACHE STRING
-    "Optional TORCH_CUDA_ARCH_LIST override for LibTorch/Caffe2 consumers")
+set(MMLTK_TORCH_ROOT "" CACHE PATH
+    "Torch installation prefix containing share/cmake/Torch")
+set(MMLTK_ONNX_ROOT "" CACHE PATH
+    "ONNX installation prefix containing lib/cmake/ONNX")
+set(MMLTK_DEFAULT_TORCH_CUDA_ARCH_LIST
+    "8.6 8.7 8.9 9.0 10.0 10.3 11.0 12.0 12.1")
+set(MMLTK_TORCH_CUDA_ARCH_LIST "${MMLTK_DEFAULT_TORCH_CUDA_ARCH_LIST}" CACHE STRING
+    "Default TORCH_CUDA_ARCH_LIST for LibTorch/Caffe2 consumers")
 
-if(FASTLOADER_NEEDS_TORCH)
-    if(FASTLOADER_TORCH_CUDA_ARCH_LIST)
-        set(TORCH_CUDA_ARCH_LIST "${FASTLOADER_TORCH_CUDA_ARCH_LIST}" CACHE STRING
+if(MMLTK_NEEDS_TORCH)
+    if(MMLTK_TORCH_CUDA_ARCH_LIST)
+        set(TORCH_CUDA_ARCH_LIST "${MMLTK_TORCH_CUDA_ARCH_LIST}" CACHE STRING
             "Pinned CUDA architectures for LibTorch/Caffe2 consumers" FORCE)
     endif()
-    set(_fastloader_nvrtc_library "${FASTLOADER_CUDA_TOOLKIT_ROOT}/lib64/libnvrtc.so")
-    if(EXISTS "${_fastloader_nvrtc_library}")
-        file(SHA256 "${_fastloader_nvrtc_library}" _fastloader_nvrtc_hash)
-        string(SUBSTRING "${_fastloader_nvrtc_hash}" 0 8 CUDA_NVRTC_SHORTHASH)
+    set(_mmltk_nvrtc_library "${MMLTK_CUDA_TOOLKIT_ROOT}/lib64/libnvrtc.so")
+    if(EXISTS "${_mmltk_nvrtc_library}")
+        file(SHA256 "${_mmltk_nvrtc_library}" _mmltk_nvrtc_hash)
+        string(SUBSTRING "${_mmltk_nvrtc_hash}" 0 8 CUDA_NVRTC_SHORTHASH)
         set(CUDA_NVRTC_SHORTHASH "${CUDA_NVRTC_SHORTHASH}" CACHE STRING
             "Pinned nvrtc shorthash for LibTorch/Caffe2 detection" FORCE)
     endif()
-    if(FASTLOADER_TORCH_ROOT)
-        list(PREPEND CMAKE_PREFIX_PATH "${FASTLOADER_TORCH_ROOT}")
+    if(MMLTK_TORCH_ROOT)
+        list(PREPEND CMAKE_PREFIX_PATH "${MMLTK_TORCH_ROOT}")
     endif()
-    set(_fastloader_saved_cuda_architectures "")
+    set(_mmltk_saved_cuda_architectures "")
     if(DEFINED CMAKE_CUDA_ARCHITECTURES)
         if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "")
-            set(_fastloader_saved_cuda_architectures "${CMAKE_CUDA_ARCHITECTURES}")
+            set(_mmltk_saved_cuda_architectures "${CMAKE_CUDA_ARCHITECTURES}")
         endif()
         unset(CMAKE_CUDA_ARCHITECTURES CACHE)
         unset(CMAKE_CUDA_ARCHITECTURES)
     endif()
     find_package(Torch REQUIRED)
-    if(NOT _fastloader_saved_cuda_architectures STREQUAL "")
-        set(CMAKE_CUDA_ARCHITECTURES "${_fastloader_saved_cuda_architectures}" CACHE STRING
+    if(NOT _mmltk_saved_cuda_architectures STREQUAL "")
+        set(CMAKE_CUDA_ARCHITECTURES "${_mmltk_saved_cuda_architectures}" CACHE STRING
             "CUDA architectures" FORCE)
     endif()
 
     if(DEFINED TORCH_INSTALL_PREFIX AND NOT TORCH_INSTALL_PREFIX STREQUAL "")
         get_filename_component(TORCH_LIBRARY_DIR "${TORCH_INSTALL_PREFIX}/lib" ABSOLUTE)
-    elseif(FASTLOADER_TORCH_ROOT)
-        get_filename_component(TORCH_LIBRARY_DIR "${FASTLOADER_TORCH_ROOT}/lib" ABSOLUTE)
+    elseif(MMLTK_TORCH_ROOT)
+        get_filename_component(TORCH_LIBRARY_DIR "${MMLTK_TORCH_ROOT}/lib" ABSOLUTE)
     elseif(DEFINED Torch_DIR AND NOT Torch_DIR STREQUAL "")
         get_filename_component(TORCH_LIBRARY_DIR "${Torch_DIR}/../../../lib" ABSOLUTE)
     else()
@@ -296,15 +379,49 @@ if(FASTLOADER_NEEDS_TORCH)
     if(NOT DEFINED TORCH_LIBRARY_DIR OR TORCH_LIBRARY_DIR STREQUAL "" OR NOT EXISTS "${TORCH_LIBRARY_DIR}")
         message(FATAL_ERROR
             "Failed to resolve the LibTorch library directory. "
-            "Set FASTLOADER_TORCH_ROOT or Torch_DIR to your CUDA 13.2 LibTorch install.")
+            "Set MMLTK_TORCH_ROOT or Torch_DIR to your LibTorch install.")
+    endif()
+    get_filename_component(MMLTK_TORCH_LIBRARY_DIR_REAL "${TORCH_LIBRARY_DIR}" REALPATH)
+    if(MMLTK_TORCH_ROOT)
+        get_filename_component(MMLTK_TORCH_ROOT_REAL "${MMLTK_TORCH_ROOT}" REALPATH)
+    else()
+        set(MMLTK_TORCH_ROOT_REAL "")
     endif()
     separate_arguments(TORCH_CXX_FLAGS_LIST NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
-    target_compile_options(fastloader_core PUBLIC ${TORCH_CXX_FLAGS_LIST})
-    target_compile_options(fastloader_cli PRIVATE ${TORCH_CXX_FLAGS_LIST})
+    set(MMLTK_TORCH_EXTRA_LIBRARIES "")
+    unset(MMLTK_NCCL_LIBRARY CACHE)
+    unset(MMLTK_NCCL_LIBRARY)
+    find_file(MMLTK_NCCL_LIBRARY
+        NAMES libnccl.so.2
+        HINTS
+            "${MMLTK_TORCH_LIBRARY_DIR_REAL}/../../nvidia/nccl/lib"
+            "${MMLTK_TORCH_LIBRARY_DIR_REAL}/../nvidia/nccl/lib"
+            "${MMLTK_TORCH_ROOT_REAL}/../../nvidia/nccl/lib"
+            "${MMLTK_TORCH_ROOT_REAL}/../nvidia/nccl/lib"
+        NO_DEFAULT_PATH)
+    if(NOT MMLTK_NCCL_LIBRARY)
+        find_library(MMLTK_NCCL_LIBRARY
+            NAMES nccl libnccl.so.2
+            HINTS
+                /usr/lib/x86_64-linux-gnu
+                /usr/local/lib
+                /usr/local/lib64
+                "${MMLTK_CUDA_TOOLKIT_ROOT}/lib64"
+                "${MMLTK_CUDA_TOOLKIT_ROOT}/targets/x86_64-linux/lib")
+    endif()
+    if(MMLTK_NCCL_LIBRARY)
+        list(APPEND MMLTK_TORCH_EXTRA_LIBRARIES "${MMLTK_NCCL_LIBRARY}")
+    elseif(EXISTS "${TORCH_LIBRARY_DIR}/libtorch_cuda.so")
+        message(FATAL_ERROR
+            "Torch resolved libtorch_cuda.so from ${TORCH_LIBRARY_DIR}, but libnccl.so was not found. "
+            "Install NCCL runtime libraries or expose them on the library search path before configuring.")
+    endif()
+    target_compile_options(mmltk_core PUBLIC ${TORCH_CXX_FLAGS_LIST})
+    target_compile_options(mmltk_cli PRIVATE ${TORCH_CXX_FLAGS_LIST})
 endif()
 
-function(fastloader_enable_torch target visibility)
-    if(NOT FASTLOADER_NEEDS_TORCH)
+function(mmltk_enable_torch target visibility)
+    if(NOT MMLTK_NEEDS_TORCH)
         message(FATAL_ERROR "Torch support requested for ${target} but Torch is not enabled")
     endif()
     target_include_directories(${target} SYSTEM ${visibility} ${TORCH_INCLUDE_DIRS})
@@ -314,92 +431,169 @@ function(fastloader_enable_torch target visibility)
             $<$<AND:$<CONFIG:Dev>,$<COMPILE_LANGUAGE:CXX>>:-Wno-null-dereference>)
     endif()
     target_link_libraries(${target} ${visibility} ${TORCH_LIBRARIES})
+    if(MMLTK_TORCH_EXTRA_LIBRARIES)
+        target_link_libraries(${target} ${visibility} ${MMLTK_TORCH_EXTRA_LIBRARIES})
+    endif()
 endfunction()
 
-function(fastloader_enable_python_checkpoint_loader target visibility)
-    if(NOT FASTLOADER_NEEDS_PYTHON)
+function(mmltk_prefer_system_protobuf_headers target visibility)
+    # ONNX-generated protobuf sources must see the system protobuf headers
+    # before LibTorch's bundled protobuf copy.
+    if(DEFINED MMLTK_SYSTEM_PROTOBUF_REDIRECT_DIR AND
+       NOT MMLTK_SYSTEM_PROTOBUF_REDIRECT_DIR STREQUAL "")
+        target_compile_options(${target} BEFORE ${visibility}
+            "-I${MMLTK_SYSTEM_PROTOBUF_REDIRECT_DIR}")
+    elseif(Protobuf_INCLUDE_DIRS)
+        foreach(_mmltk_protobuf_include_dir IN LISTS Protobuf_INCLUDE_DIRS)
+            target_compile_options(${target} BEFORE ${visibility} "-I${_mmltk_protobuf_include_dir}")
+        endforeach()
+    endif()
+endfunction()
+
+function(mmltk_enable_python_checkpoint_loader target visibility)
+    if(NOT MMLTK_NEEDS_PYTHON)
         message(FATAL_ERROR "Python checkpoint loader requested for ${target} but it is not enabled")
     endif()
     target_compile_definitions(${target} ${visibility}
-        FASTLOADER_RFDETR_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
-        FASTLOADER_RFDETR_PYTHON_CHECKPOINT_BRIDGE="${FASTLOADER_RFDETR_PYTHON_CHECKPOINT_BRIDGE}"
+        MMLTK_RFDETR_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
+        MMLTK_RFDETR_PYTHON_CHECKPOINT_BRIDGE_SOURCE="${MMLTK_RFDETR_PYTHON_CHECKPOINT_BRIDGE_SOURCE}"
     )
 endfunction()
 
-function(fastloader_enable_native_runtime_rpath target)
-    set(_fastloader_build_rpath "")
-    foreach(_fastloader_system_libdir IN ITEMS
+function(mmltk_enable_native_runtime_rpath target)
+    set(_mmltk_build_rpath "")
+    foreach(_mmltk_system_libdir IN ITEMS
             /lib64
             /usr/lib64
             /lib/x86_64-linux-gnu
             /usr/lib/x86_64-linux-gnu)
-        if(EXISTS "${_fastloader_system_libdir}")
-            list(APPEND _fastloader_build_rpath "${_fastloader_system_libdir}")
+        if(EXISTS "${_mmltk_system_libdir}")
+            list(APPEND _mmltk_build_rpath "${_mmltk_system_libdir}")
         endif()
     endforeach()
     if(DEFINED TORCH_LIBRARY_DIR AND NOT TORCH_LIBRARY_DIR STREQUAL "")
-        list(APPEND _fastloader_build_rpath "${TORCH_LIBRARY_DIR}")
+        list(APPEND _mmltk_build_rpath "${TORCH_LIBRARY_DIR}")
     endif()
     if(DEFINED ONNXRUNTIME_LIBRARY_DIR AND NOT ONNXRUNTIME_LIBRARY_DIR STREQUAL "")
-        list(APPEND _fastloader_build_rpath "${ONNXRUNTIME_LIBRARY_DIR}")
+        list(APPEND _mmltk_build_rpath "${ONNXRUNTIME_LIBRARY_DIR}")
     endif()
-    if(_fastloader_build_rpath)
-        list(JOIN _fastloader_build_rpath ";" _fastloader_build_rpath_value)
-        set_target_properties(${target} PROPERTIES BUILD_RPATH "${_fastloader_build_rpath_value}")
+    if(DEFINED MMLTK_ONNX_LIBRARY_DIR AND NOT MMLTK_ONNX_LIBRARY_DIR STREQUAL "")
+        list(APPEND _mmltk_build_rpath "${MMLTK_ONNX_LIBRARY_DIR}")
     endif()
+    if(_mmltk_build_rpath)
+        list(JOIN _mmltk_build_rpath ";" _mmltk_build_rpath_value)
+        set_target_properties(${target} PROPERTIES BUILD_RPATH "${_mmltk_build_rpath_value}")
+    endif()
+    set(_mmltk_install_rpath
+        "\$ORIGIN/../${CMAKE_INSTALL_LIBDIR}"
+        "${MMLTK_INSTALL_TORCH_ROOT}/lib"
+        "${MMLTK_CUDA_TOOLKIT_ROOT}/lib64"
+    )
+    list(JOIN _mmltk_install_rpath ";" _mmltk_install_rpath_value)
+    set_target_properties(${target} PROPERTIES INSTALL_RPATH "${_mmltk_install_rpath_value}")
 endfunction()
 
-if(FASTLOADER_NEEDS_PYTHON)
+mmltk_enable_native_runtime_rpath(mmltk_core)
+mmltk_enable_native_runtime_rpath(mmltk_logging)
+
+if(MMLTK_NEEDS_PYTHON)
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
-    set(FASTLOADER_RFDETR_PYTHON_CHECKPOINT_BRIDGE
+    set(MMLTK_RFDETR_PYTHON_CHECKPOINT_BRIDGE_SOURCE
         "${CMAKE_SOURCE_DIR}/utilities/rfdetr_checkpoint_bridge.py")
-    if(NOT EXISTS "${FASTLOADER_RFDETR_PYTHON_CHECKPOINT_BRIDGE}")
+    if(NOT EXISTS "${MMLTK_RFDETR_PYTHON_CHECKPOINT_BRIDGE_SOURCE}")
         message(FATAL_ERROR
-            "Missing RF-DETR Python checkpoint bridge: ${FASTLOADER_RFDETR_PYTHON_CHECKPOINT_BRIDGE}")
+            "Missing RF-DETR Python checkpoint bridge: ${MMLTK_RFDETR_PYTHON_CHECKPOINT_BRIDGE_SOURCE}")
     endif()
 endif()
 
 if(BUILD_RFDETR_NATIVE)
-    if(NOT EXISTS "${FASTLOADER_TORCH_SOURCE_ROOT}/third_party/onnx/onnx/checker.h"
-       OR NOT EXISTS "${FASTLOADER_TORCH_SOURCE_ROOT}/third_party/onnx/onnx/shape_inference/implementation.h")
-        message(FATAL_ERROR
-            "Missing PyTorch-matching vendored ONNX headers under ${FASTLOADER_TORCH_SOURCE_ROOT}/third_party/onnx. "
-            "Set FASTLOADER_TORCH_SOURCE_ROOT to the matching PyTorch source tree before building.")
+    find_path(MMLTK_SYSTEM_PROTOBUF_INCLUDE_DIR
+        NAMES google/protobuf/message.h
+        HINTS
+            /usr/include
+            /usr/local/include
+        NO_DEFAULT_PATH)
+    find_library(MMLTK_SYSTEM_PROTOBUF_LIBRARY
+        NAMES protobuf libprotobuf
+        HINTS
+            /usr/lib/x86_64-linux-gnu
+            /usr/local/lib
+            /usr/lib64
+            /usr/lib
+        NO_DEFAULT_PATH)
+    if(MMLTK_SYSTEM_PROTOBUF_INCLUDE_DIR)
+        set(MMLTK_SYSTEM_PROTOBUF_REDIRECT_DIR
+            "${CMAKE_BINARY_DIR}/mmltk_system_protobuf")
+        file(MAKE_DIRECTORY "${MMLTK_SYSTEM_PROTOBUF_REDIRECT_DIR}")
+        file(REMOVE_RECURSE "${MMLTK_SYSTEM_PROTOBUF_REDIRECT_DIR}/google")
+        execute_process(
+            COMMAND "${CMAKE_COMMAND}" -E create_symlink
+                "${MMLTK_SYSTEM_PROTOBUF_INCLUDE_DIR}/google"
+                "${MMLTK_SYSTEM_PROTOBUF_REDIRECT_DIR}/google"
+            RESULT_VARIABLE MMLTK_SYSTEM_PROTOBUF_SYMLINK_RESULT)
+        if(NOT MMLTK_SYSTEM_PROTOBUF_SYMLINK_RESULT EQUAL 0)
+            message(FATAL_ERROR
+                "Failed to create system protobuf include redirect under "
+                "${MMLTK_SYSTEM_PROTOBUF_REDIRECT_DIR}")
+        endif()
+        set(Protobuf_INCLUDE_DIR "${MMLTK_SYSTEM_PROTOBUF_INCLUDE_DIR}" CACHE PATH
+            "Pinned system protobuf headers for ONNX/native builds" FORCE)
     endif()
-    if(NOT EXISTS "${FASTLOADER_TORCH_BUILD_ROOT}/third_party/onnx/onnx/onnx-ml.pb.h"
-       OR NOT EXISTS "${FASTLOADER_TORCH_BUILD_ROOT}/third_party/onnx/onnx/onnx-data.pb.h")
-        message(FATAL_ERROR
-            "Missing PyTorch-matching generated ONNX protobuf headers under ${FASTLOADER_TORCH_BUILD_ROOT}/third_party/onnx. "
-            "Set FASTLOADER_TORCH_BUILD_ROOT to the matching PyTorch build tree before building.")
+    if(MMLTK_SYSTEM_PROTOBUF_LIBRARY)
+        set(Protobuf_LIBRARY "${MMLTK_SYSTEM_PROTOBUF_LIBRARY}" CACHE FILEPATH
+            "Pinned system protobuf library for ONNX/native builds" FORCE)
     endif()
-    set(FASTLOADER_PYTORCH_ONNX_LIBRARY "${FASTLOADER_TORCH_BUILD_ROOT}/lib/libonnx.a")
-    set(FASTLOADER_PYTORCH_ONNX_PROTO_LIBRARY "${FASTLOADER_TORCH_BUILD_ROOT}/lib/libonnx_proto.a")
-    set(FASTLOADER_PYTORCH_PROTOBUF_LIBRARY "${FASTLOADER_TORCH_BUILD_ROOT}/lib/libprotobuf.a")
-    if(NOT EXISTS "${FASTLOADER_PYTORCH_ONNX_LIBRARY}"
-       OR NOT EXISTS "${FASTLOADER_PYTORCH_ONNX_PROTO_LIBRARY}"
-       OR NOT EXISTS "${FASTLOADER_PYTORCH_PROTOBUF_LIBRARY}")
-        message(FATAL_ERROR
-            "Missing PyTorch-matching ONNX/protobuf static libraries under ${FASTLOADER_TORCH_BUILD_ROOT}/lib. "
-            "Set FASTLOADER_TORCH_BUILD_ROOT to the matching PyTorch build tree before building.")
+    set(Protobuf_PROTOC_EXECUTABLE "/usr/bin/protoc" CACHE FILEPATH
+        "Pinned protoc executable for ONNX/native builds" FORCE)
+    find_package(Protobuf REQUIRED)
+    if(MMLTK_SYSTEM_PROTOBUF_LIBRARY)
+        set(MMLTK_PROTOBUF_LIBRARY_TARGET "${MMLTK_SYSTEM_PROTOBUF_LIBRARY}")
+    elseif(Protobuf_LIBRARY)
+        set(MMLTK_PROTOBUF_LIBRARY_TARGET "${Protobuf_LIBRARY}")
+    elseif(Protobuf_LIBRARIES)
+        set(MMLTK_PROTOBUF_LIBRARY_TARGET ${Protobuf_LIBRARIES})
+    elseif(TARGET protobuf::libprotobuf)
+        set(MMLTK_PROTOBUF_LIBRARY_TARGET protobuf::libprotobuf)
+    else()
+        message(FATAL_ERROR "Failed to resolve a protobuf library for ONNX/native builds.")
     endif()
-    set(FASTLOADER_PYTORCH_ONNX_INCLUDE_DIR "${FASTLOADER_TORCH_SOURCE_ROOT}/third_party/onnx")
-    set(FASTLOADER_PYTORCH_ONNX_BUILD_INCLUDE_DIR "${FASTLOADER_TORCH_BUILD_ROOT}/third_party/onnx")
+    if(NOT MMLTK_ONNX_ROOT)
+        message(FATAL_ERROR
+            "BUILD_RFDETR_NATIVE requires MMLTK_ONNX_ROOT to point at a standalone ONNX install prefix.")
+    endif()
+    if(NOT EXISTS "${MMLTK_ONNX_ROOT}/lib/cmake/ONNX/ONNXConfig.cmake")
+        message(FATAL_ERROR
+            "Missing ONNX package config under ${MMLTK_ONNX_ROOT}/lib/cmake/ONNX. "
+            "Set MMLTK_ONNX_ROOT to a valid ONNX install prefix before building.")
+    endif()
+    list(PREPEND CMAKE_PREFIX_PATH "${MMLTK_ONNX_ROOT}")
+    find_package(ONNX CONFIG REQUIRED)
+    set(MMLTK_ONNX_LIBRARY_DIR "")
+    foreach(_mmltk_onnx_location_property IN ITEMS
+            IMPORTED_LOCATION_RELEASE
+            IMPORTED_LOCATION_RELWITHDEBINFO
+            IMPORTED_LOCATION_DEBUG
+            IMPORTED_LOCATION)
+        get_target_property(_mmltk_onnx_imported_location ONNX::onnx ${_mmltk_onnx_location_property})
+        if(_mmltk_onnx_imported_location AND EXISTS "${_mmltk_onnx_imported_location}")
+            get_filename_component(MMLTK_ONNX_LIBRARY_DIR "${_mmltk_onnx_imported_location}" DIRECTORY)
+            break()
+        endif()
+    endforeach()
 
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
-        set(_fastloader_cuda_architectures "${FASTLOADER_CUDA_ARCHITECTURES}")
-        if(_fastloader_cuda_architectures STREQUAL "" AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.24)
-            set(_fastloader_cuda_architectures native)
-        elseif(_fastloader_cuda_architectures STREQUAL "")
-            set(_fastloader_cuda_architectures "75;80;86;87;88;89;90")
+        set(_mmltk_cuda_architectures "${MMLTK_CUDA_ARCHITECTURES}")
+        if(_mmltk_cuda_architectures STREQUAL "")
+            set(_mmltk_cuda_architectures "${MMLTK_DEFAULT_CUDA_ARCHITECTURES}")
         endif()
-        set(CMAKE_CUDA_ARCHITECTURES "${_fastloader_cuda_architectures}" CACHE STRING
+        set(CMAKE_CUDA_ARCHITECTURES "${_mmltk_cuda_architectures}" CACHE STRING
             "CUDA architectures" FORCE)
     endif()
     enable_language(CUDA)
-    target_sources(fastloader_core PRIVATE
+    target_sources(mmltk_core PRIVATE
         src/dataset/compile/dataset_compiler_cuda.cu
     )
-    set_target_properties(fastloader_core PROPERTIES
+    set_target_properties(mmltk_core PROPERTIES
         CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
@@ -408,19 +602,21 @@ if(BUILD_RFDETR_NATIVE)
     find_path(ONNXRUNTIME_INCLUDE_DIR
         NAMES onnxruntime_cxx_api.h
         HINTS
+            "${MMLTK_ONNXRUNTIME_ROOT}/include"
             /opt/onnxruntime/include
             /usr/local/include
             /usr/include)
     find_library(ONNXRUNTIME_LIBRARY
         NAMES onnxruntime
         HINTS
+            "${MMLTK_ONNXRUNTIME_ROOT}/lib"
             /opt/onnxruntime/lib
             /usr/local/lib
             /usr/lib/x86_64-linux-gnu)
     if(NOT ONNXRUNTIME_INCLUDE_DIR OR NOT ONNXRUNTIME_LIBRARY)
         message(FATAL_ERROR
             "ONNX Runtime C++ GPU libraries were not found. Install the official onnxruntime GPU package "
-            "or run utilities/install_local_rfdetr_deps.sh before building.")
+            "and set MMLTK_ONNXRUNTIME_ROOT before building.")
     endif()
     get_filename_component(ONNXRUNTIME_LIBRARY_DIR "${ONNXRUNTIME_LIBRARY}" DIRECTORY)
 
@@ -449,12 +645,14 @@ if(BUILD_RFDETR_NATIVE)
             /opt/TensorRT/lib
             /opt/tensorrt/lib)
     if(NOT TENSORRT_INCLUDE_DIR OR NOT TENSORRT_NVINFER_LIBRARY OR NOT TENSORRT_NVONNXPARSER_LIBRARY)
-        message(FATAL_ERROR "TensorRT shared libraries and headers were not found. Install libnvinfer10, libnvinfer-headers-dev, and libnvonnxparsers-dev before building.")
+        message(FATAL_ERROR
+            "TensorRT shared libraries and headers were not found. "
+            "Install the TensorRT developer packages or expose the include/lib roots before building.")
     endif()
 
-    set(FASTLOADER_RFDETR_LIVE_CAPTURE_ENABLED ON)
+    set(MMLTK_RFDETR_LIVE_CAPTURE_ENABLED ON)
 
-    add_library(fastloader_rfdetr_cuda_ops STATIC
+    add_library(mmltk_rfdetr_cuda_ops STATIC
         src/rfdetr/layers/ms_deform_attn_op.cpp
         src/rfdetr/layers/ms_deform_attn_cuda_wrapper.cpp
         src/rfdetr/layers/training_mask_ops_cuda_wrapper.cpp
@@ -465,264 +663,578 @@ if(BUILD_RFDETR_NATIVE)
         src/rfdetr/cuda/live_preprocess.cu
     )
     file(MAKE_DIRECTORY
-        "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/fastloader_rfdetr_cuda_ops.dir/src/rfdetr"
-        "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/fastloader_rfdetr_cuda_ops.dir/src/rfdetr/cuda"
+        "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/mmltk_rfdetr_cuda_ops.dir/src/rfdetr"
+        "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/mmltk_rfdetr_cuda_ops.dir/src/rfdetr/cuda"
     )
-    target_include_directories(fastloader_rfdetr_cuda_ops
+    target_include_directories(mmltk_rfdetr_cuda_ops
         PUBLIC
             ${CMAKE_SOURCE_DIR}/include
         PRIVATE
             ${CMAKE_SOURCE_DIR}/src
     )
-    target_include_directories(fastloader_rfdetr_cuda_ops
+    target_include_directories(mmltk_rfdetr_cuda_ops
         SYSTEM PRIVATE
             ${TORCH_INCLUDE_DIRS}
     )
-    target_link_libraries(fastloader_rfdetr_cuda_ops
+    target_link_libraries(mmltk_rfdetr_cuda_ops
         PUBLIC
-            fastloader_build_options
+            mmltk_build_options
             CUDA::cudart
         PRIVATE
             ${TORCH_LIBRARIES}
     )
-    target_compile_options(fastloader_rfdetr_cuda_ops PRIVATE ${TORCH_CXX_FLAGS_LIST})
+    target_compile_options(mmltk_rfdetr_cuda_ops PRIVATE ${TORCH_CXX_FLAGS_LIST})
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        target_compile_options(fastloader_rfdetr_cuda_ops PRIVATE
+        target_compile_options(mmltk_rfdetr_cuda_ops PRIVATE
             $<$<AND:$<CONFIG:Dev>,$<COMPILE_LANGUAGE:CXX>>:-Wno-null-dereference>)
     endif()
-    set_target_properties(fastloader_rfdetr_cuda_ops PROPERTIES
+    set_target_properties(mmltk_rfdetr_cuda_ops PROPERTIES
         CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
         CUDA_SEPARABLE_COMPILATION ON
         POSITION_INDEPENDENT_CODE ON
     )
 
-    add_library(fastloader_live_capture STATIC
+    add_library(mmltk_live_capture STATIC
         src/frameshow/capture_session_core.cpp
         src/frameshow/capture_session_device.cpp
         src/frameshow/capture_session_internal.cpp
         src/frameshow/capture_session_preview.cpp
     )
-    target_include_directories(fastloader_live_capture
+    target_include_directories(mmltk_live_capture
         PUBLIC
             ${CMAKE_SOURCE_DIR}/include
         PRIVATE
             ${CMAKE_SOURCE_DIR}/src
     )
-    target_link_libraries(fastloader_live_capture
+    target_link_libraries(mmltk_live_capture
         PUBLIC
-            fastloader_build_options
-            fastloader_rfdetr_cuda_ops
+            mmltk_build_options
+            mmltk_rfdetr_cuda_ops
             CUDA::cudart
     )
-    target_compile_options(fastloader_live_capture
+    target_compile_options(mmltk_live_capture
         PRIVATE
             -Wall -Wextra -Wpedantic
     )
-    set_target_properties(fastloader_live_capture PROPERTIES
+    set_target_properties(mmltk_live_capture PROPERTIES
         CXX_STANDARD 20
         CXX_STANDARD_REQUIRED ON
         CXX_EXTENSIONS OFF
     )
 
-    add_library(fastloader_rfdetr_native STATIC
-        src/rfdetr/inference/backend_onnx.cpp
-        src/rfdetr/inference/backend_tensorrt.cpp
-        src/rfdetr/checkpoint.cpp
-        src/rfdetr/cli/cli.cpp
-        src/rfdetr/detection_ops.cpp
-        src/rfdetr/inference/evaluator.cpp
-        src/rfdetr/inference/live_predict.cpp
-        src/rfdetr/onnx_lowering.cpp
-        src/rfdetr/layers/model.cpp
-        src/rfdetr/onnx_simplify.cpp
-        src/rfdetr/layers/model_components.cpp
-        src/rfdetr/layers/model_config.cpp
-        src/rfdetr/layers/modules.cpp
-        src/rfdetr/draw.cpp
-        src/rfdetr/training/native_optimizer.cpp
-        src/rfdetr/inference/postprocess.cpp
-        src/rfdetr/inference/predict.cpp
-        src/rfdetr/checkpoint/python_checkpoint_bridge.cpp
-        src/rfdetr/core/runtime.cpp
-        src/rfdetr/target_builder.cpp
-        src/rfdetr/training/train.cpp
-        src/rfdetr/inference/validate.cpp
-        src/rfdetr/inference/validate_workers.cpp
-        src/rfdetr/weight_catalog.cpp
+    if(MMLTK_RFDETR_LIVE_CAPTURE_ENABLED)
+        add_library(mmltk_live_runtime STATIC
+            src/live/live_video_ingress.cpp
+            src/live/live_frame_fanout.cpp
+            src/live/manual_overlay_document.cpp
+            src/live/live_analyzer_worker.cpp
+            src/live/live_manual_overlay_worker.cpp
+            src/live/live_compositor.cpp
+            src/live/live_session_controller.cpp
+        )
+        target_include_directories(mmltk_live_runtime
+            PUBLIC
+                ${CMAKE_SOURCE_DIR}/include
+            PRIVATE
+                ${CMAKE_SOURCE_DIR}/src
+        )
+        target_link_libraries(mmltk_live_runtime
+            PUBLIC
+                mmltk_build_options
+                mmltk_live_capture
+                CUDA::cudart
+            PRIVATE
+                mmltk_logging
+        )
+        mmltk_enable_torch(mmltk_live_runtime PRIVATE)
+        target_compile_options(mmltk_live_runtime
+            PRIVATE
+                -Wall -Wextra -Wpedantic
+        )
+        set_target_properties(mmltk_live_runtime PROPERTIES
+            CXX_STANDARD 20
+            CXX_STANDARD_REQUIRED ON
+            CXX_EXTENSIONS OFF
+        )
+    endif()
+
+    add_library(mmltk_export_onnx_io STATIC
+        src/rfdetr/onnx_model_io.cpp
     )
-    target_include_directories(fastloader_rfdetr_native
+    target_include_directories(mmltk_export_onnx_io
         PUBLIC
             ${CMAKE_SOURCE_DIR}/include
         PRIVATE
             ${CMAKE_SOURCE_DIR}/src
     )
-    target_include_directories(fastloader_rfdetr_native
-        SYSTEM PRIVATE
-            ${FASTLOADER_PYTORCH_ONNX_INCLUDE_DIR}
-            ${FASTLOADER_PYTORCH_ONNX_BUILD_INCLUDE_DIR}
-            ${ONNXRUNTIME_INCLUDE_DIR}
-            ${TENSORRT_INCLUDE_DIR}
-    )
-    fastloader_enable_torch(fastloader_rfdetr_native PRIVATE)
-    target_link_libraries(fastloader_rfdetr_native
+    target_link_libraries(mmltk_export_onnx_io
         PUBLIC
-            fastloader_core
-            fastloader_build_options
-            fastloader_rfdetr_lsap
-            fastloader_rfdetr_cuda_ops
-            cli11
+            mmltk_build_options
+            ONNX::onnx
+            ${MMLTK_PROTOBUF_LIBRARY_TARGET}
+    )
+    mmltk_prefer_system_protobuf_headers(mmltk_export_onnx_io PRIVATE)
+    target_compile_definitions(mmltk_export_onnx_io PRIVATE ONNX_ML=1)
+    set_target_properties(mmltk_export_onnx_io PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
+    )
+
+    add_library(mmltk_export_onnx STATIC
+        src/rfdetr/onnx_lowering.cpp
+        src/rfdetr/onnx_model_proto_write.cpp
+    )
+    target_include_directories(mmltk_export_onnx
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/include
         PRIVATE
-            ${FASTLOADER_PYTORCH_ONNX_LIBRARY}
-            ${FASTLOADER_PYTORCH_ONNX_PROTO_LIBRARY}
-            ${FASTLOADER_PYTORCH_PROTOBUF_LIBRARY}
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_include_directories(mmltk_export_onnx
+        SYSTEM PRIVATE
+            $<TARGET_PROPERTY:ONNX::onnx,INTERFACE_INCLUDE_DIRECTORIES>
+    )
+    target_link_libraries(mmltk_export_onnx
+        PUBLIC
+            mmltk_build_options
+    )
+    mmltk_prefer_system_protobuf_headers(mmltk_export_onnx PRIVATE)
+    mmltk_enable_torch(mmltk_export_onnx PUBLIC)
+    target_compile_definitions(mmltk_export_onnx PRIVATE ONNX_ML=1)
+    set_target_properties(mmltk_export_onnx PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
+    )
+    add_library(mmltk_rfdetr_onnx_lowering ALIAS mmltk_export_onnx)
+
+    add_library(mmltk_export_onnx_simplify STATIC
+        src/rfdetr/onnx_simplify.cpp
+    )
+    target_include_directories(mmltk_export_onnx_simplify
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/include
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(mmltk_export_onnx_simplify
+        PUBLIC
+            mmltk_build_options
+            mmltk_logging
+            ONNX::onnx
+            ${MMLTK_PROTOBUF_LIBRARY_TARGET}
+    )
+    mmltk_prefer_system_protobuf_headers(mmltk_export_onnx_simplify PRIVATE)
+    target_compile_definitions(mmltk_export_onnx_simplify PRIVATE ONNX_ML=1)
+    set_target_properties(mmltk_export_onnx_simplify PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
+    )
+    add_library(mmltk_rfdetr_onnx_simplify ALIAS mmltk_export_onnx_simplify)
+
+    add_library(mmltk_onnx_model_info STATIC
+        src/rfdetr/onnx_model_info.cpp
+    )
+    target_include_directories(mmltk_onnx_model_info
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/include
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(mmltk_onnx_model_info
+        PUBLIC
+            mmltk_build_options
+            mmltk_export_onnx_io
+            ONNX::onnx
+            ${MMLTK_PROTOBUF_LIBRARY_TARGET}
+    )
+    mmltk_prefer_system_protobuf_headers(mmltk_onnx_model_info PRIVATE)
+    target_compile_definitions(mmltk_onnx_model_info PRIVATE ONNX_ML=1)
+    set_target_properties(mmltk_onnx_model_info PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
+    )
+
+    add_executable(mmltk_rfdetr_onnx_simplify_tool
+        src/rfdetr/onnx_simplify_main.cpp
+    )
+    target_include_directories(mmltk_rfdetr_onnx_simplify_tool
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/include
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(mmltk_rfdetr_onnx_simplify_tool
+        PRIVATE
+            mmltk_build_options
+            mmltk_logging
+            mmltk_export_onnx_io
+            mmltk_export_onnx_simplify
+            ONNX::onnx
+            ${MMLTK_PROTOBUF_LIBRARY_TARGET}
+    )
+    set_target_properties(mmltk_rfdetr_onnx_simplify_tool PROPERTIES
+        OUTPUT_NAME "mmltk-rfdetr-onnx-simplify"
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
+    )
+
+    add_executable(mmltk_rfdetr_onnx_info_tool
+        src/rfdetr/onnx_model_info_main.cpp
+    )
+    target_include_directories(mmltk_rfdetr_onnx_info_tool
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/include
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(mmltk_rfdetr_onnx_info_tool
+        PRIVATE
+            mmltk_build_options
+            mmltk_logging
+            mmltk_onnx_model_info
+            ONNX::onnx
+            ${MMLTK_PROTOBUF_LIBRARY_TARGET}
+    )
+    set_target_properties(mmltk_rfdetr_onnx_info_tool PROPERTIES
+        OUTPUT_NAME "mmltk-rfdetr-onnx-info"
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
+    )
+
+    add_library(mmltk_backend_onnx_deps INTERFACE)
+    target_link_libraries(mmltk_backend_onnx_deps
+        INTERFACE
             ${ONNXRUNTIME_LIBRARY}
+    )
+    add_library(mmltk_backend_tensorrt_deps INTERFACE)
+    target_link_libraries(mmltk_backend_tensorrt_deps
+        INTERFACE
             ${TENSORRT_NVINFER_LIBRARY}
             ${TENSORRT_NVONNXPARSER_LIBRARY}
     )
-    if(FASTLOADER_RFDETR_LIVE_CAPTURE_ENABLED)
-        target_link_libraries(fastloader_rfdetr_native PRIVATE fastloader_live_capture)
+    add_library(mmltk_rfdetr_runtime_link_deps INTERFACE)
+    target_link_options(mmltk_rfdetr_runtime_link_deps INTERFACE LINKER:--no-as-needed)
+    target_link_libraries(mmltk_rfdetr_runtime_link_deps
+        INTERFACE
+            mmltk_backend_onnx_deps
+            mmltk_backend_tensorrt_deps
+    )
+    if(MMLTK_TORCH_EXTRA_LIBRARIES)
+        target_link_libraries(mmltk_rfdetr_runtime_link_deps
+            INTERFACE
+                ${MMLTK_TORCH_EXTRA_LIBRARIES}
+        )
     endif()
+
+    add_library(mmltk_backend_onnx STATIC
+        src/rfdetr/inference/backend_onnx.cpp
+    )
+    target_include_directories(mmltk_backend_onnx
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/include
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_include_directories(mmltk_backend_onnx
+        SYSTEM PRIVATE
+            ${ONNXRUNTIME_INCLUDE_DIR}
+    )
+    target_link_libraries(mmltk_backend_onnx
+        PUBLIC
+            mmltk_core
+            mmltk_build_options
+        PRIVATE
+            mmltk_backend_onnx_deps
+    )
+    mmltk_enable_torch(mmltk_backend_onnx PRIVATE)
+    set_target_properties(mmltk_backend_onnx PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
+    )
+
+    add_library(mmltk_backend_tensorrt STATIC
+        src/rfdetr/inference/backend_tensorrt.cpp
+    )
+    target_include_directories(mmltk_backend_tensorrt
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/include
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_include_directories(mmltk_backend_tensorrt
+        SYSTEM PRIVATE
+            ${TENSORRT_INCLUDE_DIR}
+    )
+    target_link_libraries(mmltk_backend_tensorrt
+        PUBLIC
+            mmltk_core
+            mmltk_build_options
+        PRIVATE
+            mmltk_backend_tensorrt_deps
+    )
+    mmltk_enable_torch(mmltk_backend_tensorrt PRIVATE)
+    set_target_properties(mmltk_backend_tensorrt PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
+    )
+
+    add_library(mmltk_rfdetr_torch STATIC
+        src/rfdetr/checkpoint.cpp
+        src/rfdetr/detection_ops.cpp
+        src/rfdetr/draw.cpp
+        src/rfdetr/layers/model.cpp
+        src/rfdetr/layers/model_components.cpp
+        src/rfdetr/layers/modules.cpp
+        src/rfdetr/inference/postprocess.cpp
+        src/rfdetr/checkpoint/python_checkpoint_bridge.cpp
+        src/rfdetr/target_builder.cpp
+        src/rfdetr/training/native_optimizer.cpp
+        src/rfdetr/training/train.cpp
+    )
+    target_include_directories(mmltk_rfdetr_torch
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/include
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/third_party/spdmon/include
+    )
+    target_include_directories(mmltk_rfdetr_torch
+        SYSTEM PRIVATE
+            $<TARGET_PROPERTY:ONNX::onnx,INTERFACE_INCLUDE_DIRECTORIES>
+    )
+    target_link_libraries(mmltk_rfdetr_torch
+        PUBLIC
+            mmltk_core
+            mmltk_build_options
+            mmltk_rfdetr_core
+            mmltk_export_onnx
+            mmltk_logging
+        PRIVATE
+            mmltk_rfdetr_lsap
+            mmltk_rfdetr_cuda_ops
+    )
+    mmltk_prefer_system_protobuf_headers(mmltk_rfdetr_torch PRIVATE)
+    mmltk_enable_torch(mmltk_rfdetr_torch PUBLIC)
     if(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER)
-        fastloader_enable_python_checkpoint_loader(fastloader_rfdetr_native PRIVATE)
+        mmltk_enable_python_checkpoint_loader(mmltk_rfdetr_torch PRIVATE)
     endif()
-    target_compile_definitions(fastloader_rfdetr_native PUBLIC
-        FASTLOADER_RFDETR_PYTHON_CHECKPOINT_LOADER=$<IF:$<BOOL:${BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER}>,1,0>
-        FASTLOADER_RFDETR_LIVE_CAPTURE=$<IF:$<BOOL:${FASTLOADER_RFDETR_LIVE_CAPTURE_ENABLED}>,1,0>
+    target_compile_definitions(mmltk_rfdetr_torch PRIVATE
+        MMLTK_RFDETR_PYTHON_CHECKPOINT_LOADER=$<IF:$<BOOL:${BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER}>,1,0>
+        MMLTK_RFDETR_LIVE_CAPTURE=$<IF:$<BOOL:${MMLTK_RFDETR_LIVE_CAPTURE_ENABLED}>,1,0>
+        ONNX_ML=1
     )
-    target_compile_definitions(fastloader_rfdetr_native PRIVATE ONNX_ML=1)
-    set_target_properties(fastloader_rfdetr_native PROPERTIES
+    set_target_properties(mmltk_rfdetr_torch PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
         CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     )
-    add_library(fastloader_rfdetr ALIAS fastloader_rfdetr_native)
-    target_compile_definitions(fastloader_cli PRIVATE FASTLOADER_BUILD_RFDETR_NATIVE=1)
-    target_link_libraries(fastloader_cli PRIVATE fastloader_rfdetr_native)
-    set_target_properties(fastloader_cli PROPERTIES
+
+    add_library(mmltk_rfdetr_runtime STATIC
+        src/rfdetr/cli/cli.cpp
+        src/rfdetr/cli/module.cpp
+        src/rfdetr/inference/evaluator.cpp
+        src/rfdetr/inference/live_predict.cpp
+        src/rfdetr/inference/predict.cpp
+        src/rfdetr/core/runtime.cpp
+        src/rfdetr/inference/validate.cpp
+        src/rfdetr/inference/validate_workers.cpp
+    )
+    target_include_directories(mmltk_rfdetr_runtime
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/include
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/third_party/spdmon/include
+    )
+    target_link_libraries(mmltk_rfdetr_runtime
+        PUBLIC
+            mmltk_core
+            mmltk_build_options
+            mmltk_logging
+        PRIVATE
+            mmltk_rfdetr_torch
+            mmltk_backend_onnx
+            mmltk_backend_tensorrt
+            cli11
+    )
+    mmltk_enable_torch(mmltk_rfdetr_runtime PRIVATE)
+    if(MMLTK_RFDETR_LIVE_CAPTURE_ENABLED)
+        target_link_libraries(mmltk_rfdetr_runtime PRIVATE mmltk_live_capture)
+    endif()
+    target_compile_definitions(mmltk_rfdetr_runtime PRIVATE
+        MMLTK_RFDETR_PYTHON_CHECKPOINT_LOADER=$<IF:$<BOOL:${BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER}>,1,0>
+        MMLTK_RFDETR_LIVE_CAPTURE=$<IF:$<BOOL:${MMLTK_RFDETR_LIVE_CAPTURE_ENABLED}>,1,0>
+    )
+    set_target_properties(mmltk_rfdetr_runtime PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
         CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     )
-    fastloader_enable_native_runtime_rpath(fastloader_cli)
+    
+    add_library(mmltk_rfdetr_native SHARED
+        src/rfdetr/native_library_anchor.cpp
+    )
+    target_include_directories(mmltk_rfdetr_native
+        PUBLIC
+            ${CMAKE_SOURCE_DIR}/include
+        PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(mmltk_rfdetr_native
+        PUBLIC
+            mmltk_core
+            mmltk_build_options
+            mmltk_rfdetr_core
+            mmltk_rfdetr_torch
+        PRIVATE
+            -Wl,--whole-archive
+            mmltk_rfdetr_runtime
+            -Wl,--no-whole-archive
+            mmltk_rfdetr_runtime_link_deps
+    )
+    target_compile_definitions(mmltk_rfdetr_native PUBLIC
+        MMLTK_RFDETR_PYTHON_CHECKPOINT_LOADER=$<IF:$<BOOL:${BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER}>,1,0>
+        MMLTK_RFDETR_LIVE_CAPTURE=$<IF:$<BOOL:${MMLTK_RFDETR_LIVE_CAPTURE_ENABLED}>,1,0>
+    )
+    set_target_properties(mmltk_rfdetr_native PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
+        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+    )
+    target_link_options(mmltk_rfdetr_native PRIVATE LINKER:--no-as-needed)
+    add_library(mmltk_rfdetr ALIAS mmltk_rfdetr_native)
+    target_compile_definitions(mmltk_cli PRIVATE MMLTK_BUILD_RFDETR_NATIVE=1)
+    target_link_libraries(mmltk_cli PRIVATE
+        mmltk_rfdetr_runtime
+        mmltk_rfdetr_native
+        mmltk_rfdetr_runtime_link_deps
+    )
+    add_dependencies(mmltk_cli mmltk_rfdetr_onnx_info_tool)
+    set_target_properties(mmltk_cli PROPERTIES
+        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+    )
+    mmltk_enable_native_runtime_rpath(mmltk_rfdetr_native)
 else()
-    target_compile_definitions(fastloader_cli PRIVATE FASTLOADER_BUILD_RFDETR_NATIVE=0)
+    target_compile_definitions(mmltk_cli PRIVATE MMLTK_BUILD_RFDETR_NATIVE=0)
 endif()
 
-if(BUILD_FASTLOADER_GUI)
+mmltk_enable_native_runtime_rpath(mmltk_cli)
+
+if(BUILD_MMLTK_GUI)
     if(NOT BUILD_RFDETR_NATIVE)
-        message(FATAL_ERROR "BUILD_FASTLOADER_GUI requires BUILD_RFDETR_NATIVE=ON.")
+        message(FATAL_ERROR "BUILD_MMLTK_GUI requires BUILD_RFDETR_NATIVE=ON.")
     endif()
-    if(NOT FASTLOADER_NEEDS_PYTHON)
+    if(NOT MMLTK_NEEDS_PYTHON)
         find_package(Python3 REQUIRED COMPONENTS Interpreter)
     endif()
-    set(FASTLOADER_GUI_VAST_BRIDGE "${CMAKE_SOURCE_DIR}/utilities/vast_bridge.py")
-    if(NOT EXISTS "${FASTLOADER_GUI_VAST_BRIDGE}")
+    set(MMLTK_GUI_VAST_BRIDGE_SOURCE "${CMAKE_SOURCE_DIR}/utilities/vast_bridge.py")
+    if(NOT EXISTS "${MMLTK_GUI_VAST_BRIDGE_SOURCE}")
         message(FATAL_ERROR
-            "Missing Vast GUI bridge script: ${FASTLOADER_GUI_VAST_BRIDGE}")
+            "Missing Vast GUI bridge script: ${MMLTK_GUI_VAST_BRIDGE_SOURCE}")
     endif()
 
-    include(FetchContent)
     find_package(OpenGL REQUIRED)
-    find_package(glfw3 QUIET)
-
-    if(NOT TARGET glfw)
-        find_package(PkgConfig REQUIRED)
-        pkg_check_modules(FASTLOADER_GUI_WAYLAND QUIET
-            wayland-client
-            wayland-cursor
-            wayland-egl
-            xkbcommon
-        )
-        pkg_check_modules(FASTLOADER_GUI_X11 QUIET
-            x11
-            xrandr
-            xinerama
-            xcursor
-            xi
-        )
-        if(NOT FASTLOADER_GUI_WAYLAND_FOUND AND NOT FASTLOADER_GUI_X11_FOUND)
-            message(FATAL_ERROR
-                "BUILD_FASTLOADER_GUI could not find either a complete Wayland or X11 GLFW dependency set. "
-                "Install Fedora's glfw-devel package or the matching Wayland/X11 development packages.")
-        endif()
-        if(FASTLOADER_GUI_X11_FOUND)
-            set(_fastloader_gui_glfw_x11 ON)
-        else()
-            set(_fastloader_gui_glfw_x11 OFF)
-        endif()
-        if(FASTLOADER_GUI_WAYLAND_FOUND)
-            set(_fastloader_gui_glfw_wayland ON)
-        else()
-            set(_fastloader_gui_glfw_wayland OFF)
-        endif()
-
-        set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
-        set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-        set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-        set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
-        set(GLFW_BUILD_X11 ${FASTLOADER_GUI_X11_FOUND} CACHE BOOL "" FORCE)
-        set(GLFW_BUILD_WAYLAND ${FASTLOADER_GUI_WAYLAND_FOUND} CACHE BOOL "" FORCE)
-        message(STATUS
-            "fastloader GUI GLFW fallback backends: "
-            "X11=${_fastloader_gui_glfw_x11} Wayland=${_fastloader_gui_glfw_wayland}")
-
-        FetchContent_Declare(
-            glfw
-            GIT_REPOSITORY https://github.com/glfw/glfw.git
-            GIT_TAG 3.4
-        )
-        FetchContent_MakeAvailable(glfw)
+    find_package(glfw3 REQUIRED)
+    if(TARGET glfw)
+        set(MMLTK_GLFW_TARGET glfw)
+    elseif(TARGET glfw3::glfw)
+        set(MMLTK_GLFW_TARGET glfw3::glfw)
+    else()
+        message(FATAL_ERROR
+            "glfw3 was found, but CMake did not expose a supported imported target.")
     endif()
 
-    if(FASTLOADER_IMGUI_SOURCE_DIR)
-        get_filename_component(_fastloader_imgui_source_dir "${FASTLOADER_IMGUI_SOURCE_DIR}" REALPATH)
-        if(NOT EXISTS "${_fastloader_imgui_source_dir}/imgui.cpp")
+    if(MMLTK_IMGUI_SOURCE_DIR)
+        get_filename_component(_mmltk_imgui_source_dir "${MMLTK_IMGUI_SOURCE_DIR}" REALPATH)
+        if(NOT EXISTS "${_mmltk_imgui_source_dir}/imgui.cpp")
             message(FATAL_ERROR
-                "FASTLOADER_IMGUI_SOURCE_DIR must point at a Dear ImGui checkout containing imgui.cpp.")
+                "MMLTK_IMGUI_SOURCE_DIR must point at a Dear ImGui checkout containing imgui.cpp.")
         endif()
     else()
-        FetchContent_Declare(
-            imgui_src
-            GIT_REPOSITORY https://github.com/ocornut/imgui.git
-            GIT_TAG v1.91.8
-        )
-        FetchContent_MakeAvailable(imgui_src)
-        set(_fastloader_imgui_source_dir "${imgui_src_SOURCE_DIR}")
+        message(FATAL_ERROR
+            "BUILD_MMLTK_GUI requires MMLTK_IMGUI_SOURCE_DIR. "
+            "Prepare Dear ImGui before configuring instead of fetching it during configure.")
     endif()
 
-    add_library(fastloader_imgui STATIC
-        ${_fastloader_imgui_source_dir}/imgui.cpp
-        ${_fastloader_imgui_source_dir}/imgui_draw.cpp
-        ${_fastloader_imgui_source_dir}/imgui_tables.cpp
-        ${_fastloader_imgui_source_dir}/imgui_widgets.cpp
-        ${_fastloader_imgui_source_dir}/misc/cpp/imgui_stdlib.cpp
-        ${_fastloader_imgui_source_dir}/backends/imgui_impl_glfw.cpp
-        ${_fastloader_imgui_source_dir}/backends/imgui_impl_opengl3.cpp
+    add_library(mmltk_imgui STATIC
+        ${_mmltk_imgui_source_dir}/imgui.cpp
+        ${_mmltk_imgui_source_dir}/imgui_draw.cpp
+        ${_mmltk_imgui_source_dir}/imgui_tables.cpp
+        ${_mmltk_imgui_source_dir}/imgui_widgets.cpp
+        ${_mmltk_imgui_source_dir}/misc/cpp/imgui_stdlib.cpp
+        ${_mmltk_imgui_source_dir}/backends/imgui_impl_glfw.cpp
+        ${_mmltk_imgui_source_dir}/backends/imgui_impl_opengl3.cpp
     )
-    target_include_directories(fastloader_imgui
+    target_include_directories(mmltk_imgui
         PUBLIC
-            ${_fastloader_imgui_source_dir}
-            ${_fastloader_imgui_source_dir}/backends
+            ${_mmltk_imgui_source_dir}
+            ${_mmltk_imgui_source_dir}/backends
     )
-    target_link_libraries(fastloader_imgui
+    target_link_libraries(mmltk_imgui
         PUBLIC
-            fastloader_build_options
-            glfw
+            mmltk_build_options
+            ${MMLTK_GLFW_TARGET}
             OpenGL::GL
     )
     if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-        target_compile_options(fastloader_imgui PRIVATE
+        target_compile_options(mmltk_imgui PRIVATE
             $<$<COMPILE_LANGUAGE:CXX>:-Wno-conversion -Wno-null-dereference>
         )
     endif()
 
-    add_library(fastloader_gui_module STATIC
+    add_library(mmltk_gui_module STATIC
+        src/gui/annotation/controller.cpp
+        src/gui/annotation/editor.cpp
+        src/gui/annotation/editor_history.cpp
+        src/gui/annotation/save_tab.cpp
+        src/gui/annotation/setup_tab.cpp
+        src/gui/annotation/sidebar.cpp
+        src/gui/annotation/sidebar_actions.cpp
+        src/gui/annotation/document/document.cpp
+        src/gui/annotation/document/edit.cpp
+        src/gui/annotation/document/types.cpp
+        src/gui/annotation/render/renderer.cpp
+        src/gui/annotation/session.cpp
+        src/gui/annotation/tools/default_tools.cpp
+        src/gui/annotation/tools/tool_helpers.cpp
+        src/gui/annotation/tools/spline_tool_helpers.cpp
+        src/gui/annotation/tools/skeleton_tool_helpers.cpp
+        src/gui/annotation/tools/spline_tool.cpp
+        src/gui/annotation/tools/skeleton_tool.cpp
+        src/gui/annotation/tools/tool_manager.cpp
+        src/gui/annotation/workspace/canvas.cpp
+        src/gui/annotation/workspace/interaction.cpp
+        src/gui/annotation/workspace/model.cpp
         src/gui/annotation_core.cpp
-        src/gui/annotation_geometry.cpp
-        src/gui/annotation_live_capture.cpp
+        src/gui/annotation_core_preview.cpp
+        src/gui/annotation_core_persistence.cpp
+        src/gui/activity_pane_presenter.cpp
         src/gui/app.cpp
         src/gui/app_options.cpp
         src/gui/canvas_layers.cpp
+        src/gui/cli_seed.cpp
+        src/gui/default_state.cpp
+        src/gui/model_input_ui.cpp
         src/gui/file_picker.cpp
         src/gui/gui_settings.cpp
+        src/gui/local_train_controller.cpp
+        src/gui/live_predict_controller.cpp
+        src/gui/live_session_utils.cpp
         src/gui/live_preview_texture.cpp
+        src/gui/preview_interaction_overlay.cpp
+        src/gui/preview_rect_drag.cpp
         src/gui/rfdetr_module.cpp
         src/gui/rfdetr_workflows.cpp
         src/gui/source_runtime.cpp
@@ -731,459 +1243,434 @@ if(BUILD_FASTLOADER_GUI)
         src/gui/train_command.cpp
         src/gui/train_process_runtime.cpp
         src/gui/ui_style.cpp
+        src/gui/vast_query_controller.cpp
         src/gui/vast_runtime.cpp
     )
-    target_include_directories(fastloader_gui_module PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(fastloader_gui_module
+    target_include_directories(mmltk_gui_module PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_link_libraries(mmltk_gui_module
         PUBLIC
-            fastloader_build_options
-            fastloader_imgui
-            fastloader_core
-            fastloader_runtime
-            fastloader_rfdetr_native
+            mmltk_build_options
+            mmltk_imgui
+            mmltk_core
+            mmltk_runtime
+            mmltk_rfdetr_native
+            mmltk_logging
         PRIVATE
             cli11
             nlohmann_json
     )
-    target_compile_definitions(fastloader_gui_module PRIVATE
-        FASTLOADER_GUI_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
-        FASTLOADER_GUI_VAST_BRIDGE_SCRIPT="${FASTLOADER_GUI_VAST_BRIDGE}"
-        FASTLOADER_GUI_ASSET_ROOT="${CMAKE_SOURCE_DIR}/src/gui/res"
+    target_compile_definitions(mmltk_gui_module PRIVATE
+        MMLTK_GUI_PYTHON_EXECUTABLE="${Python3_EXECUTABLE}"
+        MMLTK_GUI_VAST_BRIDGE_SOURCE="${MMLTK_GUI_VAST_BRIDGE_SOURCE}"
+        MMLTK_GUI_ASSET_ROOT_SOURCE="${CMAKE_SOURCE_DIR}/src/gui/res"
     )
-    fastloader_enable_torch(fastloader_gui_module PRIVATE)
-    if(FASTLOADER_RFDETR_LIVE_CAPTURE_ENABLED)
-        target_link_libraries(fastloader_gui_module PRIVATE fastloader_live_capture)
+    mmltk_enable_torch(mmltk_gui_module PRIVATE)
+    if(MMLTK_RFDETR_LIVE_CAPTURE_ENABLED)
+        target_link_libraries(mmltk_gui_module PRIVATE
+            mmltk_live_capture
+            mmltk_live_runtime
+        )
     endif()
-    set_target_properties(fastloader_gui_module PROPERTIES
+    set_target_properties(mmltk_gui_module PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
         CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     )
 
-    add_executable(fastloader_gui
+    add_executable(mmltk_gui
         src/gui/main.cpp
     )
-    target_link_libraries(fastloader_gui PRIVATE fastloader_gui_module)
-    fastloader_enable_torch(fastloader_gui PRIVATE)
-    set_target_properties(fastloader_gui PROPERTIES
+    target_link_libraries(mmltk_gui PRIVATE
+        mmltk_gui_module
+        mmltk_rfdetr_runtime_link_deps
+        mmltk_logging
+    )
+    set_target_properties(mmltk_gui PROPERTIES
+        OUTPUT_NAME "mmltk-gui"
         CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     )
-    fastloader_enable_native_runtime_rpath(fastloader_gui)
+    mmltk_enable_native_runtime_rpath(mmltk_gui)
 
+endif()
+
+set_target_properties(mmltk_core PROPERTIES OUTPUT_NAME "mmltk_core")
+set_target_properties(mmltk_cli PROPERTIES OUTPUT_NAME "mmltk")
+
+install(TARGETS mmltk_logging mmltk_core mmltk_cli
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+)
+
+if(BUILD_RFDETR_NATIVE)
+    install(TARGETS mmltk_rfdetr_native
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    )
+    install(TARGETS mmltk_rfdetr_onnx_simplify_tool
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+    install(TARGETS mmltk_rfdetr_onnx_info_tool
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+endif()
+
+if(BUILD_MMLTK_GUI)
+    install(TARGETS mmltk_gui
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+    install(DIRECTORY "${CMAKE_SOURCE_DIR}/src/gui/res/fonts/"
+        DESTINATION "${MMLTK_INSTALL_FONTDIR}"
+    )
+    install(FILES "${MMLTK_GUI_VAST_BRIDGE_SOURCE}"
+        DESTINATION "${MMLTK_INSTALL_PYTHONDIR}"
+        RENAME "vast_bridge.py"
+    )
+endif()
+
+if(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER)
+    install(FILES "${MMLTK_RFDETR_PYTHON_CHECKPOINT_BRIDGE_SOURCE}"
+        DESTINATION "${MMLTK_INSTALL_PYTHONDIR}"
+        RENAME "rfdetr_checkpoint_bridge.py"
+    )
+endif()
+
+if(BUILD_RFDETR_NATIVE)
+    file(GLOB MMLTK_ONNX_RUNTIME_LIBS
+        "${MMLTK_ONNX_ROOT}/lib/libonnx*.so*"
+    )
+    if(MMLTK_ONNX_RUNTIME_LIBS)
+        install(FILES ${MMLTK_ONNX_RUNTIME_LIBS}
+            DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        )
+    endif()
+    file(GLOB MMLTK_ONNXRUNTIME_RUNTIME_LIBS
+        "${MMLTK_ONNXRUNTIME_ROOT}/lib/libonnxruntime*.so*"
+    )
+    if(MMLTK_ONNXRUNTIME_RUNTIME_LIBS)
+        install(FILES ${MMLTK_ONNXRUNTIME_RUNTIME_LIBS}
+            DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        )
+    endif()
 endif()
 
 # ---- Tests ----
 option(BUILD_TESTS "Build tests and profile runners" OFF)
 if(BUILD_TESTS)
     enable_testing()
-
-    add_executable(test_roundtrip
-        tests/test_roundtrip.cpp
-        tests/test_fixture.cpp
+    set(CATCH_INSTALL_DOCS OFF CACHE BOOL "Install Catch2 documentation" FORCE)
+    set(CATCH_INSTALL_EXTRAS OFF CACHE BOOL "Install Catch2 extras" FORCE)
+    set(CATCH_DEVELOPMENT_BUILD OFF CACHE BOOL "Build Catch2 development extras" FORCE)
+    set(CATCH_BUILD_TESTING OFF CACHE BOOL "Build Catch2 self tests" FORCE)
+    set(CATCH_BUILD_EXAMPLES OFF CACHE BOOL "Build Catch2 examples" FORCE)
+    set(CATCH_BUILD_EXTRA_TESTS OFF CACHE BOOL "Build Catch2 extra tests" FORCE)
+    set(CATCH_BUILD_BENCHMARKS OFF CACHE BOOL "Build Catch2 benchmarks" FORCE)
+    set(CATCH_CONFIG_NO_THREAD_SAFE_ASSERTIONS ON CACHE BOOL
+        "Force-disable Catch2 thread-safe assertions; keep test assertions on the fast default path" FORCE)
+    file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/third_party/catch2/generated-includes/catch2")
+    add_subdirectory(
+        ${CMAKE_SOURCE_DIR}/third_party/catch2
+        ${CMAKE_BINARY_DIR}/third_party/catch2
+        EXCLUDE_FROM_ALL
     )
-    target_link_libraries(test_roundtrip PRIVATE fastloader_core fastloader_build_options)
-    add_test(NAME roundtrip COMMAND test_roundtrip)
+    list(APPEND CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/third_party/catch2/extras)
+    include(Catch)
 
-    add_executable(test_worker_pool
-        tests/test_worker_pool.cpp
+    add_library(mmltk_catch_main STATIC
+        tests/support/catch_main.cpp
     )
-    target_link_libraries(test_worker_pool PRIVATE fastloader_core fastloader_build_options)
-    add_test(NAME worker_pool COMMAND test_worker_pool)
-
-    add_executable(test_image_resize
-        tests/test_image_resize.cpp
-    )
-    target_link_libraries(test_image_resize PRIVATE fastloader_core fastloader_build_options)
-    target_include_directories(test_image_resize PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    add_test(NAME image_resize COMMAND test_image_resize)
-
-    add_executable(test_compile_progress
-        tests/test_compile_progress.cpp
-        tests/test_fixture.cpp
-    )
-    target_link_libraries(test_compile_progress PRIVATE fastloader_core fastloader_build_options)
-    target_include_directories(test_compile_progress PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    add_test(NAME compile_progress COMMAND test_compile_progress)
-
-    add_executable(test_gui_train_command
-        tests/test_gui_train_command.cpp
-        src/gui/train_command.cpp
-    )
-    target_include_directories(test_gui_train_command PRIVATE
-        ${CMAKE_SOURCE_DIR}/src
+    target_include_directories(mmltk_catch_main PRIVATE
         ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/tests/support
     )
-    target_link_libraries(test_gui_train_command PRIVATE
-        fastloader_build_options
+    target_link_libraries(mmltk_catch_main PUBLIC
+        Catch2::Catch2
+        mmltk_logging
+    )
+    set_target_properties(mmltk_catch_main PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
+    )
+
+    add_library(mmltk_test_support STATIC
+        tests/support/test_fixture.cpp
+    )
+    target_include_directories(mmltk_test_support PUBLIC
+        ${CMAKE_SOURCE_DIR}/tests/support
+    )
+    target_link_libraries(mmltk_test_support PUBLIC
+        stb
+        mmltk_build_options
+    )
+
+    add_library(mmltk_test_headers INTERFACE)
+    target_include_directories(mmltk_test_headers INTERFACE
+        ${CMAKE_SOURCE_DIR}/tests
+        ${CMAKE_SOURCE_DIR}/tests/support
+        ${CMAKE_SOURCE_DIR}/tests/model/rfdetr
+    )
+
+    add_executable(mmltk_tests_core
+        tests/core/async_runtime.test.cpp
+        tests/core/cli_test_bundles.test.cpp
+        tests/core/compile_progress.test.cpp
+        tests/core/image_resize.test.cpp
+        tests/core/live_crop_state.test.cpp
+        tests/core/model_registry.test.cpp
+        tests/core/roundtrip.test.cpp
+        tests/core/vendored_helpers.test.cpp
+        tests/core/worker_pool.test.cpp
+    )
+    target_include_directories(mmltk_tests_core PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}/third_party/spdmon/include
+    )
+    target_link_libraries(mmltk_tests_core PRIVATE
+        Catch2::Catch2
+        mmltk_catch_main
+        mmltk_build_options
+        mmltk_core
+        mmltk_runtime
+        mmltk_test_headers
+        mmltk_test_support
+    )
+    target_compile_definitions(mmltk_tests_core PRIVATE
+        MMLTK_TEST_MMLTK_CLI_PATH="$<TARGET_FILE:mmltk_cli>"
+    )
+    add_dependencies(mmltk_tests_core mmltk_cli)
+    set_target_properties(mmltk_tests_core PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
+    )
+    catch_discover_tests(
+        mmltk_tests_core
+        TEST_PREFIX "core::"
+        DISCOVERY_MODE PRE_TEST
+        ADD_TAGS_AS_LABELS
+    )
+
+    set(MMLTK_GUI_TEST_SOURCES
+        tests/gui/annotation_document.test.cpp
+        tests/gui/annotation_save_tab.test.cpp
+        tests/gui/annotation_workspace_canvas.test.cpp
+        src/gui/annotation/controller.cpp
+        src/gui/annotation/editor.cpp
+        src/gui/annotation/editor_history.cpp
+        src/gui/annotation/document/document.cpp
+        src/gui/annotation/document/edit.cpp
+        src/gui/annotation/document/types.cpp
+        src/gui/annotation/render/renderer.cpp
+        src/gui/annotation/session.cpp
+        src/gui/annotation/tools/default_tools.cpp
+        src/gui/annotation/tools/tool_helpers.cpp
+        src/gui/annotation/tools/spline_tool_helpers.cpp
+        src/gui/annotation/tools/skeleton_tool_helpers.cpp
+        src/gui/annotation/tools/spline_tool.cpp
+        src/gui/annotation/tools/skeleton_tool.cpp
+        src/gui/annotation/tools/tool_manager.cpp
+        src/gui/annotation/workspace/canvas.cpp
+        src/gui/annotation/workspace/interaction.cpp
+        src/gui/annotation/workspace/model.cpp
+        src/gui/annotation_core_preview.cpp
+        src/gui/annotation_core_persistence.cpp
+        tests/gui/app_options.test.cpp
+        tests/gui/live_session_utils.test.cpp
+        tests/gui/live_overlay_runtime.test.cpp
+        tests/gui/settings.test.cpp
+        tests/gui/subprocess_utils.test.cpp
+        tests/gui/vast_runtime.test.cpp
+        src/gui/annotation_core.cpp
+        src/gui/app_options.cpp
+        src/gui/canvas_layers.cpp
+        src/gui/gui_settings.cpp
+        src/gui/live_session_utils.cpp
+        src/gui/vast_query_controller.cpp
+        src/gui/vast_runtime.cpp
+        src/live/manual_overlay_document.cpp
+    )
+    if(MMLTK_NEEDS_TORCH)
+        list(APPEND MMLTK_GUI_TEST_SOURCES
+            tests/gui/annotation_core.test.cpp
+            tests/gui/canvas_layers.test.cpp
+            tests/gui/preview_rect_drag.test.cpp
+            tests/gui/train_command.test.cpp
+            src/gui/preview_rect_drag.cpp
+            src/gui/train_command.cpp
+        )
+    endif()
+    if(BUILD_RFDETR_NATIVE)
+        list(APPEND MMLTK_GUI_TEST_SOURCES
+            tests/gui/local_train_runtime.test.cpp
+            tests/gui/rfdetr_workflows.test.cpp
+            tests/gui/cli_seed.test.cpp
+            src/gui/cli_seed.cpp
+            src/gui/default_state.cpp
+            src/gui/local_train_controller.cpp
+            src/gui/rfdetr_workflows.cpp
+            src/gui/train_process_runtime.cpp
+        )
+    endif()
+
+    add_executable(mmltk_tests_gui ${MMLTK_GUI_TEST_SOURCES})
+    target_include_directories(mmltk_tests_gui PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(mmltk_tests_gui PRIVATE
+        Catch2::Catch2
+        mmltk_catch_main
+        mmltk_build_options
+        mmltk_core
+        mmltk_runtime
+        mmltk_rfdetr_core
+        mmltk_test_headers
+        cli11
+        nlohmann_json
         CUDA::cudart
     )
-    fastloader_enable_torch(test_gui_train_command PRIVATE)
-    add_test(NAME gui_train_command COMMAND test_gui_train_command)
+    if(TARGET mmltk_imgui)
+        target_link_libraries(mmltk_tests_gui PRIVATE
+            mmltk_imgui
+        )
+    endif()
+    if(MMLTK_NEEDS_TORCH)
+        mmltk_enable_torch(mmltk_tests_gui PRIVATE)
+    endif()
+    if(BUILD_RFDETR_NATIVE)
+        target_link_libraries(mmltk_tests_gui PRIVATE
+            mmltk_rfdetr_torch
+        )
+    endif()
+    set_target_properties(mmltk_tests_gui PROPERTIES
+        CXX_STANDARD 20
+        CXX_STANDARD_REQUIRED ON
+        CXX_EXTENSIONS OFF
+    )
+    catch_discover_tests(
+        mmltk_tests_gui
+        TEST_PREFIX "gui::"
+        DISCOVERY_MODE PRE_TEST
+        ADD_TAGS_AS_LABELS
+    )
 
-    add_executable(test_gui_annotation_core
-        tests/test_gui_annotation_core.cpp
-        src/gui/annotation_core.cpp
+    install(TARGETS mmltk_tests_core mmltk_tests_gui
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
-    target_include_directories(test_gui_annotation_core PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(test_gui_annotation_core PRIVATE
-        fastloader_build_options
-        fastloader_core
-        nlohmann_json
-    )
-    fastloader_enable_torch(test_gui_annotation_core PRIVATE)
-    add_test(NAME gui_annotation_core COMMAND test_gui_annotation_core)
 
-    add_executable(test_gui_annotation_geometry
-        tests/test_gui_annotation_geometry.cpp
-        src/gui/annotation_core.cpp
-        src/gui/annotation_geometry.cpp
-    )
-    target_include_directories(test_gui_annotation_geometry PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(test_gui_annotation_geometry PRIVATE
-        fastloader_build_options
-        fastloader_core
-        nlohmann_json
-    )
-    fastloader_enable_torch(test_gui_annotation_geometry PRIVATE)
-    add_test(NAME gui_annotation_geometry COMMAND test_gui_annotation_geometry)
-
-    add_executable(test_gui_vast_runtime
-        tests/test_gui_vast_runtime.cpp
-        src/gui/vast_runtime.cpp
-    )
-    target_include_directories(test_gui_vast_runtime PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(test_gui_vast_runtime PRIVATE
-        fastloader_build_options
-        nlohmann_json
-    )
-    add_test(NAME gui_vast_runtime COMMAND test_gui_vast_runtime)
-
-    add_executable(test_gui_app_options
-        tests/test_gui_app_options.cpp
-        src/gui/app_options.cpp
-    )
-    target_include_directories(test_gui_app_options PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(test_gui_app_options PRIVATE
-        fastloader_build_options
-        cli11
-    )
-    add_test(NAME gui_app_options COMMAND test_gui_app_options)
-
-    add_executable(test_gui_settings
-        tests/test_gui_settings.cpp
-        src/gui/gui_settings.cpp
-    )
-    target_include_directories(test_gui_settings PRIVATE ${CMAKE_SOURCE_DIR}/src)
-    target_link_libraries(test_gui_settings PRIVATE
-        fastloader_build_options
-        nlohmann_json
-    )
-    add_test(NAME gui_settings COMMAND test_gui_settings)
-
-    add_executable(test_gui_canvas_layers
-        tests/test_gui_canvas_layers.cpp
-        src/gui/canvas_layers.cpp
-    )
-    target_include_directories(test_gui_canvas_layers PRIVATE
-        ${CMAKE_SOURCE_DIR}/src
-        ${CMAKE_SOURCE_DIR}/include
-    )
-    target_link_libraries(test_gui_canvas_layers PRIVATE
-        fastloader_build_options
-    )
-    fastloader_enable_torch(test_gui_canvas_layers PRIVATE)
-    add_test(NAME gui_canvas_layers COMMAND test_gui_canvas_layers)
-
-    add_executable(test_async_runtime
-        tests/test_async_runtime.cpp
-    )
-    target_link_libraries(test_async_runtime PRIVATE
-        fastloader_build_options
-        fastloader_runtime
-    )
-    add_test(NAME async_runtime COMMAND test_async_runtime)
-
-    add_executable(test_model_registry
-        tests/test_model_registry.cpp
-    )
-    target_link_libraries(test_model_registry PRIVATE
-        fastloader_build_options
-        fastloader_runtime
-    )
-    add_test(NAME model_registry COMMAND test_model_registry)
-
-    add_executable(fastloader_profile_runner
+    add_executable(mmltk_profile_runner
         tests/profile_runner.cpp
-        tests/test_fixture.cpp
     )
-    target_link_libraries(fastloader_profile_runner PRIVATE fastloader_core fastloader_build_options)
+    target_include_directories(mmltk_profile_runner PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+    )
+    target_link_libraries(mmltk_profile_runner PRIVATE
+        mmltk_core
+        mmltk_build_options
+        mmltk_test_headers
+        mmltk_test_support
+    )
 
     if(BUILD_RFDETR_NATIVE)
-        add_executable(fastloader_rfdetr_profile_runner
+        set(MMLTK_RFDETR_TEST_SOURCES
+            tests/model/rfdetr/weight_catalog.test.cpp
+            tests/model/rfdetr/cli_aliases.test.cpp
+            tests/model/rfdetr/eval_sample_writer.test.cpp
+            tests/model/rfdetr/live_preprocess.test.cpp
+            tests/model/rfdetr/model_trainability.test.cpp
+            tests/model/rfdetr/modules.test.cpp
+            tests/model/rfdetr/native_ops.test.cpp
+            tests/model/rfdetr/native_optimizer.test.cpp
+            tests/model/rfdetr/onnx_lowering.test.cpp
+            tests/model/rfdetr/prediction_json.test.cpp
+            tests/model/rfdetr/public_headers.test.cpp
+            tests/model/rfdetr/runtime_shared.test.cpp
+            tests/model/rfdetr/target_builder.test.cpp
+        )
+        if(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER)
+            list(APPEND MMLTK_RFDETR_TEST_SOURCES
+                tests/model/rfdetr/checkpoint.test.cpp
+                tests/model/rfdetr/checkpoint_parity.test.cpp
+                tests/model/rfdetr/native_integration.test.cpp
+            )
+        endif()
+        add_executable(mmltk_tests_model_rfdetr ${MMLTK_RFDETR_TEST_SOURCES})
+        target_include_directories(mmltk_tests_model_rfdetr PRIVATE
+            ${CMAKE_SOURCE_DIR}/include
+            ${CMAKE_SOURCE_DIR}/src
+            ${CMAKE_SOURCE_DIR}/third_party/spdmon/include
+        )
+        target_link_libraries(mmltk_tests_model_rfdetr PRIVATE
+            Catch2::Catch2
+            mmltk_catch_main
+            mmltk_core
+            mmltk_build_options
+            mmltk_rfdetr_native
+            mmltk_test_headers
+            mmltk_test_support
+        )
+        target_compile_definitions(mmltk_tests_model_rfdetr PRIVATE
+            MMLTK_TEST_MMLTK_CLI_PATH="$<TARGET_FILE:mmltk_cli>"
+        )
+        add_dependencies(mmltk_tests_model_rfdetr mmltk_cli)
+        mmltk_prefer_system_protobuf_headers(mmltk_tests_model_rfdetr PRIVATE)
+        mmltk_enable_torch(mmltk_tests_model_rfdetr PRIVATE)
+        set_target_properties(mmltk_tests_model_rfdetr PROPERTIES
+            CXX_STANDARD 20
+            CXX_STANDARD_REQUIRED ON
+            CXX_EXTENSIONS OFF
+            CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
+        )
+        mmltk_enable_native_runtime_rpath(mmltk_tests_model_rfdetr)
+        catch_discover_tests(
+            mmltk_tests_model_rfdetr
+            TEST_SPEC "~[optin]"
+            TEST_PREFIX "rfdetr::"
+            DISCOVERY_MODE PRE_TEST
+            ADD_TAGS_AS_LABELS
+        )
+        install(TARGETS mmltk_tests_model_rfdetr
+            RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+        )
+
+        add_executable(mmltk_rfdetr_profile_runner
             tests/rfdetr_profile_runner.cpp
         )
-        target_link_libraries(fastloader_rfdetr_profile_runner PRIVATE
-            fastloader_core
-            fastloader_build_options
-            fastloader_rfdetr_native
-        )
-        target_include_directories(fastloader_rfdetr_profile_runner PRIVATE ${CMAKE_SOURCE_DIR}/src)
-        fastloader_enable_torch(fastloader_rfdetr_profile_runner PRIVATE)
-        set_target_properties(fastloader_rfdetr_profile_runner PROPERTIES
-            CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
-        )
-        fastloader_enable_native_runtime_rpath(fastloader_rfdetr_profile_runner)
-
-        add_executable(fastloader_rfdetr_train_profile_runner
-            tests/rfdetr_train_profile_runner.cpp
-            tests/test_fixture.cpp
-        )
-        target_link_libraries(fastloader_rfdetr_train_profile_runner PRIVATE
-            fastloader_core
-            fastloader_build_options
-            fastloader_rfdetr_native
-        )
-        target_include_directories(fastloader_rfdetr_train_profile_runner PRIVATE ${CMAKE_SOURCE_DIR}/src)
-        fastloader_enable_torch(fastloader_rfdetr_train_profile_runner PRIVATE)
-        set_target_properties(fastloader_rfdetr_train_profile_runner PROPERTIES
-            CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
-        )
-        fastloader_enable_native_runtime_rpath(fastloader_rfdetr_train_profile_runner)
-
-        add_executable(test_rfdetr_weight_catalog
-            tests/test_rfdetr_weight_catalog.cpp
-        )
-        target_link_libraries(test_rfdetr_weight_catalog PRIVATE
-            fastloader_core
-            fastloader_build_options
-            fastloader_rfdetr_native
-        )
-        target_include_directories(test_rfdetr_weight_catalog PRIVATE ${CMAKE_SOURCE_DIR}/src)
-        fastloader_enable_torch(test_rfdetr_weight_catalog PRIVATE)
-        set_target_properties(test_rfdetr_weight_catalog PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
-        fastloader_enable_native_runtime_rpath(test_rfdetr_weight_catalog)
-        add_test(NAME rfdetr_weight_catalog COMMAND test_rfdetr_weight_catalog)
-
-        if(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER)
-            add_executable(test_rfdetr_checkpoint
-                tests/test_rfdetr_checkpoint.cpp
-            )
-            target_link_libraries(test_rfdetr_checkpoint PRIVATE
-                fastloader_core
-                fastloader_build_options
-                fastloader_rfdetr_native
-            )
-            target_include_directories(test_rfdetr_checkpoint PRIVATE ${CMAKE_SOURCE_DIR}/src)
-            fastloader_enable_torch(test_rfdetr_checkpoint PRIVATE)
-            set_target_properties(test_rfdetr_checkpoint PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
-            fastloader_enable_native_runtime_rpath(test_rfdetr_checkpoint)
-            add_test(NAME rfdetr_checkpoint COMMAND test_rfdetr_checkpoint)
-        endif()
-
-        add_executable(test_rfdetr_modules
-            tests/test_rfdetr_modules.cpp
-        )
-        target_link_libraries(test_rfdetr_modules PRIVATE
-            fastloader_core
-            fastloader_build_options
-            fastloader_rfdetr_native
-        )
-        target_include_directories(test_rfdetr_modules PRIVATE ${CMAKE_SOURCE_DIR}/src)
-        fastloader_enable_torch(test_rfdetr_modules PRIVATE)
-        set_target_properties(test_rfdetr_modules PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
-        fastloader_enable_native_runtime_rpath(test_rfdetr_modules)
-        add_test(NAME rfdetr_modules COMMAND test_rfdetr_modules)
-
-        add_executable(test_rfdetr_native_ops
-            tests/test_rfdetr_native_ops.cpp
-        )
-        target_link_libraries(test_rfdetr_native_ops PRIVATE
-            fastloader_core
-            fastloader_build_options
-            fastloader_rfdetr_native
-        )
-        fastloader_enable_torch(test_rfdetr_native_ops PRIVATE)
-        set_target_properties(test_rfdetr_native_ops PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
-        fastloader_enable_native_runtime_rpath(test_rfdetr_native_ops)
-        add_test(NAME rfdetr_native_ops COMMAND test_rfdetr_native_ops)
-
-        add_executable(test_rfdetr_onnx_lowering
-            tests/test_rfdetr_onnx_lowering.cpp
-        )
-        target_link_libraries(test_rfdetr_onnx_lowering PRIVATE
-            fastloader_core
-            fastloader_build_options
-            fastloader_rfdetr_native
-        )
-        target_include_directories(test_rfdetr_onnx_lowering PRIVATE ${CMAKE_SOURCE_DIR}/src)
-        fastloader_enable_torch(test_rfdetr_onnx_lowering PRIVATE)
-        set_target_properties(test_rfdetr_onnx_lowering PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
-        fastloader_enable_native_runtime_rpath(test_rfdetr_onnx_lowering)
-        add_test(NAME rfdetr_onnx_lowering COMMAND test_rfdetr_onnx_lowering)
-
-        add_executable(test_rfdetr_target_builder
-            tests/test_rfdetr_target_builder.cpp
-            tests/test_fixture.cpp
-        )
-        target_link_libraries(test_rfdetr_target_builder PRIVATE
-            fastloader_core
-            fastloader_build_options
-            fastloader_rfdetr_native
-        )
-        fastloader_enable_torch(test_rfdetr_target_builder PRIVATE)
-        set_target_properties(test_rfdetr_target_builder PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
-        fastloader_enable_native_runtime_rpath(test_rfdetr_target_builder)
-        add_test(NAME rfdetr_target_builder COMMAND test_rfdetr_target_builder)
-
-        add_executable(test_rfdetr_model_trainability
-            tests/test_rfdetr_model_trainability.cpp
-        )
-        target_link_libraries(test_rfdetr_model_trainability PRIVATE
-            fastloader_core
-            fastloader_build_options
-            fastloader_rfdetr_native
-        )
-        target_include_directories(test_rfdetr_model_trainability PRIVATE ${CMAKE_SOURCE_DIR}/src)
-        fastloader_enable_torch(test_rfdetr_model_trainability PRIVATE)
-        set_target_properties(test_rfdetr_model_trainability PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
-        fastloader_enable_native_runtime_rpath(test_rfdetr_model_trainability)
-        add_test(NAME rfdetr_model_trainability COMMAND test_rfdetr_model_trainability)
-
-        add_executable(test_rfdetr_native_optimizer
-            tests/test_rfdetr_native_optimizer.cpp
-        )
-        target_link_libraries(test_rfdetr_native_optimizer PRIVATE
-            fastloader_core
-            fastloader_build_options
-            fastloader_rfdetr_native
-        )
-        target_include_directories(test_rfdetr_native_optimizer PRIVATE ${CMAKE_SOURCE_DIR}/src)
-        fastloader_enable_torch(test_rfdetr_native_optimizer PRIVATE)
-        set_target_properties(test_rfdetr_native_optimizer PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
-        fastloader_enable_native_runtime_rpath(test_rfdetr_native_optimizer)
-        add_test(NAME rfdetr_native_optimizer COMMAND test_rfdetr_native_optimizer)
-
-        add_executable(test_rfdetr_cli_aliases
-            tests/test_rfdetr_cli_aliases.cpp
-        )
-        target_link_libraries(test_rfdetr_cli_aliases PRIVATE
-            fastloader_core
-            fastloader_build_options
-            fastloader_rfdetr_native
-        )
-        target_include_directories(test_rfdetr_cli_aliases PRIVATE ${CMAKE_SOURCE_DIR}/src)
-        target_compile_definitions(test_rfdetr_cli_aliases PRIVATE
-            FASTLOADER_TEST_FASTLOADER_CLI_PATH="$<TARGET_FILE:fastloader_cli>"
-        )
-        add_dependencies(test_rfdetr_cli_aliases fastloader_cli)
-        fastloader_enable_torch(test_rfdetr_cli_aliases PRIVATE)
-        set_target_properties(test_rfdetr_cli_aliases PROPERTIES
-            CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
-        )
-        fastloader_enable_native_runtime_rpath(test_rfdetr_cli_aliases)
-        add_test(NAME rfdetr_cli_aliases COMMAND test_rfdetr_cli_aliases)
-
-        add_executable(test_rfdetr_eval_sample_writer
-            tests/test_rfdetr_eval_sample_writer.cpp
-        )
-        target_link_libraries(test_rfdetr_eval_sample_writer PRIVATE
-            fastloader_core
-            fastloader_build_options
-            fastloader_rfdetr_native
-        )
-        target_include_directories(test_rfdetr_eval_sample_writer PRIVATE ${CMAKE_SOURCE_DIR}/src)
-        fastloader_enable_torch(test_rfdetr_eval_sample_writer PRIVATE)
-        set_target_properties(test_rfdetr_eval_sample_writer PROPERTIES
-            CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
-        )
-        fastloader_enable_native_runtime_rpath(test_rfdetr_eval_sample_writer)
-        add_test(NAME rfdetr_eval_sample_writer COMMAND test_rfdetr_eval_sample_writer)
-
-        add_executable(test_rfdetr_public_headers
-            tests/test_rfdetr_public_headers.cpp
-        )
-        target_link_libraries(test_rfdetr_public_headers PRIVATE
-            fastloader_core
-            fastloader_build_options
-            fastloader_rfdetr_native
-        )
-        fastloader_enable_torch(test_rfdetr_public_headers PRIVATE)
-        set_target_properties(test_rfdetr_public_headers PROPERTIES
-            CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
-        )
-        fastloader_enable_native_runtime_rpath(test_rfdetr_public_headers)
-        add_test(NAME rfdetr_public_headers COMMAND test_rfdetr_public_headers)
-
-        add_executable(test_rfdetr_live_preprocess
-            tests/test_rfdetr_live_preprocess.cpp
-            src/rfdetr/cuda/live_preprocess.cu
-        )
-        target_include_directories(test_rfdetr_live_preprocess PRIVATE
+        target_include_directories(mmltk_rfdetr_profile_runner PRIVATE
             ${CMAKE_SOURCE_DIR}/src
-            ${CMAKE_SOURCE_DIR}/include
         )
-        target_link_libraries(test_rfdetr_live_preprocess PRIVATE
-            fastloader_build_options
-            CUDA::cudart
+        target_link_libraries(mmltk_rfdetr_profile_runner PRIVATE
+            mmltk_core
+            mmltk_build_options
+            mmltk_rfdetr_native
+            mmltk_test_headers
         )
-        set_target_properties(test_rfdetr_live_preprocess PROPERTIES
+        mmltk_enable_torch(mmltk_rfdetr_profile_runner PRIVATE)
+        set_target_properties(mmltk_rfdetr_profile_runner PROPERTIES
             CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
         )
-        add_test(NAME rfdetr_live_preprocess COMMAND test_rfdetr_live_preprocess)
+        mmltk_enable_native_runtime_rpath(mmltk_rfdetr_profile_runner)
 
-        add_executable(test_rfdetr_prediction_json
-            tests/test_rfdetr_prediction_json.cpp
+        add_executable(mmltk_rfdetr_train_profile_runner
+            tests/rfdetr_train_profile_runner.cpp
         )
-        target_link_libraries(test_rfdetr_prediction_json PRIVATE
-            fastloader_core
-            fastloader_build_options
-            fastloader_rfdetr_native
+        target_include_directories(mmltk_rfdetr_train_profile_runner PRIVATE
+            ${CMAKE_SOURCE_DIR}/src
         )
-        fastloader_enable_torch(test_rfdetr_prediction_json PRIVATE)
-        set_target_properties(test_rfdetr_prediction_json PROPERTIES
+        target_link_libraries(mmltk_rfdetr_train_profile_runner PRIVATE
+            mmltk_core
+            mmltk_build_options
+            mmltk_rfdetr_native
+            mmltk_test_headers
+            mmltk_test_support
+        )
+        mmltk_enable_torch(mmltk_rfdetr_train_profile_runner PRIVATE)
+        set_target_properties(mmltk_rfdetr_train_profile_runner PROPERTIES
             CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
         )
-        fastloader_enable_native_runtime_rpath(test_rfdetr_prediction_json)
-        add_test(NAME rfdetr_prediction_json COMMAND test_rfdetr_prediction_json)
-
-        if(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER)
-            add_executable(test_rfdetr_native_integration
-                tests/test_rfdetr_native_integration.cpp
-                tests/test_fixture.cpp
-            )
-            target_link_libraries(test_rfdetr_native_integration PRIVATE
-                fastloader_core
-                fastloader_build_options
-                fastloader_rfdetr_native
-            )
-            target_include_directories(test_rfdetr_native_integration PRIVATE ${CMAKE_SOURCE_DIR}/src)
-            target_compile_definitions(test_rfdetr_native_integration PRIVATE
-                FASTLOADER_TEST_FASTLOADER_CLI_PATH="$<TARGET_FILE:fastloader_cli>"
-            )
-            add_dependencies(test_rfdetr_native_integration fastloader_cli)
-            fastloader_enable_torch(test_rfdetr_native_integration PRIVATE)
-            set_target_properties(test_rfdetr_native_integration PROPERTIES
-                CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
-            )
-            fastloader_enable_native_runtime_rpath(test_rfdetr_native_integration)
-            add_test(NAME rfdetr_native_integration COMMAND test_rfdetr_native_integration)
-        endif()
-
-        if(BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER)
-            add_executable(test_rfdetr_checkpoint_parity
-                tests/test_rfdetr_checkpoint_parity.cpp
-            )
-            target_link_libraries(test_rfdetr_checkpoint_parity PRIVATE
-                fastloader_core
-                fastloader_build_options
-                fastloader_rfdetr_native
-            )
-            target_include_directories(test_rfdetr_checkpoint_parity PRIVATE ${CMAKE_SOURCE_DIR}/src)
-            fastloader_enable_torch(test_rfdetr_checkpoint_parity PRIVATE)
-            set_target_properties(test_rfdetr_checkpoint_parity PROPERTIES
-                CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
-            )
-            fastloader_enable_native_runtime_rpath(test_rfdetr_checkpoint_parity)
-            add_test(NAME rfdetr_checkpoint_parity_nano COMMAND test_rfdetr_checkpoint_parity rf-detr-nano)
-            add_test(NAME rfdetr_checkpoint_parity_seg_nano COMMAND test_rfdetr_checkpoint_parity rf-detr-seg-nano)
-        endif()
+        mmltk_enable_native_runtime_rpath(mmltk_rfdetr_train_profile_runner)
     endif()
 endif()

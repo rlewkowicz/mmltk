@@ -1,4 +1,5 @@
 #include "rfdetr/onnx_simplify.h"
+#include "mmltk_logging.h"
 
 #ifndef ONNX_NAMESPACE
 #define ONNX_NAMESPACE onnx_torch
@@ -7,21 +8,20 @@
 #include <onnx/checker.h>
 #include <onnx/shape_inference/implementation.h>
 
-#include <cstdio>
 #include <stdexcept>
 #include <string>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 void run_onnx_simplify(ONNX_NAMESPACE::ModelProto& model) {
     try {
-        std::fprintf(stderr, "onnx: checking exported model...\n");
+        mmltk::logging::logger("rfdetr.onnx_simplify")->info("onnx: checking exported model...");
         ONNX_NAMESPACE::checker::check_model(model);
-        std::fprintf(stderr, "onnx: running shape inference...\n");
+        mmltk::logging::logger("rfdetr.onnx_simplify")->info("onnx: running shape inference...");
         ONNX_NAMESPACE::shape_inference::InferShapes(
             model,
             ONNX_NAMESPACE::OpSchemaRegistry::Instance());
-        std::fprintf(stderr, "onnx: shape inference complete\n");
+        mmltk::logging::logger("rfdetr.onnx_simplify")->info("onnx: shape inference complete");
     } catch (const ONNX_NAMESPACE::checker::ValidationError& error) {
         throw std::runtime_error(
             std::string("RF-DETR ONNX simplify failed: ONNX checker rejected the model: ") +
@@ -36,4 +36,4 @@ void run_onnx_simplify(ONNX_NAMESPACE::ModelProto& model) {
     }
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

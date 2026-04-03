@@ -7,9 +7,9 @@
 #include <string_view>
 #include <vector>
 
-namespace fastloader::gui {
+namespace mmltk::gui {
 
-enum class RemoteGpuFamily : int {
+enum class RemoteGpuFamily : std::uint8_t {
     A100 = 0,
     B200 = 1,
     H100 = 2,
@@ -53,4 +53,4 @@ std::vector<VastOfferSummary> rank_vast_offers(const std::vector<VastRawOffer>& 
 std::vector<VastOfferSummary> query_vast_offers(const VastQueryConfig& config,
                                                 const std::vector<RemoteGpuFamily>& selected_families);
 
-} // namespace fastloader::gui
+} // namespace mmltk::gui

@@ -9,11 +9,11 @@
 #include <stdexcept>
 #include <utility>
 
-namespace fastloader::gui::rfdetr_workflows {
+namespace mmltk::gui::rfdetr_workflows {
 
 namespace {
 
-using namespace fastloader::rfdetr;
+using namespace mmltk::rfdetr;
 
 template <typename Options>
 void apply_model_input(ModelInputMode mode,
@@ -36,14 +36,21 @@ void apply_model_input(ModelInputMode mode,
     }
 }
 
-const char* train_optimizer_cli_value(TrainOptimizerMode mode) {
+TrainOptimizerKind train_optimizer_kind_from_mode(TrainOptimizerMode mode) {
     switch (mode) {
     case TrainOptimizerMode::AdamW:
-        return "adamw";
+        return TrainOptimizerKind::AdamW;
     case TrainOptimizerMode::Muon:
-        return "muon";
+        return TrainOptimizerKind::Muon;
     }
-    return "adamw";
+    return TrainOptimizerKind::AdamW;
+}
+
+std::filesystem::path default_export_onnx_output_path(const std::filesystem::path& weights_path) {
+    if (weights_path.empty()) {
+        return {};
+    }
+    return weights_path.parent_path() / (weights_path.stem().string() + ".onnx");
 }
 
 } // namespace
@@ -76,8 +83,8 @@ int require_positive_int(int value, const char* field_name) {
     return value;
 }
 
-fastloader::rfdetr::CompilationMode compilation_mode_from_index(int index) {
-    using fastloader::rfdetr::CompilationMode;
+mmltk::rfdetr::CompilationMode compilation_mode_from_index(int index) {
+    using mmltk::rfdetr::CompilationMode;
     switch (index) {
     case 0:
         return CompilationMode::kNone;
@@ -90,28 +97,107 @@ fastloader::rfdetr::CompilationMode compilation_mode_from_index(int index) {
     }
 }
 
-std::string compilation_mode_cli_value(int index) {
-    switch (index) {
-    case 0:
-        return "none";
-    case 1:
-        return "selective";
-    case 2:
-        return "full";
-    default:
-        throw std::runtime_error("invalid compilation mode index");
-    }
+mmltk::rfdetr::BuildEngineRequest build_build_engine_request(const ExportViewState& state) {
+    return build_build_engine_request(state, std::filesystem::path(state.onnx_path));
 }
 
-fastloader::rfdetr::PredictOptions build_annotate_predict_options(
+mmltk::rfdetr::ExportOnnxRequest build_export_onnx_request(const ExportViewState& state) {
+    return build_export_onnx_request(state, std::filesystem::path(state.onnx_path));
+}
+
+mmltk::rfdetr::BuildEngineRequest build_build_engine_request(
+    const ExportViewState& state,
+    const std::filesystem::path& onnx_path_override) {
+    const std::filesystem::path onnx_path =
+        onnx_path_override.empty() ? std::filesystem::path(state.onnx_path) : onnx_path_override;
+
+    mmltk::rfdetr::BuildEngineRequest request;
+    request.onnx_path = onnx_path;
+    request.output_path = state.output_path;
+    request.device_id = state.device_id;
+    request.allow_fp16 = state.allow_fp16;
+    validate_build_engine_request(request);
+    return request;
+}
+
+mmltk::rfdetr::ExportOnnxRequest build_export_onnx_request(
+    const ExportViewState& state,
+    const std::filesystem::path& output_path_override) {
+    return build_export_onnx_request(state.weights_path,
+                                     output_path_override.empty() ? state.onnx_path : output_path_override.string(),
+                                     state.device_id,
+                                     state.opset_version,
+                                     state.simplify);
+}
+
+mmltk::rfdetr::BuildEngineRequest build_build_engine_request(
+    const mmltk::rfdetr::ExportOnnxRequest& export_request,
+    const ExportViewState& state) {
+    return build_build_engine_request(export_request,
+                                      state.output_path,
+                                      state.device_id,
+                                      state.allow_fp16);
+}
+
+mmltk::rfdetr::BuildEngineRequest build_build_engine_request(
+    const mmltk::rfdetr::ExportOnnxRequest& export_request,
+    const std::filesystem::path& output_path,
+    int device_id,
+    bool allow_fp16) {
+    mmltk::rfdetr::BuildEngineRequest request;
+    request.onnx_path = export_request.output_path;
+    request.output_path = output_path;
+    request.device_id = device_id;
+    request.allow_fp16 = allow_fp16;
+    validate_build_engine_request(request);
+    return request;
+}
+
+mmltk::rfdetr::ExportOnnxRequest build_export_onnx_request(
+    const std::string& weights_path,
+    const std::string& output_path,
+    int device_id,
+    int opset_version,
+    bool simplify) {
+    mmltk::rfdetr::ExportOnnxRequest request;
+    request.weights_path = weights_path;
+    request.output_path = output_path.empty() ? default_export_onnx_output_path(weights_path) : std::filesystem::path(output_path);
+    request.device_id = device_id;
+    request.opset_version = opset_version;
+    request.simplify = simplify;
+    validate_export_onnx_request(request);
+    return request;
+}
+
+void apply_build_engine_request(ExportViewState& state,
+                                const mmltk::rfdetr::BuildEngineRequest& request) {
+    state.weights_path.clear();
+    state.onnx_path = request.onnx_path.string();
+    state.output_path = request.output_path.string();
+    state.device_id = request.device_id;
+    state.allow_fp16 = request.allow_fp16;
+    state.build_tensorrt = true;
+}
+
+void apply_export_onnx_request(ExportViewState& state,
+                               const mmltk::rfdetr::ExportOnnxRequest& request) {
+    state.weights_path = request.weights_path.string();
+    state.onnx_path = request.output_path.string();
+    state.device_id = request.device_id;
+    state.opset_version = request.opset_version;
+    state.simplify = request.simplify;
+    state.build_tensorrt = false;
+}
+
+mmltk::rfdetr::PredictOptions build_annotate_predict_options(
     const AnnotateViewState& state,
     const std::string& preset_name,
-    fastloader::rfdetr::PredictImageInput input) {
-    fastloader::rfdetr::PredictOptions options;
+    mmltk::rfdetr::PredictImageInput input) {
+    mmltk::rfdetr::PredictOptions options;
     options.preset_name = preset_name;
-    options.source_kind = fastloader::rfdetr::PredictSourceKind::ImageFiles;
+    options.source_kind = mmltk::rfdetr::PredictSourceKind::ImageFiles;
     options.image_inputs.push_back(std::move(input));
-    options.output_path = std::filesystem::temp_directory_path() / "fastloader-annotate-predict.json";
+    options.output_path = std::filesystem::temp_directory_path() / "mmltk-annotate-predict.json";
     options.backend = state.backend;
     options.batch_size = 1U;
     options.max_dets_per_image = require_positive_size(state.max_dets_per_image, "annotate max_dets_per_image");
@@ -124,72 +210,78 @@ fastloader::rfdetr::PredictOptions build_annotate_predict_options(
     return options;
 }
 
-fastloader::rfdetr::ValidationOptions build_validate_options(const ValidateViewState& state) {
-    fastloader::rfdetr::ValidationOptions options;
-    options.compiled_path = state.compiled_path;
-    options.source_dir = state.source_dir;
-    options.onnx_path = state.onnx_path;
-    options.tensorrt_path = state.tensorrt_path;
-    options.save_engine_path = state.save_engine_path;
-    options.report_json_path = state.report_json_path;
-    options.split = state.split;
-    options.eval_order = state.eval_order;
-    options.resolution = static_cast<std::uint32_t>(require_positive_size(state.resolution, "validate resolution"));
-    options.limit_images = require_non_negative_size(state.limit_images, "validate limit_images");
-    options.alignment_images = require_non_negative_size(state.alignment_images, "validate alignment_images");
-    options.eval_max_dets = require_positive_size(state.eval_max_dets, "validate eval_max_dets");
-    options.batch_size = require_positive_size(state.batch_size, "validate batch_size");
-    options.prefetch_factor = require_positive_size(state.prefetch_factor, "validate prefetch_factor");
-    options.device_id = require_non_negative_int(state.device_id, "validate device_id");
-    options.workers = require_non_negative_int(state.workers, "validate workers");
-    options.cpu_affinity = state.cpu_affinity;
-    options.recompile = state.recompile;
-    options.profile = state.profile;
-    options.allow_fp16 = state.allow_fp16;
-    options.write_report_json = state.write_report_json;
-    options.log_mode = fastloader::rfdetr::ValidationLogMode::Quiet;
-    return options;
+mmltk::rfdetr::ValidateRequest build_validate_request(const ValidateViewState& state) {
+    mmltk::rfdetr::ValidateRequest request;
+    request.compiled_path = state.compiled_path;
+    request.source_dir = state.source_dir;
+    request.onnx_path = state.onnx_path;
+    request.tensorrt_path = state.tensorrt_path;
+    request.save_engine_path = state.save_engine_path;
+    request.report_json_path = state.report_json_path;
+    request.split = state.split;
+    request.eval_order = state.eval_order;
+    request.resolution = static_cast<std::uint32_t>(require_positive_size(state.resolution, "validate resolution"));
+    request.limit_images = require_non_negative_size(state.limit_images, "validate limit_images");
+    request.alignment_images = require_non_negative_size(state.alignment_images, "validate alignment_images");
+    request.eval_max_dets = require_positive_size(state.eval_max_dets, "validate eval_max_dets");
+    request.batch_size = require_positive_size(state.batch_size, "validate batch_size");
+    request.prefetch_factor = require_positive_size(state.prefetch_factor, "validate prefetch_factor");
+    request.device_id = require_non_negative_int(state.device_id, "validate device_id");
+    request.workers = require_non_negative_int(state.workers, "validate workers");
+    request.cpu_affinity = state.cpu_affinity;
+    request.recompile = state.recompile;
+    request.profile = state.profile;
+    request.allow_fp16 = state.allow_fp16;
+    request.write_report_json = state.write_report_json;
+    request.log_mode = mmltk::rfdetr::ValidationLogMode::Quiet;
+    finalize_validate_request(request);
+    request.log_mode = mmltk::rfdetr::ValidationLogMode::Quiet;
+    request.write_report_json = state.write_report_json;
+    return request;
 }
 
-fastloader::rfdetr::PredictOptions build_predict_options(const PredictViewState& state,
-                                                         const std::string& preset_name) {
+mmltk::rfdetr::PredictRequest build_predict_request(
+    const PredictViewState& state,
+    std::vector<mmltk::rfdetr::PredictImageInput> image_inputs) {
     if (state.source.kind == SourceKind::VideoStream) {
-        throw std::runtime_error("batch predict options do not support live video sources");
+        throw std::runtime_error("batch predict requests do not support live video sources");
     }
 
-    fastloader::rfdetr::PredictOptions options;
-    options.preset_name = preset_name;
-    options.source_kind = state.source.kind == SourceKind::CompiledDataset
-                              ? fastloader::rfdetr::PredictSourceKind::CompiledDataset
-                              : fastloader::rfdetr::PredictSourceKind::ImageFiles;
+    mmltk::rfdetr::PredictRequest request;
+    request.source_kind = state.source.kind == SourceKind::CompiledDataset
+                              ? mmltk::rfdetr::PredictSourceKind::CompiledDataset
+                              : mmltk::rfdetr::PredictSourceKind::ImageFiles;
     if (state.source.kind == SourceKind::CompiledDataset) {
-        options.compiled_path = state.source.compiled_path;
+        request.compiled_path = state.source.compiled_path;
+    } else {
+        request.image_inputs = std::move(image_inputs);
     }
-    options.output_path = state.output_path;
-    options.backend = state.backend;
-    options.batch_size = state.source.kind == SourceKind::SingleImage
+    request.output_path = state.output_path;
+    request.backend = state.backend;
+    request.batch_size = state.source.kind == SourceKind::SingleImage
                              ? 1U
                              : require_positive_size(state.batch_size, "predict batch_size");
-    options.max_dets_per_image = require_positive_size(state.max_dets_per_image, "predict max_dets_per_image");
-    options.device_id = require_non_negative_int(state.device_id, "predict device_id");
-    options.workers = require_non_negative_int(state.workers, "predict workers");
-    options.lanes = require_non_negative_int(state.lanes, "predict lanes");
-    options.threshold = state.threshold;
-    options.cpu_affinity = state.cpu_affinity;
-    options.allow_fp16 = state.allow_fp16;
-    options.progress_bar = state.progress_bar;
-    options.compilation_mode = compilation_mode_from_index(state.compile_mode);
-    apply_model_input(state.model_input, state.weights_path, state.onnx_path, state.tensorrt_path, options);
-    return options;
+    request.max_dets_per_image = require_positive_size(state.max_dets_per_image, "predict max_dets_per_image");
+    request.device_id = require_non_negative_int(state.device_id, "predict device_id");
+    request.workers = require_non_negative_int(state.workers, "predict workers");
+    request.lanes = require_non_negative_int(state.lanes, "predict lanes");
+    request.threshold = state.threshold;
+    request.cpu_affinity = state.cpu_affinity;
+    request.allow_fp16 = state.allow_fp16;
+    request.progress_bar = state.progress_bar;
+    request.compilation_mode = compilation_mode_from_index(state.compile_mode);
+    apply_model_input(state.model_input, state.weights_path, state.onnx_path, state.tensorrt_path, request);
+    finalize_predict_request(request);
+    return request;
 }
 
-fastloader::rfdetr::LivePredictOptions build_live_predict_options(const PredictViewState& state,
+mmltk::rfdetr::LivePredictOptions build_live_predict_options(const PredictViewState& state,
                                                                   const std::string& preset_name) {
     if (state.source.kind != SourceKind::VideoStream) {
         throw std::runtime_error("live predict options require a video device source");
     }
 
-    fastloader::rfdetr::LivePredictOptions options;
+    mmltk::rfdetr::LivePredictOptions options;
     options.preset_name = preset_name;
     options.source.device_path = "/dev/video" + std::to_string(std::max(0, state.source.device_index));
     options.source.width = static_cast<std::uint32_t>(require_positive_size(state.source.capture_width, "live capture width"));
@@ -197,7 +289,7 @@ fastloader::rfdetr::LivePredictOptions build_live_predict_options(const PredictV
     options.source.fps = static_cast<std::uint32_t>(require_positive_size(state.source.capture_fps, "live capture fps"));
     options.source.v4l2_buffer_count =
         static_cast<std::uint32_t>(require_positive_size(state.source.v4l2_buffer_count, "live v4l2_buffer_count"));
-    options.source.initial_region = fastloader::rfdetr::LiveCaptureRegion{
+    options.source.initial_region = mmltk::rfdetr::LiveCaptureRegion{
         0U,
         0U,
         options.source.width,
@@ -216,8 +308,8 @@ fastloader::rfdetr::LivePredictOptions build_live_predict_options(const PredictV
     return options;
 }
 
-TrainCommandConfig build_train_command_config(const TrainViewState& state,
-                                              const std::vector<int>& device_ids) {
+mmltk::rfdetr::TrainRequest build_train_request(const TrainViewState& state,
+                                                const std::vector<int>& device_ids) {
     if (state.epochs <= 0) {
         throw std::runtime_error("train epochs must be greater than zero");
     }
@@ -231,46 +323,52 @@ TrainCommandConfig build_train_command_config(const TrainViewState& state,
         throw std::runtime_error("train prefetch_factor must be greater than zero");
     }
 
-    TrainCommandConfig config;
-    config.train_compiled_path = state.train_compiled_path;
-    config.val_compiled_path = state.val_compiled_path;
-    config.test_compiled_path = state.test_compiled_path;
-    config.output_dir = state.output_dir;
-    config.weights_path = state.weights_path;
-    config.resume_path = state.resume_path;
-    config.cpu_affinity = state.cpu_affinity;
-    config.input_mode = state.input_mode == TrainInputMode::Weights
-                            ? TrainCommandInputMode::Weights
-                            : TrainCommandInputMode::Resume;
-    config.device_ids = device_ids;
-    config.batch_size = state.batch_size;
-    config.val_batch_size = state.val_batch_size;
-    config.epochs = state.epochs;
-    config.grad_accum_steps = state.grad_accum_steps;
-    config.eval_max_dets = state.eval_max_dets;
-    config.lr_drop = state.lr_drop;
-    config.prefetch_factor = state.prefetch_factor;
-    config.seed = state.seed;
-    config.workers = state.workers;
-    config.lanes = state.lanes;
-    config.lr = state.lr;
-    config.lr_encoder = state.lr_encoder;
-    config.lr_component_decay = state.lr_component_decay;
-    config.encoder_layer_decay = state.encoder_layer_decay;
-    config.momentum = state.momentum;
-    config.weight_decay = state.weight_decay;
-    config.warmup_epochs = state.warmup_epochs;
-    config.warmup_momentum = state.warmup_momentum;
-    config.lr_min_factor = state.lr_min_factor;
-    config.clip_max_norm = state.clip_max_norm;
-    config.use_ema = state.use_ema;
-    config.amp = state.amp;
-    config.progress_bar = state.progress_bar;
-    config.freeze_encoder = state.freeze_encoder;
-    config.optimizer = train_optimizer_cli_value(state.optimizer);
-    config.lr_scheduler = state.lr_scheduler;
-    config.compile_mode = compilation_mode_cli_value(state.compile_mode);
-    return config;
+    mmltk::rfdetr::TrainRequest request;
+    request.train_compiled_path = state.train_compiled_path;
+    request.val_compiled_path = state.val_compiled_path;
+    request.test_compiled_path = state.test_compiled_path;
+    request.output_dir = state.output_dir;
+    if (state.input_mode == TrainInputMode::Weights) {
+        request.weights_path = state.weights_path;
+        request.resume_path.clear();
+    } else {
+        request.resume_path = state.resume_path;
+        request.weights_path.clear();
+    }
+    request.cpu_affinity = state.cpu_affinity;
+    request.device_id = device_ids.size() == 1U ? device_ids.front() : -1;
+    request.device_ids = device_ids;
+    request.batch_size = require_positive_size(state.batch_size, "train batch_size");
+    request.val_batch_size = require_non_negative_size(state.val_batch_size, "train val_batch_size");
+    request.epochs = state.epochs;
+    request.grad_accum_steps = state.grad_accum_steps;
+    request.eval_max_dets = require_positive_size(state.eval_max_dets, "train eval_max_dets");
+    request.lr_drop = state.lr_drop;
+    request.print_freq = state.print_freq;
+    request.prefetch_factor = state.prefetch_factor;
+    request.seed = state.seed;
+    request.workers = state.workers;
+    request.lanes = state.lanes;
+    request.lr = state.lr;
+    request.lr_encoder = state.lr_encoder;
+    request.lr_component_decay = state.lr_component_decay;
+    request.encoder_layer_decay = state.encoder_layer_decay;
+    request.momentum = state.momentum;
+    request.weight_decay = state.weight_decay;
+    request.warmup_epochs = state.warmup_epochs;
+    request.warmup_momentum = state.warmup_momentum;
+    request.lr_min_factor = state.lr_min_factor;
+    request.clip_max_norm = state.clip_max_norm;
+    request.use_ema = state.use_ema;
+    request.amp = state.amp;
+    request.progress_bar = state.progress_bar;
+    request.freeze_encoder = state.freeze_encoder;
+    request.optimizer = train_optimizer_kind_from_mode(state.optimizer);
+    request.lr_scheduler = state.lr_scheduler;
+    request.compilation_mode = compilation_mode_from_index(state.compile_mode);
+    request.recipe_overrides = state.recipe_overrides;
+    validate_train_request(request);
+    return request;
 }
 
 std::string summarize_annotation_save_result(const AnnotationSaveResult& result) {
@@ -280,7 +378,7 @@ std::string summarize_annotation_save_result(const AnnotationSaveResult& result)
     return stream.str();
 }
 
-std::string summarize_validation_result(const fastloader::rfdetr::ValidationRunResult& result) {
+std::string summarize_validation_result(const mmltk::rfdetr::ValidationRunResult& result) {
     std::ostringstream stream;
     stream << "validate completed: images=" << result.images
            << " categories=" << result.categories;
@@ -295,7 +393,7 @@ std::string summarize_validation_result(const fastloader::rfdetr::ValidationRunR
     return stream.str();
 }
 
-std::string summarize_prediction_result(const fastloader::rfdetr::PredictionRunResult& result) {
+std::string summarize_prediction_result(const mmltk::rfdetr::PredictionRunResult& result) {
     std::ostringstream stream;
     stream << "predict completed: backend=" << result.backend_name
            << " images=" << result.records.size()
@@ -305,8 +403,8 @@ std::string summarize_prediction_result(const fastloader::rfdetr::PredictionRunR
 
 std::optional<StillImagePreview> maybe_make_single_image_preview(
     const PredictViewState& state,
-    const fastloader::rfdetr::PredictOptions& options,
-    const fastloader::rfdetr::PredictionRunResult& result) {
+    const mmltk::rfdetr::PredictOptions& options,
+    const mmltk::rfdetr::PredictionRunResult& result) {
     if (state.source.kind != SourceKind::SingleImage) {
         return std::nullopt;
     }
@@ -322,7 +420,7 @@ std::optional<StillImagePreview> maybe_make_single_image_preview(
                                                   state.device_id);
 }
 
-AnnotationBox prediction_to_annotation_box(const fastloader::rfdetr::Prediction& prediction,
+AnnotationBox prediction_to_annotation_box(const mmltk::rfdetr::Prediction& prediction,
                                            std::uint32_t width,
                                            std::uint32_t height) {
     AnnotationBox box;
@@ -333,4 +431,4 @@ AnnotationBox prediction_to_annotation_box(const fastloader::rfdetr::Prediction&
     return normalize_annotation_box(box, width, height);
 }
 
-} // namespace fastloader::gui::rfdetr_workflows
+} // namespace mmltk::gui::rfdetr_workflows

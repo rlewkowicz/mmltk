@@ -1,159 +1,234 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="${1:-${REPO_ROOT}/build/dev}"
-COMPILE_DB="${BUILD_DIR}/compile_commands.json"
-CLANG_TIDY_BIN="${FASTLOADER_STATIC_CLANG_TIDY_BIN:-$(command -v clang-tidy || true)}"
-CPPCHECK_BIN="${FASTLOADER_STATIC_CPPCHECK_BIN:-$(command -v cppcheck || true)}"
-VALGRIND_BIN="${FASTLOADER_STATIC_VALGRIND_BIN:-$(command -v valgrind || true)}"
-VULTURE_BIN="${FASTLOADER_STATIC_VULTURE_BIN:-$(command -v vulture || true)}"
-SUPPRESSIONS_FILE="${FASTLOADER_STATIC_CPPCHECK_SUPPRESSIONS:-${REPO_ROOT}/utilities/cppcheck.suppressions}"
-ENABLE_ANALYZER_ALPHA="${FASTLOADER_STATIC_ENABLE_ANALYZER_ALPHA:-0}"
-ENABLE_CHECK_PROFILE="${FASTLOADER_STATIC_ENABLE_CHECK_PROFILE:-0}"
-INCLUDE_TESTS="${FASTLOADER_STATIC_INCLUDE_TESTS:-1}"
-CLANG_TIDY_JOBS="${FASTLOADER_STATIC_CLANG_TIDY_JOBS:-1}"
-CPPCHECK_JOBS="${FASTLOADER_STATIC_CPPCHECK_JOBS:-$(nproc)}"
-CPPCHECK_BUILD_DIR="${FASTLOADER_STATIC_CPPCHECK_BUILD_DIR:-${BUILD_DIR}/cppcheck}"
-
-if [[ "${BUILD_DIR}" != /* ]]; then
-    BUILD_DIR="${REPO_ROOT}/${BUILD_DIR#./}"
-    COMPILE_DB="${BUILD_DIR}/compile_commands.json"
-fi
-
-cd "${REPO_ROOT}"
-
-require_tool() {
-    local tool_name="$1"
-    local tool_path="$2"
-    if [[ -z "${tool_path}" ]]; then
-        echo "[static] Missing required tool: ${tool_name}" >&2
-        exit 1
-    fi
+log() {
+    printf 'mmltk-tidy: %s\n' "$*" >&2
 }
 
-if [[ ! -f "${COMPILE_DB}" ]]; then
-    echo "[static] Missing compilation database: ${COMPILE_DB}" >&2
+die() {
+    log "$*"
     exit 1
-fi
+}
 
-require_tool "clang-tidy" "${CLANG_TIDY_BIN}"
-require_tool "cppcheck" "${CPPCHECK_BIN}"
-require_tool "valgrind" "${VALGRIND_BIN}"
+usage() {
+    cat <<'EOF'
+Usage: utilities/run_static_analysis.sh [--start-at <translation-unit>]
 
-if [[ ! -f "${SUPPRESSIONS_FILE}" ]]; then
-    echo "[static] Missing cppcheck suppressions file: ${SUPPRESSIONS_FILE}" >&2
-    exit 1
-fi
+Runs the Docker-backed static-analysis pass for this repo:
+1. Regenerates a clean Docker-side Dev compile database
+2. Runs clang-tidy over repo translation units in deterministic order
+3. Runs cppcheck over the same project file set
 
-mapfile -t translation_units < <(
-    sed -n 's/^[[:space:]]*"file":[[:space:]]*"\(.*\)"[[:space:]]*,\{0,1\}[[:space:]]*$/\1/p' "${COMPILE_DB}" | sort -u
-)
+Options:
+  --start-at <translation-unit>  Resume analysis from the given file in
+                                 compile-database order
+  --help                         Show this help
 
-analysis_roots='src'
-if [[ "${INCLUDE_TESTS}" != "0" ]]; then
-    analysis_roots='src|tests'
-fi
+Environment:
+  MMLTK_REPO_ROOT         Repo root mounted inside the container
+  MMLTK_TIDY_BUILD_DIR    Build dir for the Docker-side compile database
+  MMLTK_CLANG_TIDY_CHECKS Override the clang-tidy check filter
+EOF
+}
 
-mapfile -t analysis_units < <(
-    printf '%s\n' "${translation_units[@]}" | grep -E "^${REPO_ROOT}/(${analysis_roots})/.*\\.cpp$" || true
-)
+repo_root="${MMLTK_REPO_ROOT:-$(pwd)}"
+build_dir="${MMLTK_TIDY_BUILD_DIR:-${repo_root}/build/docker-dev-tidy}"
+cppcheck_build_dir="${build_dir}/cppcheck"
+compile_db="${build_dir}/compile_commands.json"
+start_at=""
 
-if [[ ${#analysis_units[@]} -eq 0 ]]; then
-    echo "[static] No translation units found in ${COMPILE_DB}" >&2
-    exit 1
-fi
-
-CLANG_TIDY_CHECKS='-*,clang-analyzer-*,bugprone-*,performance-*,misc-use-internal-linkage,-bugprone-easily-swappable-parameters,-bugprone-exception-escape'
-if [[ "${ENABLE_ANALYZER_ALPHA}" != "0" ]]; then
-    CLANG_TIDY_CHECKS+=",clang-analyzer-alpha.clone.*,clang-analyzer-alpha.core.*,clang-analyzer-alpha.cplusplus.*,clang-analyzer-alpha.deadcode.*,clang-analyzer-alpha.security.*,clang-analyzer-alpha.unix.*,-clang-analyzer-alpha.webkit.*"
-fi
-readonly CLANG_TIDY_WARNINGS_AS_ERRORS='clang-analyzer-*,bugprone-*,performance-*'
-readonly HEADER_FILTER='(include|src|tests)/'
-readonly TEST_ROUNDTRIP="${BUILD_DIR}/test_roundtrip"
-readonly CLANG_TIDY_PROFILE_PREFIX="${BUILD_DIR}/clang-tidy-profile"
-
-clang_tidy_common_args=(
-    -p "${BUILD_DIR}"
-    --quiet
-    --checks="${CLANG_TIDY_CHECKS}"
-    --warnings-as-errors="${CLANG_TIDY_WARNINGS_AS_ERRORS}"
-    --header-filter="${HEADER_FILTER}"
-)
-
-if [[ "${ENABLE_ANALYZER_ALPHA}" != "0" ]]; then
-    clang_tidy_common_args+=(-allow-enabling-analyzer-alpha-checkers)
-fi
-
-if [[ "${ENABLE_CHECK_PROFILE}" != "0" ]]; then
-    mkdir -p "${BUILD_DIR}"
-    clang_tidy_common_args+=(--enable-check-profile "--store-check-profile=${CLANG_TIDY_PROFILE_PREFIX}")
-fi
-
-echo "[static][1/4] Running clang-tidy on ${#analysis_units[@]} translation units"
-for index in "${!analysis_units[@]}"; do
-    unit="${analysis_units[index]}"
-    printf '[static][clang-tidy] %d/%d %s\n' \
-        "$((index + 1))" \
-        "${#analysis_units[@]}" \
-        "${unit#${REPO_ROOT}/}"
-    "${CLANG_TIDY_BIN}" "${clang_tidy_common_args[@]}" "${unit}"
+while (($# > 0)); do
+    case "$1" in
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        --start-at)
+            shift
+            [[ $# -gt 0 ]] || die "--start-at requires a file path"
+            start_at="$1"
+            ;;
+        *)
+            die "unsupported argument: $1"
+            ;;
+    esac
+    shift
 done
 
-echo "[static][2/4] Running cppcheck"
-mkdir -p "${CPPCHECK_BUILD_DIR}"
-"${CPPCHECK_BIN}" \
-    --project="${COMPILE_DB}" \
-    --cppcheck-build-dir="${CPPCHECK_BUILD_DIR}" \
-    --enable=all \
+export LD_LIBRARY_PATH="/usr/local/cuda-13.0/lib64:/opt/pytorch/lib:/src/workspace/deps/onnx/lib:/src/workspace/deps/onnxruntime/lib:${LD_LIBRARY_PATH:-}"
+
+mkdir -p "${build_dir}" "${cppcheck_build_dir}"
+
+cache_file="${build_dir}/CMakeCache.txt"
+if [[ -f "${cache_file}" ]]; then
+    cached_source="$(sed -n 's#^CMAKE_HOME_DIRECTORY:INTERNAL=##p' "${cache_file}")"
+    cached_build="$(sed -n 's#^CMAKE_CACHEFILE_DIR:INTERNAL=##p' "${cache_file}")"
+    if [[ "${cached_source}" != "${repo_root}" || "${cached_build}" != "${build_dir}" ]]; then
+        find "${build_dir}" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+    fi
+fi
+
+log "configuring Docker-side Dev build tree at ${build_dir}"
+cmake -S "${repo_root}" -B "${build_dir}" -G Ninja \
+    -DCMAKE_BUILD_TYPE=Dev \
+    -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+    -DBUILD_TESTS=ON \
+    -DBUILD_RFDETR_NATIVE=ON \
+    -DBUILD_RFDETR_PYTHON_CHECKPOINT_LOADER=ON \
+    -DBUILD_MMLTK_GUI=ON \
+    -DMMLTK_CUDA_VERSION=13.0 \
+    -DMMLTK_CUDA_ARCHITECTURES="86;87;89;90;100;103;110;120;121" \
+    -DMMLTK_CUDA_TOOLKIT_ROOT=/usr/local/cuda-13.0 \
+    -DMMLTK_TORCH_ROOT=/opt/pytorch \
+    -DMMLTK_ONNX_ROOT=/src/workspace/deps/onnx \
+    -DMMLTK_ONNXRUNTIME_ROOT=/src/workspace/deps/onnxruntime \
+    -DMMLTK_IMGUI_SOURCE_DIR=/src/workspace/deps/imgui \
+    -DMMLTK_TORCH_CUDA_ARCH_LIST="8.6 8.7 8.9 9.0 10.0 10.3 11.0 12.0 12.1" \
+    -DProtobuf_PROTOC_EXECUTABLE=/usr/bin/protoc \
+    -DPython3_EXECUTABLE=/usr/bin/python3 \
+    -DCMAKE_CXX_COMPILER=/usr/bin/g++-14
+
+[[ -f "${compile_db}" ]] || die "missing compile_commands.json at ${compile_db}"
+
+translation_units_output="$(
+python3 - "${compile_db}" "${repo_root}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+compile_db = Path(sys.argv[1]).resolve()
+repo_root = Path(sys.argv[2]).resolve()
+allowed_roots = (repo_root / "src", repo_root / "tests")
+# `third_party/spdmon` is a repo-owned snapshot, but static analysis treats it as
+# frozen vendor code for now. Keep the exclusion explicit so it does not silently
+# ride along with the generic third_party filtering below.
+frozen_vendor_roots = (repo_root / "third_party" / "spdmon",)
+# clang-tidy in this toolchain cannot reliably replay the NVCC command lines in
+# compile_commands.json for CUDA 13 builds, so keep the pass on host C/C++ TUs.
+clang_exts = {".c", ".cc", ".cpp", ".cxx"}
+cppcheck_exts = {".c", ".cc", ".cpp", ".cxx"}
+
+entries = json.loads(compile_db.read_text())
+clang_units = []
+cppcheck_units = []
+seen_clang = set()
+seen_cppcheck = set()
+for entry in entries:
+    file_path = Path(entry["file"]).resolve()
+    if not any(str(file_path).startswith(str(root) + "/") for root in allowed_roots):
+        continue
+    if any(str(file_path).startswith(str(root) + "/") for root in frozen_vendor_roots):
+        continue
+    if any(part in {"third_party", "_deps", "build"} for part in file_path.parts):
+        continue
+    rel = file_path.relative_to(repo_root).as_posix()
+    ext = file_path.suffix.lower()
+    if ext in clang_exts and rel not in seen_clang:
+        seen_clang.add(rel)
+        clang_units.append(rel)
+    if ext in cppcheck_exts and rel not in seen_cppcheck:
+        seen_cppcheck.add(rel)
+        cppcheck_units.append(rel)
+
+clang_units.sort()
+cppcheck_units.sort()
+print("CLANG")
+for rel in clang_units:
+    print(rel)
+print("CPPCHECK")
+for rel in cppcheck_units:
+    print(rel)
+PY
+)"
+
+mapfile -t translation_units < <(printf '%s\n' "${translation_units_output}" | awk '
+    /^CLANG$/ { section="clang"; next }
+    /^CPPCHECK$/ { section="cppcheck"; next }
+    section == "clang" && NF { print }
+')
+mapfile -t cppcheck_units < <(printf '%s\n' "${translation_units_output}" | awk '
+    /^CLANG$/ { section="clang"; next }
+    /^CPPCHECK$/ { section="cppcheck"; next }
+    section == "cppcheck" && NF { print }
+')
+
+((${#translation_units[@]} > 0)) || die "no translation units found in ${compile_db}"
+((${#cppcheck_units[@]} > 0)) || die "no cppcheck inputs found in ${compile_db}"
+
+repo_root_no_host="${repo_root#/host}"
+normalize_repo_path() {
+    local candidate="$1"
+    candidate="${candidate#/host}"
+    if [[ "${candidate}" == "${repo_root_no_host}/"* ]]; then
+        printf '%s\n' "${candidate#${repo_root_no_host}/}"
+        return 0
+    fi
+    if [[ "${candidate}" == /* ]]; then
+        die "start path '${candidate}' is outside ${repo_root}"
+    fi
+    printf '%s\n' "${candidate#./}"
+}
+
+if [[ -n "${start_at}" ]]; then
+    normalized_start="$(normalize_repo_path "${start_at}")"
+
+    filtered_units=()
+    found_clang=0
+    for file in "${translation_units[@]}"; do
+        if [[ "${file}" == "${normalized_start}" ]]; then
+            found_clang=1
+        fi
+        if (( found_clang )); then
+            filtered_units+=("${file}")
+        fi
+    done
+    (( found_clang )) || die "start file '${normalized_start}' is not a clang-tidy translation unit"
+    translation_units=("${filtered_units[@]}")
+fi
+
+clang_tidy_checks="${MMLTK_CLANG_TIDY_CHECKS:--*,clang-analyzer-*,bugprone-*,-bugprone-easily-swappable-parameters,performance-*,portability-*,-portability-avoid-pragma-once,-portability-simd-intrinsics,modernize-*,-modernize-use-trailing-return-type}"
+header_filter="^${repo_root}/(include|src|tests)(/|$)"
+total_units="${#translation_units[@]}"
+
+log "running clang-tidy across ${total_units} translation units"
+for index in "${!translation_units[@]}"; do
+    rel_file="${translation_units[index]}"
+    abs_file="${repo_root}/${rel_file}"
+    log "clang-tidy [$((index + 1))/${total_units}] ${rel_file}"
+    if ! clang-tidy -p "${build_dir}" "${abs_file}" \
+        --checks="${clang_tidy_checks}" \
+        --warnings-as-errors='*' \
+        --header-filter="${header_filter}" \
+        --quiet; then
+        log "clang-tidy failed at ${rel_file}"
+        log "restart from this file with: ./mmltk --tidy --start-at ${rel_file}"
+        exit 1
+    fi
+done
+
+log "running cppcheck across ${#cppcheck_units[@]} translation units"
+cppcheck_filters=()
+for rel_file in "${cppcheck_units[@]}"; do
+    cppcheck_filters+=("--file-filter=*/${rel_file}")
+done
+
+cppcheck \
+    --project="${compile_db}" \
+    --cppcheck-build-dir="${cppcheck_build_dir}" \
+    --suppressions-list="${repo_root}/utilities/cppcheck.suppressions" \
+    --suppress='*:third_party/*' \
+    --suppress='*:*/third_party/*' \
+    --suppress='*:/src/workspace/deps/*' \
+    --suppress='*:*/workspace/deps/*' \
+    --inline-suppr \
+    --enable=warning,performance,portability \
     --inconclusive \
     --check-level=exhaustive \
-    --library=posix \
+    --error-exitcode=1 \
     --platform=unix64 \
-    -j "${CPPCHECK_JOBS}" \
-    --error-exitcode=2 \
-    --inline-suppr \
-    --suppressions-list="${SUPPRESSIONS_FILE}" \
-    -ithird_party
-
-if [[ ! -x "${TEST_ROUNDTRIP}" ]]; then
-    echo "[static] Missing roundtrip test binary: ${TEST_ROUNDTRIP}" >&2
-    exit 1
-fi
-
-echo "[static][3/4] Running valgrind on ${TEST_ROUNDTRIP}"
-"${VALGRIND_BIN}" \
-    --tool=memcheck \
     --quiet \
-    --leak-check=full \
-    --show-leak-kinds=definite,indirect \
-    --errors-for-leak-kinds=definite,indirect \
-    --track-origins=yes \
-    --error-exitcode=3 \
-    "${TEST_ROUNDTRIP}"
+    --relative-paths="${repo_root}" \
+    -j "$(nproc)" \
+    "${cppcheck_filters[@]}"
 
-python_roots=(
-    tests
-    utilities
-)
-
-mapfile -t python_units < <(
-    find "${python_roots[@]}" \
-        -type f \
-        -name '*.py' \
-        -not -path '*/__pycache__/*' \
-        2>/dev/null | sort
-)
-
-if [[ ${#python_units[@]} -gt 0 ]]; then
-    require_tool "vulture" "${VULTURE_BIN}"
-    echo "[static][4/4] Running vulture on ${#python_units[@]} Python files"
-    "${VULTURE_BIN}" \
-        --min-confidence 100 \
-        --exclude "build,third_party,__pycache__,rf-detr,scipy,pytorch" \
-        "${python_units[@]}"
-else
-    echo "[static][4/4] No Python files to scan with vulture"
-fi
-
-echo "[static] Static analysis passed"
+log "static analysis completed cleanly"

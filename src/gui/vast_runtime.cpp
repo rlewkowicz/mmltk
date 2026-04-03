@@ -1,31 +1,48 @@
 #include "vast_runtime.h"
+#include "subprocess_utils.h"
 
 #include <nlohmann/json.hpp>
 
-#include <array>
 #include <algorithm>
-#include <cerrno>
+#include <cstdint>
 #include <cmath>
-#include <cstdio>
-#include <cstring>
+#include <cstdlib>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
-#include <sys/wait.h>
 #include <unistd.h>
 
-namespace fastloader::gui {
+namespace mmltk::gui {
 
 namespace {
 
 using json = nlohmann::json;
 
-constexpr char kDefaultPythonExecutable[] = "python3";
-constexpr char kDefaultBridgeScript[] = "utilities/vast_bridge.py";
+constexpr std::string_view kDefaultPythonExecutable = "python3";
+constexpr std::string_view kDefaultBridgeScript = "utilities/vast_bridge.py";
+
+enum class ChildSetupFailureStage : std::uint8_t {
+    kDup2 = 0,
+    kSetenv = 1,
+    kExecv = 2,
+};
+
+const char* child_setup_failure_stage_label(const ChildSetupFailureStage stage) {
+    switch (stage) {
+    case ChildSetupFailureStage::kDup2:
+        return "dup2";
+    case ChildSetupFailureStage::kSetenv:
+        return "setenv";
+    case ChildSetupFailureStage::kExecv:
+        return "execv";
+    }
+    return "unknown";
+}
 
 std::string normalize_gpu_name(std::string_view value) {
     std::string normalized;
@@ -40,7 +57,11 @@ std::string normalize_gpu_name(std::string_view value) {
     return normalized;
 }
 
-bool matches_family(RemoteGpuFamily family, std::string_view normalized_gpu_name) {
+bool has_prefix(std::string_view value, std::string_view prefix) {
+    return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;
+}
+
+bool matches_family(const RemoteGpuFamily family, std::string_view normalized_gpu_name) {
     switch (family) {
     case RemoteGpuFamily::A100:
         return normalized_gpu_name.find("A100") != std::string_view::npos;
@@ -51,9 +72,9 @@ bool matches_family(RemoteGpuFamily family, std::string_view normalized_gpu_name
     case RemoteGpuFamily::H200:
         return normalized_gpu_name.find("H200") != std::string_view::npos;
     case RemoteGpuFamily::LSeries:
-        return normalized_gpu_name.rfind("L4", 0) == 0 ||
-               normalized_gpu_name.rfind("L20", 0) == 0 ||
-               normalized_gpu_name.rfind("L40", 0) == 0;
+        return has_prefix(normalized_gpu_name, "L4") ||
+               has_prefix(normalized_gpu_name, "L20") ||
+               has_prefix(normalized_gpu_name, "L40");
     }
     return false;
 }
@@ -114,42 +135,21 @@ std::vector<json> extract_offer_objects(const json& payload) {
     throw std::runtime_error("Vast bridge returned an unexpected search-offers payload shape");
 }
 
-std::string build_vast_search_query(int min_gpus) {
-    return "rentable=True rented=False verified=True external=False num_gpus>=" + std::to_string(std::max(1, min_gpus));
-}
-
-std::string read_child_stdout(const int fd) {
-    std::string output;
-    std::array<char, 4096> buffer{};
-    while (true) {
-        const ssize_t bytes_read = ::read(fd, buffer.data(), buffer.size());
-        if (bytes_read == 0) {
-            break;
-        }
-        if (bytes_read < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            throw std::runtime_error(std::string("failed to read Vast bridge output: ") + std::strerror(errno));
-        }
-        output.append(buffer.data(), static_cast<size_t>(bytes_read));
-    }
-    return output;
+std::string build_vast_search_query(const int min_gpus) {
+    return "rentable=True rented=False verified=True external=False num_gpus>=" +
+           std::to_string(std::max(1, min_gpus));
 }
 
 std::string run_vast_bridge(const std::filesystem::path& python_executable,
                             const std::filesystem::path& bridge_script_path,
                             const std::string& api_key,
                             const std::string& query,
-                            std::size_t limit) {
-    int stdout_pipe[2];
-    if (::pipe(stdout_pipe) != 0) {
-        throw std::runtime_error(std::string("failed to create Vast bridge pipe: ") + std::strerror(errno));
-    }
-
+                            const std::size_t limit) {
     std::vector<std::string> argv_strings;
-    argv_strings.push_back(python_executable.empty() ? kDefaultPythonExecutable : python_executable.string());
-    argv_strings.push_back(bridge_script_path.empty() ? kDefaultBridgeScript : bridge_script_path.string());
+    argv_strings.push_back(python_executable.empty() ? std::string{kDefaultPythonExecutable}
+                                                     : python_executable.string());
+    argv_strings.push_back(bridge_script_path.empty() ? std::string{kDefaultBridgeScript}
+                                                      : bridge_script_path.string());
     argv_strings.emplace_back("search-offers");
     argv_strings.emplace_back("--query");
     argv_strings.push_back(query);
@@ -165,52 +165,40 @@ std::string run_vast_bridge(const std::filesystem::path& python_executable,
     }
     argv.push_back(nullptr);
 
-    const pid_t child_pid = ::fork();
-    if (child_pid < 0) {
-        ::close(stdout_pipe[0]);
-        ::close(stdout_pipe[1]);
-        throw std::runtime_error(std::string("failed to fork Vast bridge: ") + std::strerror(errno));
-    }
-    if (child_pid == 0) {
-        ::close(stdout_pipe[0]);
-        if (::dup2(stdout_pipe[1], STDOUT_FILENO) < 0 || ::dup2(stdout_pipe[1], STDERR_FILENO) < 0) {
-            std::fprintf(stderr, "dup2 failed for Vast bridge: %s\n", std::strerror(errno));
+    const auto captured = subprocess::run_captured_child_process<ChildSetupFailureStage>(
+        "Vast bridge",
+        "failed to read Vast bridge output: ",
+        [&](const int stdout_fd, const int setup_error_fd) {
+            if (::dup2(stdout_fd, STDOUT_FILENO) < 0 || ::dup2(stdout_fd, STDERR_FILENO) < 0) {
+                (void)subprocess::write_child_setup_failure(setup_error_fd, ChildSetupFailureStage::kDup2);
+                std::_Exit(127);
+            }
+            ::close(stdout_fd);
+            if (!api_key.empty()) {
+                if (::setenv("VAST_API_KEY", api_key.c_str(), 1) != 0) {
+                    (void)subprocess::write_child_setup_failure(setup_error_fd, ChildSetupFailureStage::kSetenv);
+                    std::_Exit(127);
+                }
+            }
+            ::execv(argv.front(), argv.data());
+            (void)subprocess::write_child_setup_failure(setup_error_fd, ChildSetupFailureStage::kExecv);
             std::_Exit(127);
-        }
-        ::close(stdout_pipe[1]);
-        if (!api_key.empty()) {
-            ::setenv("VAST_API_KEY", api_key.c_str(), 1);
-        }
-        ::execv(argv.front(), argv.data());
-        std::fprintf(stderr, "execv failed for Vast bridge: %s\n", std::strerror(errno));
-        std::_Exit(127);
+        });
+    if (captured.setup_failure.has_value()) {
+        throw std::runtime_error(subprocess::format_child_setup_failure(
+            *captured.setup_failure,
+            child_setup_failure_stage_label,
+            "Vast bridge"));
     }
-
-    ::close(stdout_pipe[1]);
-    std::string output;
-    try {
-        output = read_child_stdout(stdout_pipe[0]);
-    } catch (...) {
-        ::close(stdout_pipe[0]);
-        int status = 0;
-        ::waitpid(child_pid, &status, 0);
-        throw;
+    if (!WIFEXITED(captured.status) || WEXITSTATUS(captured.status) != 0) {
+        throw std::runtime_error(captured.output.empty() ? "Vast bridge failed" : captured.output);
     }
-    ::close(stdout_pipe[0]);
-
-    int status = 0;
-    if (::waitpid(child_pid, &status, 0) < 0) {
-        throw std::runtime_error(std::string("failed to wait for Vast bridge: ") + std::strerror(errno));
-    }
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        throw std::runtime_error(output.empty() ? "Vast bridge failed" : output);
-    }
-    return output;
+    return captured.output;
 }
 
 } // namespace
 
-const char* remote_gpu_family_label(RemoteGpuFamily family) {
+const char* remote_gpu_family_label(const RemoteGpuFamily family) {
     switch (family) {
     case RemoteGpuFamily::A100:
         return "A100";
@@ -255,8 +243,8 @@ std::vector<VastRawOffer> parse_vast_offer_payload(std::string_view payload) {
 
 std::vector<VastOfferSummary> rank_vast_offers(const std::vector<VastRawOffer>& offers,
                                                const std::vector<RemoteGpuFamily>& selected_families,
-                                               std::size_t result_limit,
-                                               int min_gpus) {
+                                               const std::size_t result_limit,
+                                               const int min_gpus) {
     std::vector<VastOfferSummary> filtered;
     filtered.reserve(offers.size());
     for (const VastRawOffer& offer : offers) {
@@ -318,4 +306,4 @@ std::vector<VastOfferSummary> query_vast_offers(const VastQueryConfig& config,
                             config.min_gpus);
 }
 
-} // namespace fastloader::gui
+} // namespace mmltk::gui

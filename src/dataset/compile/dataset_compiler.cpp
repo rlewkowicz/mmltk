@@ -2,6 +2,7 @@
 #include "dataset_compiler.h"
 #include "dataset_compiler_internal.h"
 #include "execution_policy.h"
+#include "mmltk_logging.h"
 #include "profile_utils.h"
 
 #include <atomic>
@@ -13,7 +14,7 @@
 #include <stdexcept>
 #include <thread>
 
-namespace fastloader {
+namespace mmltk {
 
 namespace {
 
@@ -97,7 +98,7 @@ private:
 
     void run() {
         try {
-            apply_worker_execution_policy(ExecutionPolicyRequest{
+            (void)apply_worker_execution_policy(ExecutionPolicyRequest{
                 {},
                 "fl_cmprpt",
                 0,
@@ -141,7 +142,7 @@ private:
         }
     }
 
-    CompileProgress make_snapshot() const noexcept {
+    [[nodiscard]] CompileProgress make_snapshot() const noexcept {
         const CompileProgressPhase explicit_phase = phase_.load(std::memory_order_acquire);
         if (explicit_phase == CompileProgressPhase::kSyncing) {
             return CompileProgress{
@@ -160,11 +161,9 @@ private:
         // Prefer an explicit pixel phase while pixel workers are active so
         // progress remains stable even when labels finish very quickly.
         CompileProgressPhase phase;
-        if (pixel_d < num_images_ && active > 0) {
-            phase = CompileProgressPhase::kPixels;
-        } else if (pixel_d >= num_images_) {
+        if (pixel_d >= num_images_) {
             phase = CompileProgressPhase::kLabels;
-        } else if (label_d >= num_images_) {
+        } else if (active > 0 || label_d >= num_images_) {
             phase = CompileProgressPhase::kPixels;
         } else {
             phase = (label_d <= pixel_d) ? CompileProgressPhase::kLabels
@@ -216,7 +215,7 @@ private:
 
 void DatasetCompiler::compile(const CompilerConfig& config,
                               const std::function<void(const CompileProgress&)>& progress_cb) {
-    FASTLOADER_PROFILE_SCOPE("compiler.total");
+    MMLTK_PROFILE_SCOPE("compiler.total");
     const std::filesystem::path split_dir = std::filesystem::path(config.source_dir) / config.split;
     const std::filesystem::path out_dir = config.output_dir;
     std::filesystem::create_directories(out_dir);
@@ -229,43 +228,50 @@ void DatasetCompiler::compile(const CompilerConfig& config,
     const int num_workers = compiler_internal::resolve_num_workers(config.num_workers);
     const int pixel_workers = std::max(1, (num_workers + 1) / 2);
     const int label_workers = std::max(1, num_workers - pixel_workers);
-    FASTLOADER_PROFILE_SET("compiler.num_workers", static_cast<size_t>(num_workers));
+    MMLTK_PROFILE_SET("compiler.num_workers", static_cast<size_t>(num_workers));
     if (config.cuda_mask_batch_size < 0) {
         throw std::runtime_error("cuda_mask_batch_size must be non-negative");
     }
 
     compiler_internal::DatasetScan scan;
     {
-        FASTLOADER_PROFILE_SCOPE("compiler.scan_dataset");
+        MMLTK_PROFILE_SCOPE("compiler.scan_dataset");
         scan = compiler_internal::scan_dataset(config);
     }
     const auto& class_map = scan.class_map;
     const uint32_t num_images = scan.num_images;
-    FASTLOADER_PROFILE_SET("compiler.num_images", num_images);
-    FASTLOADER_PROFILE_SET("compiler.image_stride_bytes", image_stride);
+    MMLTK_PROFILE_SET("compiler.num_images", num_images);
+    MMLTK_PROFILE_SET("compiler.image_stride_bytes", image_stride);
     compiler_internal::DroppedAnnotationTracker dropped_annotations;
     CompileProgressReporter progress_reporter(num_images, progress_cb, &dropped_annotations);
 
-    FASTLOADER_DEBUG_LOG("[compile] %s: %u images, %d workers (%d pixel + %d label), target %ux%u, stride=%zu bytes/img\n",
-                         config.split.c_str(), num_images, num_workers, pixel_workers, label_workers, width, height, image_stride);
+    MMLTK_DEBUG_LOG("[compile] %s: %u images, %d workers (%d pixel + %d label), target %ux%u, stride=%zu bytes/img",
+                    config.split.c_str(),
+                    num_images,
+                    num_workers,
+                    pixel_workers,
+                    label_workers,
+                    width,
+                    height,
+                    image_stride);
 
     // Phase 1: compute pixel layout (known upfront — only needs num_images + stride)
     compiler_internal::FileLayout layout;
     {
-        FASTLOADER_PROFILE_SCOPE("compiler.compute_pixel_layout");
+        MMLTK_PROFILE_SCOPE("compiler.compute_pixel_layout");
         layout = compiler_internal::compute_pixel_layout(num_images, image_stride);
     }
 
-    FASTLOADER_DEBUG_LOG("[compile] Pixel layout: pixel_offset=%zu (%.1f MB aligned), pixels=%.2f GB\n",
-                         layout.pixel_offset,
-                         static_cast<double>(layout.pixel_offset) / (1024.0 * 1024.0),
-                         static_cast<double>(layout.pixel_blob_size) / (1024.0 * 1024.0 * 1024.0));
+    MMLTK_DEBUG_LOG("[compile] Pixel layout: pixel_offset=%zu (%.1f MB aligned), pixels=%.2f GB",
+                    layout.pixel_offset,
+                    static_cast<double>(layout.pixel_offset) / (1024.0 * 1024.0),
+                    static_cast<double>(layout.pixel_blob_size) / (1024.0 * 1024.0 * 1024.0));
 
     // Create output file sized for header+index+padding+pixels (will extend later for labels/rle)
     const std::string out_path = (out_dir / (config.split + ".bin")).string();
     FileHandle fd;
     {
-        FASTLOADER_PROFILE_SCOPE("compiler.open_output");
+        MMLTK_PROFILE_SCOPE("compiler.open_output");
         fd = FileHandle::create_output(out_path, layout.pixel_offset + layout.pixel_blob_size);
     }
 
@@ -312,54 +318,59 @@ void DatasetCompiler::compile(const CompilerConfig& config,
     if (pixel_error) {
         std::rethrow_exception(pixel_error);
     }
-    FASTLOADER_DEBUG_LOG("[compile] Labels and pixels complete\n");
+    MMLTK_DEBUG_LOG("[compile] Labels and pixels complete");
 
     // Phase 2: finalize layout with actual label/rle counts
     {
-        FASTLOADER_PROFILE_SCOPE("compiler.finalize_layout");
+        MMLTK_PROFILE_SCOPE("compiler.finalize_layout");
         compiler_internal::finalize_layout(layout,
-                                           label_blocks.labels.size(),
-                                           label_blocks.rle_pairs.size());
+                                           compiler_internal::LayoutFinalizeInputs{
+                                               label_blocks.labels.size(),
+                                               label_blocks.rle_pairs.size(),
+                                           });
     }
 
     compiler_internal::assign_pixel_offsets(label_blocks.index, layout.pixel_offset, image_stride);
 
-    FASTLOADER_DEBUG_LOG("[compile] Layout: total=%.2f GB\n",
-                         static_cast<double>(layout.total_size) / (1024.0 * 1024.0 * 1024.0));
+    MMLTK_DEBUG_LOG("[compile] Layout: total=%.2f GB",
+                    static_cast<double>(layout.total_size) / (1024.0 * 1024.0 * 1024.0));
 
     // Extend file to final size for labels + rle
     fd.preallocate(layout.total_size);
 
-    const FileHeader header = compiler_internal::make_file_header(num_images,
-                                                                  width,
-                                                                  height,
-                                                                  channels,
-                                                                  image_stride,
-                                                                  class_map,
-                                                                  layout);
+    const FileHeader header = compiler_internal::make_file_header(
+        compiler_internal::FileHeaderInputs{
+            num_images,
+            width,
+            height,
+            channels,
+            image_stride,
+        },
+        class_map,
+        layout);
     compiler_internal::write_metadata_blocks(fd, layout, header, label_blocks);
     progress_reporter.enter_syncing();
     fd.sync_data();
     progress_reporter.finish();
 
     if (label_blocks.dropped_annotations > 0) {
-        std::fprintf(stderr,
-                     "\r\033[2Kcompile %s: dropped %zu annotations whose masks fully vanished during resize\n",
-                     config.split.c_str(),
-                     label_blocks.dropped_annotations);
+        mmltk::logging::logger("compile")->warn(
+            "compile {}: dropped {} annotations whose masks fully vanished during resize",
+            config.split,
+            label_blocks.dropped_annotations);
         for (const std::string& sample : label_blocks.dropped_annotation_examples) {
-            std::fprintf(stderr, "  sample: %s\n", sample.c_str());
+            mmltk::logging::logger("compile")->warn("  sample: {}", sample);
         }
         if (label_blocks.dropped_annotations > label_blocks.dropped_annotation_examples.size()) {
-            std::fprintf(stderr,
-                         "  ... %zu more omitted\n",
-                         label_blocks.dropped_annotations - label_blocks.dropped_annotation_examples.size());
+            mmltk::logging::logger("compile")->warn("  ... {} more omitted",
+                                                   label_blocks.dropped_annotations -
+                                                       label_blocks.dropped_annotation_examples.size());
         }
-        std::fflush(stderr);
     }
 
-    FASTLOADER_DEBUG_LOG("[compile] Written %s (%.2f GB)\n", out_path.c_str(),
-                         static_cast<double>(layout.total_size) / (1024.0 * 1024.0 * 1024.0));
+    MMLTK_DEBUG_LOG("[compile] Written %s (%.2f GB)",
+                    out_path.c_str(),
+                    static_cast<double>(layout.total_size) / (1024.0 * 1024.0 * 1024.0));
 }
 
-} // namespace fastloader
+} // namespace mmltk

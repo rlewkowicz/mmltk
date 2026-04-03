@@ -8,7 +8,26 @@
 #include <imgui.h>
 #include <misc/cpp/imgui_stdlib.h>
 
-namespace fastloader::gui {
+namespace mmltk::gui {
+
+inline void draw_section_heading(const char* label) {
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.87f, 0.89f, 0.92f, 1.00f));
+    ImGui::TextUnformatted(label);
+    ImGui::PopStyleColor();
+    ImGui::Separator();
+}
+
+template <typename DrawFn>
+void draw_with_optional_font(ImFont* font, DrawFn&& draw_fn) {
+    if (font != nullptr) {
+        ImGui::PushFont(font);
+    }
+    draw_fn();
+    if (font != nullptr) {
+        ImGui::PopFont();
+    }
+}
 
 template <typename DrawFn>
 void draw_labeled_widget(const char* label,
@@ -124,4 +143,4 @@ void draw_labeled_combo(const char* label,
     }, tooltip);
 }
 
-} // namespace fastloader::gui
+} // namespace mmltk::gui

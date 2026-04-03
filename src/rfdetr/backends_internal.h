@@ -5,7 +5,7 @@
 #include <filesystem>
 #include <string>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 inline std::string lower_copy(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
@@ -18,4 +18,4 @@ inline bool has_extension(const std::filesystem::path& path, const char* extensi
     return lower_copy(path.extension().string()) == extension;
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

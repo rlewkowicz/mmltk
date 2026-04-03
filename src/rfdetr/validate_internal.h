@@ -1,6 +1,6 @@
 #pragma once
 
-#include "fastloader/rfdetr/validate.h"
+#include "mmltk/rfdetr/validate.h"
 
 #include "rfdetr/cuda_utils.h"
 #include "rfdetr/backends.h"
@@ -17,7 +17,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 namespace validate_detail {
 
@@ -104,4 +104,4 @@ ValidationBackendResult run_validation_backend(const ValidationOptions& options,
                                                const CocoDataset& source_dataset,
                                                InferenceBackend& backend);
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

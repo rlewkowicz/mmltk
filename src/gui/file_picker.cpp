@@ -1,6 +1,7 @@
 #include "file_picker.h"
 #include "ui_controls.h"
 
+#include <array>
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
@@ -13,7 +14,7 @@
 #include <imgui.h>
 #include <misc/cpp/imgui_stdlib.h>
 
-namespace fastloader::gui {
+namespace mmltk::gui {
 
 namespace {
 
@@ -27,8 +28,8 @@ std::string trim_trailing_newlines(std::string value) {
 } // namespace
 
 std::optional<std::string> pick_file_with_zenity(const char* title, const std::string& initial_path) {
-    int pipe_fds[2] = {-1, -1};
-    if (::pipe(pipe_fds) != 0) {
+    std::array<int, 2> pipe_fds{-1, -1};
+    if (::pipe(pipe_fds.data()) != 0) {
         throw std::runtime_error(std::string("pipe failed for zenity file picker: ") + std::strerror(errno));
     }
 
@@ -68,9 +69,10 @@ std::optional<std::string> pick_file_with_zenity(const char* title, const std::s
 
     ::close(pipe_fds[1]);
     std::string output;
-    char buffer[512];
+    std::array<char, 512> buffer{};
     while (true) {
-        const ssize_t bytes_read = ::read(pipe_fds[0], buffer, sizeof(buffer));
+        const ssize_t bytes_read =
+            ::read(pipe_fds[0], buffer.data(), buffer.size());
         if (bytes_read == 0) {
             break;
         }
@@ -81,7 +83,7 @@ std::optional<std::string> pick_file_with_zenity(const char* title, const std::s
             (void)::waitpid(child, &status, 0);
             throw std::runtime_error(std::string("read failed for zenity file picker: ") + std::strerror(error_number));
         }
-        output.append(buffer, static_cast<size_t>(bytes_read));
+        output.append(buffer.data(), static_cast<size_t>(bytes_read));
     }
     ::close(pipe_fds[0]);
 
@@ -126,4 +128,4 @@ bool draw_file_picker_input(const char* label,
     return browse_clicked;
 }
 
-} // namespace fastloader::gui
+} // namespace mmltk::gui

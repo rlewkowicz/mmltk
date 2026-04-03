@@ -41,7 +41,7 @@ https://github.com/scipy/scipy/blob/main/scipy/optimize/rectangular_lsap/rectang
 #include <utility>
 #include <vector>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 namespace {
 
@@ -245,4 +245,4 @@ RectangularLsApStatus solve_rectangular_linear_sum_assignment(int64_t num_rows,
                       col_indices);
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-namespace fastloader {
+namespace mmltk {
 
 struct ExecutionPolicyRequest {
     std::vector<int> cpu_affinity;
@@ -24,10 +24,12 @@ struct ExecutionPolicySnapshot {
     int io_priority_data = 0;
 };
 
-ExecutionPolicySnapshot apply_process_execution_policy();
-ExecutionPolicySnapshot apply_worker_execution_policy(const ExecutionPolicyRequest& request);
-ExecutionPolicySnapshot capture_execution_policy_snapshot();
+[[nodiscard]] ExecutionPolicySnapshot apply_process_execution_policy();
+[[nodiscard]] ExecutionPolicySnapshot apply_worker_execution_policy(const ExecutionPolicyRequest& request);
+[[nodiscard]] ExecutionPolicySnapshot capture_execution_policy_snapshot();
 
+// Worker budget inputs mirror the scheduling knobs the callers already hold.
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 int clamp_worker_count_to_cpus(int requested_workers,
                                size_t cpu_count,
                                int reserved_cpus = 0,
@@ -43,4 +45,4 @@ void log_process_execution_policy(const char* process_label,
                                   bool expect_realtime_scheduler,
                                   bool expect_realtime_io);
 
-} // namespace fastloader
+} // namespace mmltk

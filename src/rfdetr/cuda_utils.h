@@ -12,7 +12,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 inline c10::DeviceIndex checked_device_index(int device_id) {
     if (device_id < std::numeric_limits<c10::DeviceIndex>::min() ||
@@ -30,11 +30,11 @@ inline void ensure_cuda_ok(cudaError_t status, const char* context) {
 
 inline c10::cuda::CUDAStream get_high_priority_cuda_stream(c10::DeviceIndex device_index) {
     c10::cuda::CUDAGuard device_guard(device_index);
-    return c10::cuda::getStreamFromPool(fastloader::current_cuda_highest_stream_priority(), device_index);
+    return c10::cuda::getStreamFromPool(mmltk::current_cuda_highest_stream_priority(), device_index);
 }
 
 inline c10::cuda::CUDAStream get_high_priority_cuda_stream(int device_id) {
     return get_high_priority_cuda_stream(checked_device_index(device_id));
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

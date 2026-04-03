@@ -4,7 +4,7 @@
 
 #include <vector>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 torch::Tensor ms_deform_attn_cuda_forward(const torch::Tensor& value,
                                           const torch::Tensor& spatial_shapes,
@@ -21,4 +21,4 @@ std::vector<torch::Tensor> ms_deform_attn_cuda_backward(const torch::Tensor& val
                                                         const torch::Tensor& grad_output,
                                                         int64_t im2col_step);
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

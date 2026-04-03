@@ -46,11 +46,24 @@ def _tensor_dtype_name(tensor: torch.Tensor) -> str:
 def _load_checkpoint_root(checkpoint_path: Path):
     checkpoint = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
     if not isinstance(checkpoint, dict):
-        raise RuntimeError(f"RF-DETR checkpoint root is not a dict: {checkpoint_path}")
+        state_dict_fn = getattr(checkpoint, "state_dict", None)
+        if callable(state_dict_fn):
+            model = state_dict_fn()
+            if isinstance(model, dict):
+                return {"model": model}
+        raise RuntimeError(
+            "RF-DETR checkpoint root is neither a dict nor a module with state_dict(): "
+            f"{checkpoint_path} ({type(checkpoint).__name__})"
+        )
     model = checkpoint.get("model")
-    if not isinstance(model, dict):
-        raise RuntimeError(f"RF-DETR checkpoint is missing dict['model']: {checkpoint_path}")
-    return checkpoint
+    if isinstance(model, dict):
+        return checkpoint
+    state_dict = checkpoint.get("state_dict")
+    if isinstance(state_dict, dict):
+        return {"model": state_dict}
+    if checkpoint and all(isinstance(name, str) and isinstance(tensor, torch.Tensor) for name, tensor in checkpoint.items()):
+        return {"model": checkpoint}
+    raise RuntimeError(f"RF-DETR checkpoint is missing dict['model'] or dict['state_dict']: {checkpoint_path}")
 
 
 def _checkpoint_arg_value(args_obj, name: str):

@@ -6,7 +6,7 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 template <typename T>
 __device__ inline T box_area(const T* box) {
@@ -128,4 +128,4 @@ torch::Tensor generalized_box_iou_cuda(const torch::Tensor& boxes1, const torch:
     return giou;
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

@@ -2,7 +2,7 @@
 
 #include <torch/torch.h>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 torch::Tensor ms_deform_attn_cuda_autograd(const torch::Tensor& value,
                                            const torch::Tensor& spatial_shapes,
@@ -11,4 +11,4 @@ torch::Tensor ms_deform_attn_cuda_autograd(const torch::Tensor& value,
                                            const torch::Tensor& attention_weights,
                                            int64_t im2col_step);
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

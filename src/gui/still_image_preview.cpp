@@ -1,7 +1,7 @@
 #include "still_image_preview.h"
 
-#include "fastloader/rfdetr/draw_cuda.h"
-#include "fastloader/rfdetr/predict.h"
+#include "mmltk/rfdetr/draw_cuda.h"
+#include "mmltk/rfdetr/predict.h"
 #include "rfdetr/cuda_utils.h"
 
 #include <c10/cuda/CUDAGuard.h>
@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-namespace fastloader::gui {
+namespace mmltk::gui {
 
 namespace {
 
@@ -37,7 +37,7 @@ void rgb_to_bgr_in_place(std::vector<std::uint8_t>& pixels) {
     }
 }
 
-void decode_encoded_mask_to_linear(const fastloader::rfdetr::EncodedMask& mask,
+void decode_encoded_mask_to_linear(const mmltk::rfdetr::EncodedMask& mask,
                                    std::uint32_t width,
                                    std::uint32_t height,
                                    std::uint8_t* destination) {
@@ -60,8 +60,8 @@ void decode_encoded_mask_to_linear(const fastloader::rfdetr::EncodedMask& mask,
 } // namespace
 
 StillImagePreview render_single_image_prediction_preview(
-    const fastloader::rfdetr::PredictImageInput& input,
-    const fastloader::rfdetr::PredictionRecord& record,
+    const mmltk::rfdetr::PredictImageInput& input,
+    const mmltk::rfdetr::PredictionRecord& record,
     int num_classes,
     int device_id) {
     int raw_width = 0;
@@ -89,7 +89,7 @@ StillImagePreview render_single_image_prediction_preview(
     std::vector<float> boxes_host;
     std::vector<int> labels_host;
     std::vector<std::uint8_t> masks_host;
-    std::vector<const fastloader::rfdetr::Prediction*> kept_detections;
+    std::vector<const mmltk::rfdetr::Prediction*> kept_detections;
     boxes_host.reserve(record.detections.size() * 4U);
     labels_host.reserve(record.detections.size());
     kept_detections.reserve(record.detections.size());
@@ -139,15 +139,15 @@ StillImagePreview render_single_image_prediction_preview(
     }
 
     std::vector<std::uint8_t> colors_host;
-    fastloader::rfdetr::build_instance_colors_from_zero_based_labels(
+    mmltk::rfdetr::build_instance_colors_from_zero_based_labels(
         labels_host.data(),
         labels_host.size(),
         num_classes,
         &colors_host);
 
-    const torch::Device device(torch::kCUDA, device_id);
+    const torch::Device device(torch::kCUDA, static_cast<torch::DeviceIndex>(device_id));
     c10::cuda::CUDAGuard guard(device);
-    const c10::cuda::CUDAStream stream = fastloader::rfdetr::get_high_priority_cuda_stream(device_id);
+    const c10::cuda::CUDAStream stream = mmltk::rfdetr::get_high_priority_cuda_stream(device_id);
 
     torch::Tensor image_device;
     torch::Tensor boxes_device;
@@ -185,7 +185,7 @@ StillImagePreview render_single_image_prediction_preview(
                                             cudaMemcpyHostToDevice,
                                             stream.stream()),
                             "cudaMemcpyAsync preview masks host->device");
-            fastloader::rfdetr::launch_draw_masks_boxes_labels_bgr_pitched(
+            mmltk::rfdetr::launch_draw_masks_boxes_labels_bgr_pitched(
                 image_device.data_ptr<std::uint8_t>(),
                 static_cast<std::size_t>(raw_width) * 3U,
                 raw_width,
@@ -200,7 +200,7 @@ StillImagePreview render_single_image_prediction_preview(
                 stream.stream());
             require_cuda_ok(cudaPeekAtLastError(), "launch_draw_masks_boxes_labels_bgr_pitched");
         } else {
-            fastloader::rfdetr::launch_draw_boxes_labels_bgr_pitched(
+            mmltk::rfdetr::launch_draw_boxes_labels_bgr_pitched(
                 image_device.data_ptr<std::uint8_t>(),
                 static_cast<std::size_t>(raw_width) * 3U,
                 raw_width,
@@ -228,4 +228,4 @@ StillImagePreview render_single_image_prediction_preview(
     return preview;
 }
 
-} // namespace fastloader::gui
+} // namespace mmltk::gui

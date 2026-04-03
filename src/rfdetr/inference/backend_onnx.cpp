@@ -11,9 +11,10 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 namespace {
 
@@ -28,21 +29,120 @@ std::string ort_type_name(ONNXTensorElementDataType dtype) {
     }
 }
 
+void infer_output_layout(ModelInfo& info) {
+    for (const auto& output : info.outputs) {
+        if (output.shape.size() == 3 && output.shape.back() == 4) {
+            info.num_queries = output.shape[1];
+        } else if (output.shape.size() == 3) {
+            info.num_classes = output.shape[2];
+        } else if (output.shape.size() == 4) {
+            info.has_masks = true;
+        }
+    }
+}
+
+void populate_model_info_from_session(const Ort::Session& session,
+                                      const std::filesystem::path& model_path,
+                                      ModelInfo& info,
+                                      std::string* input_name_out,
+                                      std::vector<std::string>* output_names_out) {
+    size_t input_count = 0;
+    try {
+        input_count = session.GetInputCount();
+    } catch (const std::exception& error) {
+        throw std::runtime_error("failed to query ONNX input count: " + std::string(error.what()));
+    }
+    if (input_count != 1) {
+        throw std::runtime_error("RF-DETR ONNX runtime expects exactly one input tensor");
+    }
+
+    size_t output_count = 0;
+    try {
+        output_count = session.GetOutputCount();
+    } catch (const std::exception& error) {
+        throw std::runtime_error("failed to query ONNX output count: " + std::string(error.what()));
+    }
+    if (output_count < 2) {
+        throw std::runtime_error("RF-DETR ONNX runtime expects at least two outputs");
+    }
+
+    Ort::AllocatorWithDefaultOptions allocator;
+    info.backend = "onnx";
+    info.model_path = model_path.string();
+
+    std::string input_name_value;
+    try {
+        auto input_name = session.GetInputNameAllocated(0, allocator);
+        input_name_value = input_name.get();
+    } catch (const std::exception& error) {
+        throw std::runtime_error("failed to read ONNX input name: " + std::string(error.what()));
+    }
+    if (input_name_out != nullptr) {
+        *input_name_out = input_name_value;
+    }
+
+    std::vector<int64_t> input_shape;
+    std::string input_dtype;
+    try {
+        const auto input_type_info = session.GetInputTypeInfo(0);
+        const auto input_type = input_type_info.GetTensorTypeAndShapeInfo();
+        input_shape = input_type.GetShape();
+        input_dtype = ort_type_name(input_type.GetElementType());
+    } catch (const std::exception& error) {
+        throw std::runtime_error("failed to read ONNX input type info: " + std::string(error.what()));
+    }
+    info.input = TensorInfo{std::move(input_name_value), std::move(input_shape), std::move(input_dtype)};
+
+    if (output_names_out != nullptr) {
+        output_names_out->clear();
+        output_names_out->reserve(output_count);
+    }
+    info.outputs.clear();
+    info.outputs.reserve(output_count);
+    for (size_t output_index = 0; output_index < output_count; ++output_index) {
+        std::string output_name_value;
+        try {
+            auto output_name = session.GetOutputNameAllocated(output_index, allocator);
+            output_name_value = output_name.get();
+        } catch (const std::exception& error) {
+            throw std::runtime_error("failed to read ONNX output name at index " +
+                                     std::to_string(output_index) + ": " + error.what());
+        }
+        if (output_names_out != nullptr) {
+            output_names_out->push_back(output_name_value);
+        }
+
+        try {
+            const auto output_type_info = session.GetOutputTypeInfo(output_index);
+            const auto output_type = output_type_info.GetTensorTypeAndShapeInfo();
+            info.outputs.push_back(TensorInfo{
+                std::move(output_name_value),
+                output_type.GetShape(),
+                ort_type_name(output_type.GetElementType()),
+            });
+        } catch (const std::exception& error) {
+            throw std::runtime_error("failed to read ONNX output tensor metadata at index " +
+                                     std::to_string(output_index) + ": " + error.what());
+        }
+    }
+    infer_output_layout(info);
+}
+
 Ort::Env& ort_env() {
-    static Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "fastloader_rfdetr");
+    static Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "mmltk_rfdetr");
     return env;
 }
 
 class OnnxBackend final : public InferenceBackend {
 public:
-    OnnxBackend(const std::filesystem::path& model_path, int device_id)
-        : model_path_(model_path),
+    OnnxBackend(std::filesystem::path model_path, int device_id)
+        : model_path_(std::move(model_path)),
           device_id_(device_id),
-          session_options_(),
-          allocator_() {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.native.onnx.construct");
+          session_options_() {
+        MMLTK_PROFILE_SCOPE("rfdetr.native.onnx.construct");
+        static_cast<void>(ort_env());
         ensure_cuda_ok(cudaSetDevice(device_id_), "cudaSetDevice for ONNX backend");
-        ensure_cuda_ok(fastloader::cuda_stream_create_with_highest_priority(&stream_, cudaStreamNonBlocking),
+        ensure_cuda_ok(mmltk::cuda_stream_create_with_highest_priority(&stream_, cudaStreamNonBlocking),
                        "cudaStreamCreateWithPriority for ONNX backend");
         session_options_.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
         session_options_.SetIntraOpNumThreads(1);
@@ -61,73 +161,8 @@ public:
         } catch (const std::exception& error) {
             throw std::runtime_error("failed to create ONNX Runtime session: " + std::string(error.what()));
         }
-
-        size_t input_count = 0;
-        try {
-            input_count = session_->GetInputCount();
-        } catch (const std::exception& error) {
-            throw std::runtime_error("failed to query ONNX input count: " + std::string(error.what()));
-        }
-        if (input_count != 1) {
-            throw std::runtime_error("RF-DETR ONNX runtime expects exactly one input tensor");
-        }
-        size_t output_count = 0;
-        try {
-            output_count = session_->GetOutputCount();
-        } catch (const std::exception& error) {
-            throw std::runtime_error("failed to query ONNX output count: " + std::string(error.what()));
-        }
-        if (output_count < 2) {
-            throw std::runtime_error("RF-DETR ONNX runtime expects at least two outputs");
-        }
-
-        std::string input_name_value;
-        try {
-            auto input_name = session_->GetInputNameAllocated(0, allocator_);
-            input_name_value = input_name.get();
-        } catch (const std::exception& error) {
-            throw std::runtime_error("failed to read ONNX input name: " + std::string(error.what()));
-        }
-        input_name_ = std::move(input_name_value);
-        std::vector<int64_t> input_shape;
-        std::string input_dtype;
-        try {
-            const auto input_type_info = session_->GetInputTypeInfo(0);
-            const auto input_type = input_type_info.GetTensorTypeAndShapeInfo();
-            input_shape = input_type.GetShape();
-            input_dtype = ort_type_name(input_type.GetElementType());
-        } catch (const std::exception& error) {
-            throw std::runtime_error("failed to read ONNX input type info: " + std::string(error.what()));
-        }
-        info_.backend = "onnx";
-        info_.model_path = model_path_.string();
-        info_.input = TensorInfo{input_name_, std::move(input_shape), std::move(input_dtype)};
-
-        output_names_owned_.reserve(output_count);
-        for (size_t output_index = 0; output_index < output_count; ++output_index) {
-            std::string output_name_value;
-            try {
-                auto output_name = session_->GetOutputNameAllocated(output_index, allocator_);
-                output_name_value = output_name.get();
-            } catch (const std::exception& error) {
-                throw std::runtime_error("failed to read ONNX output name at index " + std::to_string(output_index) +
-                                         ": " + error.what());
-            }
-            output_names_owned_.push_back(std::move(output_name_value));
-            try {
-                const auto output_type_info = session_->GetOutputTypeInfo(output_index);
-                const auto output_type = output_type_info.GetTensorTypeAndShapeInfo();
-                info_.outputs.push_back(TensorInfo{
-                    output_names_owned_.back(),
-                    output_type.GetShape(),
-                    ort_type_name(output_type.GetElementType()),
-                });
-            } catch (const std::exception& error) {
-                throw std::runtime_error("failed to read ONNX output tensor metadata at index " +
-                                         std::to_string(output_index) + ": " + error.what());
-            }
-        }
-        infer_output_layout();
+        populate_model_info_from_session(*session_, model_path_, info_, &input_name_, &output_names_owned_);
+        infer_output_indices();
     }
 
     ~OnnxBackend() override {
@@ -136,11 +171,11 @@ public:
         }
     }
 
-    const ModelInfo& info() const override { return info_; }
-    void* stream() const override { return stream_; }
+    [[nodiscard]] const ModelInfo& info() const override { return info_; }
+    [[nodiscard]] void* stream() const override { return stream_; }
 
     OutputTensors run(const torch::Tensor& normalized_input) override {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.native.onnx.run");
+        MMLTK_PROFILE_SCOPE("rfdetr.native.onnx.run");
         if (!normalized_input.is_cuda() || !normalized_input.is_contiguous()) {
             throw std::runtime_error("ONNX backend input must be contiguous CUDA tensor");
         }
@@ -175,7 +210,7 @@ public:
     }
 
 private:
-    void infer_output_layout() {
+    void infer_output_indices() {
         boxes_output_index_ = output_names_owned_.size();
         logits_output_index_ = output_names_owned_.size();
         masks_output_index_ = output_names_owned_.size();
@@ -184,13 +219,10 @@ private:
             const auto& output = info_.outputs[output_index];
             if (output.shape.size() == 3 && output.shape.back() == 4) {
                 boxes_output_index_ = output_index;
-                info_.num_queries = output.shape[1];
             } else if (output.shape.size() == 3) {
                 logits_output_index_ = output_index;
-                info_.num_classes = output.shape[2];
             } else if (output.shape.size() == 4) {
                 masks_output_index_ = output_index;
-                info_.has_masks = true;
             }
         }
         if (boxes_output_index_ >= info_.outputs.size() || logits_output_index_ >= info_.outputs.size()) {
@@ -209,7 +241,6 @@ private:
     std::filesystem::path model_path_;
     int device_id_ = 0;
     Ort::SessionOptions session_options_;
-    Ort::AllocatorWithDefaultOptions allocator_;
     std::unique_ptr<Ort::Session> session_;
     cudaStream_t stream_ = nullptr;
     std::string input_name_;
@@ -243,4 +274,4 @@ std::vector<std::unique_ptr<InferenceBackend>> make_onnx_backend_lanes(
     return backends;
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

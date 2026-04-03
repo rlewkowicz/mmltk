@@ -1,6 +1,6 @@
 #pragma once
 
-#include "fastloader/rfdetr/train.h"
+#include "mmltk/rfdetr/train.h"
 
 #include <torch/serialize.h>
 #include <torch/torch.h>
@@ -10,7 +10,7 @@
 #include <variant>
 #include <vector>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 enum class NativeOptimizerBackend : std::uint8_t {
     eager,
@@ -42,12 +42,12 @@ public:
                 NativeOptimizerBackend backend);
 
     std::vector<torch::Tensor>& parameters();
-    const std::vector<torch::Tensor>& parameters() const;
-    const std::vector<std::string>& parameter_names() const;
-    const std::vector<Group>& groups() const;
+    [[nodiscard]] const std::vector<torch::Tensor>& parameters() const;
+    [[nodiscard]] const std::vector<std::string>& parameter_names() const;
+    [[nodiscard]] const std::vector<Group>& groups() const;
 
-    NativeOptimizerBackend backend() const;
-    const char* backend_name() const;
+    [[nodiscard]] NativeOptimizerBackend backend() const;
+    [[nodiscard]] const char* backend_name() const;
 
     void zero_grad(bool set_to_none);
     void set_lrs(const std::vector<double>& base_lrs, double scale);
@@ -106,11 +106,11 @@ public:
                           std::vector<NamedParameter> params);
 
     std::vector<torch::Tensor>& parameters();
-    const std::vector<torch::Tensor>& parameters() const;
-    const std::vector<std::string>& parameter_names() const;
-    const std::vector<Group>& groups() const;
+    [[nodiscard]] const std::vector<torch::Tensor>& parameters() const;
+    [[nodiscard]] const std::vector<std::string>& parameter_names() const;
+    [[nodiscard]] const std::vector<Group>& groups() const;
 
-    const char* backend_name() const;
+    [[nodiscard]] const char* backend_name() const;
 
     void zero_grad(bool set_to_none);
     void set_lrs(const std::vector<double>& base_lrs, double scale);
@@ -143,13 +143,13 @@ public:
     explicit NativeOptimizer(NativeAdamW optimizer);
     explicit NativeOptimizer(NativeMuonWithAuxAdam optimizer);
 
-    TrainOptimizerKind kind() const;
-    const char* kind_name() const;
-    const char* backend_name() const;
+    [[nodiscard]] TrainOptimizerKind kind() const;
+    [[nodiscard]] const char* kind_name() const;
+    [[nodiscard]] const char* backend_name() const;
 
     std::vector<torch::Tensor>& parameters();
-    const std::vector<torch::Tensor>& parameters() const;
-    const std::vector<std::string>& parameter_names() const;
+    [[nodiscard]] const std::vector<torch::Tensor>& parameters() const;
+    [[nodiscard]] const std::vector<std::string>& parameter_names() const;
 
     void zero_grad(bool set_to_none);
     void set_lrs(const std::vector<double>& base_lrs, double scale);
@@ -165,4 +165,4 @@ private:
 
 const char* train_optimizer_kind_name(TrainOptimizerKind kind);
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

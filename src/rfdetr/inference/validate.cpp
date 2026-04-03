@@ -1,11 +1,12 @@
-#include "fastloader/rfdetr/validate.h"
+#include "mmltk/rfdetr/validate.h"
 #include "rfdetr/validate_internal.h"
 
 #include "dataset_compiler.h"
 #include "dataset_loader.h"
 #include "rfdetr/cuda_utils.h"
 #include "rfdetr/postprocess.h"
-#include "rfdetr/progress_bar.h"
+#include "spdmon/spdmon.hpp"
+#include "rfdetr/inference/backend_factory.h"
 #include "rfdetr/runtime.h"
 
 #include "rfdetr/common/tensor_utils.h"
@@ -30,7 +31,7 @@
 #include <utility>
 #include <vector>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 using namespace validate_detail;
 using json = nlohmann::json;
@@ -39,14 +40,14 @@ namespace {
 
 void log_line(const ValidationOptions& options, const std::string& line) {
     if (interactive_logs(options)) {
-        ProgressBar::log(line);
+        spdmon::ProgressBar::log(line);
     }
 }
 
 std::string trim_copy(const std::string& value) {
     const auto first = value.find_first_not_of(" \t\r\n");
     if (first == std::string::npos) {
-        return std::string();
+        return {};
     }
     const auto last = value.find_last_not_of(" \t\r\n");
     return value.substr(first, last - first + 1);
@@ -93,9 +94,9 @@ void compile_dataset(const ValidationOptions& options) {
 
     size_t last_done = 0;
     size_t total = 0;
-    std::optional<ProgressBar> bar;
+    std::unique_ptr<spdmon::ProgressBar> bar;
     if (interactive_logs(options)) {
-        bar.emplace("compile", 0, "img");
+        bar = std::make_unique<spdmon::ProgressBar>("compile", 0, "img");
     }
 
     CompilerConfig config;
@@ -107,7 +108,7 @@ void compile_dataset(const ValidationOptions& options) {
     config.num_workers = options.compile_workers;
     config.cuda_mask_batch_size = options.compile_cuda_mask_batch_size;
     config.cuda_device_id = options.compile_cuda_device_id;
-    if (bar.has_value()) {
+    if (bar) {
         size_t progress_pulse = 0;
         DatasetCompiler::compile(
             config,
@@ -120,7 +121,7 @@ void compile_dataset(const ValidationOptions& options) {
                     bar->add(progress.done - last_done);
                     last_done = progress.done;
                 }
-                bar->set_postfix(format_compile_postfix(progress, progress_pulse++));
+                bar->set_postfix(spdmon::format_compile_postfix(progress, progress_pulse++));
             });
         bar->close();
         return;
@@ -157,13 +158,13 @@ void print_model_metadata_impl(const ModelInfo& info,
     if (log_mode != ValidationLogMode::Interactive) {
         return;
     }
-    ProgressBar::log(
+    spdmon::ProgressBar::log(
         "model[" + info.backend + "]: path=" + info.model_path + " input=" + info.input.name + " " +
         shape_to_string(info.input.shape) + " outputs=" + std::to_string(info.outputs.size()) +
         " queries=" + std::to_string(info.num_queries) + " classes=" + std::to_string(info.num_classes) +
         " dataset_images=" + std::to_string(images) + " dataset_classes=" + std::to_string(categories));
     for (const TensorInfo& output : info.outputs) {
-        ProgressBar::log("  output: " + output.name + " " + shape_to_string(output.shape) + " " + output.dtype);
+        spdmon::ProgressBar::log("  output: " + output.name + " " + shape_to_string(output.shape) + " " + output.dtype);
     }
 }
 
@@ -212,9 +213,9 @@ AlignmentStats run_alignment(const ValidationOptions& options,
     DatasetLoader loader(make_loader_config(options, runtime));
 
     const size_t target_images = std::min(options.alignment_images, dataset.num_images());
-    std::optional<ProgressBar> bar;
+    std::unique_ptr<spdmon::ProgressBar> bar;
     if (interactive_logs(options)) {
-        bar.emplace("align", target_images, "img");
+        bar = std::make_unique<spdmon::ProgressBar>("align", target_images, "img");
     }
 
     AlignmentStats total_stats;
@@ -258,7 +259,7 @@ AlignmentStats run_alignment(const ValidationOptions& options,
         const AlignmentStats sample =
             compare_top1(lhs_results.front(), rhs_results.front(), dataset.num_categories());
         total_stats = merge_alignment(total_stats, sample);
-        if (bar.has_value() && total_stats.images_compared > 0) {
+        if (bar && total_stats.images_compared > 0) {
             std::ostringstream postfix;
             postfix.setf(std::ios::fixed);
             postfix.precision(5);
@@ -273,7 +274,7 @@ AlignmentStats run_alignment(const ValidationOptions& options,
         ++compared;
         loader.release_batch(batch);
     }
-    if (bar.has_value()) {
+    if (bar) {
         bar->close();
     }
     return total_stats;
@@ -291,9 +292,9 @@ ValidationBackendResult run_backend_eval_impl(const ValidationOptions& options,
     DatasetLoader loader(make_loader_config(options, runtime));
     CocoDataset dataset = source_dataset;
 
-    std::optional<ProgressBar> bar;
+    std::unique_ptr<spdmon::ProgressBar> bar;
     if (interactive_logs(options)) {
-        bar.emplace(backend.info().backend, dataset.num_images(), "img");
+        bar = std::make_unique<spdmon::ProgressBar>(backend.info().backend, dataset.num_images(), "img");
     }
 
     torch::NoGradGuard no_grad;
@@ -326,13 +327,13 @@ ValidationBackendResult run_backend_eval_impl(const ValidationOptions& options,
                 result_to_predictions(image_id, results.front(), dataset.num_categories(), options.eval_max_dets);
             dataset.add_predictions(std::move(predictions));
             ++processed;
-            if (bar.has_value()) {
+            if (bar) {
                 bar->add(1);
             }
         }
         loader.release_batch(batch, consumer_stream);
     }
-    if (bar.has_value()) {
+    if (bar) {
         bar->close();
     }
 
@@ -436,19 +437,21 @@ ValidationRunResult run_validation(const ValidationOptions& options) {
 
     c10::cuda::CUDAGuard device_guard(checked_device_index(options.device_id));
     auto [mean, std] = make_normalization_tensors(options.device_id);
+    InferenceBackendFactory backend_factory(
+        options.onnx_path,
+        options.tensorrt_path,
+        options.device_id,
+        options.allow_fp16,
+        options.save_engine_path);
 
     std::unordered_map<std::string, std::unique_ptr<InferenceBackend>> backends;
     if (!options.onnx_path.empty()) {
         log_line(options, "backend[onnx]: loading " + options.onnx_path.string());
-        backends["onnx"] = make_onnx_backend(options.onnx_path, options.device_id);
+        backends["onnx"] = backend_factory.make_backend("onnx");
     }
     if (!options.tensorrt_path.empty()) {
         log_line(options, "backend[tensorrt]: loading " + options.tensorrt_path.string());
-        backends["tensorrt"] = make_tensorrt_backend(
-            options.tensorrt_path,
-            options.device_id,
-            options.allow_fp16,
-            options.save_engine_path);
+        backends["tensorrt"] = backend_factory.make_backend("tensorrt");
     }
 
     ValidationRunResult result;
@@ -557,7 +560,7 @@ void print_validation_run_summary(const ValidationOptions& options, const Valida
         line.precision(4);
         line << backend_name << ": bbox_ap=" << summary.bbox.ap << " bbox_ap50=" << summary.bbox.ap50
              << " mask_ap=" << summary.mask.ap << " mask_ap50=" << summary.mask.ap50;
-        ProgressBar::log(line.str());
+        spdmon::ProgressBar::log(line.str());
     }
     if (result.delta_tensorrt_minus_onnx.has_value()) {
         const ValidationDeltaSummary& delta = *result.delta_tensorrt_minus_onnx;
@@ -568,14 +571,14 @@ void print_validation_run_summary(const ValidationOptions& options, const Valida
              << " bbox_ap50=" << delta.bbox_ap50
              << " mask_ap=" << delta.mask_ap
              << " mask_ap50=" << delta.mask_ap50;
-        ProgressBar::log(line.str());
+        spdmon::ProgressBar::log(line.str());
     }
     if (options.profile && result.total_timing.has_value()) {
-        ProgressBar::log("profile: total=" + std::to_string(result.total_timing->seconds) + "s");
+        spdmon::ProgressBar::log("profile: total=" + std::to_string(result.total_timing->seconds) + "s");
     }
     if (options.write_report_json) {
-        ProgressBar::log("report: " + options.report_json_path.string());
+        spdmon::ProgressBar::log("report: " + options.report_json_path.string());
     }
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

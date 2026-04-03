@@ -13,7 +13,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace fastloader::compiler_internal {
+namespace mmltk::compiler_internal {
 
 struct DatasetScan {
     std::unordered_map<std::string, uint8_t> class_map;
@@ -56,11 +56,11 @@ struct ProgressCounter {
         wake();
     }
 
-    size_t load() const noexcept {
+    [[nodiscard]] size_t load() const noexcept {
         return done.load(std::memory_order_acquire);
     }
 
-    size_t active_load() const noexcept {
+    [[nodiscard]] size_t active_load() const noexcept {
         return active.load(std::memory_order_acquire);
     }
 
@@ -106,6 +106,19 @@ private:
     }
 };
 
+struct LayoutFinalizeInputs {
+    size_t label_count = 0;
+    size_t rle_count = 0;
+};
+
+struct FileHeaderInputs {
+    uint32_t num_images = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t channels = 0;
+    size_t image_stride = 0;
+};
+
 struct FileLayout {
     size_t index_size = 0;
     size_t label_block_size = 0;
@@ -133,15 +146,11 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir,
                                DroppedAnnotationTracker* dropped_annotations = nullptr);
 
 FileLayout compute_pixel_layout(uint32_t num_images, size_t image_stride);
-void finalize_layout(FileLayout& layout, size_t label_count, size_t rle_count);
+void finalize_layout(FileLayout& layout, const LayoutFinalizeInputs& inputs);
 void assign_pixel_offsets(std::vector<ImageEntry>& index,
                           size_t pixel_offset,
                           size_t image_stride);
-FileHeader make_file_header(uint32_t num_images,
-                            uint32_t width,
-                            uint32_t height,
-                            uint32_t channels,
-                            size_t image_stride,
+FileHeader make_file_header(const FileHeaderInputs& inputs,
                             const std::unordered_map<std::string, uint8_t>& class_map,
                             const FileLayout& layout);
 void write_metadata_blocks(const FileHandle& fd,
@@ -149,6 +158,8 @@ void write_metadata_blocks(const FileHandle& fd,
                            const FileHeader& header,
                            const LabelBlocks& label_blocks);
 
+// Pixel emission keeps the on-disk writer API in the same order as the file layout.
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 void write_pixel_blob(const FileHandle& fd,
                       const std::filesystem::path& split_dir,
                       uint32_t num_images,
@@ -161,4 +172,4 @@ void write_pixel_blob(const FileHandle& fd,
                       ProgressCounter* completed_images,
                       size_t pixel_offset);
 
-} // namespace fastloader::compiler_internal
+} // namespace mmltk::compiler_internal

@@ -2,12 +2,12 @@
 
 #include <algorithm>
 
-namespace fastloader::gui {
+namespace mmltk::gui {
 
 namespace {
 
-constexpr float kHitPad = 6.0f;
-constexpr float kCornerSize = 18.0f;
+constexpr float kDefaultEdgeHitHalfWidth = 6.0f;
+constexpr float kDefaultCornerHitSize = 18.0f;
 
 bool boxes_equal(const AnnotationBox& lhs, const AnnotationBox& rhs) {
     return lhs.x1 == rhs.x1 &&
@@ -118,7 +118,9 @@ const RectLayerSpec* find_layer_by_id(const RectLayerSpec* layers, const std::si
 RectDragKind rectangle_hover_kind_with_options(const CanvasPointerState& pointer,
                                                const CanvasViewport& viewport,
                                                const AnnotationBox& box,
-                                               bool edge_only_move);
+                                               bool edge_only_move,
+                                               float edge_hit_half_width,
+                                               float corner_hit_size);
 
 CanvasViewport make_canvas_viewport(const float screen_x,
                                     const float screen_y,
@@ -143,40 +145,49 @@ CanvasScreenRect canvas_rect_from_box(const CanvasViewport& viewport, const Anno
 RectDragKind rectangle_hover_kind(const CanvasPointerState& pointer,
                                   const CanvasViewport& viewport,
                                   const AnnotationBox& box) {
-    return rectangle_hover_kind_with_options(pointer, viewport, box, false);
+    return rectangle_hover_kind_with_options(pointer,
+                                             viewport,
+                                             box,
+                                             false,
+                                             kDefaultEdgeHitHalfWidth,
+                                             kDefaultCornerHitSize);
 }
 
 RectDragKind rectangle_hover_kind_with_options(const CanvasPointerState& pointer,
                                                const CanvasViewport& viewport,
                                                const AnnotationBox& box,
-                                               const bool edge_only_move) {
+                                               const bool edge_only_move,
+                                               const float edge_hit_half_width,
+                                               const float corner_hit_size) {
     const CanvasScreenRect screen_box = make_screen_rect(viewport, box);
+    const float hit_pad = std::max(0.0f, edge_hit_half_width);
+    const float corner_size = std::max(0.0f, corner_hit_size);
     const bool near_left =
-        pointer.screen_x >= screen_box.x1 - kHitPad && pointer.screen_x <= screen_box.x1 + kHitPad;
+        pointer.screen_x >= screen_box.x1 - hit_pad && pointer.screen_x <= screen_box.x1 + hit_pad;
     const bool near_right =
-        pointer.screen_x >= screen_box.x2 - kHitPad && pointer.screen_x <= screen_box.x2 + kHitPad;
+        pointer.screen_x >= screen_box.x2 - hit_pad && pointer.screen_x <= screen_box.x2 + hit_pad;
     const bool near_top =
-        pointer.screen_y >= screen_box.y1 - kHitPad && pointer.screen_y <= screen_box.y1 + kHitPad;
+        pointer.screen_y >= screen_box.y1 - hit_pad && pointer.screen_y <= screen_box.y1 + hit_pad;
     const bool near_bottom =
-        pointer.screen_y >= screen_box.y2 - kHitPad && pointer.screen_y <= screen_box.y2 + kHitPad;
+        pointer.screen_y >= screen_box.y2 - hit_pad && pointer.screen_y <= screen_box.y2 + hit_pad;
     const bool in_y_range =
-        pointer.screen_y >= screen_box.y1 - kHitPad && pointer.screen_y <= screen_box.y2 + kHitPad;
+        pointer.screen_y >= screen_box.y1 - hit_pad && pointer.screen_y <= screen_box.y2 + hit_pad;
     const bool in_x_range =
-        pointer.screen_x >= screen_box.x1 - kHitPad && pointer.screen_x <= screen_box.x2 + kHitPad;
+        pointer.screen_x >= screen_box.x1 - hit_pad && pointer.screen_x <= screen_box.x2 + hit_pad;
     const bool inside_x = pointer.screen_x >= screen_box.x1 && pointer.screen_x <= screen_box.x2;
     const bool inside_y = pointer.screen_y >= screen_box.y1 && pointer.screen_y <= screen_box.y2;
     const bool near_top_left = near_top && near_left &&
-                               pointer.screen_x < screen_box.x1 + kCornerSize &&
-                               pointer.screen_y < screen_box.y1 + kCornerSize;
+                               pointer.screen_x < screen_box.x1 + corner_size &&
+                               pointer.screen_y < screen_box.y1 + corner_size;
     const bool near_top_right = near_top && near_right &&
-                                pointer.screen_x > screen_box.x2 - kCornerSize &&
-                                pointer.screen_y < screen_box.y1 + kCornerSize;
+                                pointer.screen_x > screen_box.x2 - corner_size &&
+                                pointer.screen_y < screen_box.y1 + corner_size;
     const bool near_bottom_left = near_bottom && near_left &&
-                                  pointer.screen_x < screen_box.x1 + kCornerSize &&
-                                  pointer.screen_y > screen_box.y2 - kCornerSize;
+                                  pointer.screen_x < screen_box.x1 + corner_size &&
+                                  pointer.screen_y > screen_box.y2 - corner_size;
     const bool near_bottom_right = near_bottom && near_right &&
-                                   pointer.screen_x > screen_box.x2 - kCornerSize &&
-                                   pointer.screen_y > screen_box.y2 - kCornerSize;
+                                   pointer.screen_x > screen_box.x2 - corner_size &&
+                                   pointer.screen_y > screen_box.y2 - corner_size;
     const bool on_edge = !near_top_left && !near_top_right &&
                          !near_bottom_left && !near_bottom_right &&
                          ((near_left && in_y_range) || (near_right && in_y_range) ||
@@ -329,4 +340,4 @@ bool assign_video_crop_box(SourceSelectionState& state, const AnnotationBox& box
     return changed;
 }
 
-} // namespace fastloader::gui
+} // namespace mmltk::gui

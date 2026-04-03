@@ -1,6 +1,7 @@
 #include "dataset_loader_internal.h"
 #include "execution_policy.h"
 #include "profile_utils.h"
+#include "mmltk_logging.h"
 #include "worker_pool.h"
 
 #include <algorithm>
@@ -11,7 +12,7 @@
 #include <random>
 #include <stdexcept>
 
-namespace fastloader {
+namespace mmltk {
 
 namespace {
 
@@ -43,6 +44,8 @@ void validate_config(const DatasetLoader::Config& config) {
     }
 }
 
+// Dataset size plus batch size intentionally mirror the caller's epoch inputs.
+// NOLINTBEGIN(bugprone-easily-swappable-parameters)
 void build_block_shuffled_order(std::vector<uint32_t>& order,
                                 uint32_t num_images,
                                 size_t batch_size,
@@ -51,17 +54,17 @@ void build_block_shuffled_order(std::vector<uint32_t>& order,
         return;
     }
 
-    const size_t total_images = static_cast<size_t>(num_images);
+    const auto total_images = static_cast<size_t>(num_images);
     const size_t chunk_images =
         std::min(total_images, std::max(kShuffleChunkImages, batch_size));
     const size_t chunks_per_block = std::max<size_t>(1, kShuffleBlockImages / chunk_images);
     const size_t num_chunks = (total_images + chunk_images - 1) / chunk_images;
     const size_t num_blocks = (num_chunks + chunks_per_block - 1) / chunks_per_block;
 
-    FASTLOADER_PROFILE_SET("loader.shuffle.chunk_images", chunk_images);
-    FASTLOADER_PROFILE_SET("loader.shuffle.block_images", chunk_images * chunks_per_block);
-    FASTLOADER_PROFILE_SET("loader.shuffle.chunks", num_chunks);
-    FASTLOADER_PROFILE_SET("loader.shuffle.blocks", num_blocks);
+    MMLTK_PROFILE_SET("loader.shuffle.chunk_images", chunk_images);
+    MMLTK_PROFILE_SET("loader.shuffle.block_images", chunk_images * chunks_per_block);
+    MMLTK_PROFILE_SET("loader.shuffle.chunks", num_chunks);
+    MMLTK_PROFILE_SET("loader.shuffle.blocks", num_blocks);
 
     std::vector<size_t> block_order(num_blocks);
     std::iota(block_order.begin(), block_order.end(), 0);
@@ -90,19 +93,20 @@ void build_block_shuffled_order(std::vector<uint32_t>& order,
         throw std::runtime_error("block shuffle failed to populate the full epoch order");
     }
 }
+// NOLINTEND(bugprone-easily-swappable-parameters)
 
 } // namespace
 
 DatasetLoader::DatasetLoader(const Config& config) : impl_(std::make_unique<Impl>()) {
-    FASTLOADER_PROFILE_SCOPE("loader.construct");
+    MMLTK_PROFILE_SCOPE("loader.construct");
     validate_config(config);
 
     impl_->config = config;
     impl_->use_gather_path = true;
-    FASTLOADER_PROFILE_SET("loader.prefetch_factor_requested",
+    MMLTK_PROFILE_SET("loader.prefetch_factor_requested",
                            static_cast<size_t>(config.prefetch_factor));
     impl_->num_buffers = static_cast<size_t>(config.prefetch_factor);
-    FASTLOADER_PROFILE_SET("loader.prefetch_factor", impl_->num_buffers);
+    MMLTK_PROFILE_SET("loader.prefetch_factor", impl_->num_buffers);
     impl_->load_runtime_data();
     impl_->prescan();
     impl_->slots.resize(impl_->num_buffers);
@@ -122,18 +126,19 @@ DatasetLoader::DatasetLoader(const Config& config) : impl_(std::make_unique<Impl
     } else {
         impl_->gather_worker_count = 0;
     }
-    FASTLOADER_PROFILE_SET("loader.worker_cpu_count", impl_->worker_cpus.size());
-    FASTLOADER_PROFILE_SET("loader.gather.worker_budget", impl_->gather_worker_count);
-    FASTLOADER_PROFILE_SET("loader.worker_thread_count",
+    MMLTK_PROFILE_SET("loader.worker_cpu_count", impl_->worker_cpus.size());
+    MMLTK_PROFILE_SET("loader.gather.worker_budget", impl_->gather_worker_count);
+    MMLTK_PROFILE_SET("loader.worker_thread_count",
                            impl_->gather_worker_count + static_cast<size_t>(1));
 
-    const size_t image_stride = static_cast<size_t>(impl_->header.image_stride);
-    impl_->cuda_mgr = std::make_unique<CudaStreamManager>(
-        config.batch_size,
-        image_stride,
-        impl_->num_buffers,
-        impl_->use_gather_path,
-        config.device_id);
+    const auto image_stride = static_cast<size_t>(impl_->header.image_stride);
+    CudaStreamManagerConfig cuda_config{};
+    cuda_config.batch_capacity = config.batch_size;
+    cuda_config.image_stride = image_stride;
+    cuda_config.num_buffers = impl_->num_buffers;
+    cuda_config.enable_gather_buffers = impl_->use_gather_path;
+    cuda_config.device_id = config.device_id;
+    impl_->cuda_mgr = std::make_unique<CudaStreamManager>(cuda_config);
 
     impl_->order.resize(impl_->header.num_images);
     std::iota(impl_->order.begin(), impl_->order.end(), 0u);
@@ -142,11 +147,12 @@ DatasetLoader::DatasetLoader(const Config& config) : impl_(std::make_unique<Impl
 }
 
 DatasetLoader::~DatasetLoader() {
-    FASTLOADER_PROFILE_SCOPE("loader.destruct");
+    MMLTK_PROFILE_SCOPE("loader.destruct");
     {
         std::lock_guard<std::mutex> lock(impl_->slot_mtx);
         if (impl_->has_checked_out_slots_locked()) {
-            std::fputs("DatasetLoader destroyed with unreleased batches\n", stderr);
+            mmltk::logging::logger("loader")->critical(
+                "DatasetLoader destroyed with unreleased batches");
             std::terminate();
         }
     }
@@ -158,7 +164,7 @@ DatasetLoader::~DatasetLoader() {
 }
 
 void DatasetLoader::begin_epoch() {
-    FASTLOADER_PROFILE_SCOPE("loader.begin_epoch");
+    MMLTK_PROFILE_SCOPE("loader.begin_epoch");
     {
         std::lock_guard<std::mutex> lock(impl_->slot_mtx);
         if (impl_->has_checked_out_slots_locked()) {
@@ -177,7 +183,7 @@ void DatasetLoader::begin_epoch() {
     }
 
     if (impl_->config.shuffle) {
-        FASTLOADER_PROFILE_SCOPE("loader.shuffle_order");
+        MMLTK_PROFILE_SCOPE("loader.shuffle_order");
         std::mt19937_64 rng(impl_->config.seed++);
         build_block_shuffled_order(impl_->order,
                                    impl_->header.num_images,
@@ -194,7 +200,7 @@ void DatasetLoader::begin_epoch() {
 }
 
 bool DatasetLoader::next_batch(Batch& out) {
-    FASTLOADER_PROFILE_SCOPE("loader.next_batch");
+    MMLTK_PROFILE_SCOPE("loader.next_batch");
     if (!impl_->epoch_initialized) {
         begin_epoch();
     }
@@ -207,7 +213,7 @@ bool DatasetLoader::next_batch(Batch& out) {
     uint64_t ready_lease_id = 0;
     const float* ready_host_images = nullptr;
     {
-        FASTLOADER_PROFILE_SCOPE("loader.wait_ready_batch");
+        MMLTK_PROFILE_SCOPE("loader.wait_ready_batch");
         std::unique_lock<std::mutex> lock(impl_->slot_mtx);
         while (impl_->next_consume_batch < impl_->total_batches() &&
                !impl_->batch_ready_locked(impl_->next_consume_batch)) {
@@ -294,7 +300,7 @@ const char* DatasetLoader::class_name(uint32_t id) const {
     if (id >= impl_->header.num_classes) {
         throw std::out_of_range("class id out of range");
     }
-    return impl_->header.class_names[id];
+    return impl_->header.class_names[id].data();
 }
 
 size_t DatasetLoader::image_stride() const { return impl_->header.image_stride; }
@@ -310,7 +316,7 @@ CudaStreamManager& DatasetLoader::cuda() const { return *impl_->cuda_mgr; }
 
 void DatasetLoader::Impl::rebuild_batch_schedule() {
     batch_starts.clear();
-    const size_t total_images = static_cast<size_t>(header.num_images);
+    const auto total_images = static_cast<size_t>(header.num_images);
     if (total_images == 0) {
         return;
     }
@@ -318,16 +324,16 @@ void DatasetLoader::Impl::rebuild_batch_schedule() {
     const size_t global_batches = config.drop_last ? 
         (total_images / config.batch_size) : 
         ((total_images + config.batch_size - 1) / config.batch_size);
-    const size_t shard_count = static_cast<size_t>(config.batch_shard_count);
-    const size_t shard_rank = static_cast<size_t>(config.batch_shard_rank);
+    const auto shard_count = static_cast<size_t>(config.batch_shard_count);
+    const auto shard_rank = static_cast<size_t>(config.batch_shard_rank);
     batch_starts.reserve((global_batches + shard_count - 1) / shard_count);
     for (size_t global_batch = shard_rank; global_batch < global_batches; global_batch += shard_count) {
         batch_starts.push_back(global_batch * config.batch_size);
     }
 
-    FASTLOADER_PROFILE_SET("loader.batch_shard_rank", shard_rank);
-    FASTLOADER_PROFILE_SET("loader.batch_shard_count", shard_count);
-    FASTLOADER_PROFILE_SET("loader.batch_shard_batches", batch_starts.size());
+    MMLTK_PROFILE_SET("loader.batch_shard_rank", shard_rank);
+    MMLTK_PROFILE_SET("loader.batch_shard_count", shard_count);
+    MMLTK_PROFILE_SET("loader.batch_shard_batches", batch_starts.size());
 }
 
 bool DatasetLoader::Impl::slot_state_matches(SlotState state,
@@ -364,4 +370,4 @@ void DatasetLoader::Impl::release_checked_out_batch_locked(const Batch& batch,
     slot.state = SlotState::Released;
 }
 
-} // namespace fastloader
+} // namespace mmltk

@@ -1,12 +1,14 @@
 #include "gui_settings.h"
+#include "mmltk_logging.h"
 
 #include <nlohmann/json.hpp>
 
 #include <cstdio>
 #include <fstream>
+#include <filesystem>
 #include <utility>
 
-namespace fastloader::gui {
+namespace mmltk::gui {
 
 namespace {
 
@@ -14,6 +16,56 @@ template <typename T>
 void get_optional(const nlohmann::json& j, const char* key, T& out) {
     if (j.contains(key)) {
         j.at(key).get_to(out);
+    }
+}
+
+bool has_current_schema_version(const nlohmann::json& j) {
+    if (!j.is_object()) {
+        return false;
+    }
+
+    const auto schema_it = j.find("schema_version");
+    if (schema_it == j.end()) {
+        return false;
+    }
+    if (!schema_it->is_number_integer() && !schema_it->is_number_unsigned()) {
+        return false;
+    }
+
+    try {
+        return schema_it->get<std::uint32_t>() == kGuiSettingsSchemaVersion;
+    } catch (const nlohmann::json::exception&) {
+        return false;
+    }
+}
+
+nlohmann::json snapshot_workflows(const WorkflowSettingsSnapshot& workflows) {
+    nlohmann::json j = nlohmann::json::object();
+    if (workflows.train != nullptr) j["train"] = *workflows.train;
+    if (workflows.validate != nullptr) j["validate"] = *workflows.validate;
+    if (workflows.predict != nullptr) j["predict"] = *workflows.predict;
+    if (workflows.annotate != nullptr) j["annotate"] = *workflows.annotate;
+    if (workflows.export_state != nullptr) j["export"] = *workflows.export_state;
+    return j;
+}
+
+void apply_workflows(const nlohmann::json& j, WorkflowSettingsSnapshot& workflows) {
+    if (const auto workflows_it = j.find("workflows"); workflows_it != j.end() && workflows_it->is_object()) {
+        if (workflows.train != nullptr && workflows_it->contains("train")) {
+            workflows_it->at("train").get_to(*workflows.train);
+        }
+        if (workflows.validate != nullptr && workflows_it->contains("validate")) {
+            workflows_it->at("validate").get_to(*workflows.validate);
+        }
+        if (workflows.predict != nullptr && workflows_it->contains("predict")) {
+            workflows_it->at("predict").get_to(*workflows.predict);
+        }
+        if (workflows.annotate != nullptr && workflows_it->contains("annotate")) {
+            workflows_it->at("annotate").get_to(*workflows.annotate);
+        }
+        if (workflows.export_state != nullptr && workflows_it->contains("export")) {
+            workflows_it->at("export").get_to(*workflows.export_state);
+        }
     }
 }
 
@@ -77,6 +129,7 @@ void to_json(nlohmann::json& j, const TrainViewState& s) {
         {"grad_accum_steps", s.grad_accum_steps},
         {"eval_max_dets", s.eval_max_dets},
         {"lr_drop", s.lr_drop},
+        {"print_freq", s.print_freq},
         {"prefetch_factor", s.prefetch_factor},
         {"seed", s.seed},
         {"workers", s.workers},
@@ -99,6 +152,7 @@ void to_json(nlohmann::json& j, const TrainViewState& s) {
         {"optimizer", static_cast<int>(s.optimizer)},
         {"compile_mode", s.compile_mode},
         {"execution_target", static_cast<int>(s.execution_target)},
+        {"local_device_ids", s.local_device_ids},
         {"remote_family_enabled", s.remote_family_enabled},
         {"recipe_overrides",
          {
@@ -134,6 +188,7 @@ void from_json(const nlohmann::json& j, TrainViewState& s) {
     get_optional(j, "grad_accum_steps", s.grad_accum_steps);
     get_optional(j, "eval_max_dets", s.eval_max_dets);
     get_optional(j, "lr_drop", s.lr_drop);
+    get_optional(j, "print_freq", s.print_freq);
     get_optional(j, "prefetch_factor", s.prefetch_factor);
     get_optional(j, "seed", s.seed);
     get_optional(j, "workers", s.workers);
@@ -160,6 +215,7 @@ void from_json(const nlohmann::json& j, TrainViewState& s) {
     int execution_target = static_cast<int>(s.execution_target);
     get_optional(j, "execution_target", execution_target);
     s.execution_target = static_cast<TrainExecutionTarget>(execution_target);
+    get_optional(j, "local_device_ids", s.local_device_ids);
     get_optional(j, "remote_family_enabled", s.remote_family_enabled);
     if (const auto overrides = j.find("recipe_overrides"); overrides != j.end() && overrides->is_object()) {
         get_optional(*overrides, "lr", s.recipe_overrides.lr);
@@ -285,6 +341,9 @@ void to_json(nlohmann::json& j, const UiSettingsState& s) {
         {"secondary_font_size", s.secondary_font_size},
         {"mono_font_size", s.mono_font_size},
         {"property_label_width", s.property_label_width},
+        {"crop_edge_hit_half_width", s.crop_edge_hit_half_width},
+        {"crop_corner_hit_size", s.crop_corner_hit_size},
+        {"crop_handle_radius", s.crop_handle_radius},
         {"density", static_cast<int>(s.density)},
     };
 }
@@ -295,6 +354,9 @@ void from_json(const nlohmann::json& j, UiSettingsState& s) {
     get_optional(j, "secondary_font_size", s.secondary_font_size);
     get_optional(j, "mono_font_size", s.mono_font_size);
     get_optional(j, "property_label_width", s.property_label_width);
+    get_optional(j, "crop_edge_hit_half_width", s.crop_edge_hit_half_width);
+    get_optional(j, "crop_corner_hit_size", s.crop_corner_hit_size);
+    get_optional(j, "crop_handle_radius", s.crop_handle_radius);
     int density = static_cast<int>(s.density);
     get_optional(j, "density", density);
     s.density = static_cast<UiDensity>(density);
@@ -370,14 +432,12 @@ void from_json(const nlohmann::json& j, ExportViewState& s) {
 
 nlohmann::json snapshot_gui_settings(const GuiSettingsSnapshot& snap) {
     nlohmann::json j;
+    j["schema_version"] = kGuiSettingsSchemaVersion;
     j["current_view"] = static_cast<int>(snap.current_view);
     j["selected_preset"] = snap.selected_preset;
     if (snap.ui_settings) j["ui"] = *snap.ui_settings;
-    if (snap.train) j["train"] = *snap.train;
-    if (snap.validate) j["validate"] = *snap.validate;
-    if (snap.predict) j["predict"] = *snap.predict;
-    if (snap.annotate) j["annotate"] = *snap.annotate;
-    if (snap.export_state) j["export"] = *snap.export_state;
+    const nlohmann::json workflows = snapshot_workflows(snap.workflows);
+    if (!workflows.empty()) j["workflows"] = workflows;
     return j;
 }
 
@@ -388,11 +448,7 @@ void apply_gui_settings(const nlohmann::json& j, GuiSettingsSnapshot& snap) {
     }
     get_optional(j, "selected_preset", snap.selected_preset);
     if (j.contains("ui") && snap.ui_settings) j.at("ui").get_to(*snap.ui_settings);
-    if (j.contains("train") && snap.train) j.at("train").get_to(*snap.train);
-    if (j.contains("validate") && snap.validate) j.at("validate").get_to(*snap.validate);
-    if (j.contains("predict") && snap.predict) j.at("predict").get_to(*snap.predict);
-    if (j.contains("annotate") && snap.annotate) j.at("annotate").get_to(*snap.annotate);
-    if (j.contains("export") && snap.export_state) j.at("export").get_to(*snap.export_state);
+    apply_workflows(j, snap.workflows);
 }
 
 // ---- GuiSettingsPersistence ----
@@ -420,11 +476,18 @@ bool GuiSettingsPersistence::load(GuiSettingsSnapshot& snap) {
     }
     try {
         nlohmann::json j = nlohmann::json::parse(file);
+        if (!has_current_schema_version(j)) {
+            mmltk::logging::logger("gui")->warn("[gui] ignoring settings from {} because schema_version is missing or unsupported",
+                                                path_);
+            return false;
+        }
         apply_gui_settings(j, snap);
         last_saved_ = std::move(j);
         return true;
     } catch (const nlohmann::json::exception& e) {
-        std::fprintf(stderr, "[gui] failed to load settings from %s: %s\n", path_.c_str(), e.what());
+        mmltk::logging::logger("gui")->warn("[gui] ignoring malformed settings from {}: {}",
+                                             path_,
+                                             e.what());
         return false;
     }
 }
@@ -441,8 +504,15 @@ void GuiSettingsPersistence::notify_frame(const GuiSettingsSnapshot& snap) {
     if (dirty_) {
         const auto elapsed = std::chrono::steady_clock::now() - last_change_time_;
         if (elapsed >= kSaveDelay) {
-            enqueue_save(last_saved_);
-            dirty_ = false;
+            bool coalesced_pending_save = false;
+            {
+                std::lock_guard<std::mutex> lock(writer_mutex_);
+                coalesced_pending_save = save_in_flight_ && pending_save_.has_value();
+            }
+            if (!coalesced_pending_save) {
+                enqueue_save(last_saved_);
+                dirty_ = false;
+            }
         }
     }
 }
@@ -459,11 +529,18 @@ void GuiSettingsPersistence::flush() {
 }
 
 void GuiSettingsPersistence::enqueue_save(nlohmann::json j) {
+    bool notify = false;
     {
         std::lock_guard<std::mutex> lock(writer_mutex_);
+        if (pending_save_.has_value() && *pending_save_ == j) {
+            return;
+        }
         pending_save_ = std::move(j);
+        notify = true;
     }
-    writer_cv_.notify_all();
+    if (notify) {
+        writer_cv_.notify_all();
+    }
 }
 
 void GuiSettingsPersistence::writer_main() {
@@ -478,8 +555,7 @@ void GuiSettingsPersistence::writer_main() {
                 return;
             }
             save_in_flight_ = true;
-            save_request = std::move(pending_save_);
-            pending_save_.reset();
+            save_request = std::exchange(pending_save_, std::nullopt);
         }
 
         if (save_request.has_value()) {
@@ -499,14 +575,17 @@ void GuiSettingsPersistence::save_to_disk(const nlohmann::json& j) {
     {
         std::ofstream file(tmp_path);
         if (!file.is_open()) {
-            std::fprintf(stderr, "[gui] failed to write settings to %s\n", tmp_path.c_str());
+            mmltk::logging::logger("gui")->error("[gui] failed to write settings to {}",
+                                                  tmp_path);
             return;
         }
         file << j.dump(2) << '\n';
     }
     if (std::rename(tmp_path.c_str(), path_.c_str()) != 0) {
-        std::fprintf(stderr, "[gui] failed to rename %s -> %s\n", tmp_path.c_str(), path_.c_str());
+        mmltk::logging::logger("gui")->error("[gui] failed to rename {} -> {}",
+                                              tmp_path,
+                                              path_);
     }
 }
 
-} // namespace fastloader::gui
+} // namespace mmltk::gui

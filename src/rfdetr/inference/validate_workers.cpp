@@ -1,8 +1,10 @@
 #include "rfdetr/validate_internal.h"
 
+#include "rfdetr/inference/backend_factory.h"
 #include "rfdetr/cuda_utils.h"
 #include "rfdetr/postprocess.h"
-#include "rfdetr/progress_bar.h"
+#include "rfdetr/predict_runtime_shared.h"
+#include "spdmon/spdmon.hpp"
 #include "rfdetr/runtime.h"
 #include "profile_utils.h"
 #include "worker_pool.h"
@@ -24,17 +26,11 @@
 #include <utility>
 #include <vector>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 using namespace validate_detail;
 
 namespace {
-
-size_t lane_slot_count(const RuntimeSplit& split) {
-    const size_t lane_threads = static_cast<size_t>(std::max(1, split.lane_threads));
-    const size_t cpu_threads = static_cast<size_t>(std::max(1, split.cpu_threads));
-    return std::max<size_t>(2, 1 + ((cpu_threads + lane_threads - 1) / lane_threads));
-}
 
 struct ParallelInferenceLane {
     std::unique_ptr<InferenceBackend> backend;
@@ -54,29 +50,11 @@ public:
         }
     }
 
-    cudaEvent_t get() const { return event_; }
+    [[nodiscard]] cudaEvent_t get() const { return event_; }
 
 private:
     cudaEvent_t event_ = nullptr;
 };
-
-std::vector<std::unique_ptr<InferenceBackend>> make_backend_lanes_for_name(
-    const ValidationOptions& options,
-    const std::string& backend_name,
-    int lane_count) {
-    if (backend_name == "onnx") {
-        return make_onnx_backend_lanes(options.onnx_path, options.device_id, lane_count);
-    }
-    if (backend_name == "tensorrt") {
-        return make_tensorrt_backend_lanes(
-            options.tensorrt_path,
-            options.device_id,
-            options.allow_fp16,
-            lane_count,
-            options.save_engine_path);
-    }
-    throw std::runtime_error("unsupported validation backend: " + backend_name);
-}
 
 } // namespace
 
@@ -93,9 +71,9 @@ ValidationBackendResult run_backend_eval_parallel_impl(const ValidationOptions& 
     DatasetLoader loader(make_loader_config(options, runtime));
     CocoDataset dataset = source_dataset;
 
-    std::optional<ProgressBar> bar;
+    std::unique_ptr<spdmon::ProgressBar> bar;
     if (interactive_logs(options)) {
-        bar.emplace(model_info.backend, dataset.num_images(), "img");
+        bar = std::make_unique<spdmon::ProgressBar>(model_info.backend, dataset.num_images(), "img");
     }
 
     const auto started = std::chrono::steady_clock::now();
@@ -104,11 +82,16 @@ ValidationBackendResult run_backend_eval_parallel_impl(const ValidationOptions& 
     const auto preprocess_stream =
         get_high_priority_cuda_stream(options.device_id);
 
-    auto lane_backends =
-        make_backend_lanes_for_name(options, backend_name, runtime.split().lane_threads);
+    InferenceBackendFactory backend_factory(
+        options.onnx_path,
+        options.tensorrt_path,
+        options.device_id,
+        options.allow_fp16,
+        options.save_engine_path);
+    auto lane_backends = backend_factory.make_backend_lanes(backend_name, runtime.split().lane_threads);
     std::vector<ParallelInferenceLane> lanes;
     lanes.reserve(lane_backends.size());
-    const size_t slot_count = lane_slot_count(runtime.split());
+    const size_t slot_count = predict_internal::prediction_lane_slot_count(runtime.split());
     for (auto& backend : lane_backends) {
         ParallelInferenceLane lane{
             std::move(backend),
@@ -124,8 +107,8 @@ ValidationBackendResult run_backend_eval_parallel_impl(const ValidationOptions& 
 
     auto drain_lane = [&](std::deque<std::future<StagedPredictionBatch>>& lane_futures,
                           std::deque<std::future<std::vector<Prediction>>>& cpu_futures) {
-        FASTLOADER_NVTX_RANGE("drain_lane", NVTX_COLOR_PURPLE);
-        FASTLOADER_PROFILE_SCOPE("rfdetr.native.eval.drain_lane");
+        MMLTK_NVTX_RANGE("drain_lane", NVTX_COLOR_PURPLE);
+        MMLTK_PROFILE_SCOPE("rfdetr.native.eval.drain_lane");
         StagedPredictionBatch staged = lane_futures.front().get();
         lane_futures.pop_front();
         cpu_futures.push_back(cpu_pool.enqueue([staged = std::move(staged)]() mutable {
@@ -133,13 +116,13 @@ ValidationBackendResult run_backend_eval_parallel_impl(const ValidationOptions& 
         }));
     };
     auto drain_cpu = [&](std::deque<std::future<std::vector<Prediction>>>& cpu_futures, size_t& processed) {
-        FASTLOADER_NVTX_RANGE("drain_cpu", NVTX_COLOR_GREEN);
-        FASTLOADER_PROFILE_SCOPE("rfdetr.native.eval.drain_cpu");
+        MMLTK_NVTX_RANGE("drain_cpu", NVTX_COLOR_GREEN);
+        MMLTK_PROFILE_SCOPE("rfdetr.native.eval.drain_cpu");
         std::vector<Prediction> predictions = cpu_futures.front().get();
         cpu_futures.pop_front();
         dataset.add_predictions(std::move(predictions));
         ++processed;
-        if (bar.has_value()) {
+        if (bar) {
             bar->add(1);
         }
     };
@@ -151,8 +134,8 @@ ValidationBackendResult run_backend_eval_parallel_impl(const ValidationOptions& 
     size_t processed = 0;
     size_t submitted = 0;
     size_t submitted_images = 0;
-    const int64_t image_height = static_cast<int64_t>(loader.image_height());
-    const int64_t image_width = static_cast<int64_t>(loader.image_width());
+    const auto image_height = static_cast<int64_t>(loader.image_height());
+    const auto image_width = static_cast<int64_t>(loader.image_width());
     while (loader.next_batch(batch)) {
         if (submitted_images >= dataset.num_images()) {
             loader.release_batch(batch);
@@ -237,7 +220,7 @@ ValidationBackendResult run_backend_eval_parallel_impl(const ValidationOptions& 
     while (!cpu_futures.empty()) {
         drain_cpu(cpu_futures, processed);
     }
-    if (bar.has_value()) {
+    if (bar) {
         bar->close();
     }
 
@@ -248,4 +231,4 @@ ValidationBackendResult run_backend_eval_parallel_impl(const ValidationOptions& 
     };
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

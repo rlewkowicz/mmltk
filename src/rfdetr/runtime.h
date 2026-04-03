@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 struct RuntimeConfig {
     int workers = 0;
@@ -30,15 +30,15 @@ class RuntimeContext {
 public:
     explicit RuntimeContext(const RuntimeConfig& config);
 
-    const RuntimeConfig& config() const { return config_; }
-    const RuntimeSplit& split() const { return split_; }
-    fastloader::WorkerPool& cpu_pool() const { return *cpu_pool_; }
-    const std::vector<int>& loader_cpus() const { return loader_cpus_; }
-    const std::vector<int>& lane_cpus() const { return lane_cpus_; }
-    const std::vector<int>& cpu_cpus() const { return cpu_cpus_; }
-    std::string loader_affinity_string() const;
-    std::string lane_affinity_string() const;
-    std::string cpu_affinity_string() const;
+    [[nodiscard]] const RuntimeConfig& config() const { return config_; }
+    [[nodiscard]] const RuntimeSplit& split() const { return split_; }
+    [[nodiscard]] mmltk::WorkerPool& cpu_pool() const { return *cpu_pool_; }
+    [[nodiscard]] const std::vector<int>& loader_cpus() const { return loader_cpus_; }
+    [[nodiscard]] const std::vector<int>& lane_cpus() const { return lane_cpus_; }
+    [[nodiscard]] const std::vector<int>& cpu_cpus() const { return cpu_cpus_; }
+    [[nodiscard]] std::string loader_affinity_string() const;
+    [[nodiscard]] std::string lane_affinity_string() const;
+    [[nodiscard]] std::string cpu_affinity_string() const;
 
 private:
     RuntimeConfig config_;
@@ -46,7 +46,7 @@ private:
     std::vector<int> loader_cpus_;
     std::vector<int> lane_cpus_;
     std::vector<int> cpu_cpus_;
-    std::shared_ptr<fastloader::WorkerPool> cpu_pool_;
+    std::shared_ptr<mmltk::WorkerPool> cpu_pool_;
 };
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

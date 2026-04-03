@@ -1,4 +1,6 @@
 #pragma once
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 
@@ -21,7 +23,7 @@
 // All multi-byte values are little-endian (x86 native).
 // ============================================================
 
-namespace fastloader {
+namespace mmltk {
 
 static constexpr uint64_t MAGIC = 0x46415354'4C445232ULL; // "FASTLDR2"
 static constexpr uint32_t FORMAT_VERSION = 4;
@@ -68,9 +70,10 @@ struct __attribute__((packed)) FileHeader {
     uint64_t mask_rle_offset;   // byte offset to RLE block
     uint64_t total_file_size;
     uint64_t image_stride;      // bytes per image: C * H * W * sizeof(float)
-    char     class_names[MAX_CLASSES][32];
-    uint8_t  _reserved[56];
+    std::array<std::array<char, 32>, MAX_CLASSES> class_names{};
+    std::array<uint8_t, 56> _reserved{};
 };
+static_assert(sizeof(FileHeader) == 8328, "FileHeader must preserve the on-disk layout");
 
 // Mask RLE pair
 struct __attribute__((packed)) RLEPair {
@@ -79,4 +82,4 @@ struct __attribute__((packed)) RLEPair {
 };
 static_assert(sizeof(RLEPair) == 8, "RLEPair must be 8 bytes");
 
-} // namespace fastloader
+} // namespace mmltk

@@ -5,6 +5,7 @@
 #include "execution_policy.h"
 
 #include "cpu_affinity.h"
+#include "mmltk_logging.h"
 
 #include <algorithm>
 #include <linux/ioprio.h>
@@ -23,7 +24,7 @@
 #include <utility>
 #include <vector>
 
-namespace fastloader {
+namespace mmltk {
 
 namespace {
 
@@ -213,6 +214,8 @@ ExecutionPolicySnapshot apply_worker_execution_policy(const ExecutionPolicyReque
     return apply_execution_policy(request);
 }
 
+// Worker budget inputs mirror the scheduling knobs the callers already hold.
+// NOLINTBEGIN(bugprone-easily-swappable-parameters)
 int clamp_worker_count_to_cpus(int requested_workers,
                                size_t cpu_count,
                                int reserved_cpus,
@@ -235,6 +238,7 @@ int clamp_worker_count_to_cpus(int requested_workers,
     }
     return std::max(1, std::min(requested_workers, static_cast<int>(usable)));
 }
+// NOLINTEND(bugprone-easily-swappable-parameters)
 
 void log_worker_budget_clamp(const char* subsystem,
                              int requested_workers,
@@ -244,23 +248,22 @@ void log_worker_budget_clamp(const char* subsystem,
                              int minimum_workers) {
     if (requested_workers == applied_workers) {
         if (reserved_cpus > 0 && cpus.size() <= static_cast<size_t>(reserved_cpus)) {
-            std::fprintf(stderr,
-                         "[exec] %s cpuset=%s is too small to reserve %d helper cpu(s); helper threads will overlap\n",
-                         subsystem,
-                         format_cpu_list(cpus).c_str(),
-                         reserved_cpus);
+            mmltk::logging::logger("exec")->warn(
+                "{} cpuset={} is too small to reserve {} helper cpu(s); helper threads will overlap",
+                subsystem,
+                format_cpu_list(cpus),
+                reserved_cpus);
         }
         return;
     }
 
-    std::fprintf(stderr,
-                 "[exec] %s workers clamped %d->%d for cpuset=%s (reserved=%d minimum=%d)\n",
-                 subsystem,
-                 requested_workers,
-                 applied_workers,
-                 format_cpu_list(cpus).c_str(),
-                 reserved_cpus,
-                 minimum_workers);
+    mmltk::logging::logger("exec")->warn("{} workers clamped {}->{} for cpuset={} (reserved={} minimum={})",
+                                         subsystem,
+                                         requested_workers,
+                                         applied_workers,
+                                         format_cpu_list(cpus),
+                                         reserved_cpus,
+                                         minimum_workers);
 }
 
 void log_process_execution_policy(const char* process_label,
@@ -281,16 +284,15 @@ void log_process_execution_policy(const char* process_label,
         return;
     }
 
-    std::fprintf(stderr,
-                 "[exec] %s cpuset=%s online=%d scheduler=%s/%d nice=%d io=%s/%d\n",
-                 process_label,
-                 format_cpu_list(snapshot.affinity).c_str(),
-                 snapshot.online_cpu_count,
-                 scheduler_policy_name(snapshot.scheduler_policy),
-                 snapshot.scheduler_priority,
-                 snapshot.nice_value,
-                 ioprio_class_name(snapshot.io_class),
-                 snapshot.io_priority_data);
+    mmltk::logging::logger("exec")->info("{} cpuset={} online={} scheduler={}/{} nice={} io={}/{}",
+                                         process_label,
+                                         format_cpu_list(snapshot.affinity),
+                                         snapshot.online_cpu_count,
+                                         scheduler_policy_name(snapshot.scheduler_policy),
+                                         snapshot.scheduler_priority,
+                                         snapshot.nice_value,
+                                         ioprio_class_name(snapshot.io_class),
+                                         snapshot.io_priority_data);
 }
 
-} // namespace fastloader
+} // namespace mmltk

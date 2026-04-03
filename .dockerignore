@@ -3,10 +3,13 @@
 .claude
 
 # Build outputs
-# /build/
+/build/
+/workspace/
 /compiled/
+/compiled-*
 /profiles/
 /artifacts/
+/seg-*
 *synth*
 
 # Python/cache noise

@@ -1,6 +1,7 @@
-#include "fastloader/rfdetr/target_builder.h"
+#include "mmltk/rfdetr/target_builder.h"
 
 #include "compiled_format.h"
+#include "mmltk_logging.h"
 #include "profile_utils.h"
 #include "rfdetr/cuda_utils.h"
 
@@ -11,7 +12,7 @@
 #include <exception>
 #include <limits>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 namespace {
 
@@ -58,11 +59,11 @@ c10::DeviceIndex cuda_device_index(int device_id) {
 }
 
 torch::Device cuda_device(int device_id) {
-    return torch::Device(torch::kCUDA, cuda_device_index(device_id));
+    return {torch::kCUDA, cuda_device_index(device_id)};
 }
 
 void BatchStaticTensors::ensure(int64_t batch_size, int height, int width, int target_device_id) {
-    FASTLOADER_PROFILE_SCOPE("rfdetr.targets.static_tensors");
+    MMLTK_PROFILE_SCOPE("rfdetr.targets.static_tensors");
     const bool stale_shape =
         device_id != target_device_id || image_height != height || image_width != width;
     if (!stale_shape && batch_capacity >= batch_size && sizes.defined() && nested_mask.defined()) {
@@ -96,10 +97,13 @@ TargetScratch::~TargetScratch() {
     try {
         wait_for_pending_copy();
     } catch (const std::exception& ex) {
-        std::fprintf(stderr, "fatal: failed to finish target copy before destruction: %s\n", ex.what());
+        mmltk::logging::logger("rfdetr.target_builder")->error(
+            "fatal: failed to finish target copy before destruction: {}",
+            ex.what());
         std::terminate();
     } catch (...) {
-        std::fputs("fatal: failed to finish target copy before destruction with unknown exception\n", stderr);
+        mmltk::logging::logger("rfdetr.target_builder")->error(
+            "fatal: failed to finish target copy before destruction with unknown exception");
         std::terminate();
     }
     if (copy_complete_event != nullptr) {
@@ -109,7 +113,7 @@ TargetScratch::~TargetScratch() {
 }
 
 void TargetScratch::ensure_batch(size_t batch_size, int height, int width, int target_device_id) {
-    FASTLOADER_PROFILE_SCOPE("rfdetr.targets.ensure_batch");
+    MMLTK_PROFILE_SCOPE("rfdetr.targets.ensure_batch");
     wait_for_pending_copy();
     batch.ensure(static_cast<int64_t>(batch_size), height, width, target_device_id);
     device_id = target_device_id;
@@ -126,7 +130,7 @@ void TargetScratch::ensure_batch(size_t batch_size, int height, int width, int t
 }
 
 void TargetScratch::ensure_instance_capacity(int64_t instances) {
-    FASTLOADER_PROFILE_SCOPE("rfdetr.targets.ensure_instances");
+    MMLTK_PROFILE_SCOPE("rfdetr.targets.ensure_instances");
     const bool tensors_ready =
         boxes_cpu.defined() &&
         labels_cpu.defined() &&
@@ -208,8 +212,8 @@ void TargetScratch::handoff_pending_copy_to_current_stream(int target_device_id)
         "cudaStreamWaitEvent for target copy");
 }
 
-LoaderBatchGuard::LoaderBatchGuard(fastloader::DatasetLoader& loader,
-                                   const fastloader::Batch& batch,
+LoaderBatchGuard::LoaderBatchGuard(mmltk::DatasetLoader& loader,
+                                   const mmltk::Batch& batch,
                                    int device_id)
     : loader_(&loader), batch_(batch), device_id_(device_id) {
     const auto device_index = cuda_device_index(device_id_);
@@ -223,10 +227,13 @@ LoaderBatchGuard::~LoaderBatchGuard() {
         c10::cuda::CUDAGuard device_guard(cuda_device_index(device_id_));
         loader_->release_batch(batch_, consumer_stream_);
     } catch (const std::exception& ex) {
-        std::fprintf(stderr, "fatal: failed to release dataset batch: %s\n", ex.what());
+        mmltk::logging::logger("rfdetr.target_builder")->error(
+            "fatal: failed to release dataset batch: {}",
+            ex.what());
         std::terminate();
     } catch (...) {
-        std::fputs("fatal: failed to release dataset batch with unknown exception\n", stderr);
+        mmltk::logging::logger("rfdetr.target_builder")->error(
+            "fatal: failed to release dataset batch with unknown exception");
         std::terminate();
     }
 }
@@ -244,11 +251,11 @@ torch::Tensor make_size_tensor(int64_t batch_size,
     return sizes;
 }
 
-torch::Tensor make_device_batch_tensor(const fastloader::Batch& batch,
+torch::Tensor make_device_batch_tensor(const mmltk::Batch& batch,
                                        int device_id,
                                        int64_t image_height,
                                        int64_t image_width) {
-    FASTLOADER_PROFILE_SCOPE("rfdetr.pybind.device_batch_tensor");
+    MMLTK_PROFILE_SCOPE("rfdetr.pybind.device_batch_tensor");
     return torch::from_blob(
         const_cast<float*>(batch.device_images),
         {static_cast<int64_t>(batch.num_images), 3, image_height, image_width},
@@ -260,7 +267,7 @@ std::string resolve_path(const std::string& path) {
     return std::filesystem::absolute(std::filesystem::path(path)).string();
 }
 
-fastloader::DatasetLoader::Config make_loader_config(const std::string& compiled_path,
+mmltk::DatasetLoader::Config make_loader_config(const std::string& compiled_path,
                                                      size_t batch_size,
                                                      bool shuffle,
                                                      int prefetch_factor,
@@ -270,7 +277,7 @@ fastloader::DatasetLoader::Config make_loader_config(const std::string& compiled
                                                      uint64_t seed,
                                                      uint32_t batch_shard_rank,
                                                      uint32_t batch_shard_count) {
-    fastloader::DatasetLoader::Config config;
+    mmltk::DatasetLoader::Config config;
     config.compiled_path = resolve_path(compiled_path);
     config.batch_size = batch_size;
     config.shuffle = shuffle;
@@ -285,18 +292,18 @@ fastloader::DatasetLoader::Config make_loader_config(const std::string& compiled
     return config;
 }
 
-PreparedTargets build_targets(const fastloader::Batch& batch,
+PreparedTargets build_targets(const mmltk::Batch& batch,
                               int image_height,
                               int image_width,
                               bool include_masks,
                               bool require_masks,
                               int device_id,
                               TargetScratch& scratch) {
-    FASTLOADER_PROFILE_SCOPE("rfdetr.targets.total");
+    MMLTK_PROFILE_SCOPE("rfdetr.targets.total");
     PreparedTargets prepared;
     prepared.targets.reserve(batch.num_images);
     scratch.ensure_batch(batch.num_images, image_height, image_width, device_id);
-    FASTLOADER_PROFILE_ADD("rfdetr.targets.images", batch.num_images);
+    MMLTK_PROFILE_ADD("rfdetr.targets.images", batch.num_images);
     const auto device = cuda_device(device_id);
     const auto gpu_float = torch::TensorOptions().dtype(torch::kFloat32).device(device);
     const auto gpu_int64 = torch::TensorOptions().dtype(torch::kInt64).device(device);
@@ -308,7 +315,7 @@ PreparedTargets build_targets(const fastloader::Batch& batch,
     auto image_ids_cpu = scratch.image_ids_cpu.narrow(0, 0, static_cast<int64_t>(batch.num_images));
     auto image_ids = image_ids_cpu.accessor<int64_t, 1>();
     {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.targets.index_targets");
+        MMLTK_PROFILE_SCOPE("rfdetr.targets.index_targets");
         for (size_t image_pos = 0; image_pos < batch.num_images; ++image_pos) {
             const uint32_t dataset_index = batch.image_indices[image_pos];
             const auto& entry = batch.label_index[dataset_index];
@@ -318,7 +325,7 @@ PreparedTargets build_targets(const fastloader::Batch& batch,
             image_ids[static_cast<int64_t>(image_pos)] = static_cast<int64_t>(dataset_index) + 1;
         }
     }
-    FASTLOADER_PROFILE_ADD("rfdetr.targets.instances", total_instances);
+    MMLTK_PROFILE_ADD("rfdetr.targets.instances", total_instances);
 
     scratch.ensure_copy_resources(device_id);
     torch::Tensor boxes_gpu = torch::zeros({0, 4}, gpu_float);
@@ -362,20 +369,20 @@ PreparedTargets build_targets(const fastloader::Batch& batch,
 
         int64_t mask_instances = 0;
         {
-            FASTLOADER_PROFILE_SCOPE("rfdetr.targets.pack_instances");
+            MMLTK_PROFILE_SCOPE("rfdetr.targets.pack_instances");
             for (size_t image_pos = 0; image_pos < batch.num_images; ++image_pos) {
                 const uint32_t dataset_index = batch.image_indices[image_pos];
                 const auto& entry = batch.label_index[dataset_index];
-                const size_t label_begin = static_cast<size_t>(entry.label_begin);
+                const auto label_begin = static_cast<size_t>(entry.label_begin);
                 const int64_t batch_offset = offsets[image_pos];
                 const int64_t count = counts[image_pos];
                 for (int64_t instance_index = 0; instance_index < count; ++instance_index) {
                     const int64_t target_index = batch_offset + instance_index;
                     const auto& instance = batch.labels[label_begin + static_cast<size_t>(instance_index)];
-                    const float x1 = static_cast<float>(instance.bbox_x1);
-                    const float y1 = static_cast<float>(instance.bbox_y1);
-                    const float x2 = static_cast<float>(instance.bbox_x2);
-                    const float y2 = static_cast<float>(instance.bbox_y2);
+                    const auto x1 = static_cast<float>(instance.bbox_x1);
+                    const auto y1 = static_cast<float>(instance.bbox_y1);
+                    const auto x2 = static_cast<float>(instance.bbox_x2);
+                    const auto y2 = static_cast<float>(instance.bbox_y2);
                     const float width = std::max(0.0f, x2 - x1);
                     const float height = std::max(0.0f, y2 - y1);
 
@@ -395,7 +402,7 @@ PreparedTargets build_targets(const fastloader::Batch& batch,
                     ++mask_instances;
                     const uint16_t pair_count = instance.mask_rle_pairs;
                     const size_t pair_offset =
-                        static_cast<size_t>(instance.mask_rle_offset) / sizeof(fastloader::RLEPair);
+                        static_cast<size_t>(instance.mask_rle_offset) / sizeof(mmltk::RLEPair);
                     if (pair_count == 0) {
                         if (require_masks) {
                             throw std::runtime_error(
@@ -425,10 +432,10 @@ PreparedTargets build_targets(const fastloader::Batch& batch,
                 }
             }
         }
-        FASTLOADER_PROFILE_ADD("rfdetr.targets.mask_instances", mask_instances);
+        MMLTK_PROFILE_ADD("rfdetr.targets.mask_instances", mask_instances);
 
         {
-            FASTLOADER_PROFILE_SCOPE("rfdetr.targets.h2d");
+            MMLTK_PROFILE_SCOPE("rfdetr.targets.h2d");
             c10::cuda::CUDAGuard device_guard(cuda_device_index(device_id));
             const auto copy_stream = require_copy_stream(scratch);
             c10::cuda::CUDAStreamGuard stream_guard(copy_stream);
@@ -470,7 +477,7 @@ PreparedTargets build_targets(const fastloader::Batch& batch,
     prepared.offsets = scratch.offsets;
     prepared.counts = scratch.counts;
     {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.targets.pack_views");
+        MMLTK_PROFILE_SCOPE("rfdetr.targets.pack_views");
         for (size_t image_pos = 0; image_pos < batch.num_images; ++image_pos) {
             PreparedTarget target;
             target.image_id = image_ids_gpu.narrow(0, static_cast<int64_t>(image_pos), 1);
@@ -486,4 +493,4 @@ PreparedTargets build_targets(const fastloader::Batch& batch,
     return prepared;
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

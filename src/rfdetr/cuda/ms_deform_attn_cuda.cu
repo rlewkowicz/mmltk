@@ -17,7 +17,7 @@
 
 #include <cstdint>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 void launch_ms_deform_attn_cuda_forward(const float* value,
                                         const int64_t* spatial_shapes,
@@ -105,4 +105,4 @@ void launch_ms_deform_attn_cuda_backward(const float* value,
     }
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

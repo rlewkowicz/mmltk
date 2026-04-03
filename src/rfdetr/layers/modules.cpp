@@ -1,16 +1,20 @@
-#include "fastloader/rfdetr/modules.h"
+#include "mmltk/rfdetr/modules.h"
 
 #include "profile_utils.h"
+#include "rfdetr/shared_cuda_event.h"
 
 #include <ATen/TensorIndexing.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 #include <torch/nn/functional.h>
 
 #include <cmath>
+#include <optional>
 #include <stdexcept>
 
 namespace F = torch::nn::functional;
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 namespace {
 
@@ -130,6 +134,25 @@ torch::Tensor PositionEmbeddingSineImpl::forward_full_valid(int64_t batch_size,
     }
 
     const int device_index = device.has_index() ? device.index() : -1;
+    const auto wait_for_cache_entry = [](const auto& entry) {
+        if (entry.device_type != c10::DeviceType::CUDA || !entry.ready_event) {
+            return;
+        }
+        const auto cuda_device_index = checked_device_index(entry.device_index);
+        c10::cuda::CUDAGuard device_guard(cuda_device_index);
+        wait_for_shared_cuda_event(
+            c10::cuda::getCurrentCUDAStream(cuda_device_index).stream(),
+            *entry.ready_event,
+            "cudaStreamWaitEvent for position embedding cache reuse");
+    };
+    const auto expand_entry = [batch_size](const auto& entry) {
+        if (entry.align_dim_orders) {
+            return entry.base.expand({entry.height, entry.width, batch_size, entry.base.size(3)});
+        }
+        return entry.base.expand({batch_size, entry.base.size(1), entry.height, entry.width});
+    };
+
+    std::optional<FullValidCacheEntry> cached_entry;
     {
         std::lock_guard<std::mutex> lock(cache_mutex_);
         for (const auto& entry : full_valid_cache_) {
@@ -138,17 +161,30 @@ torch::Tensor PositionEmbeddingSineImpl::forward_full_valid(int64_t batch_size,
                 entry.height == height &&
                 entry.width == width &&
                 entry.align_dim_orders == align_dim_orders) {
-                FASTLOADER_PROFILE_ADD("rfdetr.pos_embed.cache_hit", 1);
-                if (align_dim_orders) {
-                    return entry.base.expand({height, width, batch_size, entry.base.size(3)});
-                }
-                return entry.base.expand({batch_size, entry.base.size(1), height, width});
+                cached_entry = entry;
+                break;
             }
         }
     }
+    if (cached_entry.has_value()) {
+        MMLTK_PROFILE_ADD("rfdetr.pos_embed.cache_hit", 1);
+        wait_for_cache_entry(*cached_entry);
+        return expand_entry(*cached_entry);
+    }
 
-    FASTLOADER_PROFILE_ADD("rfdetr.pos_embed.cache_miss", 1);
-    auto base = build_full_valid_base(height, width, device, align_dim_orders);
+    MMLTK_PROFILE_ADD("rfdetr.pos_embed.cache_miss", 1);
+    torch::Tensor base;
+    std::shared_ptr<SharedCudaEvent> ready_event;
+    if (device.is_cuda()) {
+        const auto cuda_device_index = checked_device_index(device_index);
+        c10::cuda::CUDAGuard device_guard(cuda_device_index);
+        base = build_full_valid_base(height, width, device, align_dim_orders);
+        ready_event = record_shared_cuda_event(
+            c10::cuda::getCurrentCUDAStream(cuda_device_index).stream(),
+            "position embedding cache ready event");
+    } else {
+        base = build_full_valid_base(height, width, device, align_dim_orders);
+    }
 
     {
         std::lock_guard<std::mutex> lock(cache_mutex_);
@@ -159,21 +195,25 @@ torch::Tensor PositionEmbeddingSineImpl::forward_full_valid(int64_t batch_size,
                 entry.height == height &&
                 entry.width == width &&
                 entry.align_dim_orders == align_dim_orders) {
-                if (align_dim_orders) {
-                    return entry.base.expand({height, width, batch_size, entry.base.size(3)});
-                }
-                return entry.base.expand({batch_size, entry.base.size(1), height, width});
+                cached_entry = entry;
+                break;
             }
         }
-    
-        full_valid_cache_.push_back(FullValidCacheEntry{
-            device.type(),
-            device_index,
-            height,
-            width,
-            align_dim_orders,
-            base,
-        });
+        if (!cached_entry.has_value()) {
+            full_valid_cache_.push_back(FullValidCacheEntry{
+                device.type(),
+                device_index,
+                height,
+                width,
+                align_dim_orders,
+                base,
+                ready_event,
+            });
+        }
+    }
+    if (cached_entry.has_value()) {
+        wait_for_cache_entry(*cached_entry);
+        return expand_entry(*cached_entry);
     }
 
     if (align_dim_orders) {
@@ -417,4 +457,4 @@ std::vector<OutputLayer::SparsePredMasks> SegmentationHeadImpl::sparse_forward(
     return sparse_outputs;
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

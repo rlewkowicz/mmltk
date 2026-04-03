@@ -1,6 +1,6 @@
-#include "fastloader/runtime/async_runtime.h"
+#include "mmltk/runtime/async_runtime.h"
 
-namespace fastloader::runtime {
+namespace mmltk::runtime {
 
 TaskCancellation::TaskCancellation()
     : state_(std::make_shared<State>()) {}
@@ -65,4 +65,4 @@ void BackgroundExecutor::wait_idle() {
     worker_pool_.wait_idle();
 }
 
-} // namespace fastloader::runtime
+} // namespace mmltk::runtime

@@ -1,8 +1,9 @@
 #include "profile_utils.h"
 #include "execution_policy.h"
-#include "fastloader/rfdetr/predict.h"
+#include "mmltk/rfdetr/predict.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cmath>
@@ -38,9 +39,9 @@ struct EvaluateRun {
 };
 
 std::string iteration_label_for_run(const char* run_label, int repetition) {
-    char buffer[96];
-    std::snprintf(buffer, sizeof(buffer), "%s[%02d]", run_label, repetition);
-    return buffer;
+    std::array<char, 96> buffer{};
+    std::snprintf(buffer.data(), buffer.size(), "%s[%02d]", run_label, repetition);
+    return buffer.data();
 }
 
 Options parse_options(int argc, char** argv) {
@@ -110,15 +111,15 @@ std::string metric_name(const char* suffix) {
 }
 
 void record_duration_metric(const char* suffix, std::uint64_t elapsed_ns) {
-    fastloader::profile_record_duration_ns(metric_name(suffix).c_str(), elapsed_ns);
+    mmltk::profile_record_duration_ns(metric_name(suffix).c_str(), elapsed_ns);
 }
 
 void record_value_metric(const char* suffix, std::uint64_t value) {
-    fastloader::profile_add_value(metric_name(suffix).c_str(), value);
+    mmltk::profile_add_value(metric_name(suffix).c_str(), value);
 }
 
 EvaluateRun run_checkpoint_backend(const Options& options) {
-    fastloader::rfdetr::EvaluateOptions evaluate_options;
+    mmltk::rfdetr::EvaluateOptions evaluate_options;
     evaluate_options.compiled_path = options.compiled_path;
     evaluate_options.weights_path = options.checkpoint_path;
     evaluate_options.batch_size = static_cast<size_t>(std::max(1, options.batch_size));
@@ -128,10 +129,10 @@ EvaluateRun run_checkpoint_backend(const Options& options) {
     evaluate_options.cpu_affinity = options.cpu_affinity;
 
     const auto started = std::chrono::steady_clock::now();
-    const fastloader::rfdetr::EvaluationRunResult result = fastloader::rfdetr::run_evaluation(evaluate_options);
+    const mmltk::rfdetr::EvaluationRunResult result = mmltk::rfdetr::run_evaluation(evaluate_options);
     const std::uint64_t elapsed_ns = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
-    fastloader::rfdetr::print_evaluation_summary(evaluate_options, result);
+    mmltk::rfdetr::print_evaluation_summary(evaluate_options, result);
 
     return EvaluateRun{
         elapsed_ns,
@@ -163,14 +164,14 @@ void print_iteration_line(const char* phase, int index, int total, const Evaluat
 } // namespace
 
 int main(int argc, char** argv) {
-    FASTLOADER_PROFILE_PROCESS_LABEL("profile.rfdetr.evaluate");
-    FASTLOADER_PROFILE_RUN_LABEL("rfdetr.evaluate.checkpoint");
+    MMLTK_PROFILE_PROCESS_LABEL("profile.rfdetr.evaluate");
+    MMLTK_PROFILE_RUN_LABEL("rfdetr.evaluate.checkpoint");
 
     try {
-        const fastloader::ExecutionPolicySnapshot execution_snapshot =
-            fastloader::apply_process_execution_policy();
-        fastloader::log_process_execution_policy(
-            "fastloader_rfdetr_profile_runner",
+        const mmltk::ExecutionPolicySnapshot execution_snapshot =
+            mmltk::apply_process_execution_policy();
+        mmltk::log_process_execution_policy(
+            "mmltk_rfdetr_profile_runner",
             execution_snapshot,
             false,
             true);
@@ -184,17 +185,17 @@ int main(int argc, char** argv) {
         repetition_runs.reserve(static_cast<size_t>(std::max(1, options.repetitions)));
 
         for (int warmup = 0; warmup < options.warmup_runs; ++warmup) {
-            FASTLOADER_PROFILE_RESET_ITERATION();
+            MMLTK_PROFILE_RESET_ITERATION();
             warmup_runs.push_back(run_checkpoint_backend(options));
         }
 
         for (int repetition = 0; repetition < options.repetitions; ++repetition) {
-            fastloader::profile_set_run_label("rfdetr.evaluate.checkpoint");
-            fastloader::profile_reset_iteration();
+            mmltk::profile_set_run_label("rfdetr.evaluate.checkpoint");
+            mmltk::profile_reset_iteration();
             const EvaluateRun run = run_checkpoint_backend(options);
             record_evaluate_metrics(run);
             repetition_runs.push_back(run);
-            fastloader::profile_capture_iteration(
+            mmltk::profile_capture_iteration(
                 iteration_label_for_run("rfdetr.evaluate.checkpoint", repetition + 1).c_str());
         }
 
@@ -210,10 +211,10 @@ int main(int argc, char** argv) {
                 repetition_runs[static_cast<size_t>(repetition)]);
         }
 
-        FASTLOADER_PROFILE_FLUSH();
+        MMLTK_PROFILE_FLUSH();
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "fastloader_rfdetr_profile_runner error: %s\n", error.what());
+        std::fprintf(stderr, "mmltk_rfdetr_profile_runner error: %s\n", error.what());
         return 1;
     }
 }

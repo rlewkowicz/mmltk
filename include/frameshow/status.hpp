@@ -1,10 +1,11 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 namespace frameshow {
 
-enum class StatusCode {
+enum class StatusCode : std::uint8_t {
   kOk = 0,
   kNotReady,
   kInvalidArgument,

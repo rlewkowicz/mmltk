@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <memory>
 
-namespace fastloader {
+namespace mmltk {
 
 struct ResizeWorkerPlan {
     int image_workers = 1;
@@ -36,4 +36,4 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace fastloader
+} // namespace mmltk

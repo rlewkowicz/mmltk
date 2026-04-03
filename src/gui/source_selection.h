@@ -1,10 +1,11 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 
-namespace fastloader::gui {
+namespace mmltk::gui {
 
-enum class SourceKind : int {
+enum class SourceKind : std::uint8_t {
     CompiledDataset = 0,
     SingleImage = 1,
     ImageFolder = 2,
@@ -50,4 +51,4 @@ SourceSelectionUiActions draw_source_selection(SourceSelectionState& state,
                                                bool allow_video_stream = true,
                                                bool single_image_browse_busy = false);
 
-} // namespace fastloader::gui
+} // namespace mmltk::gui

@@ -2,6 +2,126 @@
 
 A real time interface for training, prediction, annotation, augmentation, and composition of popular opensource models.
 
+## Current State 
+The training/validation etc is all great, if you're coming across this, you won't have my dataset format, I'm sure your llm will get it, but I'll still publish one soon. Should be mathematically equivalent to python. But that is tenuously verified. Training 2-10x faster than python. 
+
+Just did a big cleanup pass, haven't done a review yet. Getting ready to push the docker image. The gui works, has some good value, but is not fully functional.
+
+## Build
+
+Build the runtime image once:
+
+```bash
+docker build -t mmltk .
+```
+
+## Usage
+
+Use the repo-root wrapper:
+
+```bash
+./mmltk --help
+./mmltk --tidy
+./mmltk --test list
+./mmltk --test all
+./mmltk rfdetr predict --compiled ./compiled-seg-medium-synth/val.bin --output ./predictions.json --weights ./engines/output-seg-medium/train-local/checkpoint_best_regular.pt
+```
+
+The wrapper:
+
+- checks Docker with an instant `docker version` probe
+- does one best-effort non-interactive daemon start if Docker is down
+- reuses a repo-scoped long-running container
+- builds a cached Docker build-stage image for `--tidy`
+- streams stdout/stderr through `docker exec`
+- rewrites absolute host paths into the container's `/host/...` bind
+
+### Static Analysis
+
+Run the full Docker-backed static-analysis pass:
+
+```bash
+./mmltk --tidy
+```
+
+The wrapper rebuilds a cached analysis image from the Docker build stage, regenerates
+`build/docker-dev-tidy/compile_commands.json` inside the container, then runs
+`clang-tidy` followed by `cppcheck`.
+
+If `clang-tidy` stops on a file you are fixing, restart from that translation unit:
+
+```bash
+./mmltk --tidy --start-at src/cpu_affinity.cpp
+```
+
+### Tests
+
+List the bundled test bundles exposed by the Docker-backed wrapper:
+
+```bash
+./mmltk --test list
+```
+
+Run every bundled suite from the wrapper-managed Docker container:
+
+```bash
+./mmltk --test all
+```
+
+RF-DETR integration assets are cached under `.mmltk-data/test-cache/rfdetr` when
+you run tests through `./mmltk`. The RF-DETR test bundle downloads the nano
+checkpoint from the built-in catalog, normalizes it to the native checkpoint
+format, exports ONNX, and builds a TensorRT engine from that cache on first use.
+
+Forward Catch2 selectors or flags after `--`:
+
+```bash
+./mmltk --test core -- --list-tests
+./mmltk --test rfdetr -- "~[optin]"
+```
+
+### GUI
+
+Open the GUI with the existing repo-root `gui.json`:
+
+```bash
+./mmltk --gui
+```
+
+Seed the GUI from CLI-compatible RF-DETR arguments before it opens:
+
+```bash
+./mmltk --gui rfdetr validate --compiled ./compiled-seg-medium-synth/val.bin --onnx ./models/rf-detr-seg-medium.onnx
+./mmltk --gui rfdetr predict --compiled ./compiled-seg-medium-synth/val.bin --output ./predictions.json --weights ./engines/output-seg-medium/train-local/checkpoint_best_regular.pt
+./mmltk --gui rfdetr train --train-compiled ./compiled-seg-medium-synth/train.bin --val-compiled ./compiled-seg-medium-synth/val.bin --output-dir ./engines/output-seg-medium/train-local --weights ./engines/output-seg-medium/train-local/checkpoint_best_regular.pt --device-id 0
+```
+
+Supported GUI-seeded commands:
+
+- `mmltk rfdetr train`
+- `mmltk rfdetr predict`
+- `mmltk rfdetr validate`
+- `mmltk rfdetr build-engine`
+- `mmltk rfdetr export-onnx`
+
+Commands or flags without matching GUI fields are rejected instead of being ignored.
+
+Wrapper-managed containers run with `--privileged`. When `--gui` is set, the wrapper also bind-mounts the active UI runtime paths, keeps the container process on your host UID/GID for display auth, prefers `MMLTK_GUI_PLATFORM=x11` when `DISPLAY` is available, and recreates the cached container if that GUI runtime shape changed.
+
+For NVIDIA/Xwayland setups, run the wrapper with the same env you use natively:
+
+```bash
+XDG_RUNTIME_DIR=/run/user/1000 \
+DISPLAY=:0 \
+XAUTHORITY=/run/user/1000/.mutter-Xwaylandauth.G5IRL3 \
+WAYLAND_DISPLAY=wayland-0 \
+__NV_PRIME_RENDER_OFFLOAD=1 \
+__GLX_VENDOR_LIBRARY_NAME=nvidia \
+./mmltk --gui rfdetr train --train-compiled ./compiled-seg-medium-synth/train.bin --val-compiled ./compiled-seg-medium-synth/val.bin --output-dir ./engines/output-seg-medium/train-local --weights ./engines/output-seg-medium/train-local/checkpoint_best_regular.pt --device-id 0
+```
+
+The wrapper writes seeded GUI state back into the repo-root `gui.json`, and the GUI loads that file on startup.
+
 ## DONE
 - [x] **RF-DETR**
 - [x] **Muon optimizer**

@@ -1,4 +1,4 @@
-#include "fastloader/rfdetr/detection_ops.h"
+#include "mmltk/rfdetr/detection_ops.h"
 #include "profile_utils.h"
 #include "rfdetr/cuda_utils.h"
 #include "rfdetr/postprocess.h"
@@ -30,11 +30,11 @@
 namespace F = torch::nn::functional;
 using namespace torch::indexing;
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 namespace {
 
-thread_local fastloader::WorkerPool* g_worker_pool = nullptr;
+thread_local mmltk::WorkerPool* g_worker_pool = nullptr;
 
 struct MatcherCostScratch {
     torch::Tensor cpu_cost;
@@ -67,18 +67,18 @@ struct MatcherCostScratch {
         live_copy_sources.clear();
     }
 
-    torch::Tensor cost_view(const int64_t batch_size,
-                            const int64_t num_queries,
-                            const int64_t max_targets_per_image) const {
+    [[nodiscard]] torch::Tensor cost_view(const int64_t batch_size,
+                                          const int64_t num_queries,
+                                          const int64_t max_targets_per_image) const {
         return cpu_cost.narrow(0, 0, batch_size)
             .narrow(1, 0, num_queries)
             .narrow(2, 0, max_targets_per_image);
     }
 
-    torch::Tensor cost_batch_view(const int64_t batch_index,
-                                  const int64_t batch_size,
-                                  const int64_t num_queries,
-                                  const int64_t max_targets_per_image) const {
+    [[nodiscard]] torch::Tensor cost_batch_view(const int64_t batch_index,
+                                                const int64_t batch_size,
+                                                const int64_t num_queries,
+                                                const int64_t max_targets_per_image) const {
         return cost_view(batch_size, num_queries, max_targets_per_image).select(0, batch_index);
     }
 };
@@ -101,7 +101,7 @@ struct LsapScratch {
         );
     }
 
-    torch::Tensor cost_view(int64_t rows, int64_t cols) const {
+    [[nodiscard]] torch::Tensor cost_view(int64_t rows, int64_t cols) const {
         return cost_double_flat.narrow(0, 0, rows * cols).view({rows, cols});
     }
 };
@@ -424,10 +424,10 @@ torch::Tensor wait_for_cost_copies(const torch::Device& device,
     }
     const auto device_index = static_cast<c10::DeviceIndex>(device.index());
     c10::cuda::CUDAGuard device_guard(device_index);
-    fastloader::rfdetr::ensure_cuda_ok(
+    mmltk::rfdetr::ensure_cuda_ok(
         cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream(device_index).stream()),
         "cudaStreamSynchronize for matcher cost copy");
-    FASTLOADER_PROFILE_ADD("rfdetr.matcher.cost_copy_syncs", 1);
+    MMLTK_PROFILE_ADD("rfdetr.matcher.cost_copy_syncs", 1);
     scratch.live_copy_sources.clear();
     return cost_cpu;
 }
@@ -439,7 +439,7 @@ void sanitize_cost_matrix_cpu_(const torch::Tensor& cost_cpu) {
             return;
         }
 
-        const double dtype_max = static_cast<double>(std::numeric_limits<float>::max());
+        const auto dtype_max = static_cast<double>(std::numeric_limits<float>::max());
         double replacement = dtype_max;
         if (finite_mask.any().item<bool>()) {
             const auto finite_costs = cost_cpu.masked_select(finite_mask);
@@ -660,7 +660,7 @@ torch::Tensor get_uncertain_point_coords_with_randomness(const torch::Tensor& co
     );
     const auto point_logits = point_sample(coarse_logits, point_coords, torch::kBilinear);
     const auto point_uncertainties = calculate_uncertainty(point_logits);
-    const int64_t num_uncertain_points =
+    const auto num_uncertain_points =
         static_cast<int64_t>(importance_sample_ratio * static_cast<double>(num_points));
     const int64_t num_random_points = num_points - num_uncertain_points;
 
@@ -697,7 +697,7 @@ torch::Tensor get_uncertain_point_coords_with_randomness(const torch::Tensor& co
     return sampled_coords;
 }
 
-using fastloader::rfdetr::box_cxcywh_to_xyxy;
+using mmltk::rfdetr::box_cxcywh_to_xyxy;
 
 torch::Tensor box_area(const torch::Tensor& boxes) {
     const auto wh = (boxes.index({Slice(), Slice(2, 4)}) - boxes.index({Slice(), Slice(0, 2)})).clamp_min(0.0);
@@ -976,7 +976,7 @@ std::pair<torch::Tensor, torch::Tensor> src_permutation_idx(
             continue;
         }
         if (device.is_cuda()) {
-            FASTLOADER_PROFILE_ADD("rfdetr.matcher.indices_to_device", src.numel());
+            MMLTK_PROFILE_ADD("rfdetr.matcher.indices_to_device", src.numel());
         }
         batch_idx.push_back(torch::full(
             src.sizes(),
@@ -1125,7 +1125,7 @@ torch::Tensor matched_pred_masks(const OutputLayer& layer,
 }
 
 std::pair<std::vector<int64_t>, std::vector<int64_t>> solve_linear_assignment(const torch::Tensor& cost_matrix_cpu) {
-    FASTLOADER_PROFILE_SCOPE("rfdetr.matcher.lsap");
+    MMLTK_PROFILE_SCOPE("rfdetr.matcher.lsap");
     const int64_t rows = cost_matrix_cpu.size(0);
     const int64_t cols = cost_matrix_cpu.size(1);
     if (rows == 0 || cols == 0) {
@@ -1139,14 +1139,14 @@ std::pair<std::vector<int64_t>, std::vector<int64_t>> solve_linear_assignment(co
     scratch.ensure_cost_capacity(rows, cols);
     const auto matrix = scratch.cost_view(rows, cols);
     {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.matcher.cost_to_double");
+        MMLTK_PROFILE_SCOPE("rfdetr.matcher.cost_to_double");
         matrix.copy_(cost_matrix_cpu, false);
     }
 
     const int64_t assignment_size = std::min(rows, cols);
     std::vector<int64_t> row_indices(static_cast<size_t>(assignment_size));
     std::vector<int64_t> col_indices(static_cast<size_t>(assignment_size));
-    const auto status = fastloader::rfdetr::solve_rectangular_linear_sum_assignment(
+    const auto status = mmltk::rfdetr::solve_rectangular_linear_sum_assignment(
         rows,
         cols,
         matrix.data_ptr<double>(),
@@ -1154,10 +1154,10 @@ std::pair<std::vector<int64_t>, std::vector<int64_t>> solve_linear_assignment(co
         row_indices.data(),
         col_indices.data()
     );
-    if (status == fastloader::rfdetr::RectangularLsApStatus::kInvalid) {
+    if (status == mmltk::rfdetr::RectangularLsApStatus::kInvalid) {
         throw std::runtime_error("native RF-DETR matcher received invalid numeric entries in the cost matrix");
     }
-    if (status == fastloader::rfdetr::RectangularLsApStatus::kInfeasible) {
+    if (status == mmltk::rfdetr::RectangularLsApStatus::kInfeasible) {
         throw std::runtime_error("native RF-DETR matcher received an infeasible cost matrix");
     }
     return {std::move(row_indices), std::move(col_indices)};
@@ -1200,7 +1200,7 @@ torch::Tensor build_matcher_cost(const OutputLayer& layer,
 
     torch::Tensor cost_giou;
     {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.matcher.cost_giou");
+        MMLTK_PROFILE_SCOPE("rfdetr.matcher.cost_giou");
         cost_giou = -generalized_box_iou(
             box_cxcywh_to_xyxy(out_bbox),
             box_cxcywh_to_xyxy(tgt_bbox));
@@ -1208,7 +1208,7 @@ torch::Tensor build_matcher_cost(const OutputLayer& layer,
 
     torch::Tensor cost_class;
     {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.matcher.cost_class");
+        MMLTK_PROFILE_SCOPE("rfdetr.matcher.cost_class");
         const auto neg_cost_class =
             (1 - alpha) * torch::pow(out_prob, gamma) * (-F::logsigmoid(-flat_pred_logits));
         const auto pos_cost_class =
@@ -1218,7 +1218,7 @@ torch::Tensor build_matcher_cost(const OutputLayer& layer,
 
     torch::Tensor cost_bbox;
     {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.matcher.cost_bbox");
+        MMLTK_PROFILE_SCOPE("rfdetr.matcher.cost_bbox");
         cost_bbox = torch::cdist(out_bbox, tgt_bbox, 1.0);
     }
 
@@ -1229,7 +1229,7 @@ torch::Tensor build_matcher_cost(const OutputLayer& layer,
 
     const bool masks_present = config.include_masks && has_target_masks(targets);
     if (masks_present) {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.matcher.cost_masks");
+        MMLTK_PROFILE_SCOPE("rfdetr.matcher.cost_masks");
         torch::Tensor point_coords;
         torch::Tensor pred_masks_logits;
         if (layer.pred_masks.has_value()) {
@@ -1244,7 +1244,7 @@ torch::Tensor build_matcher_cost(const OutputLayer& layer,
                                    point_coords.expand({out_masks.size(0), num_points, 2}),
                                    torch::kBilinear)
                                    .squeeze(1);
-            FASTLOADER_PROFILE_SET("rfdetr.matcher.mask_points", static_cast<size_t>(num_points));
+            MMLTK_PROFILE_SET("rfdetr.matcher.mask_points", static_cast<size_t>(num_points));
         } else if (layer.sparse_pred_masks.has_value()) {
             const auto& sparse = *layer.sparse_pred_masks;
             const int64_t num_points =
@@ -1263,7 +1263,7 @@ torch::Tensor build_matcher_cost(const OutputLayer& layer,
             }
             const auto bias = sparse.bias.to(sampled_features.dtype());
             pred_masks_logits = (torch::bmm(query_features, sampled_features) + bias).flatten(0, 1);
-            FASTLOADER_PROFILE_SET("rfdetr.matcher.mask_points", static_cast<size_t>(num_points));
+            MMLTK_PROFILE_SET("rfdetr.matcher.mask_points", static_cast<size_t>(num_points));
         } else {
             throw std::runtime_error("native RF-DETR mask matcher requires pred_masks in the model outputs");
         }
@@ -1302,7 +1302,7 @@ std::pair<torch::Tensor, torch::Tensor> solve_matcher_indices_for_batch_cpu(cons
     batch_rows.reserve(static_cast<size_t>(std::min(num_queries, target_count) * group_detr));
     batch_cols.reserve(static_cast<size_t>(std::min(num_queries, target_count) * group_detr));
     {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.matcher.solve_groups");
+        MMLTK_PROFILE_SCOPE("rfdetr.matcher.solve_groups");
         for (int64_t group_index = 0; group_index < group_detr; ++group_index) {
             auto group_cost = batch_cost_cpu.narrow(0, group_index * group_queries, group_queries);
             auto [rows, cols] = solve_linear_assignment(group_cost);
@@ -1320,7 +1320,7 @@ std::vector<MatchIndices> compute_matcher_indices_for_layers(const std::vector<c
                                                              const PreparedTargets& targets,
                                                              const DetectionConfig& config,
                                                              int64_t group_detr) {
-    FASTLOADER_PROFILE_SCOPE("rfdetr.matcher.total");
+    MMLTK_PROFILE_SCOPE("rfdetr.matcher.total");
     torch::NoGradGuard no_grad;
     if (layers.empty()) {
         return {};
@@ -1340,12 +1340,12 @@ std::vector<MatchIndices> compute_matcher_indices_for_layers(const std::vector<c
     int64_t max_targets_per_image = 0;
     std::vector<int64_t> layer_query_counts;
     layer_query_counts.reserve(layers.size());
-    for (size_t index = 0; index < layers.size(); ++index) {
-        const int64_t layer_queries = layers[index]->pred_logits.size(1);
-        if (layers[index]->pred_logits.size(0) != bs) {
+    for (const auto& layer : layers) {
+        const int64_t layer_queries = layer->pred_logits.size(1);
+        if (layer->pred_logits.size(0) != bs) {
             throw std::runtime_error("native RF-DETR batched matcher requires identical layer batch sizes");
         }
-        if (layers[index]->pred_logits.device() != device) {
+        if (layer->pred_logits.device() != device) {
             throw std::runtime_error("native RF-DETR batched matcher requires all layers on the same device");
         }
         if (layer_queries % group_detr != 0) {
@@ -1357,10 +1357,10 @@ std::vector<MatchIndices> compute_matcher_indices_for_layers(const std::vector<c
     for (const auto count : targets.counts) {
         max_targets_per_image = std::max(max_targets_per_image, count);
     }
-    FASTLOADER_PROFILE_ADD("rfdetr.matcher.batch_size", bs);
-    FASTLOADER_PROFILE_ADD("rfdetr.matcher.num_queries", max_queries);
-    FASTLOADER_PROFILE_ADD("rfdetr.matcher.total_targets", total_targets);
-    FASTLOADER_PROFILE_SET("rfdetr.matcher.layer_count", static_cast<size_t>(layers.size()));
+    MMLTK_PROFILE_ADD("rfdetr.matcher.batch_size", bs);
+    MMLTK_PROFILE_ADD("rfdetr.matcher.num_queries", max_queries);
+    MMLTK_PROFILE_ADD("rfdetr.matcher.total_targets", total_targets);
+    MMLTK_PROFILE_SET("rfdetr.matcher.layer_count", static_cast<size_t>(layers.size()));
     if (total_targets == 0) {
         std::vector<MatchIndices> empty(layers.size(), empty_matcher_indices(targets));
         return empty;
@@ -1373,7 +1373,7 @@ std::vector<MatchIndices> compute_matcher_indices_for_layers(const std::vector<c
                               .narrow(1, 0, layer_query_counts[layer_index]);
         torch::Tensor layer_cost_cpu;
         {
-            FASTLOADER_PROFILE_SCOPE("rfdetr.matcher.cost_to_cpu");
+            MMLTK_PROFILE_SCOPE("rfdetr.matcher.cost_to_cpu");
             for (size_t batch_index = 0; batch_index < targets.targets.size(); ++batch_index) {
                 const int64_t target_count = targets.counts[batch_index];
                 if (target_count == 0) {
@@ -1407,7 +1407,7 @@ std::vector<MatchIndices> compute_matcher_indices_for_layers(const std::vector<c
             }
             auto batch_cost_cpu = layer_cost_cpu.select(0, static_cast<int64_t>(batch_index)).narrow(1, 0, target_count);
             {
-                FASTLOADER_PROFILE_SCOPE("rfdetr.matcher.sanitize_cost");
+                MMLTK_PROFILE_SCOPE("rfdetr.matcher.sanitize_cost");
                 sanitize_cost_matrix_cpu_(batch_cost_cpu);
             }
             layer_indices.push_back(solve_matcher_indices_for_batch_cpu(batch_cost_cpu, group_detr));
@@ -1431,7 +1431,7 @@ TensorMap loss_labels(const OutputLayer& layer,
                       const DetectionConfig& config,
                       double num_boxes,
                       bool log) {
-    FASTLOADER_PROFILE_SCOPE("rfdetr.criterion.loss_labels");
+    MMLTK_PROFILE_SCOPE("rfdetr.criterion.loss_labels");
     TensorMap losses;
     const auto src_logits = layer.pred_logits;
     const auto device = src_logits.device();
@@ -1545,7 +1545,7 @@ TensorMap loss_labels(const OutputLayer& layer,
 
 TensorMap loss_cardinality(const OutputLayer& layer,
                            const PreparedTargets& targets) {
-    FASTLOADER_PROFILE_SCOPE("rfdetr.criterion.loss_cardinality");
+    MMLTK_PROFILE_SCOPE("rfdetr.criterion.loss_cardinality");
     TensorMap losses;
     const auto pred_logits = layer.pred_logits;
     const auto target_lengths = torch::tensor(
@@ -1564,7 +1564,7 @@ TensorMap loss_boxes(const OutputLayer& layer,
                      const PreparedTargets& targets,
                      const std::vector<std::pair<torch::Tensor, torch::Tensor>>& indices,
                      double num_boxes) {
-    FASTLOADER_PROFILE_SCOPE("rfdetr.criterion.loss_boxes");
+    MMLTK_PROFILE_SCOPE("rfdetr.criterion.loss_boxes");
     TensorMap losses;
     const auto device = layer.pred_boxes.device();
     const auto idx = src_permutation_idx(indices, device);
@@ -1587,7 +1587,7 @@ TensorMap loss_masks(const OutputLayer& layer,
                      const std::vector<std::pair<torch::Tensor, torch::Tensor>>& indices,
                      const DetectionConfig& config,
                      double num_boxes) {
-    FASTLOADER_PROFILE_SCOPE("rfdetr.criterion.loss_masks");
+    MMLTK_PROFILE_SCOPE("rfdetr.criterion.loss_masks");
     TensorMap losses;
     const auto device = layer.pred_logits.device();
     const auto idx = src_permutation_idx(indices, device);
@@ -1610,8 +1610,8 @@ TensorMap loss_masks(const OutputLayer& layer,
     const int64_t num_points = std::max<int64_t>(
         src_masks.size(-2),
         src_masks.size(-2) * src_masks.size(-1) / config.mask_point_sample_ratio);
-    FASTLOADER_PROFILE_ADD("rfdetr.criterion.matched_pairs", idx.first.size(0));
-    FASTLOADER_PROFILE_SET("rfdetr.criterion.mask_points", static_cast<size_t>(num_points));
+    MMLTK_PROFILE_ADD("rfdetr.criterion.matched_pairs", idx.first.size(0));
+    MMLTK_PROFILE_SET("rfdetr.criterion.mask_points", static_cast<size_t>(num_points));
 
     torch::Tensor point_coords;
     {
@@ -1684,7 +1684,7 @@ std::vector<std::pair<torch::Tensor, torch::Tensor>> matcher_indices(const Model
                                                                      const PreparedTargets& targets,
                                                                      const DetectionConfig& config,
                                                                      bool training_mode) {
-    FASTLOADER_PROFILE_SCOPE("rfdetr.matcher.public");
+    MMLTK_PROFILE_SCOPE("rfdetr.matcher.public");
     return compute_matcher_indices(outputs.main, targets, config, training_mode ? config.group_detr : 1);
 }
 
@@ -1694,7 +1694,7 @@ TensorMap detection_loss_dict(const ModelOutputs& outputs,
                               bool training_mode,
                               bool distributed_enabled,
                               const AllReduceTensorFn& distributed_all_reduce) {
-    FASTLOADER_PROFILE_SCOPE("rfdetr.criterion.total");
+    MMLTK_PROFILE_SCOPE("rfdetr.criterion.total");
     const int64_t group_detr = training_mode ? config.group_detr : 1;
     int64_t num_boxes_int = 0;
     for (const auto count : targets.counts) {
@@ -1704,13 +1704,13 @@ TensorMap detection_loss_dict(const ModelOutputs& outputs,
         num_boxes_int *= group_detr;
     }
 
-    FASTLOADER_PROFILE_ADD("rfdetr.criterion.num_boxes", num_boxes_int);
+    MMLTK_PROFILE_ADD("rfdetr.criterion.num_boxes", num_boxes_int);
     double num_boxes_value = std::max(
         static_cast<double>(num_boxes_int) / static_cast<double>(std::max<int64_t>(1, config.world_size)),
         1.0
     );
     if (distributed_enabled) {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.criterion.distributed_num_boxes");
+        MMLTK_PROFILE_SCOPE("rfdetr.criterion.distributed_num_boxes");
         auto num_boxes = torch::tensor(
             {static_cast<float>(num_boxes_int)},
             torch::TensorOptions().dtype(torch::kFloat32).device(outputs.main.pred_logits.device())
@@ -1730,7 +1730,7 @@ TensorMap detection_loss_dict(const ModelOutputs& outputs,
                               const DetectionConfig& config,
                               bool training_mode,
                               double num_boxes_value) {
-    FASTLOADER_PROFILE_SCOPE("rfdetr.criterion.total_resolved_num_boxes");
+    MMLTK_PROFILE_SCOPE("rfdetr.criterion.total_resolved_num_boxes");
     const int64_t group_detr = training_mode ? config.group_detr : 1;
     std::vector<const OutputLayer*> matcher_layers;
     matcher_layers.reserve(1 + outputs.aux_outputs.size() + (outputs.enc_outputs.has_value() ? 1 : 0));
@@ -1754,7 +1754,7 @@ TensorMap detection_loss_dict(const ModelOutputs& outputs,
     }
 
     if (!outputs.aux_outputs.empty()) {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.criterion.aux");
+        MMLTK_PROFILE_SCOPE("rfdetr.criterion.aux");
         for (size_t aux_index = 0; aux_index < outputs.aux_outputs.size(); ++aux_index) {
             const auto& aux_indices = matcher_indices_all[matcher_layer_index++];
             update_losses(
@@ -1783,7 +1783,7 @@ TensorMap detection_loss_dict(const ModelOutputs& outputs,
     }
 
     if (outputs.enc_outputs.has_value()) {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.criterion.encoder");
+        MMLTK_PROFILE_SCOPE("rfdetr.criterion.encoder");
         const auto& enc_indices = matcher_indices_all[matcher_layer_index++];
         update_losses(losses, loss_labels(*outputs.enc_outputs, targets, enc_indices, config, num_boxes_value, false), "_enc");
         update_losses(losses, loss_cardinality(*outputs.enc_outputs, targets), "_enc");
@@ -1799,7 +1799,7 @@ TensorMap detection_loss_dict(const ModelOutputs& outputs,
 torch::Tensor weighted_detection_loss(const TensorMap& loss_dict,
                                       const DetectionConfig& config,
                                       const torch::Device& device) {
-    FASTLOADER_PROFILE_SCOPE("rfdetr.criterion.weighted_total");
+    MMLTK_PROFILE_SCOPE("rfdetr.criterion.weighted_total");
     auto total = torch::zeros({}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
     bool has_loss = false;
     for (const auto& item : config.weight_dict) {
@@ -1828,10 +1828,10 @@ std::vector<TensorMap> postprocess_outputs(const ModelOutputs& outputs,
         outputs.main.pred_boxes,
         outputs.main.pred_masks,
     };
-    return fastloader::rfdetr::postprocess_outputs(tensors, target_sizes, num_select);
+    return mmltk::rfdetr::postprocess_outputs(tensors, target_sizes, num_select);
 }
 
-ScopedWorkerPool::ScopedWorkerPool(fastloader::WorkerPool* pool)
+ScopedWorkerPool::ScopedWorkerPool(mmltk::WorkerPool* pool)
     : previous_(g_worker_pool) {
     g_worker_pool = pool;
 }
@@ -1840,4 +1840,4 @@ ScopedWorkerPool::~ScopedWorkerPool() {
     g_worker_pool = previous_;
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

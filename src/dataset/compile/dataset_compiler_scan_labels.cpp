@@ -19,13 +19,13 @@
 
 using json = nlohmann::json;
 
-namespace fastloader::compiler_internal {
+namespace mmltk::compiler_internal {
 
 namespace {
 
 struct ParsedInstance {
     uint8_t class_id;
-    int16_t bbox[4];
+    std::array<int16_t, 4> bbox{};
     std::vector<RLEPair> rle_pairs;
 };
 
@@ -47,7 +47,7 @@ struct ResizeObservation {
 struct ResizedMask {
     std::vector<RLEPair> rle_pairs;
     bool has_foreground = false;
-    int16_t bbox[4] = {0, 0, 0, 0};
+    std::array<int16_t, 4> bbox{};
 };
 
 struct LabelWorkerStats {
@@ -76,7 +76,7 @@ std::filesystem::path numbered_path(const std::filesystem::path& dir,
 }
 
 uint32_t count_sequential_images(const std::filesystem::path& split_dir) {
-    FASTLOADER_PROFILE_SCOPE("compiler.scan.count_sequential_images");
+    MMLTK_PROFILE_SCOPE("compiler.scan.count_sequential_images");
     if (!std::filesystem::exists(split_dir) || !std::filesystem::is_directory(split_dir)) {
         throw std::runtime_error("split directory not found: " + split_dir.string());
     }
@@ -93,7 +93,7 @@ uint32_t count_sequential_images(const std::filesystem::path& split_dir) {
         throw std::runtime_error("no sequential PNG images found under: " + split_dir.string());
     }
 
-    FASTLOADER_PROFILE_SET("compiler.scan.num_images", count);
+    MMLTK_PROFILE_SET("compiler.scan.num_images", count);
     return count;
 }
 
@@ -242,7 +242,7 @@ ResizedMask encode_dense_mask_row_major(const uint8_t* dense_mask,
         // Skip zeros: scan 32 bytes at a time
         while (cursor + 32 <= target_pixels) {
             const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dense_mask + cursor));
-            const uint32_t nonzero_mask = static_cast<uint32_t>(~_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, zero)));
+            const auto nonzero_mask = static_cast<uint32_t>(~_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, zero)));
             if (nonzero_mask != 0) {
                 cursor += static_cast<uint32_t>(__builtin_ctz(nonzero_mask));
                 goto found_start;
@@ -262,7 +262,7 @@ ResizedMask encode_dense_mask_row_major(const uint8_t* dense_mask,
         // Scan nonzeros: 32 bytes at a time
         while (cursor + 32 <= target_pixels) {
             const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dense_mask + cursor));
-            const uint32_t zero_mask = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, zero)));
+            const auto zero_mask = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, zero)));
             if (zero_mask != 0) {
                 cursor += static_cast<uint32_t>(__builtin_ctz(zero_mask));
                 goto found_end;
@@ -281,9 +281,9 @@ ResizedMask encode_dense_mask_row_major(const uint8_t* dense_mask,
 
         // Derive bounding box from this run
         resized.has_foreground = true;
-        const uint32_t start_y = static_cast<uint32_t>(run_start / target_width);
-        const uint32_t start_x = static_cast<uint32_t>(run_start % target_width);
-        const uint32_t end_pos = static_cast<uint32_t>(cursor - 1);
+        const auto start_y = static_cast<uint32_t>(run_start / target_width);
+        const auto start_x = static_cast<uint32_t>(run_start % target_width);
+        const auto end_pos = static_cast<uint32_t>(cursor - 1);
         const uint32_t end_y = end_pos / target_width;
         const uint32_t end_x = end_pos % target_width;
         min_y = std::min(min_y, start_y);
@@ -350,6 +350,8 @@ ResizedMask resize_mask_row_major(const std::vector<RLEPair>& input_pairs,
     return encode_dense_mask_row_major(target_mask_scratch.data(), target_width, target_height);
 }
 
+// Annotation and image paths are paired inputs for one dataset item.
+// NOLINTBEGIN(bugprone-easily-swappable-parameters)
 std::vector<ParsedInstance> parse_jsonl(const std::filesystem::path& annotation_file,
                                         const std::filesystem::path& image_file,
                                         const std::unordered_map<std::string, uint8_t>& class_map,
@@ -359,7 +361,7 @@ std::vector<ParsedInstance> parse_jsonl(const std::filesystem::path& annotation_
                                         DroppedAnnotationTracker* dropped_annotations,
                                         std::vector<uint8_t>& source_mask_scratch,
                                         std::vector<uint8_t>& target_mask_scratch) {
-    FASTLOADER_PROFILE_SCOPE("compiler.labels.parse_jsonl");
+    MMLTK_PROFILE_SCOPE("compiler.labels.parse_jsonl");
     std::vector<ParsedInstance> instances;
     std::ifstream file(annotation_file);
     if (!file.is_open()) {
@@ -424,7 +426,7 @@ std::vector<ParsedInstance> parse_jsonl(const std::filesystem::path& annotation_
                             std::to_string(target_width) + "x" +
                             std::to_string(target_height) + ")");
                     }
-                    FASTLOADER_PROFILE_ADD("compiler.labels.instances_dropped", 1);
+                    MMLTK_PROFILE_ADD("compiler.labels.instances_dropped", 1);
                     continue;
                 }
                 instance.rle_pairs = std::move(resized.rle_pairs);
@@ -433,13 +435,14 @@ std::vector<ParsedInstance> parse_jsonl(const std::filesystem::path& annotation_
                 scale_bbox_in_place(instance, source_dims, target_width, target_height);
             }
         }
-        FASTLOADER_PROFILE_ADD("compiler.labels.instances", 1);
-        FASTLOADER_PROFILE_ADD("compiler.labels.rle_pairs", instance.rle_pairs.size());
+        MMLTK_PROFILE_ADD("compiler.labels.instances", 1);
+        MMLTK_PROFILE_ADD("compiler.labels.rle_pairs", instance.rle_pairs.size());
         instances.push_back(std::move(instance));
     }
 
     return instances;
 }
+// NOLINTEND(bugprone-easily-swappable-parameters)
 
 size_t parsed_rle_pair_count(const std::vector<ParsedInstance>& instances) {
     size_t total_rle_pairs = 0;
@@ -518,14 +521,14 @@ DatasetScan scan_dataset(const CompilerConfig& config) {
         min_raw_id == 1 ? 1 :
         throw std::runtime_error("class ids must be dense and start at 0 or 1");
 
-    bool seen_ids[MAX_CLASSES] = {};
+    std::array<bool, MAX_CLASSES> seen_ids{};
     for (const auto& category : parsed_categories) {
         const int normalized_id = category.raw_id - class_id_base;
         if (normalized_id < 0 || normalized_id >= static_cast<int>(MAX_CLASSES)) {
             throw std::runtime_error("class id out of supported range in categories.json");
         }
 
-        const uint8_t class_id = static_cast<uint8_t>(normalized_id);
+        const auto class_id = static_cast<uint8_t>(normalized_id);
         if (seen_ids[class_id]) {
             throw std::runtime_error("duplicate class id in categories.json");
         }
@@ -546,7 +549,7 @@ DatasetScan scan_dataset(const CompilerConfig& config) {
     // Determine num_images
     if (categories.contains("splits") && categories["splits"].contains(config.split)) {
         scan.num_images = categories["splits"][config.split]["total"].get<uint32_t>();
-        FASTLOADER_DEBUG_LOG("[compile] split '%s' count from categories.json: %u images\n",
+        MMLTK_DEBUG_LOG("[compile] split '%s' count from categories.json: %u images\n",
                              config.split.c_str(), scan.num_images);
     } else {
         scan.num_images = count_sequential_images(std::filesystem::path(config.source_dir) / config.split);
@@ -562,7 +565,7 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir,
                                int num_workers,
                                ProgressCounter* completed_images,
                                DroppedAnnotationTracker* dropped_annotations) {
-    FASTLOADER_PROFILE_SCOPE("compiler.labels.build_blocks");
+    MMLTK_PROFILE_SCOPE("compiler.labels.build_blocks");
     const uint32_t target_width = config.target_width;
     const uint32_t target_height = config.target_height;
 
@@ -577,19 +580,19 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir,
                 continue;
             }
             ++active_workers;
-            FASTLOADER_PROFILE_RECORD_DURATION_NS("compiler.labels.worker.active", stats.active_ns);
-            FASTLOADER_PROFILE_ADD("compiler.labels.worker.images", stats.images);
-            FASTLOADER_PROFILE_ADD("compiler.labels.worker.instances", stats.instances);
-            FASTLOADER_PROFILE_ADD("compiler.labels.worker.rle_pairs", stats.rle_pairs);
+            MMLTK_PROFILE_RECORD_DURATION_NS("compiler.labels.worker.active", stats.active_ns);
+            MMLTK_PROFILE_ADD("compiler.labels.worker.images", stats.images);
+            MMLTK_PROFILE_ADD("compiler.labels.worker.instances", stats.instances);
+            MMLTK_PROFILE_ADD("compiler.labels.worker.rle_pairs", stats.rle_pairs);
             total_active_ns += stats.active_ns;
             max_active_ns = std::max(max_active_ns, stats.active_ns);
             total_instances += stats.instances;
             max_instances = std::max(max_instances, stats.instances);
         }
-        FASTLOADER_PROFILE_SET("compiler.labels.worker.count", active_workers);
-        FASTLOADER_PROFILE_SET("compiler.labels.worker.active_skew_x1000",
+        MMLTK_PROFILE_SET("compiler.labels.worker.count", active_workers);
+        MMLTK_PROFILE_SET("compiler.labels.worker.active_skew_x1000",
                                compute_skew_x1000(total_active_ns, max_active_ns, active_workers));
-        FASTLOADER_PROFILE_SET("compiler.labels.worker.instances_skew_x1000",
+        MMLTK_PROFILE_SET("compiler.labels.worker.instances_skew_x1000",
                                compute_skew_x1000(total_instances, max_instances, active_workers));
     };
 
@@ -602,7 +605,7 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir,
         std::min(num_workers, checked_cast<int>(num_images, "label worker count overflow")));
     std::vector<LabelWorkerStats> worker_stats(static_cast<size_t>(worker_count));
 
-    parallel_for_range_indexed<uint32_t>(0, num_images, num_workers, [&](int worker_id, uint32_t start, uint32_t end) {
+    parallel_for_range_indexed<uint32_t>(0, num_images, num_workers, [&](int worker_id, uint32_t start, uint32_t end) { // NOLINT(bugprone-easily-swappable-parameters)
         LabelWorkerStats& stats = worker_stats[static_cast<size_t>(worker_id)];
         const auto worker_start = std::chrono::steady_clock::now();
         std::vector<uint8_t> source_mask_scratch;
@@ -662,14 +665,14 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir,
         blocks.dropped_annotations = dropped_annotations->load();
         blocks.dropped_annotation_examples = dropped_annotations->sample_snapshot();
     }
-    FASTLOADER_PROFILE_SET("compiler.labels.total_labels", total_labels);
-    FASTLOADER_PROFILE_SET("compiler.labels.total_rle_pairs", total_rle_pairs);
-    FASTLOADER_PROFILE_SET("compiler.labels.total_dropped_annotations", blocks.dropped_annotations);
+    MMLTK_PROFILE_SET("compiler.labels.total_labels", total_labels);
+    MMLTK_PROFILE_SET("compiler.labels.total_rle_pairs", total_rle_pairs);
+    MMLTK_PROFILE_SET("compiler.labels.total_dropped_annotations", blocks.dropped_annotations);
 
     size_t label_cursor = 0;
     size_t rle_cursor = 0;
     {
-        FASTLOADER_PROFILE_SCOPE("compiler.labels.merge_blocks");
+        MMLTK_PROFILE_SCOPE("compiler.labels.merge_blocks");
         for (uint32_t image_index = 0; image_index < num_images; ++image_index) {
             WorkerResult& result = worker_results[image_index];
             ImageEntry& entry = blocks.index[image_index];
@@ -711,4 +714,4 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir,
     return blocks;
 }
 
-} // namespace fastloader::compiler_internal
+} // namespace mmltk::compiler_internal

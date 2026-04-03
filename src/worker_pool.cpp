@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <thread>
 
-namespace fastloader {
+namespace mmltk {
 
 namespace {
 
@@ -94,7 +94,7 @@ WorkerPool::WorkerPool(size_t worker_count,
     }
     impl_->cpu_affinity = cpu_affinity.empty() ? allowed_cpu_set() : std::move(cpu_affinity);
     impl_->thread_name_prefix = std::move(thread_name_prefix);
-    const size_t actual_worker_count = static_cast<size_t>(
+    const auto actual_worker_count = static_cast<size_t>(
         clamp_worker_count_to_cpus(static_cast<int>(worker_count), impl_->cpu_affinity.size(), 0, 1));
     log_worker_budget_clamp("worker_pool",
                             static_cast<int>(worker_count),
@@ -219,4 +219,4 @@ bool WorkerPool::running_on_worker_thread() const noexcept {
     return impl_ && g_current_worker_pool == impl_.get();
 }
 
-} // namespace fastloader
+} // namespace mmltk

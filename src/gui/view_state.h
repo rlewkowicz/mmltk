@@ -4,11 +4,13 @@
 #include "source_selection.h"
 
 #include <array>
+#include <cstdint>
 #include <string>
+#include <vector>
 
-namespace fastloader::gui {
+namespace mmltk::gui {
 
-enum class View : int {
+enum class View : std::uint8_t {
     Train = 0,
     Validate = 1,
     Predict = 2,
@@ -17,29 +19,29 @@ enum class View : int {
     Live = 5,
 };
 
-enum class TrainInputMode : int {
+enum class TrainInputMode : std::uint8_t {
     Weights = 0,
     Resume = 1,
 };
 
-enum class TrainOptimizerMode : int {
+enum class TrainOptimizerMode : std::uint8_t {
     AdamW = 0,
     Muon = 1,
 };
 
-enum class TrainExecutionTarget : int {
+enum class TrainExecutionTarget : std::uint8_t {
     Local = 0,
     Remote = 1,
 };
 
-enum class ModelInputMode : int {
+enum class ModelInputMode : std::uint8_t {
     Weights = 0,
     Onnx = 1,
     TensorRt = 2,
     None = 3,
 };
 
-enum class UiDensity : int {
+enum class UiDensity : std::uint8_t {
     Compact = 0,
     Balanced = 1,
     Comfortable = 2,
@@ -51,7 +53,11 @@ struct UiSettingsState {
     float secondary_font_size = 14.0f;
     float mono_font_size = 14.0f;
     float property_label_width = 156.0f;
+    float crop_edge_hit_half_width = 8.0f;
+    float crop_corner_hit_size = 20.0f;
+    float crop_handle_radius = 6.0f;
     UiDensity density = UiDensity::Balanced;
+    float content_scale = 1.0f; // auto-detected from glfwGetWindowContentScale, not serialized
 };
 
 struct TrainViewState {
@@ -69,6 +75,7 @@ struct TrainViewState {
     int grad_accum_steps = 1;
     int eval_max_dets = 500;
     int lr_drop = 100;
+    int print_freq = 100;
     int prefetch_factor = 2;
     int seed = 42;
     int workers = 8;
@@ -91,8 +98,9 @@ struct TrainViewState {
     TrainOptimizerMode optimizer = TrainOptimizerMode::AdamW;
     int compile_mode = 1;
     TrainExecutionTarget execution_target = TrainExecutionTarget::Local;
+    std::vector<int> local_device_ids{0};
     std::array<bool, 5> remote_family_enabled{{true, true, true, true, true}};
-    fastloader::rfdetr::TrainRecipeFieldOverrides recipe_overrides;
+    mmltk::rfdetr::TrainRecipeFieldOverrides recipe_overrides;
 };
 
 struct ValidateViewState {
@@ -168,4 +176,4 @@ struct ExportViewState {
     bool simplify = false;
 };
 
-} // namespace fastloader::gui
+} // namespace mmltk::gui

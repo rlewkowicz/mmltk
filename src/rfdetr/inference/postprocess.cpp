@@ -11,7 +11,7 @@
 namespace F = torch::nn::functional;
 using namespace torch::indexing;
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 torch::Tensor box_cxcywh_to_xyxy(const torch::Tensor& value) {
     const auto x_c = value.select(-1, 0);
@@ -34,7 +34,7 @@ static std::vector<TensorMap> postprocess_outputs_impl(
     const torch::Tensor* target_sizes,
     std::optional<std::pair<int64_t, int64_t>> fixed_size,
     int64_t num_select) {
-    FASTLOADER_PROFILE_SCOPE("rfdetr.native.postprocess.total");
+    MMLTK_PROFILE_SCOPE("rfdetr.native.postprocess.total");
     const auto& out_logits = outputs.pred_logits;
     const auto& out_bbox = outputs.pred_boxes;
     if (target_sizes != nullptr &&
@@ -49,7 +49,7 @@ static std::vector<TensorMap> postprocess_outputs_impl(
     torch::Tensor topk_boxes;
     torch::Tensor labels;
     {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.native.postprocess.topk");
+        MMLTK_PROFILE_SCOPE("rfdetr.native.postprocess.topk");
         const auto prob = out_logits.sigmoid();
         const auto flat_prob = prob.flatten(1);
         const int64_t k = std::min<int64_t>(num_select, flat_prob.size(1));
@@ -62,12 +62,12 @@ static std::vector<TensorMap> postprocess_outputs_impl(
 
     auto boxes = box_cxcywh_to_xyxy(out_bbox);
     {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.native.postprocess.gather_boxes");
+        MMLTK_PROFILE_SCOPE("rfdetr.native.postprocess.gather_boxes");
         boxes = boxes.gather(1, topk_boxes.unsqueeze(-1).expand({topk_boxes.size(0), topk_boxes.size(1), 4}));
     }
 
     {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.native.postprocess.scale_boxes");
+        MMLTK_PROFILE_SCOPE("rfdetr.native.postprocess.scale_boxes");
         if (fixed_size.has_value()) {
             const auto [target_height, target_width] = *fixed_size;
             const auto scale =
@@ -86,7 +86,7 @@ static std::vector<TensorMap> postprocess_outputs_impl(
     results.reserve(static_cast<size_t>(out_logits.size(0)));
     if (outputs.pred_masks.has_value()) {
         const auto& out_masks = *outputs.pred_masks;
-        FASTLOADER_PROFILE_SCOPE("rfdetr.native.postprocess.masks");
+        MMLTK_PROFILE_SCOPE("rfdetr.native.postprocess.masks");
         for (int64_t batch = 0; batch < out_masks.size(0); ++batch) {
             TensorMap result;
             result["scores"] = scores[batch];
@@ -142,4 +142,4 @@ std::vector<TensorMap> postprocess_outputs_fixed_size(const OutputTensors& outpu
                                     num_select);
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

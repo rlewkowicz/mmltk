@@ -22,7 +22,7 @@
 #include <unistd.h>
 #include <vector>
 
-namespace fastloader {
+namespace mmltk {
 
 class UniqueFd {
 public:
@@ -37,7 +37,7 @@ public:
         other.fd_ = -1;
         return *this;
     }
-    int get() const { return fd_; }
+    [[nodiscard]] int get() const { return fd_; }
 
 private:
     int fd_;
@@ -109,9 +109,9 @@ public:
         return file;
     }
 
-    int get() const { return fd_.get(); }
+    [[nodiscard]] int get() const { return fd_.get(); }
 
-    size_t size() const {
+    [[nodiscard]] size_t size() const {
         struct stat st;
         if (fstat(fd_.get(), &st) != 0) {
             throw errno_error("fstat failed");
@@ -120,9 +120,9 @@ public:
     }
 
     void preallocate(size_t bytes) const {
-        FASTLOADER_PROFILE_SCOPE("io.preallocate");
-        FASTLOADER_PROFILE_ADD("io.preallocate.bytes", bytes);
-        const off_t length = checked_cast<off_t>(bytes, "file size overflow");
+        MMLTK_PROFILE_SCOPE("io.preallocate");
+        MMLTK_PROFILE_ADD("io.preallocate.bytes", bytes);
+        const auto length = checked_cast<off_t>(bytes, "file size overflow");
         if (fallocate(fd_.get(), 0, 0, length) == 0) {
             return;
         }
@@ -131,13 +131,15 @@ public:
         }
     }
 
+    // POSIX read/write syscalls conventionally take byte-count plus file offset.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     void pwrite_all(const void* src, size_t bytes, size_t offset) const {
-        FASTLOADER_PROFILE_SCOPE("io.pwrite_all");
-        FASTLOADER_PROFILE_ADD("io.pwrite_all.bytes", bytes);
-        const uint8_t* ptr = static_cast<const uint8_t*>(src);
+        MMLTK_PROFILE_SCOPE("io.pwrite_all");
+        MMLTK_PROFILE_ADD("io.pwrite_all.bytes", bytes);
+        const auto* ptr = static_cast<const uint8_t*>(src);
         size_t written = 0;
         while (written < bytes) {
-            const off_t write_offset =
+            const auto write_offset =
                 checked_cast<off_t>(offset + written, "pwrite offset overflow");
             ssize_t ret = pwrite(fd_.get(), ptr + written, bytes - written, write_offset);
             if (ret < 0) {
@@ -147,13 +149,15 @@ public:
         }
     }
 
+    // POSIX read/write syscalls conventionally take byte-count plus file offset.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     void pread_all(void* dst, size_t bytes, size_t offset) const {
-        FASTLOADER_PROFILE_SCOPE("io.pread_all");
-        FASTLOADER_PROFILE_ADD("io.pread_all.bytes", bytes);
-        uint8_t* ptr = static_cast<uint8_t*>(dst);
+        MMLTK_PROFILE_SCOPE("io.pread_all");
+        MMLTK_PROFILE_ADD("io.pread_all.bytes", bytes);
+        auto* ptr = static_cast<uint8_t*>(dst);
         size_t read_bytes = 0;
         while (read_bytes < bytes) {
-            const off_t read_offset =
+            const auto read_offset =
                 checked_cast<off_t>(offset + read_bytes, "pread offset overflow");
             ssize_t ret = pread(fd_.get(), ptr + read_bytes, bytes - read_bytes, read_offset);
             if (ret < 0) {
@@ -166,9 +170,11 @@ public:
         }
     }
 
+    // posix_fadvise uses byte offset and length as its native API contract.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     void advise(size_t offset, size_t bytes, int advice) const {
-        const off_t adv_offset = checked_cast<off_t>(offset, "posix_fadvise offset overflow");
-        const off_t adv_len = checked_cast<off_t>(bytes, "posix_fadvise length overflow");
+        const auto adv_offset = checked_cast<off_t>(offset, "posix_fadvise offset overflow");
+        const auto adv_len = checked_cast<off_t>(bytes, "posix_fadvise length overflow");
         const int ret = posix_fadvise(fd_.get(), adv_offset, adv_len, advice);
         if (ret != 0) {
             errno = ret;
@@ -177,7 +183,7 @@ public:
     }
 
     void sync_data() const {
-        FASTLOADER_PROFILE_SCOPE("io.sync_data");
+        MMLTK_PROFILE_SCOPE("io.sync_data");
         if (fdatasync(fd_.get()) != 0) {
             throw errno_error("fdatasync failed");
         }
@@ -215,11 +221,11 @@ public:
     ~MappedFile() { unmap(); }
 
     static MappedFile open_readonly(const std::string& path) {
-        FASTLOADER_PROFILE_SCOPE("mapped_file.open_readonly");
+        MMLTK_PROFILE_SCOPE("mapped_file.open_readonly");
         MappedFile mapped;
         mapped.file_ = FileHandle::open_readonly(path);
         mapped.size_ = mapped.file_.size();
-        FASTLOADER_PROFILE_ADD("mapped_file.bytes", mapped.size_);
+        MMLTK_PROFILE_ADD("mapped_file.bytes", mapped.size_);
         void* ptr = mmap(nullptr, mapped.size_, PROT_READ, MAP_SHARED,
                          mapped.file_.get(), 0);
         if (ptr == MAP_FAILED) {
@@ -230,7 +236,7 @@ public:
     }
 
     static MappedFile open_readonly_range(const std::string& path, size_t offset, size_t bytes) {
-        FASTLOADER_PROFILE_SCOPE("mapped_file.open_readonly_range");
+        MMLTK_PROFILE_SCOPE("mapped_file.open_readonly_range");
         MappedFile mapped;
         mapped.file_ = FileHandle::open_readonly(path);
         const size_t file_size = mapped.file_.size();
@@ -238,7 +244,7 @@ public:
             throw std::out_of_range("mmap range out of bounds");
         }
         mapped.size_ = bytes;
-        FASTLOADER_PROFILE_ADD("mapped_file.bytes", bytes);
+        MMLTK_PROFILE_ADD("mapped_file.bytes", bytes);
         void* ptr = mmap(nullptr, mapped.size_, PROT_READ, MAP_SHARED,
                          mapped.file_.get(), checked_cast<off_t>(offset, "mmap offset overflow"));
         if (ptr == MAP_FAILED) {
@@ -248,8 +254,8 @@ public:
         return mapped;
     }
 
-    const uint8_t* data() const { return data_; }
-    size_t size() const { return size_; }
+    [[nodiscard]] const uint8_t* data() const { return data_; }
+    [[nodiscard]] size_t size() const { return size_; }
 
     void advise(int advice) const {
         advise_range(0, size_, advice);
@@ -326,11 +332,11 @@ public:
         return buffer;
     }
 
-    T* data() { return data_; }
-    const T* data() const { return data_; }
-    size_t size() const { return count_; }
-    size_t bytes() const { return count_ * sizeof(T); }
-    bool empty() const { return count_ == 0; }
+    [[nodiscard]] T* data() { return data_; }
+    [[nodiscard]] const T* data() const { return data_; }
+    [[nodiscard]] size_t size() const { return count_; }
+    [[nodiscard]] size_t bytes() const { return count_ * sizeof(T); }
+    [[nodiscard]] bool empty() const { return count_ == 0; }
 
     void advise(int advice) const {
         if (empty()) {
@@ -364,6 +370,8 @@ inline OwnedBuffer<T> allocate_hugepage_buffer(size_t count) {
 }
 
 template <typename T>
+// Count and byte offset are distinct dataset layout coordinates here.
+// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 inline OwnedBuffer<T> load_hugepage_block(const FileHandle& file, size_t count, size_t offset) {
     OwnedBuffer<T> block = allocate_hugepage_buffer<T>(count);
     if (!block.empty()) {
@@ -375,7 +383,7 @@ inline OwnedBuffer<T> load_hugepage_block(const FileHandle& file, size_t count, 
 template <typename Index, typename Func>
 void parallel_for_range_indexed(Index begin, Index end, int num_workers, Func&& func) {
     static_assert(std::is_integral_v<Index>, "parallel_for_range index must be integral");
-    FASTLOADER_PROFILE_SCOPE("parallel_for_range.total");
+    MMLTK_PROFILE_SCOPE("parallel_for_range.total");
 
     if (begin >= end) {
         return;
@@ -389,10 +397,10 @@ void parallel_for_range_indexed(Index begin, Index end, int num_workers, Func&& 
     const int worker_count =
         clamp_worker_count_to_cpus(requested_workers, worker_cpus.size(), 0, 1);
     log_worker_budget_clamp("parallel_for_range", requested_workers, worker_count, worker_cpus);
-    FASTLOADER_PROFILE_ADD("parallel_for_range.calls", 1);
-    FASTLOADER_PROFILE_ADD("parallel_for_range.total_items",
+    MMLTK_PROFILE_ADD("parallel_for_range.calls", 1);
+    MMLTK_PROFILE_ADD("parallel_for_range.total_items",
                            checked_cast<std::uint64_t>(total, "parallel range size overflow"));
-    FASTLOADER_PROFILE_ADD("parallel_for_range.worker_count_sum",
+    MMLTK_PROFILE_ADD("parallel_for_range.worker_count_sum",
                            static_cast<std::uint64_t>(worker_count));
     if (worker_count == 1) {
         func(0, begin, end);
@@ -449,4 +457,4 @@ void parallel_for_range(Index begin, Index end, int num_workers, Func&& func) {
                                       });
 }
 
-} // namespace fastloader
+} // namespace mmltk

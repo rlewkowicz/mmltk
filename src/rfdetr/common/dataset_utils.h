@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 inline std::vector<std::string> loader_class_names(const DatasetLoader& loader) {
     std::vector<std::string> names;
@@ -24,4 +24,4 @@ inline int64_t image_id_for_dataset_index(const std::vector<int>& image_ids, int
     return dataset_index + 1;
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

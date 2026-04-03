@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace fastloader {
+namespace mmltk {
 
 namespace {
 
@@ -14,7 +14,7 @@ void populate_label_index(OwnedBuffer<LabelIndexEntry>& label_index,
                           const std::vector<ImageEntry>& disk_index,
                           const FileHeader& header,
                           size_t label_count) {
-    FASTLOADER_PROFILE_SCOPE("loader.load_runtime.populate_label_index");
+    MMLTK_PROFILE_SCOPE("loader.load_runtime.populate_label_index");
     for (size_t i = 0; i < disk_index.size(); ++i) {
         const ImageEntry& entry = disk_index[i];
         const uint64_t expected_pixel_entry =
@@ -44,7 +44,7 @@ void populate_label_index(OwnedBuffer<LabelIndexEntry>& label_index,
 }
 
 size_t compute_used_rle_bytes(const OwnedBuffer<PackedInstance>& labels, size_t rle_region_bytes) {
-    FASTLOADER_PROFILE_SCOPE("loader.load_runtime.compute_used_rle_bytes");
+    MMLTK_PROFILE_SCOPE("loader.load_runtime.compute_used_rle_bytes");
     size_t used_rle_bytes = 0;
     for (size_t i = 0; i < labels.size(); ++i) {
         const PackedInstance& inst = labels.data()[i];
@@ -62,38 +62,38 @@ size_t compute_used_rle_bytes(const OwnedBuffer<PackedInstance>& labels, size_t 
 } // namespace
 
 void DatasetLoader::Impl::load_runtime_data() {
-    FASTLOADER_PROFILE_SCOPE("loader.load_runtime_data");
+    MMLTK_PROFILE_SCOPE("loader.load_runtime_data");
     const FileHandle file = FileHandle::open_readonly(config.compiled_path);
     const size_t file_size = file.size();
     {
-        FASTLOADER_PROFILE_SCOPE("loader.load_runtime.read_header");
+        MMLTK_PROFILE_SCOPE("loader.load_runtime.read_header");
         header = read_compiled_header(file);
     }
 
     CompiledFileSections sections;
     {
-        FASTLOADER_PROFILE_SCOPE("loader.load_runtime.validate_sections");
+        MMLTK_PROFILE_SCOPE("loader.load_runtime.validate_sections");
         sections = validate_compiled_file_sections(header, file_size);
     }
 
     std::vector<ImageEntry> disk_index(header.num_images);
     if (!disk_index.empty()) {
-        FASTLOADER_PROFILE_SCOPE("loader.load_runtime.read_disk_index");
+        MMLTK_PROFILE_SCOPE("loader.load_runtime.read_disk_index");
         file.pread_all(disk_index.data(), sections.expected_index_bytes, sections.index_offset);
     }
 
     {
-        FASTLOADER_PROFILE_SCOPE("loader.load_runtime.allocate_label_index");
+        MMLTK_PROFILE_SCOPE("loader.load_runtime.allocate_label_index");
         label_index = allocate_hugepage_buffer<LabelIndexEntry>(header.num_images);
     }
-    FASTLOADER_PROFILE_SET("loader.label_index_bytes", label_index.bytes());
+    MMLTK_PROFILE_SET("loader.label_index_bytes", label_index.bytes());
     populate_label_index(label_index, disk_index, header, sections.label_count);
 
     {
-        FASTLOADER_PROFILE_SCOPE("loader.load_runtime.read_labels");
+        MMLTK_PROFILE_SCOPE("loader.load_runtime.read_labels");
         labels = load_hugepage_block<PackedInstance>(file, sections.label_count, sections.label_offset);
     }
-    FASTLOADER_PROFILE_SET("loader.label_bytes", labels.bytes());
+    MMLTK_PROFILE_SET("loader.label_bytes", labels.bytes());
 
     const size_t used_rle_bytes = compute_used_rle_bytes(labels, sections.rle_region_bytes);
     if (used_rle_bytes % sizeof(RLEPair) != 0) {
@@ -101,19 +101,19 @@ void DatasetLoader::Impl::load_runtime_data() {
     }
 
     {
-        FASTLOADER_PROFILE_SCOPE("loader.load_runtime.read_rle");
+        MMLTK_PROFILE_SCOPE("loader.load_runtime.read_rle");
         rle_pairs =
             load_hugepage_block<RLEPair>(file, used_rle_bytes / sizeof(RLEPair), sections.rle_offset);
     }
-    FASTLOADER_PROFILE_SET("loader.rle_bytes", rle_pairs.bytes());
+    MMLTK_PROFILE_SET("loader.rle_bytes", rle_pairs.bytes());
 
     {
-        FASTLOADER_PROFILE_SCOPE("loader.load_runtime.drop_metadata_pages");
+        MMLTK_PROFILE_SCOPE("loader.load_runtime.drop_metadata_pages");
         file.advise(0, sections.pixel_offset, POSIX_FADV_DONTNEED);
     }
 
     {
-        FASTLOADER_PROFILE_SCOPE("loader.load_runtime.map_pixel_blob");
+        MMLTK_PROFILE_SCOPE("loader.load_runtime.map_pixel_blob");
         pixel_file = MappedFile::open_readonly_range(config.compiled_path,
                                                      sections.pixel_offset,
                                                      sections.pixel_blob_size);
@@ -121,7 +121,7 @@ void DatasetLoader::Impl::load_runtime_data() {
     // cppcheck-suppress invalidPointerCast
     pixels = reinterpret_cast<const float*>(pixel_file.data());
 
-    FASTLOADER_DEBUG_LOG(
+    MMLTK_DEBUG_LOG(
         "[loader] labels in RAM: index=%zu bytes labels=%zu bytes rle=%zu bytes pixel_mmap=%zu bytes\n",
         label_index.bytes(),
         labels.bytes(),
@@ -130,15 +130,15 @@ void DatasetLoader::Impl::load_runtime_data() {
 }
 
 void DatasetLoader::Impl::prescan() {
-    FASTLOADER_PROFILE_SCOPE("loader.prescan.total");
+    MMLTK_PROFILE_SCOPE("loader.prescan.total");
     const size_t pixel_blob_size = static_cast<size_t>(header.num_images) * header.image_stride;
-    FASTLOADER_PROFILE_SET("loader.pixel_blob_bytes", pixel_blob_size);
+    MMLTK_PROFILE_SET("loader.pixel_blob_bytes", pixel_blob_size);
     {
-        FASTLOADER_PROFILE_SCOPE("loader.prescan.advise_hugepage");
+        MMLTK_PROFILE_SCOPE("loader.prescan.advise_hugepage");
         pixel_file.advise_range(0, pixel_blob_size, MADV_HUGEPAGE);
     }
     {
-        FASTLOADER_PROFILE_SCOPE("loader.prescan.advise_access_pattern");
+        MMLTK_PROFILE_SCOPE("loader.prescan.advise_access_pattern");
         if (config.shuffle) {
             pixel_file.advise_range(0, pixel_blob_size, MADV_NORMAL);
         } else {
@@ -147,4 +147,4 @@ void DatasetLoader::Impl::prescan() {
     }
 }
 
-} // namespace fastloader
+} // namespace mmltk

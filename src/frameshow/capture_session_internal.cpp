@@ -50,7 +50,7 @@ Status AllocateHostBuffer(std::size_t bytes, bool pinned, HostBuffer* out) {
     return MakeStatus(StatusCode::kInvalidArgument, "invalid host buffer request");
   }
 
-  const std::size_t page_size = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+  const auto page_size = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
   const std::size_t aligned_bytes = RoundUpToPage(bytes, page_size);
 
   void* memory = nullptr;

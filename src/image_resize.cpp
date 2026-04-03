@@ -7,7 +7,7 @@
 #include <cstring>
 #include <stdexcept>
 
-namespace fastloader {
+namespace mmltk {
 
 struct RgbImageResizer::Impl {
     // For 3-channel RGB on this x86_64 build, AVIR's interleaved float4 SIMD path
@@ -68,4 +68,4 @@ void RgbImageResizer::resize(const uint8_t* src,
                                nullptr);
 }
 
-} // namespace fastloader
+} // namespace mmltk

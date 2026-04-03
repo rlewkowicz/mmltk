@@ -12,18 +12,20 @@
 #include <immintrin.h>
 #include <vector>
 
-namespace fastloader::compiler_internal {
+namespace mmltk::compiler_internal {
 
 namespace {
 
 #if defined(__GNUC__) || defined(__clang__)
-#define FASTLOADER_RESTRICT __restrict__
+#define MMLTK_RESTRICT __restrict__
 #else
-#define FASTLOADER_RESTRICT
+#define MMLTK_RESTRICT
 #endif
 
 class WritablePixelRange {
 public:
+    // mmap uses byte offset plus byte length as its native contract.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     WritablePixelRange(const FileHandle& fd, size_t offset, size_t bytes) : bytes_(bytes) {
         if (bytes_ == 0) {
             return;
@@ -63,7 +65,9 @@ public:
 
     ~WritablePixelRange() { reset(); }
 
-    float* image(uint32_t image_index, size_t image_stride) const {
+    // Image ordinal plus stride are distinct dataset layout coordinates here.
+    // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
+    [[nodiscard]] float* image(uint32_t image_index, size_t image_stride) const {
         const size_t image_floats = image_stride / sizeof(float);
         return data_ + static_cast<size_t>(image_index) * image_floats;
     }
@@ -84,15 +88,15 @@ private:
 // SSSE3 deinterleave + AVX2 uint8→float conversion, 16 pixels per iteration.
 // Input: interleaved RGB uint8 (48 bytes per 16 pixels).
 // Output: 3 planar float32 channels scaled to [0,1].
-void hwc_uint8_to_nchw_float_avx2(const uint8_t* FASTLOADER_RESTRICT src,
-                                   float* FASTLOADER_RESTRICT dst,
+void hwc_uint8_to_nchw_float_avx2(const uint8_t* MMLTK_RESTRICT src,
+                                   float* MMLTK_RESTRICT dst,
                                    int height,
                                    int width) {
     const int hw = height * width;
     const __m256 scale = _mm256_set1_ps(1.0f / 255.0f);
-    float* FASTLOADER_RESTRICT dst_r = dst;
-    float* FASTLOADER_RESTRICT dst_g = dst + hw;
-    float* FASTLOADER_RESTRICT dst_b = dst + static_cast<ptrdiff_t>(hw) * 2;
+    float* MMLTK_RESTRICT dst_r = dst;
+    float* MMLTK_RESTRICT dst_g = dst + hw;
+    float* MMLTK_RESTRICT dst_b = dst + static_cast<ptrdiff_t>(hw) * 2;
 
     // SSSE3 shuffle masks for 3-channel deinterleave of 16 pixels from 48 bytes.
     // Input layout across three 16-byte registers a, b, c:
@@ -166,10 +170,12 @@ void hwc_uint8_to_nchw_float_avx2(const uint8_t* FASTLOADER_RESTRICT src,
 }
 
 void hwc_uint8_to_nchw_float(const uint8_t* src, float* dst, int height, int width) {
-    FASTLOADER_PROFILE_SCOPE("compiler.pixels.convert.avx2");
+    MMLTK_PROFILE_SCOPE("compiler.pixels.convert.avx2");
     hwc_uint8_to_nchw_float_avx2(src, dst, height, width);
 }
 
+// Image ordinal plus target geometry stay ordered to mirror the dataset scan.
+// NOLINTBEGIN(bugprone-easily-swappable-parameters)
 void decode_pixel_image(const std::filesystem::path& split_dir,
                         const WritablePixelRange& pixel_blob,
                         uint32_t image_index,
@@ -189,7 +195,7 @@ void decode_pixel_image(const std::filesystem::path& split_dir,
     int raw_channels = 0;
     uint8_t* raw_pixels = nullptr;
     {
-        FASTLOADER_PROFILE_SCOPE("compiler.pixels.load_png");
+        MMLTK_PROFILE_SCOPE("compiler.pixels.load_png");
         raw_pixels = stbi_load(img_path.c_str(), &raw_width, &raw_height, &raw_channels, 3);
     }
     if (!raw_pixels) {
@@ -201,11 +207,11 @@ void decode_pixel_image(const std::filesystem::path& split_dir,
         static_cast<uint32_t>(raw_height) != target_height) {
         const size_t resized_bytes = static_cast<size_t>(target_width) * target_height * 3;
         if (resize_scratch.capacity() < resized_bytes) {
-            FASTLOADER_PROFILE_ADD("compiler.pixels.resize_scratch_grows", 1);
-            FASTLOADER_PROFILE_ADD("compiler.pixels.resize_scratch_bytes", resized_bytes);
+            MMLTK_PROFILE_ADD("compiler.pixels.resize_scratch_grows", 1);
+            MMLTK_PROFILE_ADD("compiler.pixels.resize_scratch_bytes", resized_bytes);
         }
         {
-            FASTLOADER_PROFILE_SCOPE("compiler.pixels.resize");
+            MMLTK_PROFILE_SCOPE("compiler.pixels.resize");
             resize_scratch.resize(resized_bytes);
             image_resizer.resize(raw_pixels,
                                  raw_width,
@@ -214,16 +220,19 @@ void decode_pixel_image(const std::filesystem::path& split_dir,
                                  width,
                                  height);
         }
-        FASTLOADER_PROFILE_ADD("compiler.pixels.resize_count", 1);
+        MMLTK_PROFILE_ADD("compiler.pixels.resize_count", 1);
         src_pixels = resize_scratch.data();
     }
 
-    FASTLOADER_PROFILE_ADD("compiler.pixels.convert_bytes",
+    MMLTK_PROFILE_ADD("compiler.pixels.convert_bytes",
                            static_cast<size_t>(width) * height * 3);
     hwc_uint8_to_nchw_float(src_pixels, dst, height, width);
     stbi_image_free(raw_pixels);
 }
+// NOLINTEND(bugprone-easily-swappable-parameters)
 
+// The worker signature mirrors the decode pipeline inputs in submission order.
+// NOLINTBEGIN(bugprone-easily-swappable-parameters)
 void decode_pixel_worker(const std::filesystem::path& split_dir,
                          const WritablePixelRange& pixel_blob,
                          std::atomic<uint32_t>& next_image,
@@ -233,7 +242,7 @@ void decode_pixel_worker(const std::filesystem::path& split_dir,
                          size_t image_stride,
                          int resize_threads_per_image,
                          ProgressCounter* completed_images) {
-    FASTLOADER_PROFILE_SCOPE("compiler.pixels.decode_worker");
+    MMLTK_PROFILE_SCOPE("compiler.pixels.decode_worker");
     RgbImageResizer image_resizer(resize_threads_per_image);
     std::vector<uint8_t> resize_scratch;
     while (true) {
@@ -264,11 +273,14 @@ void decode_pixel_worker(const std::filesystem::path& split_dir,
         }
     }
 }
+// NOLINTEND(bugprone-easily-swappable-parameters)
 
-#undef FASTLOADER_RESTRICT
+#undef MMLTK_RESTRICT
 
 } // namespace
 
+// Pixel writer arguments intentionally match the compile layout and worker plan order.
+// NOLINTBEGIN(bugprone-easily-swappable-parameters)
 void write_pixel_blob(const FileHandle& fd,
                       const std::filesystem::path& split_dir,
                       uint32_t num_images,
@@ -280,9 +292,9 @@ void write_pixel_blob(const FileHandle& fd,
                       bool any_downscale,
                       ProgressCounter* completed_images,
                       size_t pixel_offset) {
-    FASTLOADER_PROFILE_SCOPE("compiler.pixels.write_blob");
+    MMLTK_PROFILE_SCOPE("compiler.pixels.write_blob");
     const size_t pixel_bytes = static_cast<size_t>(num_images) * image_stride;
-    FASTLOADER_PROFILE_SET("compiler.pixels.total_bytes", pixel_bytes);
+    MMLTK_PROFILE_SET("compiler.pixels.total_bytes", pixel_bytes);
     WritablePixelRange pixel_blob(fd, pixel_offset, pixel_bytes);
 
     if (num_images == 0) {
@@ -290,9 +302,9 @@ void write_pixel_blob(const FileHandle& fd,
     }
 
     const ResizeWorkerPlan resize_plan = plan_rgb_resize_workers(num_workers, any_resize, any_downscale);
-    FASTLOADER_PROFILE_SET("compiler.pixels.worker.count", static_cast<size_t>(resize_plan.image_workers));
-    FASTLOADER_PROFILE_SET("compiler.pixels.image_workers", static_cast<size_t>(resize_plan.image_workers));
-    FASTLOADER_PROFILE_SET("compiler.pixels.resize_threads_per_image",
+    MMLTK_PROFILE_SET("compiler.pixels.worker.count", static_cast<size_t>(resize_plan.image_workers));
+    MMLTK_PROFILE_SET("compiler.pixels.image_workers", static_cast<size_t>(resize_plan.image_workers));
+    MMLTK_PROFILE_SET("compiler.pixels.resize_threads_per_image",
                            static_cast<size_t>(resize_plan.resize_threads_per_image));
     std::atomic<uint32_t> next_image{0};
 
@@ -308,5 +320,6 @@ void write_pixel_blob(const FileHandle& fd,
                             completed_images);
     });
 }
+// NOLINTEND(bugprone-easily-swappable-parameters)
 
-} // namespace fastloader::compiler_internal
+} // namespace mmltk::compiler_internal

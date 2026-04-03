@@ -41,7 +41,7 @@ def search_offers_command(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="fastloader Vast.ai bridge")
+    parser = argparse.ArgumentParser(description="mmltk Vast.ai bridge")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     search_parser = subparsers.add_parser("search-offers")

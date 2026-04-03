@@ -1,6 +1,7 @@
 #include "rfdetr/backends.h"
 
 #include "profile_utils.h"
+#include "mmltk_logging.h"
 #include "rfdetr/backends_internal.h"
 #include "rfdetr/cuda_utils.h"
 
@@ -21,10 +22,11 @@
 #include <sstream>
 #include <string>
 #include <stdexcept>
+#include <utility>
 #include <unordered_map>
 #include <vector>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 namespace {
 
@@ -49,8 +51,7 @@ void emit_tensorrt_log_line(const std::string& line) {
     if (line.empty()) {
         return;
     }
-    std::fprintf(stderr, "%s\n", line.c_str());
-    std::fflush(stderr);
+    mmltk::logging::logger("rfdetr.tensorrt")->info("{}", line);
 
     TensorRtLogSink sink;
     {
@@ -118,7 +119,7 @@ size_t element_count(const std::vector<int64_t>& shape) {
         return 0;
     }
     return static_cast<size_t>(std::accumulate(
-        shape.begin(), shape.end(), int64_t{1}, std::multiplies<int64_t>()));
+        shape.begin(), shape.end(), int64_t{1}, std::multiplies<>()));
 }
 
 std::streamsize checked_streamsize(size_t value, const char* context) {
@@ -197,7 +198,7 @@ public:
         threshold_.store(static_cast<int>(threshold), std::memory_order_relaxed);
     }
 
-    Severity threshold() const noexcept {
+    [[nodiscard]] Severity threshold() const noexcept {
         return static_cast<Severity>(threshold_.load(std::memory_order_relaxed));
     }
 
@@ -302,15 +303,15 @@ using TensorRtUnique = std::unique_ptr<T, TensorRtDestroy<T>>;
 
 class TensorRtSharedState {
 public:
-    TensorRtSharedState(const std::filesystem::path& model_path,
+    TensorRtSharedState(std::filesystem::path model_path,
                         int device_id,
                         bool allow_fp16,
-                        const std::filesystem::path& save_engine_path)
-        : model_path_(model_path),
+                        std::filesystem::path save_engine_path)
+        : model_path_(std::move(model_path)),
           device_id_(device_id),
           allow_fp16_(allow_fp16),
-          save_engine_path_(save_engine_path) {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.native.tensorrt.shared_construct");
+          save_engine_path_(std::move(save_engine_path)) {
+        MMLTK_PROFILE_SCOPE("rfdetr.native.tensorrt.shared_construct");
         ensure_cuda_ok(cudaSetDevice(device_id_), "cudaSetDevice for TensorRT backend");
         if (has_extension(model_path_, ".engine")) {
             load_engine(read_binary(model_path_));
@@ -322,12 +323,12 @@ public:
         initialize_tensor_info();
     }
 
-    const ModelInfo& info() const { return info_; }
-    nvinfer1::ICudaEngine& engine() const { return *engine_; }
-    int device_id() const { return device_id_; }
-    size_t boxes_output_index() const { return boxes_output_index_; }
-    size_t logits_output_index() const { return logits_output_index_; }
-    size_t masks_output_index() const { return masks_output_index_; }
+    [[nodiscard]] const ModelInfo& info() const { return info_; }
+    [[nodiscard]] nvinfer1::ICudaEngine& engine() const { return *engine_; }
+    [[nodiscard]] int device_id() const { return device_id_; }
+    [[nodiscard]] size_t boxes_output_index() const { return boxes_output_index_; }
+    [[nodiscard]] size_t logits_output_index() const { return logits_output_index_; }
+    [[nodiscard]] size_t masks_output_index() const { return masks_output_index_; }
 
     void save_engine(const std::filesystem::path& path) const {
         if (serialized_engine_ == nullptr) {
@@ -529,9 +530,9 @@ class TensorRtBackend final : public InferenceBackend {
 public:
     explicit TensorRtBackend(std::shared_ptr<TensorRtSharedState> shared_state)
         : shared_state_(std::move(shared_state)) {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.native.tensorrt.construct");
+        MMLTK_PROFILE_SCOPE("rfdetr.native.tensorrt.construct");
         ensure_cuda_ok(cudaSetDevice(shared_state_->device_id()), "cudaSetDevice for TensorRT backend lane");
-        ensure_cuda_ok(fastloader::cuda_stream_create_with_highest_priority(&stream_, cudaStreamNonBlocking),
+        ensure_cuda_ok(mmltk::cuda_stream_create_with_highest_priority(&stream_, cudaStreamNonBlocking),
                        "cudaStreamCreateWithPriority for TensorRT backend lane");
         context_.reset(shared_state_->engine().createExecutionContext());
         if (context_ == nullptr) {
@@ -550,11 +551,11 @@ public:
         }
     }
 
-    const ModelInfo& info() const override { return shared_state_->info(); }
-    void* stream() const override { return stream_; }
+    [[nodiscard]] const ModelInfo& info() const override { return shared_state_->info(); }
+    [[nodiscard]] void* stream() const override { return stream_; }
 
     OutputTensors run(const torch::Tensor& normalized_input) override {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.native.tensorrt.run");
+        MMLTK_PROFILE_SCOPE("rfdetr.native.tensorrt.run");
         if (!normalized_input.is_cuda() || !normalized_input.is_contiguous()) {
             throw std::runtime_error("TensorRT backend input must be contiguous CUDA tensor");
         }
@@ -682,4 +683,4 @@ std::vector<std::unique_ptr<InferenceBackend>> make_tensorrt_backend_lanes(
     return backends;
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

@@ -11,18 +11,20 @@
       "hidden": true,
       "generator": "Ninja",
       "environment": {
-        "LD_LIBRARY_PATH": "/usr/local/cuda-13.2/lib64:/opt/pytorch-2.10.0-cu132/lib:/opt/onnxruntime/lib"
+        "LD_LIBRARY_PATH": "/usr/local/cuda-13.0/lib64:/opt/pytorch/lib:/opt/onnx/lib:/opt/onnxruntime/lib"
       },
       "cacheVariables": {
-        "FASTLOADER_CUDA_VERSION": "13.2",
-        "FASTLOADER_CUDA_TOOLKIT_ROOT": "/usr/local/cuda-13.2",
-        "FASTLOADER_CUDA_ARCHITECTURES": "native",
-        "FASTLOADER_TORCH_ROOT": "/opt/pytorch-2.10.0-cu132",
-        "FASTLOADER_TORCH_CUDA_ARCH_LIST": "8.6",
+        "MMLTK_CUDA_VERSION": "13.0",
+        "MMLTK_CUDA_TOOLKIT_ROOT": "/usr/local/cuda-13.0",
+        "MMLTK_CUDA_ARCHITECTURES": "86;87;89;90;100;103;110;120;121",
+        "MMLTK_TORCH_ROOT": "/opt/pytorch",
+        "MMLTK_ONNX_ROOT": "/opt/onnx",
+        "MMLTK_ONNXRUNTIME_ROOT": "/opt/onnxruntime",
+        "MMLTK_TORCH_CUDA_ARCH_LIST": "8.6 8.7 8.9 9.0 10.0 10.3 11.0 12.0 12.1",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "BUILD_TESTS": "ON",
         "CMAKE_CXX_COMPILER": "/usr/bin/g++-14",
-        "Python3_EXECUTABLE": "/opt/fastloader-pth-parse/bin/python"
+        "Python3_EXECUTABLE": "/usr/bin/python3"
       }
     },
     {
@@ -32,7 +34,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "BUILD_TESTS": "OFF",
-        "BUILD_FASTLOADER_GUI": "ON",
+        "BUILD_MMLTK_GUI": "ON",
         "BUILD_RFDETR_NATIVE": "ON",
         "BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER": "ON"
       }
@@ -44,6 +46,43 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Dev",
         "BUILD_TESTS": "ON",
+        "BUILD_MMLTK_GUI": "ON",
+        "BUILD_RFDETR_NATIVE": "ON",
+        "BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER": "ON"
+      }
+    },
+    {
+      "name": "docker-base",
+      "hidden": true,
+      "inherits": "base",
+      "environment": {
+        "LD_LIBRARY_PATH": "/usr/local/cuda-13.0/lib64:/opt/pytorch/lib:/build/deps/onnx/lib:/build/deps/onnxruntime/lib"
+      },
+      "cacheVariables": {
+        "MMLTK_ONNX_ROOT": "/build/deps/onnx",
+        "MMLTK_ONNXRUNTIME_ROOT": "/build/deps/onnxruntime"
+      }
+    },
+    {
+      "name": "docker-release",
+      "inherits": "docker-base",
+      "binaryDir": "${sourceDir}/build/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "BUILD_TESTS": "OFF",
+        "BUILD_MMLTK_GUI": "ON",
+        "BUILD_RFDETR_NATIVE": "ON",
+        "BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER": "ON"
+      }
+    },
+    {
+      "name": "docker-dev",
+      "inherits": "docker-base",
+      "binaryDir": "${sourceDir}/build/dev",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Dev",
+        "BUILD_TESTS": "ON",
+        "BUILD_MMLTK_GUI": "ON",
         "BUILD_RFDETR_NATIVE": "ON",
         "BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER": "ON"
       }
@@ -54,14 +93,28 @@
       "name": "release",
       "configurePreset": "release",
       "environment": {
-        "LD_LIBRARY_PATH": "/usr/local/cuda-13.2/lib64:/opt/pytorch-2.10.0-cu132/lib:/opt/onnxruntime/lib"
+        "LD_LIBRARY_PATH": "/usr/local/cuda-13.0/lib64:/opt/pytorch/lib:/opt/onnx/lib:/opt/onnxruntime/lib"
       }
     },
     {
       "name": "dev",
       "configurePreset": "dev",
       "environment": {
-        "LD_LIBRARY_PATH": "/usr/local/cuda-13.2/lib64:/opt/pytorch-2.10.0-cu132/lib:/opt/onnxruntime/lib"
+        "LD_LIBRARY_PATH": "/usr/local/cuda-13.0/lib64:/opt/pytorch/lib:/opt/onnx/lib:/opt/onnxruntime/lib"
+      }
+    },
+    {
+      "name": "docker-release",
+      "configurePreset": "docker-release",
+      "environment": {
+        "LD_LIBRARY_PATH": "/usr/local/cuda-13.0/lib64:/opt/pytorch/lib:/build/deps/onnx/lib:/build/deps/onnxruntime/lib"
+      }
+    },
+    {
+      "name": "docker-dev",
+      "configurePreset": "docker-dev",
+      "environment": {
+        "LD_LIBRARY_PATH": "/usr/local/cuda-13.0/lib64:/opt/pytorch/lib:/build/deps/onnx/lib:/build/deps/onnxruntime/lib"
       }
     }
   ],
@@ -70,7 +123,17 @@
       "name": "dev",
       "configurePreset": "dev",
       "environment": {
-        "LD_LIBRARY_PATH": "/usr/local/cuda-13.2/lib64:/opt/pytorch-2.10.0-cu132/lib:/opt/onnxruntime/lib"
+        "LD_LIBRARY_PATH": "/usr/local/cuda-13.0/lib64:/opt/pytorch/lib:/opt/onnx/lib:/opt/onnxruntime/lib"
+      },
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "docker-dev",
+      "configurePreset": "docker-dev",
+      "environment": {
+        "LD_LIBRARY_PATH": "/usr/local/cuda-13.0/lib64:/opt/pytorch/lib:/build/deps/onnx/lib:/build/deps/onnxruntime/lib"
       },
       "output": {
         "outputOnFailure": true

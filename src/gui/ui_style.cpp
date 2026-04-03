@@ -1,5 +1,7 @@
 #include "ui_style.h"
 
+#include "runtime_paths.h"
+
 #include <backends/imgui_impl_opengl3.h>
 #include <imgui.h>
 
@@ -8,7 +10,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace fastloader::gui {
+namespace mmltk::gui {
 
 namespace {
 
@@ -33,15 +35,21 @@ UiSettingsState sanitize_ui_settings(UiSettingsState settings) {
     settings.secondary_font_size = std::clamp(settings.secondary_font_size, 12.0f, 24.0f);
     settings.mono_font_size = std::clamp(settings.mono_font_size, 12.0f, 24.0f);
     settings.property_label_width = std::clamp(settings.property_label_width, 110.0f, 260.0f);
+    settings.crop_edge_hit_half_width = std::clamp(settings.crop_edge_hit_half_width, 4.0f, 16.0f);
+    settings.crop_corner_hit_size = std::clamp(settings.crop_corner_hit_size, 12.0f, 32.0f);
+    settings.crop_handle_radius = std::clamp(settings.crop_handle_radius, 3.0f, 12.0f);
     return settings;
 }
 
 std::filesystem::path asset_font_path(const char* filename) {
-#ifdef FASTLOADER_GUI_ASSET_ROOT
-    return std::filesystem::path(FASTLOADER_GUI_ASSET_ROOT) / "fonts" / filename;
-#else
-    return std::filesystem::path("src/gui/res/fonts") / filename;
+    std::filesystem::path source_path;
+#ifdef MMLTK_GUI_ASSET_ROOT_SOURCE
+    source_path = std::filesystem::path(MMLTK_GUI_ASSET_ROOT_SOURCE) / "fonts" / filename;
+    if (std::filesystem::exists(source_path)) {
+        return source_path;
+    }
 #endif
+    return runtime_paths::font_asset_path(filename);
 }
 
 ImFont* add_font_or_throw(ImFontAtlas* atlas,
@@ -82,7 +90,7 @@ void load_fonts(const UiSettingsState& settings) {
     ImFontConfig mono_config = primary_config;
     mono_config.RasterizerMultiply = 1.0f;
 
-    const float scale = settings.ui_scale;
+    const float scale = settings.ui_scale * settings.content_scale;
     g_ui_fonts.primary =
         add_font_or_throw(io.Fonts,
                           asset_font_path("SourceSansPro-Regular.otf"),
@@ -107,7 +115,7 @@ void apply_palette(const UiSettingsState& settings) {
     ImGuiStyle style;
     ImGui::StyleColorsDark(&style);
 
-    const float metric_scale = settings.ui_scale * density_multiplier(settings.density);
+    const float metric_scale = settings.ui_scale * settings.content_scale * density_multiplier(settings.density);
     style.WindowMenuButtonPosition = ImGuiDir_None;
     style.WindowPadding = ImVec2(8.0f * metric_scale, 8.0f * metric_scale);
     style.FramePadding = ImVec2(6.0f * metric_scale, 5.0f * metric_scale);
@@ -186,11 +194,11 @@ const UiFontSet& current_ui_fonts() {
 }
 
 float ui_scaled(const float value) {
-    return value * g_ui_settings.ui_scale;
+    return value * g_ui_settings.ui_scale * g_ui_settings.content_scale;
 }
 
 float ui_label_width() {
-    return g_ui_settings.property_label_width * g_ui_settings.ui_scale;
+    return g_ui_settings.property_label_width * g_ui_settings.ui_scale * g_ui_settings.content_scale;
 }
 
-} // namespace fastloader::gui
+} // namespace mmltk::gui

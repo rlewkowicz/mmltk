@@ -5,7 +5,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace fastloader {
+namespace mmltk {
 
 inline int current_cuda_highest_stream_priority() {
     int least_priority = 0;
@@ -29,4 +29,4 @@ inline cudaError_t cuda_stream_create_with_highest_priority(cudaStream_t* stream
     return cudaStreamCreateWithPriority(stream, flags, greatest_priority);
 }
 
-} // namespace fastloader
+} // namespace mmltk

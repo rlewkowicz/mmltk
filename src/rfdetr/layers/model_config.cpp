@@ -1,15 +1,101 @@
-#include "fastloader/rfdetr/model_config.h"
-#include "fastloader/rfdetr/weight_catalog.h"
+#include "mmltk/rfdetr/model_config.h"
+#include "mmltk/rfdetr/weight_catalog.h"
 
+#include <algorithm>
+#include <cctype>
+#include <filesystem>
+#include <string>
 #include <string_view>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 namespace {
 
 std::string_view url_basename(std::string_view url) {
     const size_t slash = url.find_last_of('/');
     return slash == std::string_view::npos ? url : url.substr(slash + 1);
+}
+
+std::string lowercase_copy(std::string_view value) {
+    std::string lowered(value);
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return lowered;
+}
+
+bool is_match_boundary(char ch) {
+    return !std::isalnum(static_cast<unsigned char>(ch));
+}
+
+bool contains_path_token(std::string_view normalized_path, std::string_view candidate) {
+    if (candidate.empty() || normalized_path.size() < candidate.size()) {
+        return false;
+    }
+
+    size_t pos = normalized_path.find(candidate);
+    while (pos != std::string_view::npos) {
+        const size_t end = pos + candidate.size();
+        const bool left_ok = pos == 0 || is_match_boundary(normalized_path[pos - 1]);
+        const bool right_ok = end == normalized_path.size() || is_match_boundary(normalized_path[end]);
+        if (left_ok && right_ok) {
+            return true;
+        }
+        pos = normalized_path.find(candidate, pos + 1);
+    }
+    return false;
+}
+
+std::string_view preset_suffix(std::string_view preset_name) {
+    constexpr std::string_view kPrefix = "rf-detr-";
+    if (preset_name.substr(0, kPrefix.size()) == kPrefix) {
+        return preset_name.substr(kPrefix.size());
+    }
+    return {};
+}
+
+void consider_match_candidate(const ModelPresetConfig& preset,
+                              std::string_view normalized_path,
+                              std::string_view candidate,
+                              size_t base_score,
+                              const ModelPresetConfig*& best_match,
+                              size_t& best_score) {
+    if (candidate.empty() || !contains_path_token(normalized_path, candidate)) {
+        return;
+    }
+    const size_t score = base_score + candidate.size();
+    if (score > best_score) {
+        best_match = &preset;
+        best_score = score;
+    }
+}
+
+void consider_preset_aliases(const ModelPresetConfig& preset,
+                             std::string_view normalized_path,
+                             const ModelPresetConfig*& best_match,
+                             size_t& best_score) {
+    const std::string_view suffix = preset_suffix(preset.preset_name);
+    if (suffix.empty()) {
+        return;
+    }
+
+    consider_match_candidate(preset, normalized_path, lowercase_copy(suffix), 1500, best_match, best_score);
+
+    if (suffix == "seg-nano") {
+        consider_match_candidate(preset, normalized_path, "seg-n", 1400, best_match, best_score);
+    } else if (suffix == "seg-small") {
+        consider_match_candidate(preset, normalized_path, "seg-s", 1400, best_match, best_score);
+    } else if (suffix == "seg-medium") {
+        consider_match_candidate(preset, normalized_path, "seg-med", 1400, best_match, best_score);
+        consider_match_candidate(preset, normalized_path, "seg-m", 1390, best_match, best_score);
+    } else if (suffix == "seg-large") {
+        consider_match_candidate(preset, normalized_path, "seg-l", 1400, best_match, best_score);
+    } else if (suffix == "seg-xlarge") {
+        consider_match_candidate(preset, normalized_path, "seg-xl", 1400, best_match, best_score);
+    } else if (suffix == "seg-xxlarge") {
+        consider_match_candidate(preset, normalized_path, "seg-2xl", 1400, best_match, best_score);
+        consider_match_candidate(preset, normalized_path, "seg-xxl", 1390, best_match, best_score);
+    }
 }
 
 const std::vector<ModelPresetConfig>& preset_table() {
@@ -68,4 +154,46 @@ const ModelPresetConfig* find_model_preset_by_weight_filename(std::string_view f
     return nullptr;
 }
 
-} // namespace fastloader::rfdetr
+const ModelPresetConfig* infer_model_preset_from_path(const std::filesystem::path& path) {
+    if (path.empty()) {
+        return nullptr;
+    }
+
+    if (const auto* preset = find_model_preset_by_weight_filename(path.filename().string())) {
+        return preset;
+    }
+
+    const std::string normalized_path = lowercase_copy(path.lexically_normal().string());
+    const ModelPresetConfig* best_match = nullptr;
+    size_t best_score = 0;
+
+    for (const auto& preset : preset_table()) {
+        const std::string canonical_name = lowercase_copy(preset.canonical_weight_filename);
+        consider_match_candidate(preset, normalized_path, canonical_name, 3000, best_match, best_score);
+
+        const std::string canonical_stem =
+            lowercase_copy(std::filesystem::path(std::string(preset.canonical_weight_filename)).stem().string());
+        consider_match_candidate(preset, normalized_path, canonical_stem, 2900, best_match, best_score);
+
+        const std::string preset_name = lowercase_copy(preset.preset_name);
+        consider_match_candidate(preset, normalized_path, preset_name, 2800, best_match, best_score);
+
+        if (const auto* asset = find_weight_asset(preset.canonical_weight_filename)) {
+            const std::string_view basename = url_basename(asset->download_url);
+            if (find_model_preset_by_weight_filename(basename) == &preset) {
+                const std::string upstream_name = lowercase_copy(basename);
+                consider_match_candidate(preset, normalized_path, upstream_name, 2700, best_match, best_score);
+
+                const std::string upstream_stem =
+                    lowercase_copy(std::filesystem::path(std::string(basename)).stem().string());
+                consider_match_candidate(preset, normalized_path, upstream_stem, 2600, best_match, best_score);
+            }
+        }
+
+        consider_preset_aliases(preset, normalized_path, best_match, best_score);
+    }
+
+    return best_match;
+}
+
+} // namespace mmltk::rfdetr

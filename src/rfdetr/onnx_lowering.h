@@ -7,7 +7,7 @@
 #include <memory>
 #include <unordered_map>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 constexpr int kSupportedOnnxExportOpsetVersion = 19;
 using OnnxInitializerMap = std::unordered_map<std::string, at::Tensor>;
@@ -18,4 +18,4 @@ void lower_graph_for_onnx_export(
     const std::shared_ptr<torch::jit::Graph>& graph,
     const OnnxInitializerMap* initializers = nullptr);
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

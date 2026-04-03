@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 void launch_ms_deform_attn_cuda_forward(const float* value,
                                         const int64_t* spatial_shapes,
@@ -41,4 +41,4 @@ void launch_ms_deform_attn_cuda_backward(const float* value,
                                          float* grad_attn_weight,
                                          cudaStream_t stream);
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

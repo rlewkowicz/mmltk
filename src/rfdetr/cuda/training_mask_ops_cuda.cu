@@ -3,7 +3,7 @@
 
 #include <cuda_runtime.h>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 namespace {
 
@@ -170,4 +170,4 @@ void launch_sample_packed_masks_cuda(const int64_t* packed_bits,
     ensure_cuda_ok(cudaGetLastError(), "sample_packed_masks_cuda launch");
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

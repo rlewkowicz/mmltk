@@ -8,7 +8,7 @@
 
 #include <algorithm>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 torch::Tensor ms_deform_attn_cuda_forward(const torch::Tensor& value,
                                           const torch::Tensor& spatial_shapes,
@@ -132,4 +132,4 @@ std::vector<torch::Tensor> ms_deform_attn_cuda_backward(const torch::Tensor& val
     return {grad_value, grad_sampling_loc, grad_attn_weight};
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

@@ -1,26 +1,29 @@
 #include "rfdetr/cli.h"
+#include "rfdetr/cli/workflow_cli_shared.h"
 
 #include "cpu_affinity.h"
 #include "execution_policy.h"
-#include "fastloader/rfdetr/predict.h"
-#include "fastloader/rfdetr/train.h"
-#include "fastloader/rfdetr/validate.h"
+#include "mmltk/rfdetr/checkpoint.h"
+#include "mmltk/rfdetr/model.h"
+#include "mmltk/rfdetr/predict.h"
+#include "mmltk/rfdetr/train.h"
+#include "mmltk/rfdetr/validate.h"
+#include "mmltk/rfdetr/workflow_requests.h"
+#include "rfdetr/checkpoint_internal.h"
+#include "rfdetr/tool_launch_utils.h"
 #include "rfdetr/backends.h"
-#include "fastloader/rfdetr/model.h"
-#include "fastloader/rfdetr/checkpoint.h"
-#include "rfdetr/train_recipe.h"
 #include "dataset_compiler.h"
-#include "rfdetr/progress_bar.h"
+#include "mmltk_logging.h"
+#include "spdmon/spdmon.hpp"
 #include "CLI11.hpp"
 
 #include <cuda_runtime_api.h>
 
-#include <signal.h>
+#include <csignal>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <algorithm>
 #include <cerrno>
 #include <cstddef>
 #include <cstdlib>
@@ -34,26 +37,11 @@
 #include <string>
 #include <vector>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 namespace {
 
 constexpr int kCliParseSuccess = static_cast<int>(CLI::ExitCodes::Success);
-
-struct BuildEngineOptions {
-    std::filesystem::path onnx_path;
-    std::filesystem::path output_path;
-    int device_id = 0;
-    bool allow_fp16 = true;
-};
-
-struct ExportOnnxOptions {
-    std::filesystem::path weights_path;
-    std::filesystem::path output_path;
-    int device_id = 0;
-    int opset_version = 19;
-    bool simplify = false;
-};
 
 struct InfoOptions {
     std::filesystem::path onnx_path;
@@ -61,26 +49,11 @@ struct InfoOptions {
     int device_id = 0;
 };
 
-struct PredictCliOptions : PredictOptions {};
 struct EvaluateCliOptions : EvaluateOptions {};
-struct TrainCliOptions : TrainOptions {};
-
-struct PredictCliState {
-    PredictCliOptions options;
-    std::string compile_mode = "selective";
-};
 
 struct EvaluateCliState {
     EvaluateCliOptions options;
     std::string compile_mode = "selective";
-};
-
-struct TrainCliState {
-    TrainCliOptions options;
-    std::string device_ids;
-    std::string compile_mode = "selective";
-    std::string optimizer = "adamw";
-    TrainRecipeFieldOverrides recipe_overrides;
 };
 
 struct NormalizeWeightsOptions {
@@ -102,62 +75,19 @@ int handle_parse_error(CLI::App& app, const CLI::ParseError& error) {
     return error.get_exit_code() == kCliParseSuccess ? 0 : 1;
 }
 
-CompilationMode parse_compilation_mode(const std::string& value) {
-    if (value == "none") return CompilationMode::kNone;
-    if (value == "selective") return CompilationMode::kSelective;
-    if (value == "full") return CompilationMode::kFullTrace;
-    throw std::runtime_error("--compile-mode must be 'none', 'selective', or 'full', got: " + value);
-}
-
-TrainOptimizerKind parse_train_optimizer_kind(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
-    });
-    if (value == "adamw") {
-        return TrainOptimizerKind::AdamW;
-    }
-    if (value == "muon") {
-        return TrainOptimizerKind::Muon;
-    }
-    throw std::runtime_error("--optimizer must be 'adamw' or 'muon', got: " + value);
-}
-
-template <typename Options>
-void require_model_input(const Options& options, const char* command) {
-    const size_t selected_input_count =
-        static_cast<size_t>(!options.weights_path.empty()) +
-        static_cast<size_t>(!options.onnx_path.empty()) +
-        static_cast<size_t>(!options.tensorrt_path.empty());
-    if (selected_input_count != 1) {
-        throw std::runtime_error(
-            std::string("rfdetr ") + command + " requires exactly one of --weights, --onnx, or --tensorrt");
-    }
-}
-
-std::vector<int> parse_device_ids(const std::string& value) {
-    std::vector<int> ids;
-    size_t start = 0;
-    while (start <= value.size()) {
-        const size_t comma = value.find(',', start);
-        const std::string item = value.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
-        if (item.empty()) {
-            throw std::runtime_error("rfdetr train --device-ids must not contain empty elements");
-        }
-        ids.push_back(std::stoi(item));
-        if (comma == std::string::npos) {
-            break;
-        }
-        start = comma + 1;
-    }
-    if (ids.empty()) {
-        throw std::runtime_error("rfdetr train --device-ids requires at least one CUDA device id");
-    }
-    return ids;
+[[noreturn]] void exec_onnx_info_tool(const std::filesystem::path& model_path) {
+    const std::filesystem::path tool_path = resolve_sibling_tool_path("mmltk-rfdetr-onnx-info");
+    const std::string tool = tool_path.string();
+    const std::string model = model_path.string();
+    std::vector<std::string> args{tool, model};
+    std::vector<char*> raw_args = make_exec_argv(args);
+    ::execv(raw_args.front(), raw_args.data());
+    throw std::runtime_error("failed to exec ONNX info helper " + tool + ": " + std::strerror(errno));
 }
 
 std::filesystem::path distributed_store_path_for_parent() {
     return std::filesystem::temp_directory_path() /
-           ("fastloader_rfdetr_train_" + std::to_string(static_cast<long long>(::getpid())) + ".store");
+           ("mmltk_rfdetr_train_" + std::to_string(static_cast<long long>(::getpid())) + ".store");
 }
 
 std::vector<int> shard_cpu_list(const std::vector<int>& cpus, int rank, int world_size) {
@@ -174,8 +104,8 @@ std::vector<int> shard_cpu_list(const std::vector<int>& cpus, int rank, int worl
     if (count == 0) {
         return {cpus[rank_index % cpus.size()]};
     }
-    return std::vector<int>(cpus.begin() + static_cast<std::ptrdiff_t>(begin),
-                            cpus.begin() + static_cast<std::ptrdiff_t>(begin + count));
+    return {cpus.begin() + static_cast<std::ptrdiff_t>(begin),
+            cpus.begin() + static_cast<std::ptrdiff_t>(begin + count)};
 }
 
 int shard_worker_budget(int requested_workers, int rank, int world_size) {
@@ -220,7 +150,7 @@ std::vector<std::string> distributed_worker_base_args(int argc, char** argv) {
     return normalized;
 }
 
-int spawn_distributed_training_workers(const TrainCliOptions& options, int argc, char** argv) {
+int spawn_distributed_training_workers(const TrainOptions& options, int argc, char** argv) {
     const int world_size = static_cast<int>(options.device_ids.size());
     if (world_size < 2) {
         throw std::runtime_error("distributed RF-DETR train requires at least two device ids");
@@ -253,8 +183,8 @@ int spawn_distributed_training_workers(const TrainCliOptions& options, int argc,
     std::filesystem::remove(store_path);
 
     const std::vector<int> all_cpus = options.cpu_affinity.empty()
-                                          ? fastloader::allowed_cpu_set()
-                                          : fastloader::resolve_cpu_affinity(options.cpu_affinity);
+                                          ? mmltk::allowed_cpu_set()
+                                          : mmltk::resolve_cpu_affinity(options.cpu_affinity);
     const auto base_args = distributed_worker_base_args(argc, argv);
 
     std::vector<pid_t> children;
@@ -264,15 +194,15 @@ int spawn_distributed_training_workers(const TrainCliOptions& options, int argc,
 
     for (int rank = 0; rank < world_size; ++rank) {
         std::vector<std::string> worker_args = base_args;
-        worker_args.push_back("--device-id");
+        worker_args.emplace_back("--device-id");
         worker_args.push_back(std::to_string(options.device_ids[static_cast<size_t>(rank)]));
         const auto shard_cpus = shard_cpu_list(all_cpus, rank, world_size);
         int rank_workers = shard_worker_budget(options.workers, rank, world_size);
         if (!shard_cpus.empty() && static_cast<int>(shard_cpus.size()) >= 3) {
             const int clamped_workers =
-                fastloader::clamp_worker_count_to_cpus(rank_workers, shard_cpus.size(), 0, 3);
+                mmltk::clamp_worker_count_to_cpus(rank_workers, shard_cpus.size(), 0, 3);
             const std::string subsystem = "rfdetr.distributed.rank" + std::to_string(rank);
-            fastloader::log_worker_budget_clamp(subsystem.c_str(),
+            mmltk::log_worker_budget_clamp(subsystem.c_str(),
                                                 rank_workers,
                                                 clamped_workers,
                                                 shard_cpus,
@@ -280,18 +210,18 @@ int spawn_distributed_training_workers(const TrainCliOptions& options, int argc,
                                                 3);
             rank_workers = clamped_workers;
         }
-        worker_args.push_back("--workers");
+        worker_args.emplace_back("--workers");
         worker_args.push_back(std::to_string(rank_workers));
         if (!shard_cpus.empty()) {
-            worker_args.push_back("--cpu-affinity");
-            worker_args.push_back(fastloader::format_cpu_list(shard_cpus));
+            worker_args.emplace_back("--cpu-affinity");
+            worker_args.push_back(mmltk::format_cpu_list(shard_cpus));
         }
-        worker_args.push_back("--dist-worker");
-        worker_args.push_back("--dist-rank");
+        worker_args.emplace_back("--dist-worker");
+        worker_args.emplace_back("--dist-rank");
         worker_args.push_back(std::to_string(rank));
-        worker_args.push_back("--dist-world-size");
+        worker_args.emplace_back("--dist-world-size");
         worker_args.push_back(std::to_string(world_size));
-        worker_args.push_back("--dist-store-file");
+        worker_args.emplace_back("--dist-store-file");
         worker_args.push_back(store_path.string());
 
         pid_t pid = ::fork();
@@ -307,7 +237,9 @@ int spawn_distributed_training_workers(const TrainCliOptions& options, int argc,
             }
             raw_args.push_back(nullptr);
             ::execvp(raw_args.front(), raw_args.data());
-            std::fprintf(stderr, "fastloader rfdetr error: failed to exec distributed worker: %s\n", std::strerror(errno));
+            mmltk::logging::logger("rfdetr.cli")->error(
+                "mmltk rfdetr error: failed to exec distributed worker: {}",
+                std::strerror(errno));
             std::_Exit(127);
         }
         children.push_back(pid);
@@ -341,29 +273,6 @@ int spawn_distributed_training_workers(const TrainCliOptions& options, int argc,
     return failed ? failed_status : 0;
 }
 
-CLI::Option* add_path_option(CLI::App* command,
-                             const std::string& name,
-                             std::filesystem::path& value,
-                             const char* description) {
-    return command->add_option(name, value, description)->type_name("PATH");
-}
-
-void add_compile_mode_option(CLI::App* command, std::string& compile_mode) {
-    command->add_option(
-               "--compile-mode",
-               compile_mode,
-               "Native PyTorch compilation mode: none, selective, or full")
-        ->type_name("MODE");
-}
-
-void add_model_input_options(CLI::App* command,
-                             ModelArtifactRequest& request,
-                             const char* tensorrt_description) {
-    add_path_option(command, "--weights", request.weights_path, "RF-DETR checkpoint path");
-    add_path_option(command, "--onnx", request.onnx_path, "ONNX model path");
-    add_path_option(command, "--tensorrt", request.tensorrt_path, tensorrt_description);
-}
-
 void finalize_compile_options(const CompileCliOptions& options) {
     if (options.source_dir.empty() || options.output_dir.empty()) {
         throw std::runtime_error("rfdetr compile requires --source-dir and --output-dir");
@@ -374,117 +283,23 @@ void finalize_compile_options(const CompileCliOptions& options) {
 }
 
 void finalize_info_options(const InfoOptions& options) {
-    if (options.onnx_path.empty() == options.tensorrt_path.empty()) {
-        throw std::runtime_error("rfdetr info requires exactly one of --onnx or --tensorrt");
-    }
-}
-
-void finalize_build_engine_options(const BuildEngineOptions& options) {
-    if (options.onnx_path.empty() || options.output_path.empty()) {
-        throw std::runtime_error("rfdetr build-engine requires --onnx and --output");
-    }
-}
-
-void finalize_predict_options(PredictCliState& state) {
-    state.options.compilation_mode = parse_compilation_mode(state.compile_mode);
-    if (state.options.compiled_path.empty() || state.options.output_path.empty()) {
-        throw std::runtime_error("rfdetr predict requires --compiled and --output");
-    }
-    require_model_input(state.options, "predict");
+    cli_shared::require_exactly_one_model_input(options.onnx_path, options.tensorrt_path, "info");
 }
 
 void finalize_evaluate_options(EvaluateCliState& state) {
-    state.options.compilation_mode = parse_compilation_mode(state.compile_mode);
+    state.options.compilation_mode = cli_shared::parse_compilation_mode(state.compile_mode);
     if (state.options.compiled_path.empty()) {
         throw std::runtime_error("rfdetr evaluate requires --compiled");
     }
-    require_model_input(state.options, "evaluate");
+    cli_shared::require_exactly_one_model_input(state.options, "evaluate");
 }
 
-void finalize_normalize_options(const NormalizeWeightsOptions& options) {
+void finalize_normalize_options(NormalizeWeightsOptions& options) {
     if (options.input_path.empty() || options.output_path.empty()) {
         throw std::runtime_error("rfdetr normalize-weights requires --input and --output");
     }
-}
-
-std::string infer_train_recipe_preset_name(const TrainCliOptions& options) {
-    const auto source_checkpoint = !options.resume_path.empty() ? options.resume_path : options.weights_path;
-    std::string preset_name = infer_train_recipe_preset_name_from_path(source_checkpoint);
-    if (!preset_name.empty()) {
-        return preset_name;
-    }
-    if (!is_native_checkpoint_file(source_checkpoint)) {
-        return {};
-    }
-    const auto checkpoint = load_checkpoint(source_checkpoint);
-    return checkpoint.metadata.preset_name;
-}
-
-void finalize_train_options(TrainCliState& state, bool saw_device_id, bool saw_device_ids) {
-    state.options.compilation_mode = parse_compilation_mode(state.compile_mode);
-    state.options.optimizer = parse_train_optimizer_kind(state.optimizer);
-    if (state.options.train_compiled_path.empty() ||
-        state.options.val_compiled_path.empty() ||
-        state.options.output_dir.empty()) {
-        throw std::runtime_error("rfdetr train requires --train-compiled, --val-compiled, and --output-dir");
-    }
-    const size_t selected_input_count =
-        static_cast<size_t>(!state.options.weights_path.empty()) +
-        static_cast<size_t>(!state.options.resume_path.empty());
-    if (selected_input_count != 1) {
-        throw std::runtime_error("rfdetr train requires exactly one of --weights or --resume");
-    }
-    apply_train_recipe(
-        state.options,
-        resolve_train_recipe(infer_train_recipe_preset_name(state.options), state.options.optimizer),
-        state.recipe_overrides);
-    if (state.options.lr_scheduler != "step" && state.options.lr_scheduler != "cosine") {
-        throw std::runtime_error("rfdetr train --lr-scheduler must be 'step' or 'cosine'");
-    }
-    if (saw_device_id && saw_device_ids) {
-        throw std::runtime_error("rfdetr train accepts only one of --device-id or --device-ids");
-    }
-    if (saw_device_ids) {
-        state.options.device_ids = parse_device_ids(state.device_ids);
-        if (state.options.device_ids.size() == 1) {
-            state.options.device_id = state.options.device_ids.front();
-            state.options.device_ids.clear();
-        }
-    }
-    if (state.options.distributed_worker) {
-        if (state.options.distributed_rank < 0 ||
-            state.options.distributed_world_size <= 1 ||
-            state.options.distributed_store_path.empty()) {
-            throw std::runtime_error("invalid internal RF-DETR distributed worker arguments");
-        }
-    } else if (state.options.distributed_world_size != 1 ||
-               state.options.distributed_rank != 0 ||
-               !state.options.distributed_store_path.empty()) {
-        throw std::runtime_error("internal RF-DETR distributed worker options require --dist-worker");
-    }
-}
-
-void finalize_validate_options(ValidationOptions& options) {
-    if (options.compiled_path.empty()) {
-        throw std::runtime_error("rfdetr validate requires --compiled");
-    }
-    if (options.onnx_path.empty() && options.tensorrt_path.empty()) {
-        throw std::runtime_error("rfdetr validate requires at least one of --onnx or --tensorrt");
-    }
-    if (options.recompile && options.source_dir.empty()) {
-        throw std::runtime_error("rfdetr validate --recompile requires --source");
-    }
-    if (options.compile_cuda_mask_batch_size < 0) {
-        throw std::runtime_error("rfdetr validate --compile-cuda-mask-batch-size must be non-negative");
-    }
-    if (options.split.empty()) {
-        options.split = options.compiled_path.stem().string();
-    }
-    if (options.report_json_path.empty()) {
-        options.report_json_path = options.compiled_path.parent_path() / "rfdetr-validation-report.json";
-    }
-    options.log_mode = ValidationLogMode::Interactive;
-    options.write_report_json = true;
+    options.input_path = detail::canonical_checkpoint_path(options.input_path);
+    options.output_path = detail::canonical_checkpoint_path(options.output_path);
 }
 
 void run_compile(const CompileCliOptions& options) {
@@ -502,7 +317,7 @@ void run_compile(const CompileCliOptions& options) {
         size_t last_done = 0;
         size_t total = 0;
         size_t progress_pulse = 0;
-        ProgressBar bar("compile " + split, 0, "img");
+        spdmon::ProgressBar bar("compile " + split, 0, "img");
         DatasetCompiler::compile(
             config,
             [&bar, &last_done, &total, &progress_pulse](const CompileProgress& progress) {
@@ -514,7 +329,7 @@ void run_compile(const CompileCliOptions& options) {
                     bar.add(progress.done - last_done);
                     last_done = progress.done;
                 }
-                bar.set_postfix(format_compile_postfix(progress, progress_pulse++));
+                bar.set_postfix(spdmon::format_compile_postfix(progress, progress_pulse++));
             });
         bar.close();
     }
@@ -528,9 +343,19 @@ int handle_cli(int argc, char** argv) {
     }
     try {
         CLI::App app{"RF-DETR model tooling for compilation, inference, evaluation, and training"};
-        app.name("fastloader rfdetr");
+        app.name("mmltk rfdetr");
         app.option_defaults()->always_capture_default();
         app.require_subcommand(1);
+        std::string log_level_option;
+        std::string log_file_option;
+        std::string log_dir_option;
+        app.add_option("--log-level", log_level_option,
+                       "Logging level (trace, debug, info, warn, error, critical, off)");
+        app.add_option("--log-file", log_file_option, "Explicit log file path")
+            ->type_name("PATH");
+        app.add_option("--log-dir", log_dir_option,
+                       "Log directory for the default rotating file sink")
+            ->type_name("PATH");
         app.footer(
             "notes:\n"
             "  weights overlap mode requires --batch-size 1 when predict/evaluate --weights uses --lanes > 1\n"
@@ -542,10 +367,10 @@ int handle_cli(int argc, char** argv) {
             "compile",
             "Compile train and val splits for RF-DETR experiments");
         auto* compile_dataset = compile_cmd->add_option_group("Dataset");
-        add_path_option(compile_dataset, "--source-dir", compile_options.source_dir,
-                        "Source dataset root");
-        add_path_option(compile_dataset, "--output-dir", compile_options.output_dir,
-                        "Output directory for compiled train/val binaries");
+        cli_shared::add_path_option(compile_dataset, "--source-dir", compile_options.source_dir,
+                                    "Source dataset root");
+        cli_shared::add_path_option(compile_dataset, "--output-dir", compile_options.output_dir,
+                                    "Output directory for compiled train/val binaries");
         compile_dataset->add_option("--resolution", compile_options.resolution,
                                     "Square image resolution for both splits")
             ->type_name("INT");
@@ -564,82 +389,32 @@ int handle_cli(int argc, char** argv) {
             "info",
             "Inspect ONNX or TensorRT model metadata");
         auto* info_model = info_cmd->add_option_group("Model input");
-        add_path_option(info_model, "--onnx", info_options.onnx_path, "ONNX model path");
-        add_path_option(info_model, "--tensorrt", info_options.tensorrt_path,
-                        "TensorRT engine path or ONNX path to build from");
+        cli_shared::add_path_option(info_model, "--onnx", info_options.onnx_path, "ONNX model path");
+        cli_shared::add_path_option(info_model, "--tensorrt", info_options.tensorrt_path,
+                                    "TensorRT engine path or ONNX path to build from");
         info_cmd->add_option("--device-id", info_options.device_id, "CUDA device id")
             ->type_name("INT");
 
-        BuildEngineOptions build_engine_options;
+        BuildEngineRequest build_engine_request;
         auto* build_engine_cmd = app.add_subcommand(
             "build-engine",
             "Build a TensorRT engine from an ONNX model");
         auto* build_engine_io = build_engine_cmd->add_option_group("Input and output");
-        add_path_option(build_engine_io, "--onnx", build_engine_options.onnx_path, "ONNX model path");
-        add_path_option(build_engine_io, "--output", build_engine_options.output_path,
-                        "Output TensorRT engine path");
         auto* build_engine_exec = build_engine_cmd->add_option_group("Execution");
-        build_engine_exec->add_option("--device-id", build_engine_options.device_id, "CUDA device id")
-            ->type_name("INT");
-        build_engine_exec->add_flag("--fp16,!--no-fp16", build_engine_options.allow_fp16,
-                                    "Enable FP16 TensorRT kernels when supported");
+        cli_shared::add_build_engine_request_options(build_engine_io, build_engine_exec, build_engine_request);
 
-        ExportOnnxOptions export_onnx_options;
+        ExportOnnxRequest export_onnx_request;
         auto* export_onnx_cmd = app.add_subcommand(
             "export-onnx",
             "Export .pt weights to ONNX format");
         auto* export_onnx_io = export_onnx_cmd->add_option_group("Input and output");
-        add_path_option(export_onnx_io, "--weights", export_onnx_options.weights_path,
-                        "RF-DETR checkpoint path");
-        add_path_option(export_onnx_io, "--output", export_onnx_options.output_path,
-                        "Output ONNX model path");
         auto* export_onnx_exec = export_onnx_cmd->add_option_group("Execution");
-        export_onnx_exec->add_option("--device-id", export_onnx_options.device_id, "CUDA device id")
-            ->type_name("INT");
-        export_onnx_exec->add_option("--opset-version", export_onnx_options.opset_version,
-                                     "ONNX opset version (native exporter currently supports 19 only)")
-            ->type_name("INT");
-        export_onnx_exec->add_flag("--simplify", export_onnx_options.simplify,
-                                   "Run ONNX checker and shape inference on the exported model");
+        cli_shared::add_export_onnx_request_options(export_onnx_io, export_onnx_exec, export_onnx_request);
 
-        PredictCliState predict_state;
         auto* predict_cmd = app.add_subcommand(
             "predict",
             "Run RF-DETR inference and write predictions to JSON");
-        auto* predict_dataset = predict_cmd->add_option_group("Dataset");
-        add_path_option(predict_dataset, "--compiled", predict_state.options.compiled_path,
-                        "Compiled dataset split (.bin)");
-        add_path_option(predict_dataset, "--output", predict_state.options.output_path,
-                        "Prediction JSON output path");
-        auto* predict_model = predict_cmd->add_option_group("Model input");
-        add_model_input_options(
-            predict_model,
-            predict_state.options,
-            "TensorRT engine path or ONNX path to build from");
-        auto* predict_execution = predict_cmd->add_option_group("Execution");
-        predict_execution->add_option("--batch-size", predict_state.options.batch_size,
-                                      "Batch size for inference")
-            ->type_name("INT");
-        predict_execution->add_option("--device-id", predict_state.options.device_id, "CUDA device id")
-            ->type_name("INT");
-        predict_execution->add_option("--threshold", predict_state.options.threshold,
-                                      "Minimum score threshold for saved detections")
-            ->type_name("FLOAT");
-        predict_execution->add_option("--workers", predict_state.options.workers,
-                                      "Dataset worker count")
-            ->type_name("INT");
-        predict_execution->add_option("--lanes", predict_state.options.lanes,
-                                      "Parallel backend lane count")
-            ->type_name("INT");
-        predict_execution->add_option("--cpu-affinity", predict_state.options.cpu_affinity,
-                                      "Linux CPU list or range string for workers");
-        predict_execution->add_option("--backend", predict_state.options.backend,
-                                      "Backend preference for ONNX/TensorRT artifacts: auto, onnx, or tensorrt");
-        predict_execution->add_flag("--fp16,!--no-fp16", predict_state.options.allow_fp16,
-                                    "Enable FP16 backend execution when supported");
-        predict_execution->add_flag("--progress,!--no-progress", predict_state.options.progress_bar,
-                                    "Render interactive progress output");
-        add_compile_mode_option(predict_execution, predict_state.compile_mode);
+        auto predict_state = cli_shared::add_predict_command_options(predict_cmd);
 
         EvaluateCliState evaluate_state;
         auto* evaluate_cmd = app.add_subcommand(
@@ -648,10 +423,10 @@ int handle_cli(int argc, char** argv) {
         evaluate_cmd->alias("eval");
         evaluate_cmd->alias("val");
         auto* evaluate_dataset = evaluate_cmd->add_option_group("Dataset");
-        add_path_option(evaluate_dataset, "--compiled", evaluate_state.options.compiled_path,
-                        "Compiled dataset split (.bin)");
+        cli_shared::add_path_option(evaluate_dataset, "--compiled", evaluate_state.options.compiled_path,
+                                    "Compiled dataset split (.bin)");
         auto* evaluate_model = evaluate_cmd->add_option_group("Model input");
-        add_model_input_options(
+        cli_shared::add_model_input_options(
             evaluate_model,
             evaluate_state.options,
             "TensorRT engine path or ONNX path to build from");
@@ -681,222 +456,31 @@ int handle_cli(int argc, char** argv) {
                                      "Enable FP16 backend execution when supported");
         evaluate_execution->add_flag("--progress,!--no-progress", evaluate_state.options.progress_bar,
                                      "Render interactive progress output");
-        add_compile_mode_option(evaluate_execution, evaluate_state.compile_mode);
+        cli_shared::add_compile_mode_option(evaluate_execution, evaluate_state.compile_mode);
 
-        TrainCliState train_state;
         auto* train_cmd = app.add_subcommand(
             "train",
             "Train RF-DETR natively against compiled datasets");
-        auto* train_dataset = train_cmd->add_option_group("Dataset");
-        add_path_option(train_dataset, "--train-compiled", train_state.options.train_compiled_path,
-                        "Compiled training split (.bin)");
-        add_path_option(train_dataset, "--val-compiled", train_state.options.val_compiled_path,
-                        "Compiled validation split (.bin)");
-        add_path_option(train_dataset, "--test-compiled", train_state.options.test_compiled_path,
-                        "Optional compiled test split (.bin)");
-        auto* train_checkpoint = train_cmd->add_option_group("Checkpoint");
-        add_path_option(train_checkpoint, "--output-dir", train_state.options.output_dir,
-                        "Output directory for checkpoints and logs");
-        add_path_option(train_checkpoint, "--weights", train_state.options.weights_path,
-                        "Source checkpoint used for initialization");
-        add_path_option(train_checkpoint, "--resume", train_state.options.resume_path,
-                        "Existing native checkpoint to resume");
-        auto* train_optimization = train_cmd->add_option_group("Optimization");
-        train_optimization->add_option("--batch-size", train_state.options.batch_size,
-                                       "Per-rank training batch size")
-            ->type_name("INT");
-        train_optimization->add_option("--val-batch-size", train_state.options.val_batch_size,
-                                       "Validation batch size, 0 reuses --batch-size")
-            ->type_name("INT");
-        train_optimization->add_option("--epochs", train_state.options.epochs,
-                                       "Number of training epochs")
-            ->type_name("INT");
-        train_optimization->add_option("--grad-accum-steps", train_state.options.grad_accum_steps,
-                                       "Gradient accumulation steps")
-            ->type_name("INT");
-        train_optimization->add_option("--optimizer", train_state.optimizer,
-                                       "Training optimizer: adamw or muon");
-        auto* train_lr = train_optimization->add_option("--lr", train_state.options.lr, "Decoder/base learning rate");
-        train_lr->type_name("FLOAT");
-        auto* train_lr_encoder = train_optimization->add_option("--lr-encoder",
-                                                                train_state.options.lr_encoder,
-                                                                "Encoder learning rate");
-        train_lr_encoder->type_name("FLOAT");
-        auto* train_momentum = train_optimization->add_option("--momentum",
-                                                              train_state.options.momentum,
-                                                              "Muon momentum");
-        train_momentum->type_name("FLOAT");
-        train_optimization->add_flag("--freeze-encoder,!--no-freeze-encoder",
-                                     train_state.options.freeze_encoder,
-                                     "Freeze encoder/backbone parameters");
-        auto* train_lr_component_decay = train_optimization->add_option(
-            "--lr-component-decay",
-            train_state.options.lr_component_decay,
-            "Component-wise learning rate decay");
-        train_lr_component_decay->type_name("FLOAT");
-        auto* train_encoder_layer_decay = train_optimization->add_option(
-            "--encoder-layer-decay",
-            train_state.options.encoder_layer_decay,
-            "Per-layer encoder learning rate decay");
-        train_encoder_layer_decay->type_name("FLOAT");
-        auto* train_weight_decay = train_optimization->add_option("--weight-decay",
-                                                                  train_state.options.weight_decay,
-                                                                  "Optimizer weight decay");
-        train_weight_decay->type_name("FLOAT");
-        auto* train_lr_drop = train_optimization->add_option("--lr-drop",
-                                                             train_state.options.lr_drop,
-                                                             "Step scheduler drop epoch");
-        train_lr_drop->type_name("INT");
-        auto* train_lr_scheduler = train_optimization->add_option("--lr-scheduler",
-                                                                  train_state.options.lr_scheduler,
-                                                                  "Learning rate scheduler: step or cosine");
-        auto* train_lr_min_factor = train_optimization->add_option("--lr-min-factor",
-                                                                   train_state.options.lr_min_factor,
-                                                                   "Minimum LR multiplier for cosine decay");
-        train_lr_min_factor->type_name("FLOAT");
-        auto* train_warmup_epochs = train_optimization->add_option("--warmup-epochs",
-                                                                   train_state.options.warmup_epochs,
-                                                                   "Warmup duration in epochs");
-        train_warmup_epochs->type_name("FLOAT");
-        auto* train_warmup_momentum = train_optimization->add_option("--warmup-momentum",
-                                                                     train_state.options.warmup_momentum,
-                                                                     "Muon warmup momentum start value");
-        train_warmup_momentum->type_name("FLOAT");
-        train_optimization->add_option("--clip-max-norm", train_state.options.clip_max_norm,
-                                       "Gradient clipping max norm")
-            ->type_name("FLOAT");
-        train_optimization->add_flag("--fused-optimizer,!--no-fused-optimizer",
-                                     train_state.options.fused_optimizer,
-                                     "Use the native fused AdamW backend when available (AdamW only)");
-        train_optimization->add_flag("--use-ema,!--no-ema", train_state.options.use_ema,
-                                     "Maintain an EMA shadow model");
-        train_optimization->add_option("--ema-decay", train_state.options.ema_decay,
-                                       "EMA decay factor")
-            ->type_name("FLOAT");
-        train_optimization->add_option("--ema-tau", train_state.options.ema_tau,
-                                       "EMA warmup tau in steps")
-            ->type_name("INT");
-        train_optimization->add_option("--eval-max-dets", train_state.options.eval_max_dets,
-                                       "Maximum detections per image during validation")
-            ->type_name("INT");
-        auto* train_execution = train_cmd->add_option_group("Execution");
-        auto* train_device_id = train_execution->add_option("--device-id", train_state.options.device_id,
-                                                            "Single CUDA device id")
-                                    ->type_name("INT");
-        auto* train_device_ids = train_execution->add_option(
-            "--device-ids",
-            train_state.device_ids,
-            "Comma-separated CUDA device ids for distributed training");
-        train_device_ids->type_name("LIST");
-        train_execution->add_option("--workers", train_state.options.workers,
-                                    "Dataset worker count")
-            ->type_name("INT");
-        train_execution->add_option("--lanes", train_state.options.lanes,
-                                    "Parallel backend lane count")
-            ->type_name("INT");
-        train_execution->add_option("--cpu-affinity", train_state.options.cpu_affinity,
-                                    "Linux CPU list or range string for workers");
-        train_execution->add_option("--prefetch-factor", train_state.options.prefetch_factor,
-                                    "Per-rank prefetch factor")
-            ->type_name("INT");
-        train_execution->add_option("--print-freq", train_state.options.print_freq,
-                                    "Logging frequency in training steps")
-            ->type_name("INT");
-        train_execution->add_option("--seed", train_state.options.seed, "Random seed")
-            ->type_name("INT");
-        train_execution->add_flag("--amp,!--no-amp", train_state.options.amp,
-                                  "Enable automatic mixed precision");
-        train_execution->add_flag("--progress,!--no-progress", train_state.options.progress_bar,
-                                  "Render interactive progress output");
-        add_compile_mode_option(train_execution, train_state.compile_mode);
-        auto* train_internal = train_cmd->add_option_group("Distributed (internal)");
-        train_internal->add_flag("--dist-worker", train_state.options.distributed_worker,
-                                 "Internal flag for forked distributed workers");
-        train_internal->add_option("--dist-rank", train_state.options.distributed_rank,
-                                   "Internal worker rank")
-            ->type_name("INT");
-        train_internal->add_option("--dist-world-size", train_state.options.distributed_world_size,
-                                   "Internal worker world size")
-            ->type_name("INT");
-        add_path_option(train_internal, "--dist-store-file", train_state.options.distributed_store_path,
-                        "Internal distributed rendezvous file");
+        auto train_state = cli_shared::add_train_command_options(train_cmd);
 
         NormalizeWeightsOptions normalize_options;
         auto* normalize_cmd = app.add_subcommand(
             "normalize-weights",
-            "Convert an upstream RF-DETR checkpoint into fastloader's native format");
+            "Convert an upstream RF-DETR checkpoint into mmltk's native format");
         auto* normalize_io = normalize_cmd->add_option_group("Input and output");
-        add_path_option(normalize_io, "--input", normalize_options.input_path,
-                        "Input upstream checkpoint path");
-        add_path_option(normalize_io, "--output", normalize_options.output_path,
-                        "Output native checkpoint path");
+        cli_shared::add_path_option(normalize_io, "--input", normalize_options.input_path,
+                                    "Input upstream checkpoint path");
+        cli_shared::add_path_option(normalize_io, "--output", normalize_options.output_path,
+                                    "Output native checkpoint path");
 
-        ValidationOptions validate_options;
         auto* validate_cmd = app.add_subcommand(
             "validate",
             "Compare ONNX and TensorRT backends against a compiled dataset split");
-        auto* validate_dataset = validate_cmd->add_option_group("Dataset");
-        add_path_option(validate_dataset, "--compiled", validate_options.compiled_path,
-                        "Compiled dataset split (.bin)");
-        add_path_option(validate_dataset, "--source", validate_options.source_dir,
-                        "Source dataset root used for optional recompiles");
-        validate_dataset->add_option("--split", validate_options.split,
-                                     "Source dataset split name used when recompiling");
-        validate_dataset->add_option("--resolution", validate_options.resolution,
-                                     "Square resolution for recompiles")
-            ->type_name("INT");
-        validate_dataset->add_flag("--recompile", validate_options.recompile,
-                                   "Recompile the source dataset before validation");
-        validate_dataset->add_option("--compile-workers", validate_options.compile_workers,
-                                     "Total CPU worker budget for recompiles; 0 or negative selects all available CPUs")
-            ->type_name("INT");
-        validate_dataset->add_option("--compile-cuda-mask-batch-size",
-                                     validate_options.compile_cuda_mask_batch_size,
-                                     "Batched CUDA mask-resize task count for recompiles; 0 disables GPU mask resizing")
-            ->type_name("INT");
-        validate_dataset->add_option("--compile-cuda-device-id",
-                                     validate_options.compile_cuda_device_id,
-                                     "CUDA device id used for batched mask resizing during recompiles")
-            ->type_name("INT");
-        auto* validate_model = validate_cmd->add_option_group("Model input");
-        add_path_option(validate_model, "--onnx", validate_options.onnx_path, "ONNX model path");
-        add_path_option(validate_model, "--tensorrt", validate_options.tensorrt_path,
-                        "TensorRT engine path or ONNX path to build from");
-        add_path_option(validate_model, "--save-engine", validate_options.save_engine_path,
-                        "Optional path to save a built TensorRT engine");
-        auto* validate_reports = validate_cmd->add_option_group("Reports");
-        add_path_option(validate_reports, "--report-json", validate_options.report_json_path,
-                        "Validation report JSON path");
-        validate_reports->add_option("--eval-order", validate_options.eval_order,
-                                     "Comma-separated backend evaluation order");
-        auto* validate_execution = validate_cmd->add_option_group("Execution");
-        validate_execution->add_option("--limit-images", validate_options.limit_images,
-                                       "Limit the number of validated images")
-            ->type_name("INT");
-        validate_execution->add_option("--alignment-images", validate_options.alignment_images,
-                                       "Number of images used for backend alignment probes")
-            ->type_name("INT");
-        validate_execution->add_option("--eval-max-dets", validate_options.eval_max_dets,
-                                       "Maximum detections per image during evaluation")
-            ->type_name("INT");
-        validate_execution->add_option("--device-id", validate_options.device_id, "CUDA device id")
-            ->type_name("INT");
-        validate_execution->add_option("--workers", validate_options.workers,
-                                       "Dataset worker count")
-            ->type_name("INT");
-        validate_execution->add_option("--batch-size", validate_options.batch_size,
-                                       "Backend batch size")
-            ->type_name("INT");
-        validate_execution->add_option("--cpu-affinity", validate_options.cpu_affinity,
-                                       "Linux CPU list or range string for workers");
-        validate_execution->add_flag("--profile", validate_options.profile,
-                                     "Collect detailed timing metrics during validation");
-        validate_execution->add_flag("--fp16,!--no-fp16", validate_options.allow_fp16,
-                                     "Enable FP16 TensorRT execution when supported");
+        auto validate_state = cli_shared::add_validate_command_options(validate_cmd);
 
         std::vector<std::string> args;
         args.reserve(static_cast<size_t>(argc - 1));
-        args.emplace_back("fastloader rfdetr");
+        args.emplace_back("mmltk rfdetr");
         for (int index = 2; index < argc; ++index) {
             args.emplace_back(argv[index]);
         }
@@ -920,43 +504,44 @@ int handle_cli(int argc, char** argv) {
 
         if (info_cmd->parsed()) {
             finalize_info_options(info_options);
+            if (!info_options.onnx_path.empty()) {
+                exec_onnx_info_tool(info_options.onnx_path);
+            }
             std::unique_ptr<InferenceBackend> backend =
-                !info_options.onnx_path.empty()
-                    ? make_onnx_backend(info_options.onnx_path, info_options.device_id)
-                    : make_tensorrt_backend(info_options.tensorrt_path, info_options.device_id, true);
+                make_tensorrt_backend(info_options.tensorrt_path, info_options.device_id, true);
             print_model_metadata(backend->info(), 0, 0, ValidationLogMode::Interactive);
             return 0;
         }
 
         if (build_engine_cmd->parsed()) {
-            finalize_build_engine_options(build_engine_options);
+            validate_build_engine_request(build_engine_request);
             make_tensorrt_backend(
-                build_engine_options.onnx_path,
-                build_engine_options.device_id,
-                build_engine_options.allow_fp16,
-                build_engine_options.output_path);
-            std::fprintf(stderr, "tensorrt: wrote engine to %s\n", build_engine_options.output_path.c_str());
+                build_engine_request.onnx_path,
+                build_engine_request.device_id,
+                build_engine_request.allow_fp16,
+                build_engine_request.output_path);
+            mmltk::logging::logger("rfdetr.cli")->info("tensorrt: wrote engine to {}",
+                                                      build_engine_request.output_path.string());
             return 0;
         }
 
         if (export_onnx_cmd->parsed()) {
-            if (export_onnx_options.weights_path.empty() || export_onnx_options.output_path.empty()) {
-                throw std::runtime_error("rfdetr export-onnx requires --weights and --output");
-            }
+            validate_export_onnx_request(export_onnx_request);
             export_weights_to_onnx(
-                export_onnx_options.weights_path,
-                export_onnx_options.output_path,
-                export_onnx_options.device_id,
-                export_onnx_options.opset_version,
-                export_onnx_options.simplify);
+                export_onnx_request.weights_path,
+                export_onnx_request.output_path,
+                export_onnx_request.device_id,
+                export_onnx_request.opset_version,
+                export_onnx_request.simplify);
             return 0;
         }
 
         if (predict_cmd->parsed()) {
-            finalize_predict_options(predict_state);
-            const PredictionRunResult result = run_prediction(predict_state.options);
-            write_prediction_json(predict_state.options, result);
-            print_prediction_summary(predict_state.options, result);
+            cli_shared::finalize_predict_command(predict_state);
+            const PredictOptions options = to_predict_options(predict_state.request);
+            const PredictionRunResult result = run_prediction(options);
+            write_prediction_json(options, result);
+            print_prediction_summary(options, result);
             return 0;
         }
 
@@ -968,26 +553,13 @@ int handle_cli(int argc, char** argv) {
         }
 
         if (train_cmd->parsed()) {
-            train_state.recipe_overrides.lr = train_lr->count() > 0;
-            train_state.recipe_overrides.lr_encoder = train_lr_encoder->count() > 0;
-            train_state.recipe_overrides.lr_component_decay = train_lr_component_decay->count() > 0;
-            train_state.recipe_overrides.encoder_layer_decay = train_encoder_layer_decay->count() > 0;
-            train_state.recipe_overrides.momentum = train_momentum->count() > 0;
-            train_state.recipe_overrides.weight_decay = train_weight_decay->count() > 0;
-            train_state.recipe_overrides.lr_drop = train_lr_drop->count() > 0;
-            train_state.recipe_overrides.lr_scheduler = train_lr_scheduler->count() > 0;
-            train_state.recipe_overrides.lr_min_factor = train_lr_min_factor->count() > 0;
-            train_state.recipe_overrides.warmup_epochs = train_warmup_epochs->count() > 0;
-            train_state.recipe_overrides.warmup_momentum = train_warmup_momentum->count() > 0;
-            finalize_train_options(
-                train_state,
-                train_device_id->count() > 0,
-                train_device_ids->count() > 0);
-            if (!train_state.options.distributed_worker && train_state.options.device_ids.size() > 1) {
-                return spawn_distributed_training_workers(train_state.options, argc, argv);
+            cli_shared::finalize_train_command(train_state);
+            const TrainOptions options = to_train_options(train_state.request);
+            if (!options.distributed_worker && options.device_ids.size() > 1) {
+                return spawn_distributed_training_workers(options, argc, argv);
             }
-            const TrainRunResult result = run_training(train_state.options);
-            print_training_summary(train_state.options, result);
+            const TrainRunResult result = run_training(options);
+            print_training_summary(options, result);
             return 0;
         }
 
@@ -995,27 +567,28 @@ int handle_cli(int argc, char** argv) {
             finalize_normalize_options(normalize_options);
             const NativeCheckpoint checkpoint =
                 normalize_checkpoint_to_native(normalize_options.input_path, normalize_options.output_path);
-            std::fprintf(stderr,
-                         "rfdetr.normalize-weights: wrote %zu tensors for preset=%s to %s\n",
-                         checkpoint.state_dict.size(),
-                         checkpoint.metadata.preset_name.c_str(),
-                         normalize_options.output_path.c_str());
+            mmltk::logging::logger("rfdetr.cli")->info(
+                "rfdetr.normalize-weights: wrote {} tensors for preset={} to {}",
+                checkpoint.state_dict.size(),
+                checkpoint.metadata.preset_name,
+                normalize_options.output_path.string());
             return 0;
         }
 
         if (validate_cmd->parsed()) {
-            finalize_validate_options(validate_options);
-            const ValidationRunResult result = run_validation(validate_options);
-            write_validation_report(validate_options, result);
-            print_validation_run_summary(validate_options, result);
+            cli_shared::finalize_validate_command(validate_state);
+            const ValidationOptions options = to_validate_options(validate_state.request);
+            const ValidationRunResult result = run_validation(options);
+            write_validation_report(options, result);
+            print_validation_run_summary(options, result);
             return 0;
         }
 
         return 1;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "fastloader rfdetr error: %s\n", error.what());
+        mmltk::logging::logger("rfdetr.cli")->error("mmltk rfdetr error: {}", error.what());
         return 1;
     }
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

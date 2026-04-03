@@ -1,9 +1,9 @@
-#include "fastloader/runtime/model_registry.h"
+#include "mmltk/runtime/model_registry.h"
 
 #include <stdexcept>
 #include <utility>
 
-namespace fastloader::runtime {
+namespace mmltk::runtime {
 
 void ModelRegistry::register_module(std::shared_ptr<const ModelModule> module) {
     if (!module) {
@@ -48,4 +48,4 @@ bool ModelRegistry::empty() const noexcept {
     return modules_.empty();
 }
 
-} // namespace fastloader::runtime
+} // namespace mmltk::runtime

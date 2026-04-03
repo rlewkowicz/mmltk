@@ -1,12 +1,13 @@
 #pragma once
 
-#include "fastloader/rfdetr/evaluation.h"
+#include "mmltk/rfdetr/evaluation.h"
 
 #include "rfdetr/postprocess.h"
 
 #include <cuda_runtime.h>
 #include <torch/torch.h>
 
+#include <array>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -17,7 +18,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 struct GroundTruthAnnotation {
     int image_id = 0;
@@ -73,7 +74,7 @@ public:
     CudaEventHandle(const CudaEventHandle&) = delete;
     CudaEventHandle& operator=(const CudaEventHandle&) = delete;
 
-    cudaEvent_t get() const { return event_; }
+    [[nodiscard]] cudaEvent_t get() const { return event_; }
 
 private:
     cudaEvent_t event_ = nullptr;
@@ -128,4 +129,4 @@ std::vector<Prediction> encode_staged_predictions(StagedPredictionBatch&& staged
 
 AlignmentStats compare_top1(const TensorMap& lhs, const TensorMap& rhs, size_t category_count);
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

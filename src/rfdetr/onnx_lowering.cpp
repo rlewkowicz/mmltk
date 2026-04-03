@@ -11,15 +11,17 @@
 #include <deque>
 #include <limits>
 #include <map>
+#include <numbers>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 namespace {
 
@@ -29,6 +31,10 @@ struct LoweringContext {
 };
 
 thread_local const LoweringContext* g_current_lowering_context = nullptr;
+
+bool has_prefix(std::string_view value, std::string_view prefix) {
+    return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;
+}
 
 class LoweringContextScope {
 public:
@@ -315,7 +321,7 @@ std::optional<std::vector<int64_t>> value_tensor_sizes(const torch::jit::Value* 
 }
 
 int64_t normalize_axis(int64_t axis, size_t rank, const torch::jit::Node* node, const char* what = "axis") {
-    const int64_t rank_i = static_cast<int64_t>(rank);
+    const auto rank_i = static_cast<int64_t>(rank);
     if (axis < 0) {
         axis += rank_i;
     }
@@ -386,11 +392,11 @@ std::optional<std::string> full_attribute_name(
     }
 
     std::string full_name;
-    for (auto it = names.rbegin(); it != names.rend(); ++it) {
+    for (size_t index = names.size(); index-- > 0;) {
         if (!full_name.empty()) {
             full_name.push_back('.');
         }
-        full_name += *it;
+        full_name += names[index];
     }
     return full_name;
 }
@@ -1048,7 +1054,7 @@ bool is_onnx_node(const torch::jit::Node* node) {
         return false;
     }
     const std::string qual_name = node->kind().toQualString();
-    return qual_name.rfind("onnx::", 0) == 0;
+    return has_prefix(qual_name, "onnx::");
 }
 
 bool is_trivially_removable_prim_node(const torch::jit::Node* node) {
@@ -1663,7 +1669,7 @@ void lower_layer_norm_node(torch::jit::Node* node) {
     const auto scalar_type =
         value_scalar_type(node->input(0))
             .value_or(value_scalar_type(node->output(0)).value_or(at::kFloat));
-    const int64_t axis = static_cast<int64_t>(*input_rank - normalized_shape->size());
+    const auto axis = static_cast<int64_t>(*input_rank - normalized_shape->size());
 
     std::vector<torch::jit::Value*> inputs{
         node->input(0),
@@ -1771,7 +1777,7 @@ void lower_repeat_node(torch::jit::Node* node) {
     }
 
     torch::jit::Value* repeated_input = node->input(0);
-    std::vector<int64_t> normalized_repeats = *repeats;
+    const std::vector<int64_t>& normalized_repeats = *repeats;
     if (normalized_repeats.size() < input_sizes->size()) {
         throw_lowering_error(node, "repeat rank smaller than input rank is not supported");
     }
@@ -1844,7 +1850,7 @@ void lower_gelu_node(torch::jit::Node* node) {
     const auto scalar_type = value_scalar_type(node->input(0)).value_or(at::kFloat);
     auto* div = node->owningGraph()->create(
         kOnnxDiv,
-        {node->input(0), create_scalar_constant(node, std::sqrt(2.0), scalar_type)},
+        {node->input(0), create_scalar_constant(node, std::numbers::sqrt2, scalar_type)},
         1);
     div->copyMetadata(node);
     div->insertBefore(node);
@@ -2345,7 +2351,7 @@ void lower_slice_node(torch::jit::Node* node) {
         if (input_rank.has_value()) {
             axis = normalize_axis(*dim, *input_rank, node);
         } else if (*dim >= 0) {
-            axis = *dim;
+            axis = dim;
         }
     }
 
@@ -2407,7 +2413,7 @@ void lower_narrow_node(torch::jit::Node* node) {
         if (input_rank.has_value()) {
             axis = normalize_axis(*dim, *input_rank, node);
         } else if (*dim >= 0) {
-            axis = *dim;
+            axis = dim;
         }
     }
 
@@ -3217,4 +3223,4 @@ void lower_graph_for_onnx_export(
     validate_graph_is_onnx_only(graph);
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 enum class RectangularLsApStatus : std::uint8_t {
     kOk = 0,
@@ -17,4 +17,4 @@ RectangularLsApStatus solve_rectangular_linear_sum_assignment(int64_t num_rows,
                                                              int64_t* row_indices,
                                                              int64_t* col_indices);
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

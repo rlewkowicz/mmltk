@@ -4,7 +4,7 @@
 #include <functional>
 #include <string>
 
-namespace fastloader {
+namespace mmltk {
 
 enum class CompileProgressPhase : uint8_t {
     kLabels,
@@ -39,4 +39,4 @@ public:
                         const std::function<void(const CompileProgress&)>& progress_cb = nullptr);
 };
 
-} // namespace fastloader
+} // namespace mmltk

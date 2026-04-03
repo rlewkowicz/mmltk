@@ -298,17 +298,17 @@ Status CaptureSession::Impl::ScheduleInferenceCopy(HostSlotRuntime& host_slot,
   inference_slot.short_frame = short_frame;
   inference_slot.region = full_region;
 
-  const cudaError_t copy_status = cudaMemcpy2DAsync(
-      reinterpret_cast<void*>(inference_slot.device_ptr), inference_slot.pitch_bytes, src,
-      bytes_per_line_, copy_width_bytes, full_region.height, cudaMemcpyHostToDevice,
-      inference_slot.copy_stream);
+  const cudaError_t copy_status =
+      cudaMemcpy2DAsync(inference_slot.device_ptr, inference_slot.pitch_bytes, src,
+                        bytes_per_line_, copy_width_bytes, full_region.height,
+                        cudaMemcpyHostToDevice, inference_slot.copy_stream);
   if (copy_status != cudaSuccess) {
     return MakeCudaStatus(copy_status, "cudaMemcpy2DAsync");
   }
 
-  const cudaError_t flip_status = fastloader::rfdetr::launch_bgr_vertical_flip_in_place_pitched(
-      reinterpret_cast<std::uint8_t*>(inference_slot.device_ptr), inference_slot.pitch_bytes,
-      full_region.width, full_region.height, inference_slot.copy_stream);
+  const cudaError_t flip_status = mmltk::rfdetr::launch_bgr_vertical_flip_in_place_pitched(
+      inference_slot.device_ptr, inference_slot.pitch_bytes, full_region.width,
+      full_region.height, inference_slot.copy_stream);
   if (flip_status != cudaSuccess) {
     return MakeCudaStatus(flip_status, "launch_bgr_vertical_flip_in_place_pitched");
   }
@@ -360,11 +360,11 @@ Status CaptureSession::Impl::TrySchedulePreviewTap(
 
   const std::size_t copy_width_bytes =
       static_cast<std::size_t>(preview_slot.region.width) * kBgr3BytesPerPixel;
-  const cudaError_t copy_status = cudaMemcpy2DAsync(
-      reinterpret_cast<void*>(preview_slot.device_ptr), preview_slot.pitch_bytes,
-      reinterpret_cast<const void*>(inference_slot.device_ptr), inference_slot.pitch_bytes,
-      copy_width_bytes, preview_slot.region.height, cudaMemcpyDeviceToDevice,
-      preview_slot.copy_stream);
+  const cudaError_t copy_status =
+      cudaMemcpy2DAsync(preview_slot.device_ptr, preview_slot.pitch_bytes,
+                        inference_slot.device_ptr, inference_slot.pitch_bytes, copy_width_bytes,
+                        preview_slot.region.height, cudaMemcpyDeviceToDevice,
+                        preview_slot.copy_stream);
   if (copy_status != cudaSuccess) {
     preview_slot.state.store(ToStateValue(PreviewState::kFree), std::memory_order_release);
     return MakeCudaStatus(copy_status, "cudaMemcpy2DAsync");

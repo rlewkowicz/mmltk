@@ -144,7 +144,7 @@ Status CaptureSession::Impl::try_acquire_latest_inference_frame(InferenceFrameVi
       .buffer_index = slot.slot_index,
       .frame_id = slot.frame_id,
       .buffer = InferenceBuffer{
-          .data = slot.device_ptr,
+          .data = reinterpret_cast<CUdeviceptr>(slot.device_ptr),
           .pitch_bytes = slot.pitch_bytes,
           .x_px = slot.region.x,
           .y_px = slot.region.y,
@@ -198,7 +198,7 @@ Status CaptureSession::Impl::try_acquire_latest_preview(PreviewFrameView* out_vi
       .buffer_index = slot.slot_index,
       .frame_id = slot.frame_id,
       .buffer = PreviewBuffer{
-          .data = slot.device_ptr,
+          .data = reinterpret_cast<CUdeviceptr>(slot.device_ptr),
           .pitch_bytes = slot.pitch_bytes,
           .x_px = slot.region.x,
           .y_px = slot.region.y,

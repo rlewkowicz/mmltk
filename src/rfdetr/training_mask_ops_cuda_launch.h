@@ -4,7 +4,7 @@
 
 #include <cstdint>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 void launch_matcher_point_sample_cuda(const float* input,
                                       const float* coords,
@@ -30,4 +30,4 @@ void launch_sample_packed_masks_cuda(const int64_t* packed_bits,
                                      int64_t point_count,
                                      cudaStream_t stream);
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

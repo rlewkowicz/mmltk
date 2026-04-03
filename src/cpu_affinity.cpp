@@ -18,7 +18,7 @@
 #include <string_view>
 #include <system_error>
 
-namespace fastloader {
+namespace mmltk {
 
 namespace {
 
@@ -43,10 +43,10 @@ public:
     CpuSetBuffer(const CpuSetBuffer&) = delete;
     CpuSetBuffer& operator=(const CpuSetBuffer&) = delete;
 
-    cpu_set_t* get() noexcept { return set_; }
-    const cpu_set_t* get() const noexcept { return set_; }
-    size_t bytes() const noexcept { return bytes_; }
-    size_t cpu_count() const noexcept { return cpu_count_; }
+    [[nodiscard]] cpu_set_t* get() noexcept { return set_; }
+    [[nodiscard]] const cpu_set_t* get() const noexcept { return set_; }
+    [[nodiscard]] size_t bytes() const noexcept { return bytes_; }
+    [[nodiscard]] size_t cpu_count() const noexcept { return cpu_count_; }
 
 private:
     size_t cpu_count_ = 0;
@@ -117,13 +117,14 @@ std::vector<int> allowed_cpu_set() {
 
 std::vector<int> parse_cpu_list(const std::string& spec) {
     std::vector<int> cpus;
+    const std::string_view spec_view{spec};
     size_t cursor = 0;
-    while (cursor <= spec.size()) {
+    while (cursor <= spec_view.size()) {
         size_t next = spec.find(',', cursor);
         if (next == std::string::npos) {
-            next = spec.size();
+            next = spec_view.size();
         }
-        std::string_view token(spec.data() + cursor, next - cursor);
+        std::string_view token = spec_view.substr(cursor, next - cursor);
         token = trim_ascii(token);
         if (!token.empty()) {
             const size_t dash = token.find('-');
@@ -234,4 +235,4 @@ void set_thread_name(const std::string& name) {
     }
 }
 
-} // namespace fastloader
+} // namespace mmltk

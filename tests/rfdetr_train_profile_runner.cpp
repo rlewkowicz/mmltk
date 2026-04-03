@@ -1,9 +1,10 @@
 #include "dataset_compiler.h"
 #include "execution_policy.h"
 #include "profile_utils.h"
-#include "fastloader/rfdetr/train.h"
+#include "mmltk/rfdetr/train.h"
 #include "test_fixture.h"
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -19,14 +20,14 @@ namespace fs = std::filesystem;
 
 namespace {
 
-using fastloader::DatasetCompiler;
-using fastloader::CompilerConfig;
-using fastloader::rfdetr::TrainOptions;
-using fastloader::rfdetr::TrainRunResult;
-using fastloader::testsupport::FixtureSpec;
+using mmltk::DatasetCompiler;
+using mmltk::CompilerConfig;
+using mmltk::rfdetr::TrainOptions;
+using mmltk::rfdetr::TrainRunResult;
+using mmltk::testsupport::FixtureSpec;
 
 struct Options {
-    std::string test_dir = "/tmp/fastloader_rfdetr_train_profile";
+    std::string test_dir = "/tmp/mmltk_rfdetr_train_profile";
     std::string weights_path;
     bool keep_artifacts = false;
     int width = 432;
@@ -122,11 +123,11 @@ std::string metric_name(const char* suffix) {
 }
 
 void record_duration_metric(const char* suffix, std::uint64_t elapsed_ns) {
-    fastloader::profile_record_duration_ns(metric_name(suffix).c_str(), elapsed_ns);
+    mmltk::profile_record_duration_ns(metric_name(suffix).c_str(), elapsed_ns);
 }
 
 void record_value_metric(const char* suffix, std::uint64_t value) {
-    fastloader::profile_add_value(metric_name(suffix).c_str(), value);
+    mmltk::profile_add_value(metric_name(suffix).c_str(), value);
 }
 
 std::uint64_t x10000_metric(double value) {
@@ -142,15 +143,15 @@ std::uint64_t img_per_sec_x100(std::uint64_t elapsed_ns, size_t images) {
 }
 
 std::string compiled_path_for(const FixtureSpec& spec) {
-    return fastloader::testsupport::compiled_bin_path(spec);
+    return mmltk::testsupport::compiled_bin_path(spec);
 }
 
 void build_fixture(const Options& options, const FixtureSpec& fixture) {
-    fastloader::testsupport::create_synthetic_dataset(fixture);
+    mmltk::testsupport::create_synthetic_dataset(fixture);
 
     CompilerConfig config;
-    config.source_dir = fastloader::testsupport::dataset_dir(fixture);
-    config.output_dir = fastloader::testsupport::compiled_dir(fixture);
+    config.source_dir = mmltk::testsupport::dataset_dir(fixture);
+    config.output_dir = mmltk::testsupport::compiled_dir(fixture);
     config.split = fixture.split;
     config.target_width = static_cast<uint32_t>(fixture.width);
     config.target_height = static_cast<uint32_t>(fixture.height);
@@ -180,7 +181,7 @@ TrainRun run_train_iteration(const Options& options,
     train_options.amp = true;
 
     const auto started = std::chrono::steady_clock::now();
-    const TrainRunResult result = fastloader::rfdetr::run_training(train_options);
+    const TrainRunResult result = mmltk::rfdetr::run_training(train_options);
     const auto elapsed_ns = static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
 
@@ -208,9 +209,9 @@ void record_train_metrics(const TrainRun& run, const Options& options) {
 }
 
 std::string iteration_label_for_run(int repetition) {
-    char buffer[64];
-    std::snprintf(buffer, sizeof(buffer), "rfdetr.train[%02d]", repetition);
-    return buffer;
+    std::array<char, 64> buffer{};
+    std::snprintf(buffer.data(), buffer.size(), "rfdetr.train[%02d]", repetition);
+    return buffer.data();
 }
 
 void print_iteration_line(const char* phase, int index, int total, const TrainRun& run) {
@@ -228,14 +229,14 @@ void print_iteration_line(const char* phase, int index, int total, const TrainRu
 } // namespace
 
 int main(int argc, char** argv) {
-    FASTLOADER_PROFILE_PROCESS_LABEL("profile.rfdetr.train");
-    FASTLOADER_PROFILE_RUN_LABEL("rfdetr.train");
+    MMLTK_PROFILE_PROCESS_LABEL("profile.rfdetr.train");
+    MMLTK_PROFILE_RUN_LABEL("rfdetr.train");
 
     try {
-        const fastloader::ExecutionPolicySnapshot execution_snapshot =
-            fastloader::apply_process_execution_policy();
-        fastloader::log_process_execution_policy(
-            "fastloader_rfdetr_train_profile_runner",
+        const mmltk::ExecutionPolicySnapshot execution_snapshot =
+            mmltk::apply_process_execution_policy();
+        mmltk::log_process_execution_policy(
+            "mmltk_rfdetr_train_profile_runner",
             execution_snapshot,
             false,
             true);
@@ -258,19 +259,19 @@ int main(int argc, char** argv) {
         repetition_runs.reserve(static_cast<size_t>(std::max(1, options.repetitions)));
 
         for (int warmup = 0; warmup < options.warmup_runs; ++warmup) {
-            fastloader::profile_reset_iteration();
+            mmltk::profile_reset_iteration();
             warmup_runs.push_back(run_train_iteration(
                 options, compiled_path, fs::path(fixture.root_dir) / ("run-warmup-" + std::to_string(warmup + 1))));
         }
 
         for (int repetition = 0; repetition < options.repetitions; ++repetition) {
-            fastloader::profile_set_run_label("rfdetr.train");
-            fastloader::profile_reset_iteration();
+            mmltk::profile_set_run_label("rfdetr.train");
+            mmltk::profile_reset_iteration();
             const TrainRun run = run_train_iteration(
                 options, compiled_path, fs::path(fixture.root_dir) / ("run-" + std::to_string(repetition + 1)));
             record_train_metrics(run, options);
             repetition_runs.push_back(run);
-            fastloader::profile_capture_iteration(iteration_label_for_run(repetition + 1).c_str());
+            mmltk::profile_capture_iteration(iteration_label_for_run(repetition + 1).c_str());
         }
 
         for (int warmup = 0; warmup < options.warmup_runs; ++warmup) {
@@ -281,13 +282,13 @@ int main(int argc, char** argv) {
                 "repetition", repetition + 1, options.repetitions, repetition_runs[static_cast<size_t>(repetition)]);
         }
 
-        fastloader::profile_flush();
+        mmltk::profile_flush();
         if (!options.keep_artifacts) {
             fs::remove_all(fixture.root_dir);
         }
         return 0;
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "fastloader_rfdetr_train_profile_runner error: %s\n", error.what());
+        std::fprintf(stderr, "mmltk_rfdetr_train_profile_runner error: %s\n", error.what());
         return 1;
     }
 }

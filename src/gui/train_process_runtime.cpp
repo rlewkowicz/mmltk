@@ -1,14 +1,15 @@
 #include "train_process_runtime.h"
+#include "subprocess_utils.h"
 
 #include <nlohmann/json.hpp>
 
-#include <array>
 #include <cerrno>
+#include <cstdint>
 #include <chrono>
-#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
@@ -16,11 +17,10 @@
 #include <utility>
 #include <vector>
 
-#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-namespace fastloader::gui {
+namespace mmltk::gui {
 
 namespace {
 
@@ -28,6 +28,24 @@ using json = nlohmann::json;
 
 constexpr std::chrono::milliseconds kTrainPollInterval{20};
 constexpr std::chrono::milliseconds kProgressPollInterval{100};
+
+enum class ChildSetupFailureStage : std::uint8_t {
+    kSetpgid = 0,
+    kDup2 = 1,
+    kExecv = 2,
+};
+
+const char* child_setup_failure_stage_label(const ChildSetupFailureStage stage) {
+    switch (stage) {
+    case ChildSetupFailureStage::kSetpgid:
+        return "setpgid";
+    case ChildSetupFailureStage::kDup2:
+        return "dup2";
+    case ChildSetupFailureStage::kExecv:
+        return "execv";
+    }
+    return "unknown";
+}
 
 std::string format_decimal(double value, int precision) {
     std::ostringstream stream;
@@ -75,6 +93,7 @@ std::optional<TrainArtifactProgress> read_train_artifact_progress(const std::fil
         try {
             target = found->get<std::decay_t<decltype(target)>>();
         } catch (const std::exception&) {
+            return;
         }
     };
     auto assign_val_metrics = [&](const json& object, TrainArtifactProgress& progress) {
@@ -137,78 +156,6 @@ std::optional<TrainArtifactProgress> read_train_artifact_progress(const std::fil
     return progress;
 }
 
-void trim_output_tail(std::string& output_tail, std::size_t max_size = 65536) {
-    if (output_tail.size() > max_size) {
-        output_tail.erase(0, output_tail.size() - max_size);
-    }
-}
-
-void append_console_output(std::string& tail, const std::string_view chunk, std::size_t max_size = 65536) {
-    size_t index = 0;
-    while (index < chunk.size()) {
-        const char ch = chunk[index];
-        if (ch == '\r') {
-            const size_t newline = tail.rfind('\n');
-            if (newline == std::string::npos) {
-                tail.clear();
-            } else {
-                tail.erase(newline + 1);
-            }
-            ++index;
-            continue;
-        }
-        if (ch == '\b') {
-            if (!tail.empty()) {
-                tail.pop_back();
-            }
-            ++index;
-            continue;
-        }
-        if (ch == '\033') {
-            ++index;
-            if (index < chunk.size() && chunk[index] == '[') {
-                ++index;
-                while (index < chunk.size()) {
-                    const unsigned char code = static_cast<unsigned char>(chunk[index++]);
-                    if (code >= 0x40 && code <= 0x7E) {
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-        tail.push_back(ch);
-        ++index;
-    }
-    trim_output_tail(tail, max_size);
-}
-
-std::string drain_nonblocking_fd(const int fd) {
-    std::string drained;
-    if (fd < 0) {
-        return drained;
-    }
-    std::array<char, 4096> buffer{};
-    while (true) {
-        const ssize_t bytes_read = ::read(fd, buffer.data(), buffer.size());
-        if (bytes_read > 0) {
-            drained.append(buffer.data(), static_cast<std::size_t>(bytes_read));
-            continue;
-        }
-        if (bytes_read == 0) {
-            break;
-        }
-        if (errno == EINTR) {
-            continue;
-        }
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            break;
-        }
-        throw std::runtime_error(std::string("failed to read train subprocess output: ") + std::strerror(errno));
-    }
-    return drained;
-}
-
 std::string summarize_train_process(const LocalTrainSessionState& state) {
     if (state.progress.has_value()) {
         std::ostringstream stream;
@@ -224,7 +171,7 @@ std::string summarize_train_process(const LocalTrainSessionState& state) {
     return "train completed";
 }
 
-bool process_group_alive(int process_group_id) {
+bool process_group_alive(const int process_group_id) {
     if (process_group_id <= 0) {
         return false;
     }
@@ -241,8 +188,9 @@ struct LocalTrainSession::Impl {
     std::thread worker;
     LocalTrainSessionState state;
 
-    void start(const TrainCommandConfig& config,
-               const std::filesystem::path& cli_path) {
+    void start(const mmltk::rfdetr::TrainRequest& request,
+               const std::filesystem::path& cli_path,
+               std::string fallback_preset_name) {
         shutdown();
         {
             std::lock_guard<std::mutex> lock(mutex);
@@ -250,12 +198,16 @@ struct LocalTrainSession::Impl {
             state.running = true;
             state.label = "train.local";
             state.last_summary = "starting local training...";
-            state.output_dir = config.output_dir;
+            state.output_dir = request.output_dir;
         }
-        worker = std::thread(&Impl::worker_main, this, config, cli_path);
+        worker = std::thread(&Impl::worker_main,
+                             this,
+                             request,
+                             cli_path,
+                             std::move(fallback_preset_name));
     }
 
-    void request_stop(bool force) {
+    void request_stop(const bool force) {
         std::lock_guard<std::mutex> lock(mutex);
         if (!state.running) {
             return;
@@ -288,21 +240,19 @@ struct LocalTrainSession::Impl {
         return state.running;
     }
 
-    void worker_main(TrainCommandConfig config,
-                     std::filesystem::path cli_path) {
+    void worker_main(const mmltk::rfdetr::TrainRequest& request,
+                     const std::filesystem::path& cli_path,
+                     const std::string& fallback_preset_name) {
         int stdout_fd = -1;
+        int setup_error_fd = -1;
         try {
-            const std::vector<std::string> args = build_train_command_arguments(config);
-            const std::filesystem::path output_dir = config.output_dir;
+            const std::vector<std::string> args =
+                build_train_command_arguments(request, fallback_preset_name);
+            const std::filesystem::path output_dir = request.output_dir;
             std::error_code ignored_error;
             std::filesystem::remove(output_dir / "progress.json", ignored_error);
             std::filesystem::remove(output_dir / "log.txt", ignored_error);
             std::filesystem::remove(output_dir / "results.json", ignored_error);
-
-            int output_pipe[2];
-            if (::pipe(output_pipe) != 0) {
-                throw std::runtime_error(std::string("failed to create local train pipe: ") + std::strerror(errno));
-            }
 
             std::vector<std::string> argv_strings;
             argv_strings.reserve(args.size() + 1U);
@@ -316,36 +266,35 @@ struct LocalTrainSession::Impl {
             }
             argv.push_back(nullptr);
 
-            const pid_t child_pid = ::fork();
-            if (child_pid < 0) {
-                ::close(output_pipe[0]);
-                ::close(output_pipe[1]);
-                throw std::runtime_error(std::string("failed to fork local train subprocess: ") + std::strerror(errno));
-            }
-            if (child_pid == 0) {
-                (void)::setpgid(0, 0);
-                ::close(output_pipe[0]);
-                if (::dup2(output_pipe[1], STDOUT_FILENO) < 0 || ::dup2(output_pipe[1], STDERR_FILENO) < 0) {
-                    std::fprintf(stderr, "dup2 failed for local train subprocess: %s\n", std::strerror(errno));
+            subprocess::CapturedChildProcess child = subprocess::spawn_captured_child_process(
+                "local train subprocess",
+                [&](const int output_fd, const int setup_fd) {
+                    if (::setpgid(0, 0) != 0) {
+                        (void)subprocess::write_child_setup_failure(setup_fd, ChildSetupFailureStage::kSetpgid);
+                        std::_Exit(127);
+                    }
+                    if (::dup2(output_fd, STDOUT_FILENO) < 0 || ::dup2(output_fd, STDERR_FILENO) < 0) {
+                        (void)subprocess::write_child_setup_failure(setup_fd, ChildSetupFailureStage::kDup2);
+                        std::_Exit(127);
+                    }
+                    ::close(output_fd);
+                    ::execv(argv.front(), argv.data());
+                    (void)subprocess::write_child_setup_failure(setup_fd, ChildSetupFailureStage::kExecv);
                     std::_Exit(127);
-                }
-                ::close(output_pipe[1]);
-                ::execv(argv.front(), argv.data());
-                std::fprintf(stderr, "execv failed for local train subprocess: %s\n", std::strerror(errno));
-                std::_Exit(127);
-            }
-
-            ::close(output_pipe[1]);
+                });
+            const pid_t child_pid = child.pid;
             if (::setpgid(child_pid, child_pid) != 0 && errno != EACCES && errno != ESRCH) {
-                ::close(output_pipe[0]);
+                const int error_number = errno;
+                subprocess::close_captured_child_process(child);
                 (void)::kill(child_pid, SIGKILL);
-                throw std::runtime_error(std::string("failed to group local train subprocess: ") + std::strerror(errno));
+                (void)::waitpid(child_pid, nullptr, 0);
+                throw std::runtime_error(std::string("failed to group local train subprocess: ") +
+                                         std::strerror(error_number));
             }
-            const int flags = ::fcntl(output_pipe[0], F_GETFL, 0);
-            if (flags >= 0) {
-                (void)::fcntl(output_pipe[0], F_SETFL, flags | O_NONBLOCK);
-            }
-            stdout_fd = output_pipe[0];
+            stdout_fd = child.stdout_fd;
+            setup_error_fd = child.setup_error_fd;
+            child.stdout_fd = -1;
+            child.setup_error_fd = -1;
 
             {
                 std::lock_guard<std::mutex> lock(mutex);
@@ -390,10 +339,11 @@ struct LocalTrainSession::Impl {
                     }
                 }
 
-                const std::string output_chunk = drain_nonblocking_fd(stdout_fd);
+                const std::string output_chunk =
+                    subprocess::read_fd(stdout_fd, "failed to read local train subprocess output: ", true);
                 if (!output_chunk.empty()) {
                     std::lock_guard<std::mutex> lock(mutex);
-                    append_console_output(state.output_tail, output_chunk);
+                    subprocess::append_console_output(state.output_tail, output_chunk, 65536);
                 }
 
                 const auto now = std::chrono::steady_clock::now();
@@ -420,16 +370,21 @@ struct LocalTrainSession::Impl {
                         std::this_thread::sleep_for(kTrainPollInterval);
                         continue;
                     }
-                    throw std::runtime_error(std::string("failed to wait for local train subprocess: ") + std::strerror(errno));
+                    throw std::runtime_error(std::string("failed to wait for local train subprocess: ") +
+                                             std::strerror(errno));
                 }
 
-                finalize_process(status, stdout_fd, process_group_id, output_dir);
+                finalize_process(status, stdout_fd, setup_error_fd, process_group_id, output_dir);
                 stdout_fd = -1;
+                setup_error_fd = -1;
                 return;
             }
         } catch (const std::exception& error) {
             if (stdout_fd >= 0) {
                 ::close(stdout_fd);
+            }
+            if (setup_error_fd >= 0) {
+                ::close(setup_error_fd);
             }
             std::lock_guard<std::mutex> lock(mutex);
             state.running = false;
@@ -444,13 +399,19 @@ struct LocalTrainSession::Impl {
         }
     }
 
-    void finalize_process(int status,
-                          int stdout_fd,
-                          int process_group_id,
+    void finalize_process(const int status,
+                          const int stdout_fd,
+                          const int setup_error_fd,
+                          const int process_group_id,
                           const std::filesystem::path& output_dir) {
-        const std::string output_chunk = drain_nonblocking_fd(stdout_fd);
+        const std::string output_chunk =
+            subprocess::read_fd(stdout_fd, "failed to read local train subprocess output: ", true);
         ::close(stdout_fd);
         const auto progress = read_train_artifact_progress(output_dir);
+        const auto child_setup_failure =
+            subprocess::read_child_setup_failure<ChildSetupFailureStage>(setup_error_fd);
+        ::close(setup_error_fd);
+
         std::lock_guard<std::mutex> lock(mutex);
         if (WIFEXITED(status)) {
             state.exit_code = WEXITSTATUS(status);
@@ -465,7 +426,7 @@ struct LocalTrainSession::Impl {
         }
 
         if (!output_chunk.empty()) {
-            append_console_output(state.output_tail, output_chunk);
+            subprocess::append_console_output(state.output_tail, output_chunk, 65536);
         }
         if (progress.has_value()) {
             state.progress = progress;
@@ -474,6 +435,19 @@ struct LocalTrainSession::Impl {
         state.process_group_id = -1;
         state.running = false;
 
+        if (child_setup_failure.has_value()) {
+            state.exit_code = 127;
+            state.last_summary.clear();
+            state.last_error = subprocess::format_child_setup_failure(
+                *child_setup_failure,
+                child_setup_failure_stage_label,
+                "local train");
+            if (!state.output_tail.empty()) {
+                state.last_error += "\n";
+                state.last_error += state.output_tail;
+            }
+            return;
+        }
         if (state.stop_requested) {
             state.last_error.clear();
             state.last_summary = state.force_kill_requested ? "local train killed" : "local train stopped";
@@ -508,12 +482,13 @@ LocalTrainSession::~LocalTrainSession() {
     shutdown();
 }
 
-void LocalTrainSession::start(const TrainCommandConfig& config,
-                              const std::filesystem::path& cli_path) {
-    impl_->start(config, cli_path);
+void LocalTrainSession::start(const mmltk::rfdetr::TrainRequest& request,
+                              const std::filesystem::path& cli_path,
+                              std::string fallback_preset_name) {
+    impl_->start(request, cli_path, std::move(fallback_preset_name));
 }
 
-void LocalTrainSession::request_stop(bool force) {
+void LocalTrainSession::request_stop(const bool force) {
     impl_->request_stop(force);
 }
 
@@ -529,4 +504,4 @@ bool LocalTrainSession::running() const {
     return impl_->running();
 }
 
-} // namespace fastloader::gui
+} // namespace mmltk::gui

@@ -1,11 +1,11 @@
 #pragma once
 
-#include "fastloader/runtime/model_registry.h"
+#include "mmltk/rfdetr/module.h"
 
 #include <memory>
 
-namespace fastloader::gui {
+namespace mmltk::gui {
 
-std::shared_ptr<const fastloader::runtime::ModelModule> make_rfdetr_model_module();
+std::shared_ptr<const mmltk::model::ModelModule> make_rfdetr_model_module();
 
-} // namespace fastloader::gui
+} // namespace mmltk::gui

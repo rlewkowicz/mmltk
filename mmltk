@@ -1,0 +1,541 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+image_name="${MMLTK_IMAGE:-mmltk}"
+analysis_image_name="${MMLTK_ANALYSIS_IMAGE:-${image_name}-analysis}"
+settings_host_path="${MMLTK_GUI_SETTINGS_PATH:-${repo_root}/gui.json}"
+host_workdir="${PWD}"
+uid="$(id -u)"
+gid="$(id -g)"
+
+log() {
+    printf 'mmltk: %s\n' "$*" >&2
+}
+
+die() {
+    log "$*"
+    exit 1
+}
+
+# When running as root, resolve the first real (login-capable) user on the box
+# and import their graphical session environment so the container can access the
+# display, runtime dir, Xauthority, etc.
+resolve_real_user() {
+    if (( uid != 0 )); then
+        return 0
+    fi
+
+    local target_user="${MMLTK_USER:-}"
+    if [[ -z "${target_user}" ]]; then
+        # First UID >= 1000 with a real login shell
+        local entry
+        while IFS=: read -r entry; do
+            local u_name u_uid u_gid u_shell
+            u_name="$(echo "${entry}" | cut -d: -f1)"
+            u_uid="$(echo "${entry}" | cut -d: -f3)"
+            u_gid="$(echo "${entry}" | cut -d: -f4)"
+            u_shell="$(echo "${entry}" | cut -d: -f7)"
+            if (( u_uid >= 1000 )) && [[ "${u_shell}" != */nologin && "${u_shell}" != */false ]]; then
+                target_user="${u_name}"
+                uid="${u_uid}"
+                gid="${u_gid}"
+                break
+            fi
+        done < /etc/passwd
+    else
+        uid="$(id -u "${target_user}")"
+        gid="$(id -g "${target_user}")"
+    fi
+
+    if [[ -z "${target_user}" ]]; then
+        log "warning: running as root, no real user found (set MMLTK_USER to override)"
+        return 0
+    fi
+    log "running as root, resolved container user to ${target_user} (${uid}:${gid})"
+
+    # Import display/session env vars from the user's active graphical session.
+    local user_pid
+    user_pid="$(loginctl list-sessions --no-legend 2>/dev/null \
+        | awk -v user="${target_user}" '$3 == user {print $0; exit}' \
+        | awk '{print $NF}')" || true
+
+    if [[ -z "${user_pid}" ]]; then
+        # Fallback: grab the leader PID of the user's systemd slice
+        user_pid="$(loginctl show-user "${target_user}" --property=Slice --value 2>/dev/null | xargs -I{} systemctl show {} --property=MainPID --value 2>/dev/null)" || true
+    fi
+
+    local env_source=""
+    if [[ -n "${user_pid}" && -r "/proc/${user_pid}/environ" ]]; then
+        env_source="/proc/${user_pid}/environ"
+    else
+        # Fallback: any process owned by the target user that has DISPLAY set
+        local candidate_pid
+        candidate_pid="$(find /proc -maxdepth 2 -name environ -user "${target_user}" 2>/dev/null \
+            | head -20 \
+            | while read -r ef; do
+                if tr '\0' '\n' < "${ef}" 2>/dev/null | grep -q '^DISPLAY='; then
+                    dirname "${ef}" | xargs basename
+                    break
+                fi
+            done)" || true
+        if [[ -n "${candidate_pid}" && -r "/proc/${candidate_pid}/environ" ]]; then
+            env_source="/proc/${candidate_pid}/environ"
+        fi
+    fi
+
+    if [[ -z "${env_source}" ]]; then
+        log "warning: could not find a graphical session for ${target_user}; display vars will be unset"
+        return 0
+    fi
+
+    local var_name
+    for var_name in \
+        XDG_RUNTIME_DIR \
+        XDG_SESSION_TYPE \
+        XDG_CURRENT_DESKTOP \
+        XDG_SESSION_DESKTOP \
+        DESKTOP_SESSION \
+        DBUS_SESSION_BUS_ADDRESS \
+        DISPLAY \
+        XAUTHORITY \
+        WAYLAND_DISPLAY \
+        __NV_PRIME_RENDER_OFFLOAD \
+        __GLX_VENDOR_LIBRARY_NAME; do
+        if [[ -z "${!var_name:-}" ]]; then
+            local val
+            val="$(tr '\0' '\n' < "${env_source}" | grep "^${var_name}=" | head -1 | cut -d= -f2-)" || true
+            if [[ -n "${val}" ]]; then
+                export "${var_name}=${val}"
+            fi
+        fi
+    done
+}
+resolve_real_user
+
+container_hash="$(printf '%s' "${repo_root}" | sha256sum | cut -c1-12)"
+container_name="${MMLTK_CONTAINER_NAME:-mmltk-${container_hash}}"
+
+docker_server_ready() {
+    docker version --format '{{.Server.Version}}' >/dev/null 2>&1
+}
+
+best_effort_start_docker() {
+    local -a attempts=(
+        "systemctl --user start docker"
+        "systemctl start docker"
+        "service docker start"
+        "sudo -n systemctl --user start docker"
+        "sudo -n systemctl start docker"
+        "sudo -n service docker start"
+    )
+    local attempt
+    for attempt in "${attempts[@]}"; do
+        if ${attempt} >/dev/null 2>&1; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+ensure_docker() {
+    command -v docker >/dev/null 2>&1 || die "docker is not installed"
+    if docker_server_ready; then
+        return 0
+    fi
+
+    log "docker daemon is unavailable; attempting a best-effort start"
+    best_effort_start_docker || true
+    docker_server_ready && return 0
+
+    die "docker is still unavailable. Start dockerd, then rerun this command."
+}
+
+ensure_image() {
+    docker image inspect "${image_name}" >/dev/null 2>&1 || die \
+        "image '${image_name}' is missing. Build it first with: docker build -t ${image_name} ."
+}
+
+ensure_analysis_image() {
+    log "building analysis image '${analysis_image_name}' from the Docker analysis stage"
+    docker build --target analysis -t "${analysis_image_name}" "${repo_root}"
+}
+
+container_exists() {
+    docker container inspect "${container_name}" >/dev/null 2>&1
+}
+
+container_running() {
+    [[ "$(docker inspect --format '{{.State.Running}}' "${container_name}" 2>/dev/null || true)" == "true" ]]
+}
+
+image_id() {
+    docker image inspect --format '{{.Id}}' "${image_name}"
+}
+
+container_runtime_label() {
+    docker inspect --format '{{ index .Config.Labels "com.mmltk.runtime" }}' "${container_name}" 2>/dev/null || true
+}
+
+bind_mount_specs=()
+desired_runtime_label=""
+
+path_is_covered_by_bind_mount() {
+    local source_path="$1"
+    local existing_spec
+    local existing_source
+    for existing_spec in "${bind_mount_specs[@]}"; do
+        existing_source="${existing_spec%%:*}"
+        if [[ "${source_path}" == "${existing_source}" || "${source_path}" == "${existing_source}"/* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+append_bind_mount() {
+    local source_path="$1"
+    local target_path="${2:-$1}"
+    local mode="${3:-rw}"
+    [[ -e "${source_path}" ]] || return 0
+    path_is_covered_by_bind_mount "${source_path}" && return 0
+    bind_mount_specs+=("${source_path}:${target_path}:${mode}")
+}
+
+prepare_bind_mounts() {
+    bind_mount_specs=()
+    if (( ! gui_mode )); then
+        return 0
+    fi
+
+    if [[ -d /tmp/.X11-unix ]]; then
+        append_bind_mount /tmp/.X11-unix /tmp/.X11-unix rw
+    fi
+
+    if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+        append_bind_mount "${XDG_RUNTIME_DIR}" "${XDG_RUNTIME_DIR}" rw
+    fi
+
+    if [[ -n "${XAUTHORITY:-}" ]]; then
+        append_bind_mount "${XAUTHORITY}" "${XAUTHORITY}" rw
+    fi
+}
+
+desired_container_runtime_label() {
+    local -a spec_parts=(
+        "image=$(image_id)"
+        "privileged=1"
+        "user=${uid}:${gid}"
+        "home=/tmp/mmltk-home"
+    )
+    if (( gui_mode )); then
+        spec_parts+=("gui=1")
+    else
+        spec_parts+=("gui=0")
+    fi
+
+    local mount_spec
+    for mount_spec in "${bind_mount_specs[@]}"; do
+        spec_parts+=("mount=${mount_spec}")
+    done
+
+    local joined_spec
+    printf -v joined_spec '%s|' "${spec_parts[@]}"
+    printf '%s' "${joined_spec%|}"
+}
+
+rewrite_host_path() {
+    local value="$1"
+    if [[ "${value}" == /host/* ]]; then
+        printf '%s' "${value}"
+        return 0
+    fi
+    if [[ "${value}" == /* ]]; then
+        printf '/host%s' "${value}"
+        return 0
+    fi
+    printf '%s' "${value}"
+}
+
+is_path_option() {
+    case "$1" in
+        --source-dir|--output-dir|--compiled|--weights|--resume|--onnx|--tensorrt|--output|--input|--save-engine|--report-json|--source|--train-compiled|--val-compiled|--test-compiled|--dist-store-file|source_dir|output_dir|compiled)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+rewrite_passthrough_args() {
+    rewritten_args=()
+    local expect_path_value=0
+    local arg
+    for arg in "${passthrough_args[@]}"; do
+        if (( expect_path_value )); then
+            rewritten_args+=("$(rewrite_host_path "${arg}")")
+            expect_path_value=0
+            continue
+        fi
+
+        if [[ "${arg}" == --*=* ]]; then
+            local option_name="${arg%%=*}"
+            local option_value="${arg#*=}"
+            if is_path_option "${option_name}"; then
+                rewritten_args+=("${option_name}=$(rewrite_host_path "${option_value}")")
+            else
+                rewritten_args+=("${arg}")
+            fi
+            continue
+        fi
+
+        if is_path_option "${arg}"; then
+            rewritten_args+=("${arg}")
+            expect_path_value=1
+            continue
+        fi
+
+        if [[ "${arg}" == /* ]]; then
+            rewritten_args+=("$(rewrite_host_path "${arg}")")
+            continue
+        fi
+
+        rewritten_args+=("${arg}")
+    done
+}
+
+build_run_args() {
+    run_args=(
+        run
+        -d
+        --init
+        --privileged
+        --name "${container_name}"
+        --entrypoint /bin/sh
+        --gpus all
+        --network host
+        --ipc host
+        --user "${uid}:${gid}"
+        --env HOME=/tmp/mmltk-home
+        --env NVIDIA_DRIVER_CAPABILITIES=all
+        --label com.mmltk.wrapper=1
+        --label "com.mmltk.repo=${repo_root}"
+        --label "com.mmltk.runtime=${desired_runtime_label}"
+        --volume /:/host:rw
+        --workdir "/host${repo_root}"
+    )
+
+    build_common_group_args
+    run_args+=("${common_group_args[@]}")
+
+    local bind_mount_spec
+    for bind_mount_spec in "${bind_mount_specs[@]}"; do
+        run_args+=(--volume "${bind_mount_spec}")
+    done
+
+    run_args+=(
+        "${image_name}"
+        -lc
+        'mkdir -p "${HOME}" && trap "exit 0" TERM INT; while :; do sleep 3600; done'
+    )
+}
+
+build_common_group_args() {
+    common_group_args=()
+
+    local -a host_groups=()
+    mapfile -t host_groups < <(id -G | tr ' ' '\n' | sort -u)
+    local group_id
+    for group_id in "${host_groups[@]}"; do
+        [[ -n "${group_id}" ]] || continue
+        common_group_args+=(--group-add "${group_id}")
+    done
+
+    # Add the video group for V4L2 capture device access inside the container.
+    # The host user may not be in the video group (ACLs grant access on the host
+    # but are not carried through to the container).
+    local video_gid
+    video_gid="$(getent group video 2>/dev/null | cut -d: -f3)"
+    if [[ -n "${video_gid}" ]]; then
+        common_group_args+=(--group-add "${video_gid}")
+    fi
+}
+
+ensure_container() {
+    ensure_docker
+    ensure_image
+    prepare_bind_mounts
+
+    desired_runtime_label="$(desired_container_runtime_label)"
+    if container_exists && [[ "$(container_runtime_label)" != "${desired_runtime_label}" ]]; then
+        log "recreating ${container_name} for updated runtime configuration"
+        docker rm -f "${container_name}" >/dev/null 2>&1 || true
+    fi
+
+    if ! container_exists; then
+        local -a run_args=()
+        build_run_args
+        docker "${run_args[@]}" >/dev/null
+        return 0
+    fi
+
+    if ! container_running; then
+        docker start "${container_name}" >/dev/null || true
+    fi
+
+    if ! container_running; then
+        log "recreating ${container_name} because it did not stay running"
+        docker rm -f "${container_name}" >/dev/null 2>&1 || true
+        local -a run_args=()
+        build_run_args
+        docker "${run_args[@]}" >/dev/null
+    fi
+}
+
+ensure_runtime_test_cli_compatibility() {
+    docker exec -i \
+        -e "MMLTK_REPO_ROOT=/host${repo_root}" \
+        "${container_name}" /bin/sh -lc '
+            mkdir -p "${MMLTK_REPO_ROOT}/build/release" &&
+            ln -sfn /opt/mmltk/bin/mmltk "${MMLTK_REPO_ROOT}/build/release/mmltk"
+        ' >/dev/null
+}
+
+build_exec_env_args() {
+    exec_env_args=()
+    exec_env_args+=(-e "MMLTK_RFDETR_TEST_CACHE_DIR=/host${repo_root}/.mmltk-data/test-cache/rfdetr")
+    if [[ -n "${MMLTK_LOG_LEVEL:-}" ]]; then
+        exec_env_args+=(-e "MMLTK_LOG_LEVEL=${MMLTK_LOG_LEVEL}")
+    fi
+    if [[ -n "${MMLTK_LOG_FILE:-}" ]]; then
+        exec_env_args+=(-e "MMLTK_LOG_FILE=$(rewrite_host_path "${MMLTK_LOG_FILE}")")
+    elif [[ -z "${MMLTK_LOG_DIR:-}" ]]; then
+        exec_env_args+=(-e "MMLTK_LOG_DIR=/host${repo_root}/.mmltk-data/logs")
+    fi
+    if [[ -n "${MMLTK_LOG_DIR:-}" ]]; then
+        exec_env_args+=(-e "MMLTK_LOG_DIR=$(rewrite_host_path "${MMLTK_LOG_DIR}")")
+    fi
+    if (( gui_mode )); then
+        local gui_platform="${MMLTK_GUI_PLATFORM:-}"
+        if [[ -z "${gui_platform}" ]]; then
+            if [[ -n "${DISPLAY:-}" ]]; then
+                gui_platform="x11"
+            elif [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
+                gui_platform="wayland"
+            fi
+        fi
+
+        local env_name
+        for env_name in \
+            XDG_RUNTIME_DIR \
+            XDG_SESSION_TYPE \
+            XDG_CURRENT_DESKTOP \
+            XDG_SESSION_DESKTOP \
+            DESKTOP_SESSION \
+            DBUS_SESSION_BUS_ADDRESS \
+            DISPLAY \
+            XAUTHORITY \
+            WAYLAND_DISPLAY \
+            GDK_SCALE \
+            GDK_DPI_SCALE \
+            QT_SCALE_FACTOR \
+            QT_SCREEN_SCALE_FACTORS \
+            QT_AUTO_SCREEN_SCALE_FACTOR \
+            XCURSOR_SIZE \
+            XCURSOR_THEME \
+            __NV_PRIME_RENDER_OFFLOAD \
+            __GLX_VENDOR_LIBRARY_NAME; do
+            # Don't leak WAYLAND_DISPLAY into an X11-only container session;
+            # the NVIDIA EGL layer probes the Wayland socket even under GLX,
+            # and credential checks fail across PID namespaces.
+            if [[ "${env_name}" == "WAYLAND_DISPLAY" && "${gui_platform}" == "x11" ]]; then
+                continue
+            fi
+            if [[ -n "${!env_name:-}" ]]; then
+                exec_env_args+=(-e "${env_name}=${!env_name}")
+            fi
+        done
+
+        if [[ -n "${gui_platform}" ]]; then
+            exec_env_args+=(-e "MMLTK_GUI_PLATFORM=${gui_platform}")
+        fi
+    fi
+}
+
+run_tidy() {
+    ensure_docker
+    ensure_analysis_image
+    build_common_group_args
+
+    local -a docker_args=(run --rm --init -i)
+    if [[ -t 0 && -t 1 ]]; then
+        docker_args+=(-t)
+    fi
+    docker_args+=(
+        --user "${uid}:${gid}"
+        --env HOME=/tmp/mmltk-home
+        --env "MMLTK_REPO_ROOT=/host${repo_root}"
+        --volume /:/host:rw
+        --workdir "/host${host_workdir}"
+    )
+    docker_args+=("${common_group_args[@]}")
+    docker_args+=(
+        "${analysis_image_name}"
+        /bin/bash
+        "/host${repo_root}/utilities/run_static_analysis.sh"
+    )
+    docker_args+=("${rewritten_args[@]}")
+
+    docker "${docker_args[@]}"
+}
+
+gui_mode=0
+tidy_mode=0
+passthrough_args=()
+for arg in "$@"; do
+    if [[ "${arg}" == "--gui" ]]; then
+        gui_mode=1
+        continue
+    fi
+    if [[ "${arg}" == "--tidy" ]]; then
+        tidy_mode=1
+        continue
+    fi
+    passthrough_args+=("${arg}")
+done
+
+if (( gui_mode && tidy_mode )); then
+    die "--gui and --tidy cannot be used together"
+fi
+
+rewrite_passthrough_args
+
+if (( tidy_mode )); then
+    run_tidy
+    exit $?
+fi
+
+ensure_container
+ensure_runtime_test_cli_compatibility
+build_exec_env_args
+
+container_workdir="/host${host_workdir}"
+settings_container_path="$(rewrite_host_path "${settings_host_path}")"
+
+exec_args=(exec -i)
+if [[ -t 0 && -t 1 ]]; then
+    exec_args+=(-t)
+fi
+exec_args+=("${exec_env_args[@]}" -w "${container_workdir}" "${container_name}")
+
+if (( gui_mode )); then
+    container_command=(/opt/mmltk/bin/mmltk-gui --settings-path "${settings_container_path}")
+    if ((${#rewritten_args[@]} > 0)); then
+        container_command+=(--seed-from-cli -- "${rewritten_args[@]}")
+    fi
+else
+    container_command=(/opt/mmltk/bin/mmltk "${rewritten_args[@]}")
+fi
+
+docker "${exec_args[@]}" "${container_command[@]}"

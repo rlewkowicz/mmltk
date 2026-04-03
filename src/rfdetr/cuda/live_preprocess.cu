@@ -2,7 +2,7 @@
 
 #include <cmath>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 namespace {
 
 struct AffineMatrix {
@@ -204,4 +204,4 @@ cudaError_t launch_bgr_vertical_flip_in_place_pitched(std::uint8_t* buffer,
     return cudaPeekAtLastError();
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

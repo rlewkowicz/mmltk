@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <string>
 
-namespace fastloader {
+namespace mmltk {
 
 namespace {
 
@@ -39,6 +39,8 @@ bool batch_order_is_contiguous(const uint32_t* batch_order, size_t num_images) {
     return true;
 }
 
+// Batch image count plus stride intentionally track the gathered image layout.
+// NOLINTBEGIN(bugprone-easily-swappable-parameters)
 void copy_batch_images(float* dst,
                        const float* pixels,
                        const uint32_t* batch_order,
@@ -66,9 +68,10 @@ void copy_batch_images(float* dst,
         image += run_length;
     }
 
-    FASTLOADER_PROFILE_ADD("loader.gather.runs", runs);
-    FASTLOADER_PROFILE_ADD("loader.gather.contiguous_images", contiguous_images);
+    MMLTK_PROFILE_ADD("loader.gather.runs", runs);
+    MMLTK_PROFILE_ADD("loader.gather.contiguous_images", contiguous_images);
 }
+// NOLINTEND(bugprone-easily-swappable-parameters)
 
 } // namespace
 
@@ -92,7 +95,7 @@ void DatasetLoader::Impl::prepare_slot(BatchSlot& slot, size_t batch_id) {
         const bool contiguous = batch_order_is_contiguous(order.data() + slot.batch_start, slot.num_images);
         if (contiguous) {
             const size_t stride_floats = header.image_stride / sizeof(float);
-            const size_t pixel_start = static_cast<size_t>(order[slot.batch_start]);
+            const auto pixel_start = static_cast<size_t>(order[slot.batch_start]);
             slot.host_images = pixels + pixel_start * stride_floats;
         } else {
             slot.host_images = nullptr;
@@ -101,7 +104,7 @@ void DatasetLoader::Impl::prepare_slot(BatchSlot& slot, size_t batch_id) {
         slot.state = SlotState::Queued;
     } else {
         const size_t stride_floats = header.image_stride / sizeof(float);
-        const size_t pixel_start = static_cast<size_t>(order[slot.batch_start]);
+        const auto pixel_start = static_cast<size_t>(order[slot.batch_start]);
         slot.host_images = pixels + pixel_start * stride_floats;
         slot.transfer_images = slot.host_images;
         slot.state = SlotState::HostReady;
@@ -184,10 +187,10 @@ void DatasetLoader::Impl::prefetch_worker() {
         }
 
         const size_t stride = header.image_stride;
-        FASTLOADER_PROFILE_SCOPE("loader.gather_batch");
+        MMLTK_PROFILE_SCOPE("loader.gather_batch");
         float* dst = cuda_mgr->gather_buffer(static_cast<int>(slot_idx));
-        FASTLOADER_PROFILE_ADD("loader.gather.images", slot_snapshot.num_images);
-        FASTLOADER_PROFILE_ADD("loader.gather.bytes", slot_snapshot.num_images * stride);
+        MMLTK_PROFILE_ADD("loader.gather.images", slot_snapshot.num_images);
+        MMLTK_PROFILE_ADD("loader.gather.bytes", slot_snapshot.num_images * stride);
         copy_batch_images(dst,
                           pixels,
                           order.data() + slot_snapshot.batch_start,
@@ -238,7 +241,7 @@ void DatasetLoader::Impl::transfer_worker() {
         }
 
         const size_t bytes = slot_snapshot.num_images * header.image_stride;
-        FASTLOADER_PROFILE_ADD("loader.h2d.bytes", bytes);
+        MMLTK_PROFILE_ADD("loader.h2d.bytes", bytes);
         cuda_mgr->async_h2d(slot_idx, slot_snapshot.transfer_images, bytes);
 
         {
@@ -255,7 +258,7 @@ void DatasetLoader::Impl::transfer_worker() {
 }
 
 void DatasetLoader::Impl::start_workers() {
-    FASTLOADER_PROFILE_SCOPE("loader.start_workers");
+    MMLTK_PROFILE_SCOPE("loader.start_workers");
     if (!workers.empty() || transfer_worker_thread.joinable()) {
         return;
     }
@@ -263,7 +266,7 @@ void DatasetLoader::Impl::start_workers() {
         if (gather_worker_count == 0) {
             throw std::runtime_error("shuffle path requires at least one gather worker");
         }
-        FASTLOADER_PROFILE_SET("loader.gather.worker_count", gather_worker_count);
+        MMLTK_PROFILE_SET("loader.gather.worker_count", gather_worker_count);
         workers.reserve(gather_worker_count);
         for (size_t i = 0; i < gather_worker_count; ++i) {
             workers.emplace_back([this, i] {
@@ -278,7 +281,7 @@ void DatasetLoader::Impl::start_workers() {
             });
         }
     } else {
-        FASTLOADER_PROFILE_SET("loader.gather.worker_count", 0);
+        MMLTK_PROFILE_SET("loader.gather.worker_count", 0);
     }
     transfer_worker_thread = std::thread([this] {
         apply_worker_execution_policy(ExecutionPolicyRequest{
@@ -293,7 +296,7 @@ void DatasetLoader::Impl::start_workers() {
 }
 
 void DatasetLoader::Impl::stop_workers() {
-    FASTLOADER_PROFILE_SCOPE("loader.stop_workers");
+    MMLTK_PROFILE_SCOPE("loader.stop_workers");
     shutdown.store(true);
     gather_cv.notify_all();
     transfer_cv.notify_all();
@@ -309,7 +312,7 @@ void DatasetLoader::Impl::stop_workers() {
 }
 
 void DatasetLoader::Impl::reset_epoch_state() {
-    FASTLOADER_PROFILE_SCOPE("loader.reset_epoch_state");
+    MMLTK_PROFILE_SCOPE("loader.reset_epoch_state");
     if (cuda_mgr) {
         cuda_mgr->sync();
     }
@@ -389,7 +392,7 @@ bool DatasetLoader::Impl::pipeline_idle_locked() const {
 }
 
 void DatasetLoader::Impl::refill_pipeline_locked() {
-    FASTLOADER_PROFILE_SCOPE("loader.refill_pipeline");
+    MMLTK_PROFILE_SCOPE("loader.refill_pipeline");
     const size_t total = total_batches();
     size_t refilled_slots = 0;
     while (next_submit_batch < total && !free_slots.empty()) {
@@ -402,7 +405,7 @@ void DatasetLoader::Impl::refill_pipeline_locked() {
         ++next_submit_batch;
         ++refilled_slots;
     }
-    FASTLOADER_PROFILE_ADD("loader.refill.slots", refilled_slots);
+    MMLTK_PROFILE_ADD("loader.refill.slots", refilled_slots);
 }
 
-} // namespace fastloader
+} // namespace mmltk

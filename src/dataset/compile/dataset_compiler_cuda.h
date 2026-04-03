@@ -4,7 +4,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace fastloader::compiler_internal {
+namespace mmltk::compiler_internal {
 
 class CudaBinaryMaskResizer {
 public:
@@ -34,4 +34,4 @@ private:
     Impl* impl_ = nullptr;
 };
 
-} // namespace fastloader::compiler_internal
+} // namespace mmltk::compiler_internal

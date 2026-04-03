@@ -5,7 +5,7 @@
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 torch::Tensor matcher_point_sample_cuda_forward(const torch::Tensor& input,
                                                 const torch::Tensor& point_coords,
@@ -90,4 +90,4 @@ torch::Tensor sample_packed_masks_cuda(const torch::Tensor& packed_mask_bits,
     return output;
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

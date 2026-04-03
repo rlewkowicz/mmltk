@@ -11,7 +11,7 @@
 #include <string>
 #include <utility>
 
-namespace fastloader::compiler_internal {
+namespace mmltk::compiler_internal {
 
 namespace {
 
@@ -150,7 +150,7 @@ CudaBinaryMaskResizer::CudaBinaryMaskResizer(int device_id)
 
     ensure_cuda_ok(cudaSetDevice(device_id), "cudaSetDevice for mask resize");
     ensure_cuda_ok(
-        fastloader::cuda_stream_create_with_highest_priority(&impl_->stream, cudaStreamNonBlocking),
+        mmltk::cuda_stream_create_with_highest_priority(&impl_->stream, cudaStreamNonBlocking),
         "cudaStreamCreateWithPriority for mask resize");
 }
 
@@ -353,4 +353,4 @@ void CudaBinaryMaskResizer::resize_batch(const std::vector<uint8_t>& source_mask
     std::memcpy(output_masks.data(), impl_->host_output, output_bytes);
 }
 
-} // namespace fastloader::compiler_internal
+} // namespace mmltk::compiler_internal

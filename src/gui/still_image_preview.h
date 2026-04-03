@@ -4,12 +4,12 @@
 #include <string>
 #include <vector>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 struct PredictImageInput;
 struct PredictionRecord;
 }
 
-namespace fastloader::gui {
+namespace mmltk::gui {
 
 struct StillImagePreview {
     std::string source_name;
@@ -19,9 +19,9 @@ struct StillImagePreview {
 };
 
 StillImagePreview render_single_image_prediction_preview(
-    const fastloader::rfdetr::PredictImageInput& input,
-    const fastloader::rfdetr::PredictionRecord& record,
+    const mmltk::rfdetr::PredictImageInput& input,
+    const mmltk::rfdetr::PredictionRecord& record,
     int num_classes,
     int device_id);
 
-} // namespace fastloader::gui
+} // namespace mmltk::gui

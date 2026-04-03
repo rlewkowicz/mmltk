@@ -1,14 +1,17 @@
-#include "fastloader/rfdetr/model.h"
+#include "mmltk/rfdetr/model.h"
 
-#include "fastloader/rfdetr/checkpoint.h"
-#include "fastloader/rfdetr/model_config.h"
-#include "fastloader/rfdetr/modules.h"
-#include "fastloader/rfdetr/weight_catalog.h"
+#include "mmltk/rfdetr/checkpoint.h"
+#include "mmltk/rfdetr/model_config.h"
+#include "mmltk/rfdetr/modules.h"
+#include "mmltk/rfdetr/weight_catalog.h"
+#include "mmltk_logging.h"
 #include "profile_utils.h"
 #include "rfdetr/onnx_lowering.h"
-#include "rfdetr/onnx_simplify.h"
+#include "rfdetr/onnx_model_io.h"
 #include "rfdetr/ms_deform_attn_op.h"
+#include "rfdetr/tool_launch_utils.h"
 #include "common_utils.h"
+#include "runtime_paths.h"
 
 #include <ATen/ops/scaled_dot_product_attention.h>
 #include <ATen/TensorIndexing.h>
@@ -20,9 +23,12 @@
 #include <torch/csrc/onnx/onnx.h>
 
 #include <algorithm>
-#include <fstream>
 #include <array>
+#include <cerrno>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -33,9 +39,12 @@
 #include <utility>
 #include <vector>
 
+#include <sys/wait.h>
+#include <unistd.h>
+
 namespace F = torch::nn::functional;
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 namespace {
 
@@ -46,6 +55,63 @@ constexpr int64_t kDinoNumLayers = 12;
 constexpr int64_t kDinoNumHeads = 6;
 constexpr int64_t kProjectorBlocks = 3;
 constexpr std::array<int64_t, 4> kOutFeatureStages = {3, 6, 9, 12};
+
+bool has_prefix(std::string_view value, std::string_view prefix) {
+    return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;
+}
+
+void run_onnx_simplify_tool(const std::filesystem::path& model_path) {
+    const std::filesystem::path helper_path =
+        resolve_sibling_tool_path("mmltk-rfdetr-onnx-simplify", "MMLTK_ONNX_SIMPLIFY_TOOL");
+    if (!std::filesystem::exists(helper_path)) {
+        throw std::runtime_error("RF-DETR ONNX simplify helper not found: " + helper_path.string());
+    }
+
+    const std::string helper_path_string = helper_path.string();
+    const std::string model_path_string = model_path.string();
+    mmltk::logging::logger("rfdetr.model")->info("onnx: checking exported model with {}...",
+                                                 helper_path_string);
+
+    const pid_t child_pid = ::fork();
+    if (child_pid < 0) {
+        throw std::runtime_error(
+            std::string("failed to fork RF-DETR ONNX simplify helper: ") + std::strerror(errno));
+    }
+    if (child_pid == 0) {
+        ::execl(helper_path_string.c_str(),
+                helper_path_string.c_str(),
+                model_path_string.c_str(),
+                static_cast<char*>(nullptr));
+        mmltk::logging::logger("rfdetr.model")->error("onnx: failed to exec simplify helper {}: {}",
+                                                      helper_path_string,
+                                                      std::strerror(errno));
+        _exit(127);
+    }
+
+    int status = 0;
+    while (::waitpid(child_pid, &status, 0) < 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+        throw std::runtime_error(
+            std::string("failed to wait for RF-DETR ONNX simplify helper: ") + std::strerror(errno));
+    }
+
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        return;
+    }
+    if (WIFSIGNALED(status)) {
+        throw std::runtime_error(
+            "RF-DETR ONNX simplify helper terminated by signal " +
+            std::to_string(WTERMSIG(status)));
+    }
+    if (WIFEXITED(status)) {
+        throw std::runtime_error(
+            "RF-DETR ONNX simplify helper failed with exit code " +
+            std::to_string(WEXITSTATUS(status)));
+    }
+    throw std::runtime_error("RF-DETR ONNX simplify helper terminated unexpectedly");
+}
 
 void erase_unused_module_self_input(const std::shared_ptr<torch::jit::Graph>& graph) {
     if (!graph || graph->inputs().empty()) {
@@ -326,7 +392,7 @@ public:
         const int64_t dim = embeddings.size(-1);
         const int64_t patch_height = height / patch_size_;
         const int64_t patch_width = width / patch_size_;
-        const int64_t sqrt_num_positions = static_cast<int64_t>(std::llround(std::sqrt(static_cast<double>(num_positions))));
+        const auto sqrt_num_positions = static_cast<int64_t>(std::llround(std::sqrt(static_cast<double>(num_positions))));
         patch_pos_embed = patch_pos_embed.view({1, sqrt_num_positions, sqrt_num_positions, dim}).permute({0, 3, 1, 2});
         patch_pos_embed = F::interpolate(
                               patch_pos_embed.to(torch::kFloat32),
@@ -661,7 +727,7 @@ public:
           projector(register_module("projector", NativeBackboneProjector(config.hidden_dim))) {}
 
     std::vector<NestedTensor> forward(const NestedTensor& samples) {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.model.backbone");
+        MMLTK_PROFILE_SCOPE("rfdetr.model.backbone");
         std::vector<torch::Tensor> projected = projector->forward(encoder->forward(samples.tensors));
         std::vector<NestedTensor> out;
         out.reserve(projected.size());
@@ -714,8 +780,8 @@ torch::Tensor ms_deform_attn_core_pytorch(const torch::Tensor& value,
 
     int64_t start = 0;
     for (int64_t level = 0; level < num_levels; ++level) {
-        const int64_t height = value_spatial_shapes.index({level, 0}).item<int64_t>();
-        const int64_t width = value_spatial_shapes.index({level, 1}).item<int64_t>();
+        const auto height = value_spatial_shapes.index({level, 0}).item<int64_t>();
+        const auto width = value_spatial_shapes.index({level, 1}).item<int64_t>();
         auto value_level = value.narrow(1, start, height * width)
                                .flatten(2)
                                .transpose(1, 2)
@@ -742,7 +808,6 @@ public:
           n_levels_(n_levels),
           n_heads_(n_heads),
           n_points_(n_points),
-          im2col_step_(64),
           sampling_offsets(register_module(
               "sampling_offsets",
               torch::nn::Linear(d_model, n_heads * n_levels * n_points * 2))),
@@ -763,7 +828,7 @@ public:
                           const torch::Tensor& input_spatial_shapes,
                           const torch::Tensor& input_level_start_index,
                           const torch::Tensor& input_padding_mask) {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.model.ms_deform_attn");
+        MMLTK_PROFILE_SCOPE("rfdetr.model.ms_deform_attn");
         const int64_t batch = query.size(0);
         const int64_t len_q = query.size(1);
         const int64_t len_in = input_flatten.size(1);
@@ -1048,8 +1113,8 @@ std::pair<torch::Tensor, torch::Tensor> gen_encoder_output_proposals(const torch
 
     int64_t start = 0;
     for (int64_t level = 0; level < spatial_shapes.size(0); ++level) {
-        const int64_t height = spatial_shapes.index({level, 0}).item<int64_t>();
-        const int64_t width = spatial_shapes.index({level, 1}).item<int64_t>();
+        const auto height = spatial_shapes.index({level, 0}).item<int64_t>();
+        const auto width = spatial_shapes.index({level, 1}).item<int64_t>();
 
         torch::Tensor valid_h;
         torch::Tensor valid_w;
@@ -1123,10 +1188,10 @@ public:
 
         torch::NoGradGuard no_grad;
         const double prior_prob = 0.01;
-        const float bias_value = static_cast<float>(-std::log((1.0 - prior_prob) / prior_prob));
-        for (size_t index = 0; index < enc_out_class_embed->size(); ++index) {
-            auto& linear = enc_out_class_embed->at<torch::nn::LinearImpl>(index);
-            linear.bias.fill_(bias_value);
+        const auto bias_value = static_cast<float>(-std::log((1.0 - prior_prob) / prior_prob));
+        for (auto& module : *enc_out_class_embed) {
+            auto linear = module->as<torch::nn::Linear>();
+            linear->bias.fill_(bias_value);
         }
     }
 
@@ -1135,18 +1200,18 @@ public:
     }
 
     void resize_output_classes(int64_t output_classes) {
-        for (size_t index = 0; index < enc_out_class_embed->size(); ++index) {
-            auto& linear = enc_out_class_embed->at<torch::nn::LinearImpl>(index);
-            resize_linear_output(linear, output_classes);
+        for (auto& module : *enc_out_class_embed) {
+            auto linear = module->as<torch::nn::Linear>();
+            resize_linear_output(*linear, output_classes);
         }
     }
 
     std::vector<LinearOutputState> output_class_state() const {
         std::vector<LinearOutputState> state;
         state.reserve(static_cast<size_t>(enc_out_class_embed->size()));
-        for (size_t index = 0; index < enc_out_class_embed->size(); ++index) {
+        for (const auto& module : *enc_out_class_embed) {
             state.push_back(capture_linear_output_state(
-                enc_out_class_embed->at<torch::nn::LinearImpl>(index)));
+                *module->as<torch::nn::Linear>()));
         }
         return state;
     }
@@ -1183,7 +1248,7 @@ public:
                                     const torch::Tensor& refpoint_embed,
                                     const torch::Tensor& query_feat,
                                     bool training_mode) {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.model.transformer");
+        MMLTK_PROFILE_SCOPE("rfdetr.model.transformer");
         if (srcs.empty()) {
             throw std::runtime_error("RF-DETR transformer requires at least one source feature");
         }
@@ -1202,7 +1267,7 @@ public:
         spatial_shape_values.reserve(srcs.size() * 2);
 
         {
-            FASTLOADER_PROFILE_SCOPE("rfdetr.model.transformer.flatten_inputs");
+            MMLTK_PROFILE_SCOPE("rfdetr.model.transformer.flatten_inputs");
             for (size_t level = 0; level < srcs.size(); ++level) {
                 const auto& src = srcs[level];
                 const auto& pos = pos_embeds[level];
@@ -1243,7 +1308,7 @@ public:
         torch::Tensor enc_boxes;
 
         if (config_.two_stage) {
-            FASTLOADER_PROFILE_SCOPE("rfdetr.model.transformer.two_stage");
+            MMLTK_PROFILE_SCOPE("rfdetr.model.transformer.two_stage");
             auto [output_memory, output_proposals] =
                 gen_encoder_output_proposals(memory, mask_flatten_tensor, spatial_shapes, !config_.bbox_reparam);
 
@@ -1297,7 +1362,7 @@ public:
             enc_boxes = config_.bbox_reparam ? torch::cat(boxes_ts, 1) : torch::cat(boxes_ts, 1).sigmoid();
 
             if (config_.dec_layers > 0) {
-                FASTLOADER_PROFILE_SCOPE("rfdetr.model.transformer.decoder");
+                MMLTK_PROFILE_SCOPE("rfdetr.model.transformer.decoder");
                 auto tgt = query_feat.unsqueeze(0).repeat({batch, 1, 1});
                 auto refpoints = refpoint_embed.unsqueeze(0).repeat({batch, 1, 1});
                 auto topk_refs = torch::cat(refpoint_embed_ts, 1);
@@ -1329,7 +1394,7 @@ public:
                         valid_ratios_tensor.to(memory.dtype()));
             }
         } else if (config_.dec_layers > 0) {
-            FASTLOADER_PROFILE_SCOPE("rfdetr.model.transformer.decoder");
+            MMLTK_PROFILE_SCOPE("rfdetr.model.transformer.decoder");
             auto tgt = query_feat.unsqueeze(0).repeat({batch, 1, 1});
             auto refpoints = refpoint_embed.unsqueeze(0).repeat({batch, 1, 1});
             std::tie(hidden_states, refs_unsigmoid) =
@@ -1361,28 +1426,6 @@ private:
     NativeRfDetrConfig config_;
 };
 
-const ModelPresetConfig* infer_preset_from_path(const std::filesystem::path& input_path) {
-    const std::string normalized = input_path.lexically_normal().string();
-    const ModelPresetConfig* best_match = nullptr;
-    size_t best_score = 0;
-    for (const auto& preset : model_presets()) {
-        size_t score = 0;
-        const std::string canonical_weight_filename(preset.canonical_weight_filename);
-        if (normalized.find(canonical_weight_filename) != std::string::npos) {
-            score = 1000 + canonical_weight_filename.size();
-        }
-        const std::string preset_name(preset.preset_name);
-        if (normalized.find(preset_name) != std::string::npos) {
-            score = std::max(score, preset_name.size());
-        }
-        if (score > best_score) {
-            best_match = &preset;
-            best_score = score;
-        }
-    }
-    return best_match;
-}
-
 NativeRfDetrConfig make_config_from_preset(const ModelPresetConfig& preset) {
     return NativeRfDetrConfig{
         std::string(preset.preset_name),
@@ -1413,7 +1456,7 @@ NativeRfDetrConfig make_config_from_preset(const ModelPresetConfig& preset) {
 }
 
 NativeRfDetrConfig make_config_from_path(const std::filesystem::path& input_path) {
-    if (const auto* preset = infer_preset_from_path(input_path)) {
+    if (const auto* preset = infer_model_preset_from_path(input_path)) {
         return make_config_from_preset(*preset);
     }
     NativeRfDetrConfig config;
@@ -1441,10 +1484,10 @@ NativeCheckpoint prepare_checkpoint_for_module(const NativeCheckpoint& checkpoin
 
     for (auto& entry : prepared.state_dict) {
         // Remap upstream Python top-level encoder heads to C++ transformer namespace
-        if (entry.name.find("enc_output.") == 0 ||
-            entry.name.find("enc_output_norm.") == 0 ||
-            entry.name.find("enc_out_class_embed.") == 0 ||
-            entry.name.find("enc_out_bbox_embed.") == 0) {
+        if (has_prefix(entry.name, "enc_output.") ||
+            has_prefix(entry.name, "enc_output_norm.") ||
+            has_prefix(entry.name, "enc_out_class_embed.") ||
+            has_prefix(entry.name, "enc_out_bbox_embed.")) {
             
             const std::string original_name = entry.name;
             entry.name = "transformer." + original_name;
@@ -1615,7 +1658,7 @@ ResolvedModelArtifacts resolve_upstream_weight_artifacts(const std::filesystem::
     } else if (const auto* preset =
                    find_model_preset_by_weight_filename(canonical_weights_path.filename().string())) {
         artifacts.config = make_config_from_preset(*preset);
-    } else if (const auto* inferred_preset = infer_preset_from_path(canonical_weights_path)) {
+    } else if (const auto* inferred_preset = infer_model_preset_from_path(canonical_weights_path)) {
         artifacts.config = make_config_from_preset(*inferred_preset);
     } else {
         throw std::runtime_error(
@@ -1673,7 +1716,7 @@ NativeRfDetrModel::NativeRfDetrModel(const NativeRfDetrConfig& config)
     refpoint_embed->weight.zero_();
 
     const double prior_prob = 0.01;
-    const float bias_value = static_cast<float>(-std::log((1.0 - prior_prob) / prior_prob));
+    const auto bias_value = static_cast<float>(-std::log((1.0 - prior_prob) / prior_prob));
     class_embed->bias.fill_(bias_value);
 
     if (auto bbox = std::dynamic_pointer_cast<RfDetrMlpImpl>(bbox_embed_)) {
@@ -1707,11 +1750,11 @@ ModelOutputs NativeRfDetrModel::forward(const NestedTensor& batch,
     const bool is_train = is_training();
     if ((is_train && is_compiled_train_) || (!is_train && is_compiled_eval_)) {
         std::vector<torch::jit::IValue> inputs;
-        inputs.push_back(batch.tensors);
+        inputs.emplace_back(batch.tensors);
         if (batch.mask.defined()) {
-            inputs.push_back(batch.mask);
+            inputs.emplace_back(batch.mask);
         } else {
-            inputs.push_back(torch::zeros(
+            inputs.emplace_back(torch::zeros(
                 {batch.tensors.size(0), batch.tensors.size(2), batch.tensors.size(3)},
                 torch::TensorOptions().dtype(torch::kBool).device(batch.tensors.device())));
         }
@@ -1774,7 +1817,7 @@ ModelOutputs NativeRfDetrModel::forward(const NestedTensor& batch,
         return outputs;
     }
 
-    FASTLOADER_PROFILE_SCOPE("rfdetr.model.forward");
+    MMLTK_PROFILE_SCOPE("rfdetr.model.forward");
     if (!batch.tensors.defined()) {
         throw std::runtime_error("NativeRfDetrModel::forward requires batch.tensors");
     }
@@ -1788,7 +1831,7 @@ ModelOutputs NativeRfDetrModel::forward(const NestedTensor& batch,
 
     std::vector<NestedTensor> features;
     {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.model.forward.backbone");
+        MMLTK_PROFILE_SCOPE("rfdetr.model.forward.backbone");
         const bool use_traced_backbone = is_train
             ? has_traced_backbone_train_ : has_traced_backbone_eval_;
         if (use_traced_backbone) {
@@ -1813,7 +1856,7 @@ ModelOutputs NativeRfDetrModel::forward(const NestedTensor& batch,
     masks.reserve(features.size());
     poss.reserve(features.size());
     {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.model.forward.position_embeddings");
+        MMLTK_PROFILE_SCOPE("rfdetr.model.forward.position_embeddings");
         for (const auto& feature : features) {
             srcs.push_back(feature.tensors);
             masks.push_back(feature.mask);
@@ -1838,7 +1881,7 @@ ModelOutputs NativeRfDetrModel::forward(const NestedTensor& batch,
 
     NativeTransformerOutput transformed;
     {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.model.forward.transformer");
+        MMLTK_PROFILE_SCOPE("rfdetr.model.forward.transformer");
         transformed = transformer->forward(srcs, masks, poss, ref_weights, query_weights, is_training());
     }
 
@@ -1851,7 +1894,7 @@ ModelOutputs NativeRfDetrModel::forward(const NestedTensor& batch,
     std::vector<torch::Tensor> dense_masks;
     std::vector<OutputLayer::SparsePredMasks> sparse_masks;
     if (include_masks && segmentation_head_ && !decoder_query_features.empty()) {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.model.forward.segmentation");
+        MMLTK_PROFILE_SCOPE("rfdetr.model.forward.segmentation");
         auto* seg = seg_override ? seg_override
                                  : std::dynamic_pointer_cast<SegmentationHeadImpl>(segmentation_head_).get();
         if (!seg) {
@@ -1872,7 +1915,7 @@ ModelOutputs NativeRfDetrModel::forward(const NestedTensor& batch,
 
     ModelOutputs outputs;
     if (!decoder_query_features.empty()) {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.model.forward.decoder_heads");
+        MMLTK_PROFILE_SCOPE("rfdetr.model.forward.decoder_heads");
         const int64_t ref_layers = transformed.refs_unsigmoid.size(0);
         for (size_t index = 0; index < decoder_query_features.size(); ++index) {
             const int64_t ref_index = ref_layers == 1 ? 0 : static_cast<int64_t>(index);
@@ -1912,7 +1955,7 @@ ModelOutputs NativeRfDetrModel::forward(const NestedTensor& batch,
     }
 
     if (config_.two_stage && transformed.enc_memory.defined() && transformed.enc_boxes.defined()) {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.model.forward.encoder_heads");
+        MMLTK_PROFILE_SCOPE("rfdetr.model.forward.encoder_heads");
         OutputLayer enc_output;
         enc_output.pred_logits = transformer->encoder_class_logits(transformed.enc_memory, is_training());
         enc_output.pred_boxes = transformed.enc_boxes;
@@ -2018,8 +2061,9 @@ void NativeRfDetrModel::optimize_for_inference(int batch_size, bool for_training
     }
 
     if (mode == CompilationMode::kNone) {
-        std::fprintf(stderr, "rfdetr: compilation disabled, using raw C++ forward for %s\n",
-                     for_training ? "training" : "evaluation");
+        mmltk::logging::logger("rfdetr.model")->info(
+            "rfdetr: compilation disabled, using raw C++ forward for {}",
+            for_training ? "training" : "evaluation");
         return;
     }
 
@@ -2034,8 +2078,9 @@ void NativeRfDetrModel::optimize_for_inference(int batch_size, bool for_training
         // This is the dominant compute and is safely traceable (no custom CUDA
         // kernels, no data-dependent control flow — only config-constant branches).
         // The transformer, decoder, detection/segmentation heads run as raw C++.
-        std::fprintf(stderr, "rfdetr: selectively compiling backbone for %s via torch::jit...\n",
-                     for_training ? "training" : "evaluation");
+        mmltk::logging::logger("rfdetr.model")->info(
+            "rfdetr: selectively compiling backbone for {} via torch::jit...",
+            for_training ? "training" : "evaluation");
 
         auto& backbone = backbone_->at<NativeBackboneImpl>(0);
 
@@ -2079,8 +2124,9 @@ void NativeRfDetrModel::optimize_for_inference(int batch_size, bool for_training
     }
 
     // kFullTrace: trace the entire model (original behavior).
-    std::fprintf(stderr, "rfdetr: compiling entire model %s graph via torch::jit...\n",
-                 for_training ? "training" : "evaluation");
+    mmltk::logging::logger("rfdetr.model")->info(
+        "rfdetr: compiling entire model {} graph via torch::jit...",
+        for_training ? "training" : "evaluation");
 
     auto dummy_mask = torch::zeros(
         {batch_size, config_.resolution, config_.resolution},
@@ -2267,22 +2313,14 @@ void NativeRfDetrModel::export_onnx(const std::filesystem::path& output_path,
             false,
             output_path.string());
 
-    if (simplify) {
-        run_onnx_simplify(*model_proto);
-    }
+    write_onnx_model_proto(model_proto, output_path);
 
-    std::string serialized = torch::jit::serialize_model_proto_to_string(model_proto);
-    std::filesystem::create_directories(output_path.parent_path());
-    std::ofstream out(output_path, std::ios::binary);
-    if (!out.is_open()) {
-        set_force_pytorch_deformable_attn(false);
-        throw std::runtime_error("failed to open ONNX output file: " + output_path.string());
+    if (simplify) {
+        run_onnx_simplify_tool(output_path);
     }
-    out.write(serialized.data(), static_cast<std::streamsize>(serialized.size()));
-    out.close();
 
     set_force_pytorch_deformable_attn(false);
-    std::fprintf(stderr, "onnx: exported model to %s\n", output_path.c_str());
+    mmltk::logging::logger("rfdetr.model")->info("onnx: exported model to {}", output_path.string());
 }
 
 void export_weights_to_onnx(const std::filesystem::path& weights_path,
@@ -2298,4 +2336,4 @@ void export_weights_to_onnx(const std::filesystem::path& weights_path,
     model.export_onnx(output_path, opset_version, 1, simplify);
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

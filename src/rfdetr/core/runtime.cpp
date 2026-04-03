@@ -1,6 +1,7 @@
 #include "rfdetr/runtime.h"
 
 #include "execution_policy.h"
+#include "mmltk_logging.h"
 
 #include <ATen/Context.h>
 #include <torch/script.h>
@@ -9,7 +10,7 @@
 #include <cstdio>
 #include <stdexcept>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 namespace {
 
@@ -49,15 +50,15 @@ RuntimeConfig resolve_runtime_config(int requested_workers,
                                      const std::string& cpu_affinity_value) {
     RuntimeConfig config;
     config.cpu_affinity =
-        cpu_affinity_value.empty() ? fastloader::allowed_cpu_set()
-                                   : fastloader::resolve_cpu_affinity(cpu_affinity_value);
+        cpu_affinity_value.empty() ? mmltk::allowed_cpu_set()
+                                   : mmltk::resolve_cpu_affinity(cpu_affinity_value);
     const int available_workers = static_cast<int>(std::max<size_t>(config.cpu_affinity.size(), 1));
     const int default_workers = available_workers;
     const int requested_total = clamp_positive(requested_workers, std::max(1, default_workers));
     if (available_workers >= 3) {
         config.workers =
-            fastloader::clamp_worker_count_to_cpus(requested_total, config.cpu_affinity.size(), 0, 3);
-        fastloader::log_worker_budget_clamp("rfdetr.runtime",
+            mmltk::clamp_worker_count_to_cpus(requested_total, config.cpu_affinity.size(), 0, 3);
+        mmltk::log_worker_budget_clamp("rfdetr.runtime",
                                             requested_total,
                                             config.workers,
                                             config.cpu_affinity,
@@ -65,9 +66,9 @@ RuntimeConfig resolve_runtime_config(int requested_workers,
                                             3);
     } else {
         config.workers = std::max(3, requested_total);
-        std::fprintf(stderr,
-                     "[exec] rfdetr.runtime cpuset=%s has fewer than 3 CPUs; runtime helper threads will overlap\n",
-                     fastloader::format_cpu_list(config.cpu_affinity).c_str());
+        mmltk::logging::logger("exec")->warn(
+            "rfdetr.runtime cpuset={} has fewer than 3 CPUs; runtime helper threads will overlap",
+            mmltk::format_cpu_list(config.cpu_affinity));
     }
     config.lanes = clamp_positive(requested_lanes, 1);
     return config;
@@ -118,7 +119,7 @@ RuntimeContext::RuntimeContext(const RuntimeConfig& config)
     if (cpu_cpus_.empty()) {
         cpu_cpus_ = config_.cpu_affinity;
     }
-    cpu_pool_ = std::make_shared<fastloader::WorkerPool>(
+    cpu_pool_ = std::make_shared<mmltk::WorkerPool>(
         static_cast<size_t>(split_.cpu_threads),
         cpu_cpus_,
         "rfdetrcpu");
@@ -136,4 +137,4 @@ std::string RuntimeContext::cpu_affinity_string() const {
     return join_cpu_list(cpu_cpus_);
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

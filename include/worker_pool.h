@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-namespace fastloader {
+namespace mmltk {
 
 class WorkerPool {
 public:
@@ -24,7 +24,7 @@ public:
     WorkerPool(const WorkerPool&) = delete;
     WorkerPool& operator=(const WorkerPool&) = delete;
 
-    size_t size() const noexcept;
+    [[nodiscard]] size_t size() const noexcept;
     void wait_idle();
 
     template <typename Func>
@@ -35,7 +35,7 @@ public:
 
 private:
     void enqueue_task(std::function<void()> task);
-    bool running_on_worker_thread() const noexcept;
+    [[nodiscard]] bool running_on_worker_thread() const noexcept;
 
     struct Impl;
     std::unique_ptr<Impl> impl_;
@@ -98,4 +98,4 @@ void WorkerPool::parallel_for(Index begin, Index end, int max_workers, Func&& fu
     }
 }
 
-} // namespace fastloader
+} // namespace mmltk

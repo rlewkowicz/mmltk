@@ -1,6 +1,8 @@
-#include "app.h"
+#include "app_api.h"
+#include "cli_seed.h"
 #include "app_options.h"
 #include "execution_policy.h"
+#include "mmltk_logging.h"
 
 #include <imgui.h>
 #include <backends/imgui_impl_glfw.h>
@@ -8,15 +10,15 @@
 
 #include <GLFW/glfw3.h>
 
+#include <cstdio>
 #include <exception>
 #include <cstdlib>
 #include <cstring>
-#include <cstdio>
 
 namespace {
 
 void glfw_error_callback(int error, const char* description) {
-    std::fprintf(stderr, "glfw error %d: %s\n", error, description);
+    mmltk::logging::logger("gui")->error("glfw error {}: {}", error, description);
 }
 
 const char* env_or_unset(const char* name) {
@@ -27,6 +29,16 @@ const char* env_or_unset(const char* name) {
 bool env_is_set(const char* name) {
     const char* value = std::getenv(name);
     return value != nullptr && value[0] != '\0';
+}
+
+void report_gui_error(std::string_view message) noexcept {
+    try {
+        mmltk::logging::logger("gui")->error("{}", message);
+        return;
+    } catch (...) {
+        std::fprintf(stderr, "%.*s\n", static_cast<int>(message.size()), message.data());
+        return;
+    }
 }
 
 #if GLFW_VERSION_MAJOR > 3 || (GLFW_VERSION_MAJOR == 3 && GLFW_VERSION_MINOR >= 4)
@@ -45,28 +57,27 @@ const char* glfw_platform_name(int platform) {
 #endif
 
 void print_display_environment_hint() {
-    std::fprintf(stderr,
-                 "display env: XDG_SESSION_TYPE=%s XDG_RUNTIME_DIR=%s WAYLAND_DISPLAY=%s DISPLAY=%s XAUTHORITY=%s __NV_PRIME_RENDER_OFFLOAD=%s __GLX_VENDOR_LIBRARY_NAME=%s FASTLOADER_GUI_PLATFORM=%s\n",
-                 env_or_unset("XDG_SESSION_TYPE"),
-                 env_or_unset("XDG_RUNTIME_DIR"),
-                 env_or_unset("WAYLAND_DISPLAY"),
-                 env_or_unset("DISPLAY"),
-                 env_or_unset("XAUTHORITY"),
-                 env_or_unset("__NV_PRIME_RENDER_OFFLOAD"),
-                 env_or_unset("__GLX_VENDOR_LIBRARY_NAME"),
-                 env_or_unset("FASTLOADER_GUI_PLATFORM"));
-    std::fputs(
-        "For Linux/NVIDIA CUDA-OpenGL interop, use the same Xwayland/NVIDIA env as the live capture preview when DISPLAY is available: "
+    mmltk::logging::logger("gui")->warn(
+        "display env: XDG_SESSION_TYPE={} XDG_RUNTIME_DIR={} WAYLAND_DISPLAY={} DISPLAY={} XAUTHORITY={} __NV_PRIME_RENDER_OFFLOAD={} __GLX_VENDOR_LIBRARY_NAME={} MMLTK_GUI_PLATFORM={}",
+        env_or_unset("XDG_SESSION_TYPE"),
+        env_or_unset("XDG_RUNTIME_DIR"),
+        env_or_unset("WAYLAND_DISPLAY"),
+        env_or_unset("DISPLAY"),
+        env_or_unset("XAUTHORITY"),
+        env_or_unset("__NV_PRIME_RENDER_OFFLOAD"),
+        env_or_unset("__GLX_VENDOR_LIBRARY_NAME"),
+        env_or_unset("MMLTK_GUI_PLATFORM"));
+    mmltk::logging::logger("gui")->warn(
+        "For Linux/NVIDIA CUDA-OpenGL interop, prefer Xwayland/NVIDIA env values when DISPLAY is available: "
         "XAUTHORITY=/run/user/1000/.mutter-Xwaylandauth.* __NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia "
-        "FASTLOADER_GUI_PLATFORM=x11.\n",
-        stderr);
+        "MMLTK_GUI_PLATFORM=x11.");
 }
 
 void configure_platform_hint_from_session() {
 #if GLFW_VERSION_MAJOR > 3 || (GLFW_VERSION_MAJOR == 3 && GLFW_VERSION_MINOR >= 4)
     const bool x11_supported = glfwPlatformSupported(GLFW_PLATFORM_X11) == GLFW_TRUE;
     const bool wayland_supported = glfwPlatformSupported(GLFW_PLATFORM_WAYLAND) == GLFW_TRUE;
-    const char* requested_platform = std::getenv("FASTLOADER_GUI_PLATFORM");
+    const char* requested_platform = std::getenv("MMLTK_GUI_PLATFORM");
 
     if (requested_platform != nullptr && requested_platform[0] != '\0' &&
         std::strcmp(requested_platform, "auto") != 0) {
@@ -75,9 +86,8 @@ void configure_platform_hint_from_session() {
         } else if (std::strcmp(requested_platform, "wayland") == 0 && wayland_supported) {
             glfwInitHint(GLFW_PLATFORM, GLFW_PLATFORM_WAYLAND);
         } else {
-            std::fprintf(stderr,
-                         "FASTLOADER_GUI_PLATFORM=%s is not supported by this GLFW build\n",
-                         requested_platform);
+            mmltk::logging::logger("gui")->warn("MMLTK_GUI_PLATFORM={} is not supported by this GLFW build",
+                                                requested_platform);
         }
         return;
     }
@@ -98,27 +108,37 @@ void configure_platform_hint_from_session() {
 
 int main(int argc, char** argv) {
     try {
-        const fastloader::ExecutionPolicySnapshot execution_snapshot =
-            fastloader::apply_process_execution_policy();
-        fastloader::log_process_execution_policy("fastloader_gui", execution_snapshot, false, true);
+        mmltk::logging::initialize(mmltk::logging::merge(mmltk::logging::config_from_env("mmltk_gui"),
+                                                         mmltk::logging::scan_cli_overrides(argc, argv)));
+        const mmltk::ExecutionPolicySnapshot execution_snapshot =
+            mmltk::apply_process_execution_policy();
+        mmltk::log_process_execution_policy("mmltk_gui", execution_snapshot, false, true);
     } catch (const std::exception& error) {
-        std::fprintf(stderr, "fastloader gui error: %s\n", error.what());
+        report_gui_error(std::string("mmltk gui error: ") + error.what());
         return 1;
     }
 
-    const fastloader::gui::AppLaunchOptions launch_options =
-        fastloader::gui::parse_app_launch_options(argc, argv);
+    mmltk::gui::AppLaunchOptions launch_options;
+    try {
+        launch_options = mmltk::gui::parse_app_launch_options(argc, argv);
+        if (launch_options.seed_from_cli) {
+            mmltk::gui::apply_gui_cli_seed_file(launch_options.settings_path, launch_options.seed_cli_args);
+        }
+    } catch (const std::exception& error) {
+        report_gui_error(std::string("mmltk gui error: ") + error.what());
+        return 1;
+    }
 
     glfwSetErrorCallback(glfw_error_callback);
     configure_platform_hint_from_session();
     if (glfwInit() == 0) {
-        std::fputs("failed to initialize GLFW\n", stderr);
+        mmltk::logging::logger("gui")->error("failed to initialize GLFW");
         print_display_environment_hint();
         return 1;
     }
 
 #if GLFW_VERSION_MAJOR > 3 || (GLFW_VERSION_MAJOR == 3 && GLFW_VERSION_MINOR >= 4)
-    std::fprintf(stderr, "glfw platform: %s\n", glfw_platform_name(glfwGetPlatform()));
+    mmltk::logging::logger("gui")->info("glfw platform: {}", glfw_platform_name(glfwGetPlatform()));
 #endif
 
     constexpr const char* glsl_version = "#version 330";
@@ -127,10 +147,10 @@ int main(int argc, char** argv) {
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     glfwWindowHint(GLFW_DOUBLEBUFFER, GLFW_TRUE);
 
-    GLFWwindow* window = glfwCreateWindow(1600, 960, "fastloader GUI", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(1600, 960, "mmltk GUI", nullptr, nullptr);
     if (window == nullptr) {
         glfwTerminate();
-        std::fputs("failed to create GLFW window\n", stderr);
+        mmltk::logging::logger("gui")->error("failed to create GLFW window");
         print_display_environment_hint();
         return 1;
     }
@@ -144,23 +164,24 @@ int main(int argc, char** argv) {
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.IniFilename = "imgui.ini";
 
-    fastloader::gui::App::apply_style();
+    mmltk::gui::apply_app_style();
 
     if (!ImGui_ImplGlfw_InitForOpenGL(window, true)) {
         glfwDestroyWindow(window);
         glfwTerminate();
-        std::fputs("failed to initialize ImGui GLFW backend\n", stderr);
+        mmltk::logging::logger("gui")->error("failed to initialize ImGui GLFW backend");
         return 1;
     }
     if (!ImGui_ImplOpenGL3_Init(glsl_version)) {
         ImGui_ImplGlfw_Shutdown();
         glfwDestroyWindow(window);
         glfwTerminate();
-        std::fputs("failed to initialize ImGui OpenGL backend\n", stderr);
+        mmltk::logging::logger("gui")->error("failed to initialize ImGui OpenGL backend");
         return 1;
     }
 
-    fastloader::gui::App app(window, launch_options.vast_api_key);
+    mmltk::gui::AppHandle app =
+        mmltk::gui::make_app(window, launch_options.vast_api_key, launch_options.settings_path);
     while (glfwWindowShouldClose(window) == 0) {
         glfwPollEvents();
 
@@ -168,8 +189,8 @@ int main(int argc, char** argv) {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        app.poll_background_work();
-        app.render();
+        mmltk::gui::poll_background_work(*app);
+        mmltk::gui::render(*app);
 
         ImGui::Render();
 
@@ -183,7 +204,7 @@ int main(int argc, char** argv) {
         glfwSwapBuffers(window);
     }
 
-    app.shutdown();
+    mmltk::gui::shutdown(*app);
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();

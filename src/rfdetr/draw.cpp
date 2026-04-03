@@ -1,4 +1,4 @@
-#include "fastloader/rfdetr/draw_cuda.h"
+#include "mmltk/rfdetr/draw_cuda.h"
 #include "rfdetr/cuda_utils.h"
 #include "worker_pool.h"
 
@@ -19,7 +19,7 @@
 
 #include <stb_image_write.h>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 namespace {
 
@@ -36,7 +36,7 @@ public:
     CudaEventHandle(const CudaEventHandle&) = delete;
     CudaEventHandle& operator=(const CudaEventHandle&) = delete;
 
-    cudaEvent_t get() const { return event_; }
+    [[nodiscard]] cudaEvent_t get() const { return event_; }
 
 private:
     cudaEvent_t event_ = nullptr;
@@ -52,7 +52,7 @@ struct PendingEvalSampleWrite {
 };
 
 struct EvalSampleWriterState {
-    fastloader::WorkerPool pool{1, {}, "rfdwrite"};
+    mmltk::WorkerPool pool{1, {}, "rfdwrite"};
     std::mutex mutex;
     std::deque<std::future<void>> futures;
 };
@@ -226,7 +226,7 @@ void draw_eval_sample_async_gpu(
     {
         c10::cuda::CUDAStreamGuard stream_guard(draw_stream);
         image_hwc = image_chw.permute({1, 2, 0}).contiguous();
-        const double image_max = image_hwc.max().item<double>();
+        const auto image_max = image_hwc.max().item<double>();
         if (image_max <= 1.0) {
             image_u8 = image_hwc.mul(255.0f).clamp(0, 255).to(torch::kUInt8);
         } else {
@@ -301,4 +301,4 @@ void flush_eval_sample_writes() {
     }
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

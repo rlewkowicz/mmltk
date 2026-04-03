@@ -1,19 +1,20 @@
-#include "fastloader/rfdetr/train.h"
+#include "mmltk/rfdetr/train.h"
 
 #include "dataset_loader.h"
-#include "fastloader/rfdetr/checkpoint.h"
-#include "fastloader/rfdetr/detection_ops.h"
-#include "fastloader/rfdetr/modules.h"
-#include "fastloader/rfdetr/target_builder.h"
-#include "fastloader/rfdetr/training_ops.h"
+#include "mmltk/rfdetr/checkpoint.h"
+#include "mmltk/rfdetr/detection_ops.h"
+#include "mmltk/rfdetr/modules.h"
+#include "mmltk/rfdetr/target_builder.h"
+#include "mmltk/rfdetr/training_ops.h"
+#include "mmltk_logging.h"
 #include "profile_utils.h"
 #include "rfdetr/checkpoint_internal.h"
 #include "rfdetr/cuda_utils.h"
 #include "rfdetr/native_optimizer.h"
-#include "rfdetr/progress_bar.h"
+#include "spdmon/spdmon.hpp"
 #include "rfdetr/runtime.h"
 #include "rfdetr/validate_internal.h"
-#include "fastloader/rfdetr/draw_cuda.h"
+#include "mmltk/rfdetr/draw_cuda.h"
 
 #include "rfdetr/common/dataset_utils.h"
 #include "rfdetr/common/tensor_utils.h"
@@ -50,7 +51,7 @@
 #include <utility>
 #include <vector>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 using json = nlohmann::json;
 using namespace validate_detail;
@@ -121,7 +122,9 @@ size_t eval_prediction_slot_count(const RuntimeSplit& split) {
 struct TrainLaneContext {
     c10::cuda::CUDAStream stream;
     TargetScratch target_scratch;
-    std::shared_ptr<SegmentationHeadImpl> segmentation_head;
+    std::shared_ptr<NativeRfDetrModel> model;
+    std::vector<torch::Tensor> grad_params;
+    size_t synced_parameter_version = std::numeric_limits<size_t>::max();
 };
 
 struct TrainLaneResult {
@@ -202,9 +205,7 @@ double resolve_num_boxes_value(int64_t num_boxes_int,
     return torch::clamp_min(num_boxes / std::max<int64_t>(1, config.world_size), 1.0).item<double>();
 }
 
-void merge_lane_gradients(const TrainLaneResult& lane_result,
-                          std::vector<torch::Tensor>& parameters,
-                          int device_id) {
+void wait_for_lane_result(const TrainLaneResult& lane_result, int device_id) {
     if (!lane_result.ready_event) {
         throw std::runtime_error("parallel RF-DETR train result is missing a completion event");
     }
@@ -213,7 +214,13 @@ void merge_lane_gradients(const TrainLaneResult& lane_result,
             c10::cuda::getCurrentCUDAStream(checked_device_index(device_id)).stream(),
             lane_result.ready_event->get(),
             0),
-        "cudaStreamWaitEvent for merged train gradients");
+        "cudaStreamWaitEvent for parallel train lane result");
+}
+
+void merge_lane_gradients(const TrainLaneResult& lane_result,
+                          std::vector<torch::Tensor>& parameters,
+                          int device_id) {
+    wait_for_lane_result(lane_result, device_id);
 
     torch::NoGradGuard no_grad;
     const size_t limit = std::min(parameters.size(), lane_result.gradients.size());
@@ -228,6 +235,52 @@ void merge_lane_gradients(const TrainLaneResult& lane_result,
             parameters[index].mutable_grad().add_(gradient);
         }
     }
+}
+
+void copy_module_state(torch::nn::Module& destination, const torch::nn::Module& source) {
+    torch::NoGradGuard no_grad;
+
+    auto destination_parameters = destination.named_parameters(true);
+    for (const auto& item : source.named_parameters(true)) {
+        auto* target = destination_parameters.find(item.key());
+        if (target == nullptr) {
+            throw std::runtime_error("parallel RF-DETR lane is missing parameter: " + item.key());
+        }
+        target->copy_(item.value());
+        target->requires_grad_(item.value().requires_grad());
+    }
+
+    auto destination_buffers = destination.named_buffers(true);
+    for (const auto& item : source.named_buffers(true)) {
+        auto* target = destination_buffers.find(item.key());
+        if (target == nullptr) {
+            throw std::runtime_error("parallel RF-DETR lane is missing buffer: " + item.key());
+        }
+        target->copy_(item.value());
+    }
+}
+
+std::shared_ptr<NativeRfDetrModel> make_train_lane_model(NativeRfDetrModel& model, int device_id) {
+    auto lane_model = std::make_shared<NativeRfDetrModel>(model.config());
+    lane_model->to(cuda_device(device_id));
+    lane_model->train();
+    copy_module_state(*lane_model, model);
+    return lane_model;
+}
+
+std::vector<torch::Tensor> lane_grad_parameters(const NativeRfDetrModel& lane_model,
+                                                const std::vector<std::string>& parameter_names) {
+    const auto named_parameters = lane_model.named_parameters(true);
+    std::vector<torch::Tensor> parameters;
+    parameters.reserve(parameter_names.size());
+    for (const auto& name : parameter_names) {
+        auto* tensor = named_parameters.find(name);
+        if (tensor == nullptr) {
+            throw std::runtime_error("parallel RF-DETR lane is missing trainable parameter: " + name);
+        }
+        parameters.push_back(*tensor);
+    }
+    return parameters;
 }
 
 std::optional<std::string> first_running_stats_buffer_name(NativeRfDetrModel& model) {
@@ -561,7 +614,7 @@ OptimizerBuildResult build_optimizer(NativeRfDetrModel& model, const TrainOption
             found = group_index.emplace(key, groups.size()).first;
             groups.push_back(GroupSpec{lr, weight_decay, use_muon, {}});
         }
-        named_params.push_back({item.key(), param});
+        named_params.emplace_back(item.key(), param);
         groups[found->second].param_indices.push_back(named_params.size() - 1);
     }
 
@@ -805,7 +858,7 @@ void save_resume_checkpoint(const std::filesystem::path& checkpoint_path,
                             double best_ema,
                             const std::vector<std::string>& param_names,
                             const std::optional<ModelEma>& ema) {
-    FASTLOADER_PROFILE_SCOPE("rfdetr.train.save.resume.total");
+    MMLTK_PROFILE_SCOPE("rfdetr.train.save.resume.total");
     std::filesystem::create_directories(checkpoint_path.parent_path());
 
     torch::serialize::OutputArchive archive;
@@ -862,17 +915,17 @@ void save_resume_checkpoint(const std::filesystem::path& checkpoint_path,
     }
     std::vector<StateDictEntry> model_state;
     {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.train.save.resume.collect_state");
+        MMLTK_PROFILE_SCOPE("rfdetr.train.save.resume.collect_state");
         model_state = collect_module_state(model);
     }
     {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.train.save.resume.write_state");
+        MMLTK_PROFILE_SCOPE("rfdetr.train.save.resume.write_state");
         detail::write_state_archive(archive, "state", model_state);
     }
 
     torch::serialize::OutputArchive optimizer_archive;
     {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.train.save.resume.optimizer_state");
+        MMLTK_PROFILE_SCOPE("rfdetr.train.save.resume.optimizer_state");
         optimizer.save(optimizer_archive);
     }
     write_string(archive, "optimizer_kind", optimizer.kind_name());
@@ -881,11 +934,11 @@ void save_resume_checkpoint(const std::filesystem::path& checkpoint_path,
     if (ema.has_value()) {
         std::vector<StateDictEntry> ema_state;
         {
-            FASTLOADER_PROFILE_SCOPE("rfdetr.train.save.resume.ema_collect_state");
+            MMLTK_PROFILE_SCOPE("rfdetr.train.save.resume.ema_collect_state");
             ema_state = ema_state_entries(param_names, *ema);
         }
         {
-            FASTLOADER_PROFILE_SCOPE("rfdetr.train.save.resume.ema_write_state");
+            MMLTK_PROFILE_SCOPE("rfdetr.train.save.resume.ema_write_state");
             detail::write_state_archive(archive, "ema_state", ema_state);
         }
     }
@@ -901,7 +954,7 @@ void save_resume_checkpoint(const std::filesystem::path& checkpoint_path,
     write_double(archive, "grad_scaler_scale", static_cast<double>(grad_scaler.current_scale()));
     write_int(archive, "grad_scaler_growth_tracker", grad_scaler.growth_tracker());
     {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.train.save.resume.archive_save_to");
+        MMLTK_PROFILE_SCOPE("rfdetr.train.save.resume.archive_save_to");
         archive.save_to(checkpoint_path.string());
     }
 }
@@ -1048,13 +1101,13 @@ std::future<TrainLaneResult> enqueue_train_lane(WorkerPool& lane_pool,
                                                 WorkerPool* cpu_pool,
                                                 DatasetLoader& loader,
                                                 TrainLaneContext& lane,
-                                                Batch batch,
+                                                const Batch& batch,
                                                 std::shared_ptr<CudaEventHandle> params_ready,
                                                 double num_boxes_value,
                                                 double scaled_loss_factor,
+                                                size_t parameter_version,
                                                 const DetectionConfig& detection_config,
-                                                NativeRfDetrModel& model,
-                                                const std::vector<torch::Tensor>& parameters,
+                                                const NativeRfDetrModel& model,
                                                 const std::vector<std::string>& parameter_names,
                                                 int device_id,
                                                 int image_height,
@@ -1070,9 +1123,9 @@ std::future<TrainLaneResult> enqueue_train_lane(WorkerPool& lane_pool,
                               params_ready = std::move(params_ready),
                               num_boxes_value,
                               scaled_loss_factor,
+                              parameter_version,
                               &detection_config,
                               &model,
-                              &parameters,
                               &parameter_names,
                               device_id,
                               image_height,
@@ -1083,7 +1136,7 @@ std::future<TrainLaneResult> enqueue_train_lane(WorkerPool& lane_pool,
                               autocast_dtype]() mutable {
         ScopedWorkerPool worker_scope(cpu_pool);
         {
-            FASTLOADER_PROFILE_SCOPE("rfdetr.train.parallel.wait_batch");
+            MMLTK_PROFILE_SCOPE("rfdetr.train.parallel.wait_batch");
             loader.wait_batch(batch);
         }
 
@@ -1095,14 +1148,14 @@ std::future<TrainLaneResult> enqueue_train_lane(WorkerPool& lane_pool,
 
         torch::Tensor normalized;
         {
-            FASTLOADER_PROFILE_SCOPE("rfdetr.train.parallel.normalize");
+            MMLTK_PROFILE_SCOPE("rfdetr.train.parallel.normalize");
             normalized = normalize_batch(batch, device_id, image_height, image_width, mean, std_t).contiguous();
         }
         loader.release_batch(batch, consumer_stream);
 
         PreparedTargets prepared;
         {
-            FASTLOADER_PROFILE_SCOPE("rfdetr.train.parallel.targets");
+            MMLTK_PROFILE_SCOPE("rfdetr.train.parallel.targets");
             prepared = build_targets(batch,
                                      image_height,
                                      image_width,
@@ -1112,66 +1165,45 @@ std::future<TrainLaneResult> enqueue_train_lane(WorkerPool& lane_pool,
                                      lane.target_scratch);
         }
 
-        if (params_ready) {
-            ensure_cuda_ok(
-                cudaStreamWaitEvent(lane.stream.stream(), params_ready->get(), 0),
-                "cudaStreamWaitEvent for parallel train parameter readiness");
+        if (!lane.model) {
+            throw std::runtime_error("parallel RF-DETR train lane is missing its model replica");
         }
-
-        // Sync per-lane segmentation head clone from model parameters and
-        // build a lane-local parameter vector that references the clone's
-        // parameters instead of the model's.  This lets each lane run
-        // sparse_forward() on its own module instance — no shared mutable
-        // state, so no mutex and full GPU parallelism across lanes.
-        std::vector<torch::Tensor> lane_params;
-        const std::vector<torch::Tensor>* grad_params = &parameters;
-        if (lane.segmentation_head) {
-            {
-                torch::NoGradGuard no_grad;
-                auto* model_seg = model.segmentation_head_ptr();
-                auto model_seg_params = model_seg->parameters();
-                auto clone_params = lane.segmentation_head->parameters();
-                for (size_t i = 0; i < model_seg_params.size(); ++i) {
-                    clone_params[i].copy_(model_seg_params[i]);
-                }
+        if (lane.synced_parameter_version != parameter_version) {
+            if (params_ready) {
+                ensure_cuda_ok(
+                    cudaStreamWaitEvent(lane.stream.stream(), params_ready->get(), 0),
+                    "cudaStreamWaitEvent for parallel train parameter readiness");
             }
-
-            auto clone_params = lane.segmentation_head->parameters();
-            lane_params.reserve(parameters.size());
-            size_t clone_idx = 0;
-            for (size_t i = 0; i < parameters.size(); ++i) {
-                if (parameter_names[i].rfind("segmentation_head.", 0) == 0) {
-                    lane_params.push_back(clone_params[clone_idx++]);
-                } else {
-                    lane_params.push_back(parameters[i]);
-                }
-            }
-            grad_params = &lane_params;
+            copy_module_state(*lane.model, model);
+            lane.synced_parameter_version = parameter_version;
         }
+        lane.model->train();
 
-        TensorMap loss_dict;
-        torch::Tensor loss;
-        torch::Tensor class_loss;
-        torch::Tensor box_loss;
+        torch::Tensor detached_loss;
+        torch::Tensor detached_class_loss;
+        torch::Tensor detached_box_loss;
         std::vector<torch::Tensor> gradients;
         {
+            TensorMap loss_dict;
+            torch::Tensor loss;
+            torch::Tensor class_loss;
+            torch::Tensor box_loss;
             AutocastGuard autocast_guard(amp_enabled, autocast_dtype);
             ModelOutputs outputs;
             {
-                FASTLOADER_PROFILE_SCOPE("rfdetr.train.parallel.forward");
-                outputs = model.forward(NestedTensor{normalized, prepared.nested_mask},
-                                        lane.segmentation_head.get());
+                MMLTK_PROFILE_SCOPE("rfdetr.train.parallel.forward");
+                outputs = lane.model->forward(NestedTensor{normalized, prepared.nested_mask});
             }
             {
-                FASTLOADER_PROFILE_SCOPE("rfdetr.train.parallel.targets_handoff");
+                MMLTK_PROFILE_SCOPE("rfdetr.train.parallel.targets_handoff");
                 lane.target_scratch.handoff_pending_copy_to_current_stream(device_id);
             }
             {
-                FASTLOADER_PROFILE_SCOPE("rfdetr.train.parallel.loss_dict");
+                MMLTK_PROFILE_SCOPE("rfdetr.train.parallel.loss_dict");
                 loss_dict = detection_loss_dict(outputs, prepared, detection_config, true, num_boxes_value);
             }
             {
-                FASTLOADER_PROFILE_SCOPE("rfdetr.train.parallel.loss_total");
+                MMLTK_PROFILE_SCOPE("rfdetr.train.parallel.loss_total");
                 loss = weighted_detection_loss(loss_dict, detection_config, normalized.device());
                 class_loss = loss_value_or_zero(loss_dict, normalized.device(), "loss_ce");
                 box_loss = loss_value_or_zero(loss_dict, normalized.device(), "loss_bbox");
@@ -1179,24 +1211,27 @@ std::future<TrainLaneResult> enqueue_train_lane(WorkerPool& lane_pool,
             if (!torch::isfinite(loss).item<bool>()) {
                 throw std::runtime_error(
                     "non-finite RF-DETR loss encountered during native training" +
-                    format_nonfinite_loss_report(loss_dict, *grad_params, parameter_names));
+                    format_nonfinite_loss_report(loss_dict, lane.grad_params, parameter_names));
             }
             {
-                FASTLOADER_PROFILE_SCOPE("rfdetr.train.parallel.grad");
+                MMLTK_PROFILE_SCOPE("rfdetr.train.parallel.grad");
                 gradients = torch::autograd::grad(
                     {loss * scaled_loss_factor},
-                    *grad_params,
+                    lane.grad_params,
                     {},
                     std::nullopt,
                     false,
                     true);
             }
+            detached_loss = loss.detach();
+            detached_class_loss = class_loss.detach();
+            detached_box_loss = box_loss.detach();
         }
 
         return TrainLaneResult{
-            loss.detach(),
-            class_loss.detach(),
-            box_loss.detach(),
+            std::move(detached_loss),
+            std::move(detached_class_loss),
+            std::move(detached_box_loss),
             std::move(gradients),
             record_cuda_event(lane.stream.stream(), "parallel train lane completion event"),
         };
@@ -1210,7 +1245,7 @@ EvalPassResult evaluate_model(const TrainOptions& options,
                               const DetectionConfig& detection_config,
                               std::optional<int> current_epoch,
                               std::string progress_label) {
-    FASTLOADER_PROFILE_SCOPE("rfdetr.train.eval.total");
+    MMLTK_PROFILE_SCOPE("rfdetr.train.eval.total");
     const size_t eval_batch_size = options.val_batch_size > 0 ? options.val_batch_size : options.batch_size;
     CocoDataset dataset = CocoDataset::load_from_binary(compiled_path);
     const std::vector<int> image_ids = dataset.image_ids();
@@ -1237,10 +1272,10 @@ EvalPassResult evaluate_model(const TrainOptions& options,
     double loss_sum = 0.0;
     std::optional<CapturedEvalSample> captured_sample;
     const bool capture_eval_sample =
-        current_epoch.has_value() && progress_label.rfind("val ", 0) == 0;
-    std::optional<ProgressBar> progress;
+        current_epoch.has_value() && progress_label.starts_with("val ");
+    std::unique_ptr<spdmon::ProgressBar> progress;
     if (options.progress_bar) {
-        progress.emplace(std::move(progress_label), loader.num_images(), "img");
+        progress = std::make_unique<spdmon::ProgressBar>(std::move(progress_label), loader.num_images(), "img");
     }
     std::mt19937_64 sample_rng(
         static_cast<uint64_t>(options.seed) ^
@@ -1282,7 +1317,7 @@ EvalPassResult evaluate_model(const TrainOptions& options,
         cpu_futures.pop_front();
         dataset.add_predictions(std::move(predictions));
         ++image_count;
-        if (progress.has_value()) {
+        if (progress) {
             progress->add(1);
         }
     };
@@ -1290,17 +1325,17 @@ EvalPassResult evaluate_model(const TrainOptions& options,
     loader.begin_epoch();
     Batch batch{};
     while (loader.next_batch(batch)) {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.train.eval.batch");
+        MMLTK_PROFILE_SCOPE("rfdetr.train.eval.batch");
         {
-            FASTLOADER_PROFILE_SCOPE("rfdetr.train.eval.wait_batch");
+            MMLTK_PROFILE_SCOPE("rfdetr.train.eval.wait_batch");
             loader.wait_batch(batch);
         }
         LoaderBatchGuard batch_guard(loader, batch, options.device_id);
-        FASTLOADER_PROFILE_ADD("rfdetr.train.eval.images", batch.num_images);
+        MMLTK_PROFILE_ADD("rfdetr.train.eval.images", batch.num_images);
 
         torch::Tensor normalized;
         {
-            FASTLOADER_PROFILE_SCOPE("rfdetr.train.eval.normalize");
+            MMLTK_PROFILE_SCOPE("rfdetr.train.eval.normalize");
             normalized =
                 normalize_batch(batch, options.device_id, loader.image_height(), loader.image_width(), mean, std)
                     .contiguous();
@@ -1308,7 +1343,7 @@ EvalPassResult evaluate_model(const TrainOptions& options,
 
         PreparedTargets prepared;
         {
-            FASTLOADER_PROFILE_SCOPE("rfdetr.train.eval.targets");
+            MMLTK_PROFILE_SCOPE("rfdetr.train.eval.targets");
             prepared = build_targets(batch,
                                      static_cast<int>(loader.image_height()),
                                      static_cast<int>(loader.image_width()),
@@ -1320,31 +1355,31 @@ EvalPassResult evaluate_model(const TrainOptions& options,
 
         ModelOutputs outputs;
         {
-            FASTLOADER_PROFILE_SCOPE("rfdetr.train.eval.forward");
+            MMLTK_PROFILE_SCOPE("rfdetr.train.eval.forward");
             outputs = model.forward(NestedTensor{normalized, prepared.nested_mask});
         }
 
         TensorMap loss_dict;
         {
-            FASTLOADER_PROFILE_SCOPE("rfdetr.train.eval.targets_handoff");
+            MMLTK_PROFILE_SCOPE("rfdetr.train.eval.targets_handoff");
             target_scratch.handoff_pending_copy_to_current_stream(options.device_id);
         }
 
         {
-            FASTLOADER_PROFILE_SCOPE("rfdetr.train.eval.loss_dict");
+            MMLTK_PROFILE_SCOPE("rfdetr.train.eval.loss_dict");
             loss_dict = detection_loss_dict(outputs, prepared, detection_config, false, false);
         }
 
         torch::Tensor loss;
         {
-            FASTLOADER_PROFILE_SCOPE("rfdetr.train.eval.loss_total");
+            MMLTK_PROFILE_SCOPE("rfdetr.train.eval.loss_total");
             loss = weighted_detection_loss(loss_dict, detection_config, normalized.device());
         }
         loss_sum += loss.item<double>();
         ++batch_count;
 
         auto processed = [&]() {
-            FASTLOADER_PROFILE_SCOPE("rfdetr.train.eval.postprocess");
+            MMLTK_PROFILE_SCOPE("rfdetr.train.eval.postprocess");
             return postprocess_outputs(outputs, prepared.orig_sizes, model.config().num_select);
         }();
         cudaEvent_t processed_ready_event = nullptr;
@@ -1357,7 +1392,7 @@ EvalPassResult evaluate_model(const TrainOptions& options,
 
         const size_t processed_count = std::min(processed.size(), batch.num_images);
         for (size_t image_pos = 0; image_pos < processed_count; ++image_pos) {
-            const int64_t dataset_index = static_cast<int64_t>(batch.image_indices[image_pos]);
+            const auto dataset_index = static_cast<int64_t>(batch.image_indices[image_pos]);
             const int image_id = static_cast<int>(image_id_for_dataset_index(image_ids, dataset_index));
             const size_t lane_index = submitted_images % lanes.size();
 
@@ -1453,12 +1488,12 @@ EvalPassResult evaluate_model(const TrainOptions& options,
                                    captured_sample->masks,
                                    render_options);
     }
-    if (progress.has_value()) {
+    if (progress) {
         progress->close();
     }
     result.loss = batch_count > 0 ? loss_sum / static_cast<double>(batch_count) : 0.0;
     {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.train.eval.metric");
+        MMLTK_PROFILE_SCOPE("rfdetr.train.eval.metric");
         result.summary = dataset.evaluate(options.eval_max_dets);
     }
     flush_eval_sample_writes();
@@ -1469,7 +1504,7 @@ EvalPassResult evaluate_model(const TrainOptions& options,
 } // namespace
 
 TrainRunResult run_training(const TrainOptions& options) {
-    FASTLOADER_PROFILE_SCOPE("rfdetr.train.total");
+    MMLTK_PROFILE_SCOPE("rfdetr.train.total");
     if (options.train_compiled_path.empty() || options.val_compiled_path.empty() || options.output_dir.empty()) {
         throw std::runtime_error(
             "RF-DETR train requires --train-compiled, --val-compiled, and --output-dir");
@@ -1580,18 +1615,18 @@ TrainRunResult run_training(const TrainOptions& options) {
             options.compilation_mode);
     }
     if (main_process) {
-        std::fprintf(stderr,
-                     "rfdetr weights: loaded=%zu missing=%zu unexpected=%zu incompatible=%zu input=%s\n",
-                     load_summary.loaded_names.size(),
-                     load_summary.missing_names.size(),
-                     load_summary.unexpected_names.size(),
-                     load_summary.incompatible_names.size(),
-                     source_checkpoint.c_str());
+        mmltk::logging::logger("rfdetr.train")->info(
+            "rfdetr weights: loaded={} missing={} unexpected={} incompatible={} input={}",
+            load_summary.loaded_names.size(),
+            load_summary.missing_names.size(),
+            load_summary.unexpected_names.size(),
+            load_summary.incompatible_names.size(),
+            source_checkpoint.string());
         for (const auto& name : load_summary.missing_names) {
-            std::fprintf(stderr, "  missing: %s\n", name.c_str());
+            mmltk::logging::logger("rfdetr.train")->warn("  missing: {}", name);
         }
         for (const auto& name : load_summary.unexpected_names) {
-            std::fprintf(stderr, "  unexpected: %s\n", name.c_str());
+            mmltk::logging::logger("rfdetr.train")->warn("  unexpected: {}", name);
         }
     }
     ensure_train_lane_model_supported(model, train_lane_count);
@@ -1648,20 +1683,20 @@ TrainRunResult run_training(const TrainOptions& options) {
     lr_config.lr_min_factor = options.lr_min_factor;
 
     if (main_process) {
-        std::fprintf(stderr,
-                     "rfdetr train runtime: torch=%s autocast=%s optimizer=%s optimizer_backend=%s scaler=%s train_lanes=%d eval_lanes=%d effective_batch_per_rank=%zu effective_batch_global=%zu\n",
-                     TORCH_VERSION,
-                     scalar_type_name(autocast_dtype),
-                     optimizer.kind_name(),
-                     optimizer.backend_name(),
-                     grad_scaler.enabled() ? "on" : "off",
-                     train_lane_count,
-                     train_runtime.split().lane_threads,
-                     effective_batch_per_rank(options, train_lane_count),
-                     effective_batch_global(options, distributed, train_lane_count));
+        mmltk::logging::logger("rfdetr.train")->info(
+            "rfdetr train runtime: torch={} autocast={} optimizer={} optimizer_backend={} scaler={} train_lanes={} eval_lanes={} effective_batch_per_rank={} effective_batch_global={}",
+            TORCH_VERSION,
+            scalar_type_name(autocast_dtype),
+            optimizer.kind_name(),
+            optimizer.backend_name(),
+            grad_scaler.enabled() ? "on" : "off",
+            train_lane_count,
+            train_runtime.split().lane_threads,
+            effective_batch_per_rank(options, train_lane_count),
+            effective_batch_global(options, distributed, train_lane_count));
         if (options.optimizer == TrainOptimizerKind::Muon && options.fused_optimizer) {
-            std::fprintf(stderr,
-                         "rfdetr train runtime: optimizer=muon ignores --fused-optimizer and runs with the eager backend only\n");
+            mmltk::logging::logger("rfdetr.train")->warn(
+                "rfdetr train runtime: optimizer=muon ignores --fused-optimizer and runs with the eager backend only");
         }
     }
 
@@ -1677,7 +1712,7 @@ TrainRunResult run_training(const TrainOptions& options) {
             "grad_accum_steps, --lanes, or world size");
     }
     const size_t batches_per_step = micro_batches_per_optimizer_step(options, train_lane_count);
-    const int64_t steps_per_epoch =
+    const auto steps_per_epoch =
         static_cast<int64_t>(usable_full_batches / batches_per_step);
     const int64_t total_training_steps = std::max<int64_t>(1, steps_per_epoch * options.epochs);
     DetectionConfig detection_config =
@@ -1755,13 +1790,21 @@ TrainRunResult run_training(const TrainOptions& options) {
             train_lanes.push_back(TrainLaneContext{
                 get_high_priority_cuda_stream(options.device_id),
                 {},
-                model.clone_segmentation_head(),
             });
         }
+        for (auto& lane : train_lanes) {
+            lane.model = make_train_lane_model(model, options.device_id);
+            lane.model->optimize_for_inference(
+                checked_inference_batch_size(options.batch_size),
+                true,
+                options.compilation_mode);
+            lane.grad_params = lane_grad_parameters(*lane.model, all_param_names);
+        }
     }
+    size_t parameter_version = 0;
     distributed_barrier(distributed);
     for (int epoch = start_epoch; epoch < options.epochs; ++epoch) {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.train.epoch");
+        MMLTK_PROFILE_SCOPE("rfdetr.train.epoch");
         result.last_epoch = epoch;
         train_loader.begin_epoch();
         model.train();
@@ -1788,9 +1831,12 @@ TrainRunResult run_training(const TrainOptions& options) {
         double current_step_class_loss = 0.0;
         double current_step_box_loss = 0.0;
 
-        std::optional<ProgressBar> progress;
+        std::unique_ptr<spdmon::ProgressBar> progress;
         if (main_process && options.progress_bar) {
-            progress.emplace(phase_progress_label("train", epoch, options.epochs), static_cast<size_t>(usable_full_batches) * static_cast<size_t>(options.batch_size), "img");
+            progress = std::make_unique<spdmon::ProgressBar>(
+                phase_progress_label("train", epoch, options.epochs),
+                static_cast<size_t>(usable_full_batches) * static_cast<size_t>(options.batch_size),
+                "img");
             progress->set_postfix("cl=warming, bl=warming, l=warming");
         }
 
@@ -1865,7 +1911,7 @@ TrainRunResult run_training(const TrainOptions& options) {
                     ? static_cast<double>(local_micro_batches) * static_cast<double>(options.batch_size) / elapsed_seconds
                     : 0.0;
             const bool should_update_bar =
-                progress.has_value() &&
+                static_cast<bool>(progress) &&
                 (force || local_micro_batches % std::max(1, options.print_freq) == 0);
             if (should_update_bar) {
                 progress->set_postfix(train_progress_postfix(
@@ -1896,9 +1942,9 @@ TrainRunResult run_training(const TrainOptions& options) {
         auto next_train_full_batch = [&](bool wait_now = true) -> std::optional<Batch> {
             Batch batch{};
             while (train_loader.next_batch(batch)) {
-                FASTLOADER_PROFILE_SCOPE("rfdetr.train.batch");
+                MMLTK_PROFILE_SCOPE("rfdetr.train.batch");
                 if (wait_now) {
-                    FASTLOADER_PROFILE_SCOPE("rfdetr.train.wait_batch");
+                    MMLTK_PROFILE_SCOPE("rfdetr.train.wait_batch");
                     train_loader.wait_batch(batch);
                 }
                 if (batch.num_images != options.batch_size) {
@@ -1916,8 +1962,8 @@ TrainRunResult run_training(const TrainOptions& options) {
                     return std::nullopt;
                 }
                 ++local_full_batches;
-                FASTLOADER_PROFILE_ADD("rfdetr.train.images", batch.num_images);
-                FASTLOADER_PROFILE_ADD("rfdetr.train.full_batches", 1);
+                MMLTK_PROFILE_ADD("rfdetr.train.images", batch.num_images);
+                MMLTK_PROFILE_ADD("rfdetr.train.full_batches", 1);
                 return batch;
             }
             return std::nullopt;
@@ -1940,7 +1986,7 @@ TrainRunResult run_training(const TrainOptions& options) {
                 LoaderBatchGuard batch_guard(train_loader, *batch, options.device_id);
                 torch::Tensor normalized;
                 {
-                    FASTLOADER_PROFILE_SCOPE("rfdetr.train.normalize");
+                    MMLTK_PROFILE_SCOPE("rfdetr.train.normalize");
                     normalized =
                         normalize_batch(*batch,
                                         options.device_id,
@@ -1958,7 +2004,7 @@ TrainRunResult run_training(const TrainOptions& options) {
                 {
                     PreparedTargets prepared;
                     {
-                        FASTLOADER_PROFILE_SCOPE("rfdetr.train.targets");
+                        MMLTK_PROFILE_SCOPE("rfdetr.train.targets");
                         prepared = build_targets(*batch,
                                                  static_cast<int>(train_loader.image_height()),
                                                  static_cast<int>(train_loader.image_width()),
@@ -1971,15 +2017,15 @@ TrainRunResult run_training(const TrainOptions& options) {
                     AutocastGuard autocast_guard(amp_enabled, autocast_dtype);
                     ModelOutputs outputs;
                     {
-                        FASTLOADER_PROFILE_SCOPE("rfdetr.train.forward");
+                        MMLTK_PROFILE_SCOPE("rfdetr.train.forward");
                         outputs = model.forward(NestedTensor{normalized, prepared.nested_mask});
                     }
                     {
-                        FASTLOADER_PROFILE_SCOPE("rfdetr.train.targets_handoff");
+                        MMLTK_PROFILE_SCOPE("rfdetr.train.targets_handoff");
                         target_scratch.handoff_pending_copy_to_current_stream(options.device_id);
                     }
                     {
-                        FASTLOADER_PROFILE_SCOPE("rfdetr.train.loss_dict");
+                        MMLTK_PROFILE_SCOPE("rfdetr.train.loss_dict");
                         loss_dict = detection_loss_dict(
                             outputs,
                             prepared,
@@ -1993,7 +2039,7 @@ TrainRunResult run_training(const TrainOptions& options) {
                                 : AllReduceTensorFn{});
                     }
                     {
-                        FASTLOADER_PROFILE_SCOPE("rfdetr.train.loss_total");
+                        MMLTK_PROFILE_SCOPE("rfdetr.train.loss_total");
                         loss = weighted_detection_loss(loss_dict, detection_config, normalized.device());
                         class_loss = loss_value_or_zero(loss_dict, normalized.device(), "loss_ce");
                         box_loss = loss_value_or_zero(loss_dict, normalized.device(), "loss_bbox");
@@ -2005,9 +2051,9 @@ TrainRunResult run_training(const TrainOptions& options) {
                         format_nonfinite_loss_report(loss_dict, all_params, all_param_names));
                 }
 
-                const double loss_value = loss.detach().item<double>();
-                const double class_loss_value = class_loss.detach().item<double>();
-                const double box_loss_value = box_loss.detach().item<double>();
+                const auto loss_value = loss.detach().item<double>();
+                const auto class_loss_value = class_loss.detach().item<double>();
+                const auto box_loss_value = box_loss.detach().item<double>();
                 loss_sum_device.add_(loss.detach());
                 class_loss_sum_device.add_(class_loss.detach());
                 box_loss_sum_device.add_(box_loss.detach());
@@ -2021,12 +2067,12 @@ TrainRunResult run_training(const TrainOptions& options) {
                 ++local_waves;
                 const auto scaled_loss = grad_scaler.scale(loss / static_cast<double>(options.grad_accum_steps));
                 {
-                    FASTLOADER_PROFILE_SCOPE("rfdetr.train.backward");
+                    MMLTK_PROFILE_SCOPE("rfdetr.train.backward");
                     scaled_loss.backward();
                 }
 
                 if (local_waves % options.grad_accum_steps == 0) {
-                    FASTLOADER_PROFILE_SCOPE("rfdetr.train.optimizer");
+                    MMLTK_PROFILE_SCOPE("rfdetr.train.optimizer");
                     const int64_t current_step = static_cast<int64_t>(epoch) * steps_per_epoch + optimizer_steps;
                     apply_optimizer_schedule(current_step);
                     average_gradients(distributed, all_params);
@@ -2043,7 +2089,7 @@ TrainRunResult run_training(const TrainOptions& options) {
                     ++optimizer_steps;
                 }
 
-                if (progress.has_value()) {
+                if (progress) {
                     progress->add(static_cast<size_t>(options.batch_size));
                 }
                 flush_progress(false);
@@ -2084,9 +2130,9 @@ TrainRunResult run_training(const TrainOptions& options) {
                                                               params_ready,
                                                               num_boxes_value,
                                                               scaled_loss_factor,
+                                                              parameter_version,
                                                               detection_config,
                                                               model,
-                                                              all_params,
                                                               all_param_names,
                                                               options.device_id,
                                                               static_cast<int>(train_loader.image_height()),
@@ -2100,9 +2146,9 @@ TrainRunResult run_training(const TrainOptions& options) {
                 for (auto& lane_future : lane_futures) {
                     TrainLaneResult lane_result = lane_future.get();
                     merge_lane_gradients(lane_result, all_params, options.device_id);
-                    const double lane_loss_value = lane_result.loss.item<double>();
-                    const double lane_class_loss_value = lane_result.class_loss.item<double>();
-                    const double lane_box_loss_value = lane_result.box_loss.item<double>();
+                    const auto lane_loss_value = lane_result.loss.item<double>();
+                    const auto lane_class_loss_value = lane_result.class_loss.item<double>();
+                    const auto lane_box_loss_value = lane_result.box_loss.item<double>();
                     loss_sum_device.add_(lane_result.loss);
                     class_loss_sum_device.add_(lane_result.class_loss);
                     box_loss_sum_device.add_(lane_result.box_loss);
@@ -2113,7 +2159,7 @@ TrainRunResult run_training(const TrainOptions& options) {
                     wave_class_loss_sum += lane_class_loss_value;
                     wave_box_loss_sum += lane_box_loss_value;
                     ++local_micro_batches;
-                    if (progress.has_value()) {
+                    if (progress) {
                         progress->add(static_cast<size_t>(options.batch_size));
                     }
                 }
@@ -2123,7 +2169,7 @@ TrainRunResult run_training(const TrainOptions& options) {
                 current_step_box_loss = wave_box_loss_sum / static_cast<double>(lane_futures.size());
                 ++local_waves;
                 if (local_waves % options.grad_accum_steps == 0) {
-                    FASTLOADER_PROFILE_SCOPE("rfdetr.train.optimizer");
+                    MMLTK_PROFILE_SCOPE("rfdetr.train.optimizer");
                     const int64_t current_step = static_cast<int64_t>(epoch) * steps_per_epoch + optimizer_steps;
                     apply_optimizer_schedule(current_step);
                     average_gradients(distributed, all_params);
@@ -2138,6 +2184,7 @@ TrainRunResult run_training(const TrainOptions& options) {
                         ema->update(all_params, optimizer_steps);
                     }
                     ++optimizer_steps;
+                    ++parameter_version;
                     params_ready = record_current_stream_event(
                         options.device_id,
                         "parallel train parameter readiness event");
@@ -2147,7 +2194,7 @@ TrainRunResult run_training(const TrainOptions& options) {
         }
 
         {
-            FASTLOADER_PROFILE_SCOPE("rfdetr.train.drain_loader");
+            MMLTK_PROFILE_SCOPE("rfdetr.train.drain_loader");
             Batch drain_batch{};
             while (train_loader.next_batch(drain_batch)) {
                 train_loader.release_batch(drain_batch);
@@ -2159,17 +2206,17 @@ TrainRunResult run_training(const TrainOptions& options) {
         }
         if (train_lane_count <= 1) {
             {
-                FASTLOADER_PROFILE_SCOPE("rfdetr.train.wait_pending_copy");
+                MMLTK_PROFILE_SCOPE("rfdetr.train.wait_pending_copy");
                 target_scratch.wait_for_pending_copy();
             }
         } else {
-            FASTLOADER_PROFILE_SCOPE("rfdetr.train.parallel.wait_pending_copy");
+            MMLTK_PROFILE_SCOPE("rfdetr.train.parallel.wait_pending_copy");
             for (auto& lane : train_lanes) {
                 lane.target_scratch.wait_for_pending_copy();
             }
         }
         flush_progress(true);
-        if (progress.has_value()) {
+        if (progress) {
             progress->close();
         }
 
@@ -2190,17 +2237,17 @@ TrainRunResult run_training(const TrainOptions& options) {
             auto val_result = evaluate_model(
                 options, train_runtime, model, options.val_compiled_path, detection_config, epoch, phase_progress_label("val", epoch, options.epochs));
 
-            std::fprintf(stderr,
-                         "\n[Rank 0] Epoch %d stats: optimizer=%s train_loss=%.6f val_loss=%.6f bbox_ap=%.4f mask_ap=%.4f\n\n",
-                         epoch + 1,
-                         optimizer.kind_name(),
-                         train_loss,
-                         val_result.loss,
-                         val_result.summary.bbox.ap,
-                         detection_config.include_masks ? val_result.summary.mask.ap : 0.0);
+            mmltk::logging::logger("rfdetr.train")->info(
+                "epoch {} stats: optimizer={} train_loss={:.6f} val_loss={:.6f} bbox_ap={:.4f} mask_ap={:.4f}",
+                epoch + 1,
+                optimizer.kind_name(),
+                train_loss,
+                val_result.loss,
+                val_result.summary.bbox.ap,
+                detection_config.include_masks ? val_result.summary.mask.ap : 0.0);
                          
             {
-                FASTLOADER_PROFILE_SCOPE("rfdetr.train.save.epoch");
+                MMLTK_PROFILE_SCOPE("rfdetr.train.save.epoch");
                 NativeCheckpoint epoch_checkpoint;
                 epoch_checkpoint.metadata = metadata;
                 epoch_checkpoint.state_dict = collect_module_state(model);
@@ -2219,11 +2266,11 @@ TrainRunResult run_training(const TrainOptions& options) {
             if (regular_metric > best_regular) {
                 best_regular = regular_metric;
                 {
-                    FASTLOADER_PROFILE_SCOPE("rfdetr.train.save.best_regular");
+                    MMLTK_PROFILE_SCOPE("rfdetr.train.save.best_regular");
                     NativeCheckpoint checkpoint;
                     checkpoint.metadata = metadata;
                     {
-                        FASTLOADER_PROFILE_SCOPE("rfdetr.train.save.best_regular.collect_state");
+                        MMLTK_PROFILE_SCOPE("rfdetr.train.save.best_regular.collect_state");
                         checkpoint.state_dict = collect_module_state(model);
                     }
                     save_native_checkpoint(best_regular_checkpoint_path, checkpoint);
@@ -2264,11 +2311,11 @@ TrainRunResult run_training(const TrainOptions& options) {
                 if (ema_metric > best_ema) {
                     best_ema = ema_metric;
                     {
-                        FASTLOADER_PROFILE_SCOPE("rfdetr.train.save.best_ema");
+                        MMLTK_PROFILE_SCOPE("rfdetr.train.save.best_ema");
                         NativeCheckpoint checkpoint;
                         checkpoint.metadata = metadata;
                         {
-                            FASTLOADER_PROFILE_SCOPE("rfdetr.train.save.best_ema.collect_state");
+                            MMLTK_PROFILE_SCOPE("rfdetr.train.save.best_ema.collect_state");
                             const auto overrides = ema_override_map(all_param_names, *ema);
                             checkpoint.state_dict = collect_module_state(model, &overrides);
                         }
@@ -2280,7 +2327,7 @@ TrainRunResult run_training(const TrainOptions& options) {
             }
 
             {
-                FASTLOADER_PROFILE_SCOPE("rfdetr.train.save.resume");
+                MMLTK_PROFILE_SCOPE("rfdetr.train.save.resume");
                 save_resume_checkpoint(checkpoint_path,
                                        model,
                                        metadata,
@@ -2296,7 +2343,7 @@ TrainRunResult run_training(const TrainOptions& options) {
 
             result.history.push_back(epoch_summary);
             {
-                FASTLOADER_PROFILE_SCOPE("rfdetr.train.save.log_json");
+                MMLTK_PROFILE_SCOPE("rfdetr.train.save.log_json");
                 append_json_line(
                     log_path,
                     json{
@@ -2336,7 +2383,7 @@ TrainRunResult run_training(const TrainOptions& options) {
     }
 
     if (main_process) {
-        FASTLOADER_PROFILE_SCOPE("rfdetr.train.save.results_json");
+        MMLTK_PROFILE_SCOPE("rfdetr.train.save.results_json");
         write_json_file(
             results_path,
             json{
@@ -2373,22 +2420,23 @@ void print_training_summary(const TrainOptions& options, const TrainRunResult& r
     }
     const char* source_label = options.resume_path.empty() ? "weights" : "resume";
     const auto best_path = result.best_checkpoint_path.has_value() ? result.best_checkpoint_path->string() : "";
+    const auto checkpoint_path = result.checkpoint_path.string();
     const double train_loss = result.history.empty() ? 0.0 : result.history.back().train_loss;
     const double val_loss = result.history.empty() ? 0.0 : result.history.back().val_loss;
     const double val_bbox_ap = result.history.empty() ? 0.0 : result.history.back().val_summary.bbox.ap;
     const double val_mask_ap = result.history.empty() ? 0.0 : result.history.back().val_summary.mask.ap;
-    std::fprintf(stderr,
-                 "rfdetr train[%s]: preset=%s optimizer=%s epochs=%d train_loss=%.6f val_loss=%.6f val_bbox_ap=%.4f val_mask_ap=%.4f best=%s checkpoint=%s\n",
-                 source_label,
-                 result.artifacts.config.preset_name.c_str(),
-                 train_optimizer_kind_name(options.optimizer),
-                 result.last_epoch + 1,
-                 train_loss,
-                 val_loss,
-                 val_bbox_ap,
-                 val_mask_ap,
-                 best_path.c_str(),
-                 result.checkpoint_path.c_str());
+    mmltk::logging::logger("rfdetr.train")->info(
+        "rfdetr train[{}]: preset={} optimizer={} epochs={} train_loss={:.6f} val_loss={:.6f} val_bbox_ap={:.4f} val_mask_ap={:.4f} best={} checkpoint={}",
+        source_label,
+        result.artifacts.config.preset_name,
+        train_optimizer_kind_name(options.optimizer),
+        result.last_epoch + 1,
+        train_loss,
+        val_loss,
+        val_bbox_ap,
+        val_mask_ap,
+        best_path,
+        checkpoint_path);
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

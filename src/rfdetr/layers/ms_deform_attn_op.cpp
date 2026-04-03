@@ -5,7 +5,7 @@
 
 #include <torch/autograd.h>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 namespace {
 
@@ -65,7 +65,7 @@ public:
         ctx->saved_data["value_dtype"] = static_cast<int64_t>(value.scalar_type());
         ctx->saved_data["sampling_dtype"] = static_cast<int64_t>(sampling_locations.scalar_type());
         ctx->saved_data["attention_dtype"] = static_cast<int64_t>(attention_weights.scalar_type());
-        FASTLOADER_PROFILE_ADD("rfdetr.ms_deform_attn.cuda_path", 1);
+        MMLTK_PROFILE_ADD("rfdetr.ms_deform_attn.cuda_path", 1);
         return {output.to(value.scalar_type())};
     }
 
@@ -117,4 +117,4 @@ torch::Tensor ms_deform_attn_cuda_autograd(const torch::Tensor& value,
         .front();
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

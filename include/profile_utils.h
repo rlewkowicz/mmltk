@@ -2,13 +2,13 @@
 
 #include <cstdint>
 
-#if FASTLOADER_ENABLE_PROFILING
+#if MMLTK_ENABLE_PROFILING
 #include <nvtx3/nvToolsExt.h>
 #endif
 
-namespace fastloader {
+namespace mmltk {
 
-#if FASTLOADER_ENABLE_PROFILING
+#if MMLTK_ENABLE_PROFILING
 
 class ScopedProfile {
 public:
@@ -32,30 +32,30 @@ void profile_reset_iteration();
 void profile_capture_iteration(const char* label);
 void profile_flush();
 
-#define FASTLOADER_DETAIL_CONCAT_IMPL(lhs, rhs) lhs##rhs
-#define FASTLOADER_DETAIL_CONCAT(lhs, rhs) FASTLOADER_DETAIL_CONCAT_IMPL(lhs, rhs)
+#define MMLTK_DETAIL_CONCAT_IMPL(lhs, rhs) lhs##rhs
+#define MMLTK_DETAIL_CONCAT(lhs, rhs) MMLTK_DETAIL_CONCAT_IMPL(lhs, rhs)
 
-#define FASTLOADER_PROFILE_SCOPE(name) \
-    ::fastloader::ScopedProfile FASTLOADER_DETAIL_CONCAT(fastloader_profile_scope_, __LINE__)(name)
-#define FASTLOADER_PROFILE_ADD(name, value) \
-    ::fastloader::profile_add_value(name, static_cast<std::uint64_t>(value))
-#define FASTLOADER_PROFILE_SET(name, value) \
-    ::fastloader::profile_set_value(name, static_cast<std::uint64_t>(value))
-#define FASTLOADER_PROFILE_RECORD_DURATION_NS(name, elapsed_ns) \
-    ::fastloader::profile_record_duration_ns(name, static_cast<std::uint64_t>(elapsed_ns))
-#define FASTLOADER_PROFILE_PROCESS_LABEL(label) \
-    ::fastloader::profile_set_process_label(label)
-#define FASTLOADER_PROFILE_RUN_LABEL(label) \
-    ::fastloader::profile_set_run_label(label)
-#define FASTLOADER_PROFILE_RESET_ITERATION() \
-    ::fastloader::profile_reset_iteration()
-#define FASTLOADER_PROFILE_CAPTURE_ITERATION(label) \
-    ::fastloader::profile_capture_iteration(label)
-#define FASTLOADER_PROFILE_FLUSH() \
-    ::fastloader::profile_flush()
+#define MMLTK_PROFILE_SCOPE(name) \
+    ::mmltk::ScopedProfile MMLTK_DETAIL_CONCAT(mmltk_profile_scope_, __LINE__)(name)
+#define MMLTK_PROFILE_ADD(name, value) \
+    ::mmltk::profile_add_value(name, static_cast<std::uint64_t>(value))
+#define MMLTK_PROFILE_SET(name, value) \
+    ::mmltk::profile_set_value(name, static_cast<std::uint64_t>(value))
+#define MMLTK_PROFILE_RECORD_DURATION_NS(name, elapsed_ns) \
+    ::mmltk::profile_record_duration_ns(name, static_cast<std::uint64_t>(elapsed_ns))
+#define MMLTK_PROFILE_PROCESS_LABEL(label) \
+    ::mmltk::profile_set_process_label(label)
+#define MMLTK_PROFILE_RUN_LABEL(label) \
+    ::mmltk::profile_set_run_label(label)
+#define MMLTK_PROFILE_RESET_ITERATION() \
+    ::mmltk::profile_reset_iteration()
+#define MMLTK_PROFILE_CAPTURE_ITERATION(label) \
+    ::mmltk::profile_capture_iteration(label)
+#define MMLTK_PROFILE_FLUSH() \
+    ::mmltk::profile_flush()
 
-#define FASTLOADER_NVTX_RANGE(name, color) \
-    ::fastloader::ScopedNvtxRange FASTLOADER_DETAIL_CONCAT(fastloader_nvtx_range_, __LINE__)(name, color)
+#define MMLTK_NVTX_RANGE(name, color) \
+    ::mmltk::ScopedNvtxRange MMLTK_DETAIL_CONCAT(mmltk_nvtx_range_, __LINE__)(name, color)
 
 class ScopedNvtxRange {
 public:
@@ -101,21 +101,21 @@ inline void profile_reset_iteration() {}
 inline void profile_capture_iteration(const char*) {}
 inline void profile_flush() {}
 
-#define FASTLOADER_PROFILE_SCOPE(name) ((void)0)
-#define FASTLOADER_PROFILE_ADD(name, value) ((void)0)
-#define FASTLOADER_PROFILE_SET(name, value) ((void)0)
-#define FASTLOADER_PROFILE_RECORD_DURATION_NS(name, elapsed_ns) ((void)0)
-#define FASTLOADER_PROFILE_PROCESS_LABEL(label) ((void)0)
-#define FASTLOADER_PROFILE_RUN_LABEL(label) ((void)0)
-#define FASTLOADER_PROFILE_RESET_ITERATION() ((void)0)
-#define FASTLOADER_PROFILE_CAPTURE_ITERATION(label) ((void)0)
-#define FASTLOADER_PROFILE_FLUSH() ((void)0)
+#define MMLTK_PROFILE_SCOPE(name) ((void)0)
+#define MMLTK_PROFILE_ADD(name, value) ((void)0)
+#define MMLTK_PROFILE_SET(name, value) ((void)0)
+#define MMLTK_PROFILE_RECORD_DURATION_NS(name, elapsed_ns) ((void)0)
+#define MMLTK_PROFILE_PROCESS_LABEL(label) ((void)0)
+#define MMLTK_PROFILE_RUN_LABEL(label) ((void)0)
+#define MMLTK_PROFILE_RESET_ITERATION() ((void)0)
+#define MMLTK_PROFILE_CAPTURE_ITERATION(label) ((void)0)
+#define MMLTK_PROFILE_FLUSH() ((void)0)
 
-#define FASTLOADER_NVTX_RANGE(name, color) ((void)0)
+#define MMLTK_NVTX_RANGE(name, color) ((void)0)
 
-#undef FASTLOADER_DETAIL_CONCAT
-#undef FASTLOADER_DETAIL_CONCAT_IMPL
+#undef MMLTK_DETAIL_CONCAT
+#undef MMLTK_DETAIL_CONCAT_IMPL
 
 #endif
 
-} // namespace fastloader
+} // namespace mmltk

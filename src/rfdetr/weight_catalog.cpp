@@ -1,8 +1,8 @@
-#include "fastloader/rfdetr/weight_catalog.h"
+#include "mmltk/rfdetr/weight_catalog.h"
 
 #include <filesystem>
 
-namespace fastloader::rfdetr {
+namespace mmltk::rfdetr {
 
 const std::vector<WeightAsset>& weight_catalog() {
     static const std::vector<WeightAsset> kCatalog = {
@@ -43,4 +43,4 @@ bool is_registered_weight_asset(std::string_view filename) {
     return find_weight_asset(filename) != nullptr;
 }
 
-} // namespace fastloader::rfdetr
+} // namespace mmltk::rfdetr

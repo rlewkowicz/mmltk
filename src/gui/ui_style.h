@@ -4,7 +4,7 @@
 
 struct ImFont;
 
-namespace fastloader::gui {
+namespace mmltk::gui {
 
 struct UiFontSet {
     ImFont* primary = nullptr;
@@ -18,4 +18,4 @@ const UiFontSet& current_ui_fonts();
 float ui_scaled(float value);
 float ui_label_width();
 
-} // namespace fastloader::gui
+} // namespace mmltk::gui

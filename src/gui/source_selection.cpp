@@ -7,7 +7,7 @@
 
 #include <imgui.h>
 
-namespace fastloader::gui {
+namespace mmltk::gui {
 
 namespace {
 
@@ -158,4 +158,4 @@ SourceSelectionUiActions draw_source_selection(SourceSelectionState& state,
     return actions;
 }
 
-} // namespace fastloader::gui
+} // namespace mmltk::gui

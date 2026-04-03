@@ -7,7 +7,7 @@
 #include <optional>
 #include <string>
 
-namespace fastloader::gui {
+namespace mmltk::gui {
 
 struct TrainArtifactProgress {
     std::string phase;
@@ -57,17 +57,18 @@ public:
     LocalTrainSession(const LocalTrainSession&) = delete;
     LocalTrainSession& operator=(const LocalTrainSession&) = delete;
 
-    void start(const TrainCommandConfig& config,
-               const std::filesystem::path& cli_path);
+    void start(const mmltk::rfdetr::TrainRequest& request,
+               const std::filesystem::path& cli_path,
+               std::string fallback_preset_name);
     void request_stop(bool force);
     void shutdown();
 
-    LocalTrainSessionState snapshot() const;
-    bool running() const;
+    [[nodiscard]] LocalTrainSessionState snapshot() const;
+    [[nodiscard]] bool running() const;
 
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace fastloader::gui
+} // namespace mmltk::gui

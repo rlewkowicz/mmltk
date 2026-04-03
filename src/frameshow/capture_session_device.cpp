@@ -159,12 +159,13 @@ Status CaptureSession::Impl::AllocateInferenceSlots() {
     auto slot = std::make_unique<InferenceSlotRuntime>();
     slot->slot_index = slot_index;
 
-    cudaError_t cuda_status = cudaMallocPitch(reinterpret_cast<void**>(&slot->device_ptr),
-                                              &slot->pitch_bytes, frame_width_bytes,
-                                              config.height);
+    void* device_allocation = nullptr;
+    cudaError_t cuda_status =
+        cudaMallocPitch(&device_allocation, &slot->pitch_bytes, frame_width_bytes, config.height);
     if (cuda_status != cudaSuccess) {
       return MakeCudaStatus(cuda_status, "cudaMallocPitch");
     }
+    slot->device_ptr = static_cast<std::uint8_t*>(device_allocation);
 
     cuda_status = cudaStreamCreateWithFlags(&slot->copy_stream, cudaStreamNonBlocking);
     if (cuda_status != cudaSuccess) {
@@ -191,9 +192,9 @@ void CaptureSession::Impl::DestroyInferenceSlots() {
       cudaStreamDestroy(slot->copy_stream);
       slot->copy_stream = nullptr;
     }
-    if (slot->device_ptr != 0) {
-      cudaFree(reinterpret_cast<void*>(slot->device_ptr));
-      slot->device_ptr = 0;
+    if (slot->device_ptr != nullptr) {
+      cudaFree(slot->device_ptr);
+      slot->device_ptr = nullptr;
     }
   }
   inference_slots_.clear();
@@ -214,12 +215,13 @@ Status CaptureSession::Impl::AllocatePreviewSlots() {
     auto slot = std::make_unique<PreviewSlotRuntime>();
     slot->slot_index = slot_index;
 
-    cudaError_t cuda_status = cudaMallocPitch(reinterpret_cast<void**>(&slot->device_ptr),
-                                              &slot->pitch_bytes, preview_width_bytes,
-                                              config.height);
+    void* device_allocation = nullptr;
+    cudaError_t cuda_status = cudaMallocPitch(&device_allocation, &slot->pitch_bytes,
+                                              preview_width_bytes, config.height);
     if (cuda_status != cudaSuccess) {
       return MakeCudaStatus(cuda_status, "cudaMallocPitch");
     }
+    slot->device_ptr = static_cast<std::uint8_t*>(device_allocation);
 
     cuda_status = cudaStreamCreateWithFlags(&slot->copy_stream, cudaStreamNonBlocking);
     if (cuda_status != cudaSuccess) {
@@ -255,9 +257,9 @@ void CaptureSession::Impl::DestroyPreviewSlots() {
       cudaStreamDestroy(slot->copy_stream);
       slot->copy_stream = nullptr;
     }
-    if (slot->device_ptr != 0) {
-      cudaFree(reinterpret_cast<void*>(slot->device_ptr));
-      slot->device_ptr = 0;
+    if (slot->device_ptr != nullptr) {
+      cudaFree(slot->device_ptr);
+      slot->device_ptr = nullptr;
     }
   }
   preview_slots_.clear();
