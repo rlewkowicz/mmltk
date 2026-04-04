@@ -1,3 +1,5 @@
+#include "rfdetr/cuda/cuda_launch_common.h"
+
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <cstdint>
@@ -56,6 +58,14 @@ __device__ void hsv2rgb_device(float h,
     r = static_cast<uint8_t>((rf + m) * 255.0f);
     g = static_cast<uint8_t>((gf + m) * 255.0f);
     b = static_cast<uint8_t>((bf + m) * 255.0f);
+}
+
+inline dim3 draw_kernel_block() {
+    return dim3(16, 16, 1);
+}
+
+inline dim3 draw_kernel_grid(const int width, const int height) {
+    return cuda_launch::make_2d_grid(width, height, draw_kernel_block());
 }
 
 __global__ void build_instance_colors_from_labels_kernel(
@@ -163,6 +173,43 @@ __device__ bool pixel_hits_label_digit(int x,
     return false;
 }
 
+template <typename PixelT>
+__device__ void apply_box_color(PixelT& pixel, const uint8_t* colors, int offset);
+
+template <>
+__device__ void apply_box_color<cuda_launch::RgbPixelFloat>(cuda_launch::RgbPixelFloat& pixel, const uint8_t* colors, int offset) {
+    cuda_launch::apply_rgb(&pixel, colors, offset);
+}
+
+template <>
+__device__ void apply_box_color<cuda_launch::RgbaPixelU8>(cuda_launch::RgbaPixelU8& pixel, const uint8_t* colors, int offset) {
+    cuda_launch::apply_rgb(&pixel.r, &pixel.g, &pixel.b, colors, offset);
+    pixel.a = 255U;
+}
+
+template <typename PixelT>
+__device__ void apply_boxes_and_labels(
+    int x, int y,
+    const float* boxes,
+    const uint8_t* colors,
+    const int* labels,
+    int num_instances,
+    int box_thickness,
+    PixelT& pixel
+) {
+    for (int i = 0; i < num_instances; ++i) {
+        const int x1 = static_cast<int>(boxes[i * 4 + 0]);
+        const int y1 = static_cast<int>(boxes[i * 4 + 1]);
+        const int x2 = static_cast<int>(boxes[i * 4 + 2]);
+        const int y2 = static_cast<int>(boxes[i * 4 + 3]);
+        const bool is_edge = pixel_hits_box_edge(x, y, x1, y1, x2, y2, box_thickness);
+        const bool is_label = pixel_hits_label_digit(x, y, x1, y1, labels[i]);
+        if (is_edge || is_label) {
+            apply_box_color(pixel, colors, i * 3);
+        }
+    }
+}
+
 // Colors blending kernel
 __global__ void draw_masks_and_boxes_kernel(
     uint8_t* image_out,
@@ -180,46 +227,33 @@ __global__ void draw_masks_and_boxes_kernel(
     
     if (x >= width || y >= height) return;
     
-    int pixel_idx = (y * width + x) * 3;
-    float r = image_out[pixel_idx];
-    float g = image_out[pixel_idx + 1];
-    float b = image_out[pixel_idx + 2];
+    auto pixel = cuda_launch::load_rgb_pixel(
+        image_out,
+        static_cast<std::size_t>(width) * 3U,
+        x,
+        y);
     
     // Draw masks
     for (int i = 0; i < num_instances; ++i) {
         if (masks[i * width * height + y * width + x]) {
-            r = r * (1.0f - mask_alpha) + colors[i * 3] * mask_alpha;
-            g = g * (1.0f - mask_alpha) + colors[i * 3 + 1] * mask_alpha;
-            b = b * (1.0f - mask_alpha) + colors[i * 3 + 2] * mask_alpha;
+            pixel = cuda_launch::blend_rgb(
+                pixel,
+                colors[i * 3],
+                colors[i * 3 + 1],
+                colors[i * 3 + 2],
+                mask_alpha);
         }
     }
     
     // Draw edges for bounding boxes
-    for (int i = 0; i < num_instances; ++i) {
-        int x1 = static_cast<int>(boxes[i * 4 + 0]);
-        int y1 = static_cast<int>(boxes[i * 4 + 1]);
-        int x2 = static_cast<int>(boxes[i * 4 + 2]);
-        int y2 = static_cast<int>(boxes[i * 4 + 3]);
-        
-        const bool is_edge = pixel_hits_box_edge(x, y, x1, y1, x2, y2, box_thickness);
-        
-        if (is_edge) {
-            r = colors[i * 3];
-            g = colors[i * 3 + 1];
-            b = colors[i * 3 + 2];
-        }
-        
-        if (pixel_hits_label_digit(x, y, x1, y1, labels[i])) {
-            r = colors[i * 3];
-            g = colors[i * 3 + 1];
-            b = colors[i * 3 + 2];
-        }
-    }
-    
-    // clamp and write back
-    image_out[pixel_idx] = static_cast<uint8_t>(fminf(255.0f, fmaxf(0.0f, r)));
-    image_out[pixel_idx + 1] = static_cast<uint8_t>(fminf(255.0f, fmaxf(0.0f, g)));
-    image_out[pixel_idx + 2] = static_cast<uint8_t>(fminf(255.0f, fmaxf(0.0f, b)));
+    apply_boxes_and_labels(x, y, boxes, colors, labels, num_instances, box_thickness, pixel);
+
+    cuda_launch::store_rgb_pixel(
+        image_out,
+        static_cast<std::size_t>(width) * 3U,
+        x,
+        y,
+        pixel);
 }
 
 __global__ void draw_boxes_labels_bgr_pitched_kernel(
@@ -239,30 +273,11 @@ __global__ void draw_boxes_labels_bgr_pitched_kernel(
         return;
     }
 
-    uint8_t* pixel = image_out + static_cast<std::size_t>(y) * pitch_bytes + static_cast<std::size_t>(x) * 3U;
-    float b = pixel[0];
-    float g = pixel[1];
-    float r = pixel[2];
+    auto pixel = cuda_launch::load_bgr_pixel(image_out, pitch_bytes, x, y);
 
-    for (int i = 0; i < num_instances; ++i) {
-        const int x1 = static_cast<int>(boxes[i * 4 + 0]);
-        const int y1 = static_cast<int>(boxes[i * 4 + 1]);
-        const int x2 = static_cast<int>(boxes[i * 4 + 2]);
-        const int y2 = static_cast<int>(boxes[i * 4 + 3]);
-        const bool is_edge = pixel_hits_box_edge(x, y, x1, y1, x2, y2, box_thickness);
-        const bool is_label = pixel_hits_label_digit(x, y, x1, y1, labels[i]);
-        if (!is_edge && !is_label) {
-            continue;
-        }
+    apply_boxes_and_labels(x, y, boxes, colors, labels, num_instances, box_thickness, pixel);
 
-        r = colors[i * 3];
-        g = colors[i * 3 + 1];
-        b = colors[i * 3 + 2];
-    }
-
-    pixel[0] = static_cast<uint8_t>(fminf(255.0f, fmaxf(0.0f, b)));
-    pixel[1] = static_cast<uint8_t>(fminf(255.0f, fmaxf(0.0f, g)));
-    pixel[2] = static_cast<uint8_t>(fminf(255.0f, fmaxf(0.0f, r)));
+    cuda_launch::store_bgr_pixel(image_out, pitch_bytes, x, y, pixel);
 }
 
 __global__ void draw_masks_boxes_labels_bgr_pitched_kernel(
@@ -284,38 +299,22 @@ __global__ void draw_masks_boxes_labels_bgr_pitched_kernel(
         return;
     }
 
-    uint8_t* pixel = image_out + static_cast<std::size_t>(y) * pitch_bytes + static_cast<std::size_t>(x) * 3U;
-    float b = pixel[0];
-    float g = pixel[1];
-    float r = pixel[2];
+    auto pixel = cuda_launch::load_bgr_pixel(image_out, pitch_bytes, x, y);
 
     for (int i = 0; i < num_instances; ++i) {
         if (masks[i * width * height + y * width + x]) {
-            r = r * (1.0f - mask_alpha) + colors[i * 3] * mask_alpha;
-            g = g * (1.0f - mask_alpha) + colors[i * 3 + 1] * mask_alpha;
-            b = b * (1.0f - mask_alpha) + colors[i * 3 + 2] * mask_alpha;
+            pixel = cuda_launch::blend_rgb(
+                pixel,
+                colors[i * 3],
+                colors[i * 3 + 1],
+                colors[i * 3 + 2],
+                mask_alpha);
         }
     }
 
-    for (int i = 0; i < num_instances; ++i) {
-        const int x1 = static_cast<int>(boxes[i * 4 + 0]);
-        const int y1 = static_cast<int>(boxes[i * 4 + 1]);
-        const int x2 = static_cast<int>(boxes[i * 4 + 2]);
-        const int y2 = static_cast<int>(boxes[i * 4 + 3]);
-        const bool is_edge = pixel_hits_box_edge(x, y, x1, y1, x2, y2, box_thickness);
-        const bool is_label = pixel_hits_label_digit(x, y, x1, y1, labels[i]);
-        if (!is_edge && !is_label) {
-            continue;
-        }
+    apply_boxes_and_labels(x, y, boxes, colors, labels, num_instances, box_thickness, pixel);
 
-        r = colors[i * 3];
-        g = colors[i * 3 + 1];
-        b = colors[i * 3 + 2];
-    }
-
-    pixel[0] = static_cast<uint8_t>(fminf(255.0f, fmaxf(0.0f, b)));
-    pixel[1] = static_cast<uint8_t>(fminf(255.0f, fmaxf(0.0f, g)));
-    pixel[2] = static_cast<uint8_t>(fminf(255.0f, fmaxf(0.0f, r)));
+    cuda_launch::store_bgr_pixel(image_out, pitch_bytes, x, y, pixel);
 }
 
 __global__ void draw_analysis_overlay_rgba_pitched_kernel(
@@ -337,44 +336,21 @@ __global__ void draw_analysis_overlay_rgba_pitched_kernel(
         return;
     }
 
-    uint8_t* pixel = overlay_out + static_cast<std::size_t>(y) * pitch_bytes + static_cast<std::size_t>(x) * 4U;
-    uint8_t r = 0U;
-    uint8_t g = 0U;
-    uint8_t b = 0U;
-    uint8_t a = 0U;
+    cuda_launch::RgbaPixelU8 pixel{};
 
     if (masks != nullptr) {
         for (int i = 0; i < num_instances; ++i) {
             if (!masks[i * width * height + y * width + x]) {
                 continue;
             }
-            r = colors[i * 3];
-            g = colors[i * 3 + 1];
-            b = colors[i * 3 + 2];
-            a = mask_alpha;
+            cuda_launch::apply_rgb(&pixel.r, &pixel.g, &pixel.b, colors, i * 3);
+            pixel.a = mask_alpha;
         }
     }
 
-    for (int i = 0; i < num_instances; ++i) {
-        const int x1 = static_cast<int>(boxes[i * 4 + 0]);
-        const int y1 = static_cast<int>(boxes[i * 4 + 1]);
-        const int x2 = static_cast<int>(boxes[i * 4 + 2]);
-        const int y2 = static_cast<int>(boxes[i * 4 + 3]);
-        const bool is_edge = pixel_hits_box_edge(x, y, x1, y1, x2, y2, box_thickness);
-        const bool is_label = pixel_hits_label_digit(x, y, x1, y1, labels[i]);
-        if (!is_edge && !is_label) {
-            continue;
-        }
-        r = colors[i * 3];
-        g = colors[i * 3 + 1];
-        b = colors[i * 3 + 2];
-        a = 255U;
-    }
+    apply_boxes_and_labels(x, y, boxes, colors, labels, num_instances, box_thickness, pixel);
 
-    pixel[0] = r;
-    pixel[1] = g;
-    pixel[2] = b;
-    pixel[3] = a;
+    cuda_launch::store_rgba_pixel(overlay_out, pitch_bytes, x, y, pixel);
 }
 
 __global__ void composite_rgba_over_bgr_pitched_kernel(
@@ -391,30 +367,17 @@ __global__ void composite_rgba_over_bgr_pitched_kernel(
         return;
     }
 
-    const uint8_t* overlay_pixel =
-        overlay_rgba + static_cast<std::size_t>(y) * overlay_pitch_bytes + static_cast<std::size_t>(x) * 4U;
-    const uint8_t alpha_u8 = overlay_pixel[3];
-    if (alpha_u8 == 0U) {
+    const auto overlay_pixel = cuda_launch::load_rgba_pixel(overlay_rgba, overlay_pitch_bytes, x, y);
+    if (overlay_pixel.a == 0U) {
         return;
     }
 
-    uint8_t* base_pixel =
-        base_bgr + static_cast<std::size_t>(y) * base_pitch_bytes + static_cast<std::size_t>(x) * 3U;
-    if (alpha_u8 == 255U) {
-        base_pixel[0] = overlay_pixel[2];
-        base_pixel[1] = overlay_pixel[1];
-        base_pixel[2] = overlay_pixel[0];
-        return;
-    }
-
-    const float alpha = static_cast<float>(alpha_u8) / 255.0f;
-    const float inv_alpha = 1.0f - alpha;
-    const float b = static_cast<float>(overlay_pixel[2]) * alpha + static_cast<float>(base_pixel[0]) * inv_alpha;
-    const float g = static_cast<float>(overlay_pixel[1]) * alpha + static_cast<float>(base_pixel[1]) * inv_alpha;
-    const float r = static_cast<float>(overlay_pixel[0]) * alpha + static_cast<float>(base_pixel[2]) * inv_alpha;
-    base_pixel[0] = static_cast<uint8_t>(fminf(255.0f, fmaxf(0.0f, b)));
-    base_pixel[1] = static_cast<uint8_t>(fminf(255.0f, fmaxf(0.0f, g)));
-    base_pixel[2] = static_cast<uint8_t>(fminf(255.0f, fmaxf(0.0f, r)));
+    const auto base_pixel = cuda_launch::load_bgr_pixel(base_bgr, base_pitch_bytes, x, y);
+    cuda_launch::store_bgr_pixel(base_bgr,
+                                 base_pitch_bytes,
+                                 x,
+                                 y,
+                                 cuda_launch::composite_rgba_over_bgr(base_pixel, overlay_pixel));
 }
 
 __global__ void draw_manual_mask_rgba_pitched_kernel(
@@ -437,11 +400,12 @@ __global__ void draw_manual_mask_rgba_pitched_kernel(
         return;
     }
 
-    uint8_t* pixel = overlay_region + static_cast<std::size_t>(y) * pitch_bytes + static_cast<std::size_t>(x) * 4U;
-    pixel[0] = r;
-    pixel[1] = g;
-    pixel[2] = b;
-    pixel[3] = alpha;
+    cuda_launch::store_rgba_pixel(
+        overlay_region,
+        pitch_bytes,
+        x,
+        y,
+        cuda_launch::RgbaPixelU8{r, g, b, alpha});
 }
 
 __global__ void draw_box_outline_rgba_pitched_kernel(
@@ -467,11 +431,12 @@ __global__ void draw_box_outline_rgba_pitched_kernel(
         return;
     }
 
-    uint8_t* pixel = overlay_out + static_cast<std::size_t>(y) * pitch_bytes + static_cast<std::size_t>(x) * 4U;
-    pixel[0] = r;
-    pixel[1] = g;
-    pixel[2] = b;
-    pixel[3] = 255U;
+    cuda_launch::store_rgba_pixel(
+        overlay_out,
+        pitch_bytes,
+        x,
+        y,
+        cuda_launch::RgbaPixelU8{r, g, b, 255U});
 }
 
 __global__ void draw_selection_handles_rgba_pitched_kernel(
@@ -498,41 +463,14 @@ __global__ void draw_selection_handles_rgba_pitched_kernel(
             y < corners_y[i] - handle_radius || y > corners_y[i] + handle_radius) {
             continue;
         }
-        uint8_t* pixel =
-            overlay_out + static_cast<std::size_t>(y) * pitch_bytes + static_cast<std::size_t>(x) * 4U;
-        pixel[0] = 255U;
-        pixel[1] = 220U;
-        pixel[2] = 96U;
-        pixel[3] = 240U;
+        cuda_launch::store_rgba_pixel(
+            overlay_out,
+            pitch_bytes,
+            x,
+            y,
+            cuda_launch::RgbaPixelU8{255U, 220U, 96U, 240U});
         return;
     }
-}
-
-__device__ float point_distance_sq(float px,
-                                   float py,
-                                   float qx,
-                                   float qy) {
-    const float dx = px - qx;
-    const float dy = py - qy;
-    return dx * dx + dy * dy;
-}
-
-__device__ float point_to_segment_distance_sq(float px,
-                                              float py,
-                                              float ax,
-                                              float ay,
-                                              float bx,
-                                              float by) {
-    const float abx = bx - ax;
-    const float aby = by - ay;
-    const float apx = px - ax;
-    const float apy = py - ay;
-    const float ab_len_sq = abx * abx + aby * aby;
-    if (ab_len_sq <= 0.0f) {
-        return point_distance_sq(px, py, ax, ay);
-    }
-    const float t = fminf(1.0f, fmaxf(0.0f, (apx * abx + apy * aby) / ab_len_sq));
-    return point_distance_sq(px, py, ax + abx * t, ay + aby * t);
 }
 
 __global__ void draw_polyline_rgba_pitched_kernel(
@@ -565,15 +503,15 @@ __global__ void draw_polyline_rgba_pitched_kernel(
         const float ay = static_cast<float>(points_xy[start_index + 1]);
         const float bx = static_cast<float>(points_xy[end_point_index + 0]);
         const float by = static_cast<float>(points_xy[end_point_index + 1]);
-        if (point_to_segment_distance_sq(px, py, ax, ay, bx, by) > max_distance_sq) {
+        if (cuda_launch::point_to_segment_distance_sq(px, py, ax, ay, bx, by) > max_distance_sq) {
             continue;
         }
-        uint8_t* pixel =
-            overlay_out + static_cast<std::size_t>(y) * pitch_bytes + static_cast<std::size_t>(x) * 4U;
-        pixel[0] = r;
-        pixel[1] = g;
-        pixel[2] = b;
-        pixel[3] = 255U;
+        cuda_launch::store_rgba_pixel(
+            overlay_out,
+            pitch_bytes,
+            x,
+            y,
+            cuda_launch::RgbaPixelU8{r, g, b, 255U});
         return;
     }
 }
@@ -604,15 +542,15 @@ __global__ void draw_points_rgba_pitched_kernel(
         const int xy_index = point_index * 2;
         const float qx = static_cast<float>(points_xy[xy_index + 0]);
         const float qy = static_cast<float>(points_xy[xy_index + 1]);
-        if (point_distance_sq(px, py, qx, qy) > max_distance_sq) {
+        if (cuda_launch::point_distance_sq(px, py, qx, qy) > max_distance_sq) {
             continue;
         }
-        uint8_t* pixel =
-            overlay_out + static_cast<std::size_t>(y) * pitch_bytes + static_cast<std::size_t>(x) * 4U;
-        pixel[0] = r;
-        pixel[1] = g;
-        pixel[2] = b;
-        pixel[3] = alpha;
+        cuda_launch::store_rgba_pixel(
+            overlay_out,
+            pitch_bytes,
+            x,
+            y,
+            cuda_launch::RgbaPixelU8{r, g, b, alpha});
         return;
     }
 }
@@ -655,15 +593,15 @@ __global__ void draw_skeleton_rgba_pitched_kernel(
         const float ay = static_cast<float>(points_xy[source_xy_index + 1]);
         const float bx = static_cast<float>(points_xy[target_xy_index + 0]);
         const float by = static_cast<float>(points_xy[target_xy_index + 1]);
-        if (point_to_segment_distance_sq(px, py, ax, ay, bx, by) > max_distance_sq) {
+        if (cuda_launch::point_to_segment_distance_sq(px, py, ax, ay, bx, by) > max_distance_sq) {
             continue;
         }
-        uint8_t* pixel =
-            overlay_out + static_cast<std::size_t>(y) * pitch_bytes + static_cast<std::size_t>(x) * 4U;
-        pixel[0] = r;
-        pixel[1] = g;
-        pixel[2] = b;
-        pixel[3] = 255U;
+        cuda_launch::store_rgba_pixel(
+            overlay_out,
+            pitch_bytes,
+            x,
+            y,
+            cuda_launch::RgbaPixelU8{r, g, b, 255U});
         return;
     }
 }
@@ -682,8 +620,8 @@ void launch_draw_masks_boxes(
 ) {
     if (width <= 0 || height <= 0) return;
     
-    dim3 block(16, 16);
-    dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+    const dim3 block = draw_kernel_block();
+    const dim3 grid = draw_kernel_grid(width, height);
     
     draw_masks_and_boxes_kernel<<<grid, block, 0, stream>>>(
         image_out, width, height, masks, boxes, colors, labels, 
@@ -708,8 +646,8 @@ void launch_draw_boxes_labels_bgr_pitched(
         return;
     }
 
-    dim3 block(16, 16);
-    dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+    const dim3 block = draw_kernel_block();
+    const dim3 grid = draw_kernel_grid(width, height);
     draw_boxes_labels_bgr_pitched_kernel<<<grid, block, 0, stream>>>(
         image_out,
         pitch_bytes,
@@ -734,8 +672,8 @@ void launch_build_instance_colors_from_zero_based_labels(
     }
 
     const int safe_count = static_cast<int>(count);
-    const int threads = 128;
-    const int blocks = (safe_count + threads - 1) / threads;
+    constexpr int threads = 128;
+    const int blocks = cuda_launch::linear_blocks_for(safe_count, threads);
     build_instance_colors_from_labels_kernel<<<blocks, threads, 0, stream>>>(
         labels,
         safe_count,
@@ -762,8 +700,8 @@ void launch_draw_masks_boxes_labels_bgr_pitched(
         return;
     }
 
-    dim3 block(16, 16);
-    dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+    const dim3 block = draw_kernel_block();
+    const dim3 grid = draw_kernel_grid(width, height);
     draw_masks_boxes_labels_bgr_pitched_kernel<<<grid, block, 0, stream>>>(
         image_out,
         pitch_bytes,
@@ -797,8 +735,8 @@ void launch_draw_analysis_overlay_rgba_pitched(
         return;
     }
 
-    dim3 block(16, 16);
-    dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+    const dim3 block = draw_kernel_block();
+    const dim3 grid = draw_kernel_grid(width, height);
     draw_analysis_overlay_rgba_pitched_kernel<<<grid, block, 0, stream>>>(
         overlay_out,
         pitch_bytes,
@@ -826,8 +764,8 @@ void launch_composite_rgba_over_bgr_pitched(
         return;
     }
 
-    dim3 block(16, 16);
-    dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+    const dim3 block = draw_kernel_block();
+    const dim3 grid = draw_kernel_grid(width, height);
     composite_rgba_over_bgr_pitched_kernel<<<grid, block, 0, stream>>>(
         base_bgr,
         base_pitch_bytes,
@@ -853,8 +791,8 @@ void launch_draw_manual_mask_rgba_pitched(
         return;
     }
 
-    dim3 block(16, 16);
-    dim3 grid((width + block.x - 1) / block.x, (height + block.y - 1) / block.y);
+    const dim3 block = draw_kernel_block();
+    const dim3 grid = draw_kernel_grid(width, height);
     draw_manual_mask_rgba_pitched_kernel<<<grid, block, 0, stream>>>(
         overlay_region,
         pitch_bytes,
@@ -886,8 +824,8 @@ void launch_draw_box_outline_rgba_pitched(
         return;
     }
 
-    dim3 block(16, 16);
-    dim3 grid((image_width + block.x - 1) / block.x, (image_height + block.y - 1) / block.y);
+    const dim3 block = draw_kernel_block();
+    const dim3 grid = draw_kernel_grid(image_width, image_height);
     draw_box_outline_rgba_pitched_kernel<<<grid, block, 0, stream>>>(
         overlay_out,
         pitch_bytes,
@@ -919,8 +857,8 @@ void launch_draw_selection_handles_rgba_pitched(
         return;
     }
 
-    dim3 block(16, 16);
-    dim3 grid((image_width + block.x - 1) / block.x, (image_height + block.y - 1) / block.y);
+    const dim3 block = draw_kernel_block();
+    const dim3 grid = draw_kernel_grid(image_width, image_height);
     draw_selection_handles_rgba_pitched_kernel<<<grid, block, 0, stream>>>(
         overlay_out,
         pitch_bytes,
@@ -951,8 +889,8 @@ void launch_draw_polyline_rgba_pitched(
         return;
     }
 
-    dim3 block(16, 16);
-    dim3 grid((image_width + block.x - 1) / block.x, (image_height + block.y - 1) / block.y);
+    const dim3 block = draw_kernel_block();
+    const dim3 grid = draw_kernel_grid(image_width, image_height);
     draw_polyline_rgba_pitched_kernel<<<grid, block, 0, stream>>>(
         overlay_out,
         pitch_bytes,
@@ -985,8 +923,8 @@ void launch_draw_points_rgba_pitched(
         return;
     }
 
-    dim3 block(16, 16);
-    dim3 grid((image_width + block.x - 1) / block.x, (image_height + block.y - 1) / block.y);
+    const dim3 block = draw_kernel_block();
+    const dim3 grid = draw_kernel_grid(image_width, image_height);
     draw_points_rgba_pitched_kernel<<<grid, block, 0, stream>>>(
         overlay_out,
         pitch_bytes,
@@ -1021,8 +959,8 @@ void launch_draw_skeleton_rgba_pitched(
         return;
     }
 
-    dim3 block(16, 16);
-    dim3 grid((image_width + block.x - 1) / block.x, (image_height + block.y - 1) / block.y);
+    const dim3 block = draw_kernel_block();
+    const dim3 grid = draw_kernel_grid(image_width, image_height);
     draw_skeleton_rgba_pitched_kernel<<<grid, block, 0, stream>>>(
         overlay_out,
         pitch_bytes,

@@ -27,6 +27,12 @@ void test_prediction_lane_slot_count_scales_with_runtime_pressure() {
     assert(prediction_lane_slot_count(split) == 2U);
 }
 
+void test_effective_lane_count_prefers_explicit_lane_override() {
+    assert(effective_lane_count(1U, 0) == 1);
+    assert(effective_lane_count(4U, 2) == 2);
+    assert(effective_lane_count(0U, -3) == 1);
+}
+
 void test_live_split_helpers_clamp_counts_and_preserve_regions() {
     const std::vector<LiveSplitRegion> splits = build_horizontal_splits(10U, 4U);
     assert(splits.size() == 4U);
@@ -92,13 +98,32 @@ void test_make_live_runner_state_allocates_single_frame_cuda_state() {
     destroy_cuda_event(state.ready_event);
 }
 
+void test_make_raw_image_batch_workspace_reuses_batch_tensors() {
+    if (!torch::cuda::is_available()) {
+        SKIP("CUDA unavailable");
+    }
+
+    const RawImageBatchWorkspace workspace = make_raw_image_batch_workspace(3, 16, 0);
+    assert(workspace.batch_cpu.defined());
+    assert(workspace.batch_gpu.defined());
+    assert(workspace.nested_mask.defined());
+    assert(workspace.batch_cpu.size(0) == 3);
+    assert(workspace.batch_gpu.size(0) == 3);
+    assert(workspace.nested_mask.size(0) == 3);
+    assert(workspace.resize_scratch_slots.size() == 3U);
+}
+
 } // namespace
 
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][runtime_shared]",
                          test_prediction_lane_slot_count_scales_with_runtime_pressure);
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][runtime_shared]",
+                         test_effective_lane_count_prefers_explicit_lane_override);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][runtime_shared]",
                          test_live_split_helpers_clamp_counts_and_preserve_regions);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][runtime_shared]",
                          test_live_runtime_helpers_format_context_and_clamp_large_frame_ids);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][runtime_shared]",
                          test_make_live_runner_state_allocates_single_frame_cuda_state);
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][runtime_shared]",
+                         test_make_raw_image_batch_workspace_reuses_batch_tensors);

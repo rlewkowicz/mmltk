@@ -1,5 +1,6 @@
 #include "activity_pane_presenter.h"
 
+#include "layout_primitives.h"
 #include "ui_controls.h"
 #include "ui_style.h"
 
@@ -45,37 +46,7 @@ constexpr ImVec4 kBannerBackgroundColor{0.33f, 0.17f, 0.12f, 0.95f};
 constexpr ImVec4 kBannerTextColor{0.98f, 0.90f, 0.82f, 1.00f};
 constexpr ImVec4 kErrorTextColor{0.94f, 0.45f, 0.41f, 1.00f};
 
-} // namespace
-
-void draw_output_console(const char* id,
-                         const std::string_view output_tail,
-                         const float height,
-                         const bool running,
-                         const char* waiting_message) {
-    ImGui::TextUnformatted(running ? "Live Output" : "Recent Output");
-    ImGui::BeginChild(id, ImVec2(0.0f, height), true);
-    const bool stick_to_bottom = ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 8.0f;
-    ImGui::PushTextWrapPos();
-    if (current_ui_fonts().mono != nullptr) {
-        ImGui::PushFont(current_ui_fonts().mono);
-    }
-    if (output_tail.empty()) {
-        ImGui::TextUnformatted(waiting_message);
-    } else {
-        ImGui::TextUnformatted(output_tail.data(), output_tail.data() + output_tail.size());
-    }
-    if (current_ui_fonts().mono != nullptr) {
-        ImGui::PopFont();
-    }
-    if (running && stick_to_bottom) {
-        ImGui::SetScrollHereY(1.0f);
-    }
-    ImGui::PopTextWrapPos();
-    ImGui::EndChild();
-}
-
-void draw_training_activity_section(const TrainingActivityViewModel& view_model) {
-    draw_section_heading("Training");
+void draw_training_activity_content(const TrainingActivityViewModel& view_model) {
     ImGui::Text("Target: %.*s",
                 static_cast<int>(view_model.execution_target_label.size()),
                 view_model.execution_target_label.data());
@@ -128,10 +99,9 @@ void draw_training_activity_section(const TrainingActivityViewModel& view_model)
     }
 }
 
-void draw_local_train_activity_section(const LocalTrainSessionState& state,
+void draw_local_train_activity_content(const LocalTrainSessionState& state,
                                        const std::function<void(bool)>& request_stop_local_training,
                                        ImFont* compact_font) {
-    draw_section_heading("Local Train");
     if (state.running) {
         ImGui::TextWrapped("Running: %s", state.label.c_str());
         if (ImGui::Button(state.stop_requested ? "Force Kill" : "Stop Training")) {
@@ -193,17 +163,20 @@ void draw_local_train_activity_section(const LocalTrainSessionState& state,
     if (state.running || !state.output_tail.empty()) {
         ImGui::Spacing();
         draw_with_optional_font(compact_font, [&state]() {
-            draw_output_console("activity_train_output_tail",
-                                state.output_tail,
-                                state.running ? 140.0f : 96.0f,
-                                state.running,
-                                "Waiting for local train output...");
+            draw_console_tile("activity_train_output_tile",
+                              state.running ? "Live Output" : "Recent Output",
+                              [&state]() {
+                                  draw_output_console("activity_train_output_tail",
+                                                      state.output_tail,
+                                                      state.running ? 140.0f : 96.0f,
+                                                      state.running,
+                                                      "Waiting for local train output...");
+                              });
         });
     }
 }
 
-void draw_job_activity_section(const JobActivityViewModel& view_model, ImFont* compact_font) {
-    draw_section_heading("Job State");
+void draw_job_activity_content(const JobActivityViewModel& view_model, ImFont* compact_font) {
     if (view_model.running) {
         ImGui::TextWrapped("Running: %.*s",
                            static_cast<int>(view_model.label.size()),
@@ -227,11 +200,15 @@ void draw_job_activity_section(const JobActivityViewModel& view_model, ImFont* c
     if (view_model.running || !view_model.output_tail.empty()) {
         ImGui::Spacing();
         draw_with_optional_font(compact_font, [&view_model]() {
-            draw_output_console("activity_job_output_tail",
-                                view_model.output_tail,
-                                180.0f,
-                                view_model.running,
-                                "Waiting for job output...");
+            draw_console_tile("activity_job_output_tile",
+                              view_model.running ? "Live Output" : "Recent Output",
+                              [&view_model]() {
+                                  draw_output_console("activity_job_output_tail",
+                                                      view_model.output_tail,
+                                                      180.0f,
+                                                      view_model.running,
+                                                      "Waiting for job output...");
+                              });
         });
     }
     if (!view_model.last_error.empty()) {
@@ -250,8 +227,7 @@ void draw_job_activity_section(const JobActivityViewModel& view_model, ImFont* c
     }
 }
 
-void draw_annotate_activity_section(const AnnotateActivityViewModel& view_model, ImFont* compact_font) {
-    draw_section_heading("Annotate");
+void draw_annotate_activity_content(const AnnotateActivityViewModel& view_model, ImFont* compact_font) {
     if (view_model.has_frame) {
         draw_with_optional_font(compact_font, [&view_model]() {
             ImGui::TextWrapped("Frame: %.*s",
@@ -282,76 +258,157 @@ void draw_annotate_activity_section(const AnnotateActivityViewModel& view_model,
     }
 }
 
-void draw_live_predict_activity_section(const LivePredictActivityViewModel& view_model, ImFont* compact_font) {
-    if (view_model.show_running_section) {
-        draw_section_heading("Live Predict");
-        ImGui::Text("Controller: %s", view_model.controller_running ? "running" : "stopped");
-        ImGui::Text("Analyzer: %s",
-                    view_model.analyzer_model_hot ? "hot"
-                    : view_model.analyzer_running ? "running"
-                                                  : "idle");
-        ImGui::Text("Frames analyzed/skipped: %llu / %llu",
-                    static_cast<unsigned long long>(view_model.frames_analyzed),
-                    static_cast<unsigned long long>(view_model.frames_skipped));
-        ImGui::Text("Compositor frames: %llu  Last latency: %.3f ms",
-                    static_cast<unsigned long long>(view_model.frames_composited),
-                    view_model.last_latency_ms);
-        if (view_model.analyzer_backend_name.empty()) {
-            ImGui::TextUnformatted("Analyzer backend: n/a");
-        } else {
-            ImGui::TextWrapped("Analyzer backend: %.*s",
-                               static_cast<int>(view_model.analyzer_backend_name.size()),
-                               view_model.analyzer_backend_name.data());
-        }
-        if (view_model.preview_has_frame) {
-            ImGui::Text("Preview frame: %llu",
-                        static_cast<unsigned long long>(view_model.preview_frame_id));
-        }
-        if (!view_model.last_error.empty()) {
-            ImGui::Spacing();
-            draw_banner("live_predict_error_banner",
-                        kBannerBackgroundColor,
-                        kBannerTextColor,
-                        view_model.last_error);
-        } else if (!view_model.start_error.empty()) {
-            ImGui::Spacing();
-            draw_banner("live_predict_start_error_banner",
-                        kBannerBackgroundColor,
-                        kBannerTextColor,
-                        view_model.start_error);
-        } else if (!view_model.action_error.empty()) {
-            ImGui::Spacing();
-            draw_banner("live_predict_action_activity_error_banner",
-                        kBannerBackgroundColor,
-                        kBannerTextColor,
-                        view_model.action_error);
-        } else if (!view_model.preview_error.empty()) {
-            ImGui::Spacing();
-            draw_banner("live_preview_activity_error_banner",
-                        kBannerBackgroundColor,
-                        kBannerTextColor,
-                        view_model.preview_error);
-        }
-    } else if (view_model.show_static_preview) {
-        draw_section_heading("Preview");
-        draw_with_optional_font(compact_font, [&view_model]() {
-            ImGui::TextWrapped("Source: %.*s",
-                               static_cast<int>(view_model.static_preview_source_name.size()),
-                               view_model.static_preview_source_name.data());
-        });
-        ImGui::Text("Frame: %llu",
-                    static_cast<unsigned long long>(view_model.preview_frame_id));
-        ImGui::Text("Image: %u x %u",
-                    view_model.preview_width,
-                    view_model.preview_height);
+void draw_live_predict_running_content(const LivePredictActivityViewModel& view_model) {
+    ImGui::Text("Controller: %s", view_model.controller_running ? "running" : "stopped");
+    ImGui::Text("Analyzer: %s",
+                view_model.analyzer_model_hot ? "hot"
+                : view_model.analyzer_running ? "running"
+                                              : "idle");
+    ImGui::Text("Frames analyzed/skipped: %llu / %llu",
+                static_cast<unsigned long long>(view_model.frames_analyzed),
+                static_cast<unsigned long long>(view_model.frames_skipped));
+    ImGui::Text("Compositor frames: %llu  Last latency: %.3f ms",
+                static_cast<unsigned long long>(view_model.frames_composited),
+                view_model.last_latency_ms);
+    if (view_model.analyzer_backend_name.empty()) {
+        ImGui::TextUnformatted("Analyzer backend: n/a");
+    } else {
+        ImGui::TextWrapped("Analyzer backend: %.*s",
+                           static_cast<int>(view_model.analyzer_backend_name.size()),
+                           view_model.analyzer_backend_name.data());
     }
-
-    if (view_model.show_idle_start_error) {
-        draw_section_heading("Live Predict");
+    if (view_model.preview_has_frame) {
+        ImGui::Text("Preview frame: %llu",
+                    static_cast<unsigned long long>(view_model.preview_frame_id));
+    }
+    if (!view_model.last_error.empty()) {
+        ImGui::Spacing();
+        draw_banner("live_predict_error_banner",
+                    kBannerBackgroundColor,
+                    kBannerTextColor,
+                    view_model.last_error);
+    } else if (!view_model.start_error.empty()) {
+        ImGui::Spacing();
         draw_banner("live_predict_start_error_banner",
                     kBannerBackgroundColor,
                     kBannerTextColor,
                     view_model.start_error);
+    } else if (!view_model.action_error.empty()) {
+        ImGui::Spacing();
+        draw_banner("live_predict_action_activity_error_banner",
+                    kBannerBackgroundColor,
+                    kBannerTextColor,
+                    view_model.action_error);
+    } else if (!view_model.preview_error.empty()) {
+        ImGui::Spacing();
+        draw_banner("live_preview_activity_error_banner",
+                    kBannerBackgroundColor,
+                    kBannerTextColor,
+                    view_model.preview_error);
+    }
+}
+
+void draw_live_predict_preview_content(const LivePredictActivityViewModel& view_model,
+                                       ImFont* compact_font) {
+    draw_with_optional_font(compact_font, [&view_model]() {
+        ImGui::TextWrapped("Source: %.*s",
+                           static_cast<int>(view_model.static_preview_source_name.size()),
+                           view_model.static_preview_source_name.data());
+    });
+    ImGui::Text("Frame: %llu",
+                static_cast<unsigned long long>(view_model.preview_frame_id));
+    ImGui::Text("Image: %u x %u",
+                view_model.preview_width,
+                view_model.preview_height);
+}
+
+} // namespace
+
+void draw_output_console(const char* id,
+                         const std::string_view output_tail,
+                         const float height,
+                         const bool running,
+                         const char* waiting_message) {
+    ImGui::BeginChild(id, ImVec2(0.0f, height), true);
+    const bool stick_to_bottom = ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 8.0f;
+    ImGui::PushTextWrapPos();
+    if (current_ui_fonts().mono != nullptr) {
+        ImGui::PushFont(current_ui_fonts().mono);
+    }
+    if (output_tail.empty()) {
+        ImGui::TextUnformatted(waiting_message);
+    } else {
+        ImGui::TextUnformatted(output_tail.data(), output_tail.data() + output_tail.size());
+    }
+    if (current_ui_fonts().mono != nullptr) {
+        ImGui::PopFont();
+    }
+    if (running && stick_to_bottom) {
+        ImGui::SetScrollHereY(1.0f);
+    }
+    ImGui::PopTextWrapPos();
+    ImGui::EndChild();
+}
+
+void draw_activity_sidebar_tiles(const ActivitySidebarTilesViewModel& view_model,
+                                 const ActivitySidebarTileActions& actions) {
+    draw_training_activity_section(view_model.training);
+    if (view_model.local_train != nullptr) {
+        draw_local_train_activity_section(*view_model.local_train,
+                                          actions.request_stop_local_training,
+                                          actions.compact_font);
+    }
+    draw_job_activity_section(view_model.job, actions.compact_font);
+    if (view_model.show_annotate) {
+        draw_annotate_activity_section(view_model.annotate, actions.compact_font);
+    }
+    draw_live_predict_activity_section(view_model.live_predict, actions.compact_font);
+}
+
+void draw_training_activity_section(const TrainingActivityViewModel& view_model) {
+    draw_section_tile("training_activity_tile", "Training", [&view_model]() {
+        draw_training_activity_content(view_model);
+    });
+}
+
+void draw_local_train_activity_section(const LocalTrainSessionState& state,
+                                       const std::function<void(bool)>& request_stop_local_training,
+                                       ImFont* compact_font) {
+    draw_section_tile("local_train_activity_tile", "Local Train", [&]() {
+        draw_local_train_activity_content(state, request_stop_local_training, compact_font);
+    });
+}
+
+void draw_job_activity_section(const JobActivityViewModel& view_model, ImFont* compact_font) {
+    draw_section_tile("job_activity_tile", "Job State", [&]() {
+        draw_job_activity_content(view_model, compact_font);
+    });
+}
+
+void draw_annotate_activity_section(const AnnotateActivityViewModel& view_model, ImFont* compact_font) {
+    draw_section_tile("annotate_activity_tile", "Annotate", [&]() {
+        draw_annotate_activity_content(view_model, compact_font);
+    });
+}
+
+void draw_live_predict_activity_section(const LivePredictActivityViewModel& view_model, ImFont* compact_font) {
+    if (view_model.show_running_section) {
+        draw_section_tile("live_predict_activity_tile", "Live Predict", [&]() {
+            draw_live_predict_running_content(view_model);
+        });
+    } else if (view_model.show_static_preview) {
+        draw_section_tile("live_predict_preview_tile", "Preview", [&]() {
+            draw_live_predict_preview_content(view_model, compact_font);
+        });
+    }
+
+    if (view_model.show_idle_start_error) {
+        draw_banner_tile("live_predict_start_error_tile", "Live Predict", [&]() {
+            draw_banner("live_predict_start_error_banner",
+                        kBannerBackgroundColor,
+                        kBannerTextColor,
+                        view_model.start_error);
+        });
     }
 }
 

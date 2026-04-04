@@ -1,3 +1,5 @@
+#include "rfdetr/cuda/cuda_launch_common.h"
+
 #include <torch/torch.h>
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -94,8 +96,8 @@ torch::Tensor box_iou_cuda(const torch::Tensor& boxes1, const torch::Tensor& box
     int M = boxes2.size(0);
     auto iou = torch::empty({N, M}, boxes1.options());
 
-    int threads = 256;
-    int blocks = (N * M + threads - 1) / threads;
+    const int threads = cuda_launch::kDefaultLinearThreads;
+    const int blocks = cuda_launch::linear_blocks_for(N * M, threads);
 
     AT_DISPATCH_FLOATING_TYPES(boxes1.scalar_type(), "box_iou_cuda", ([&] {
         box_iou_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
@@ -114,8 +116,8 @@ torch::Tensor generalized_box_iou_cuda(const torch::Tensor& boxes1, const torch:
     int M = boxes2.size(0);
     auto giou = torch::empty({N, M}, boxes1.options());
 
-    int threads = 256;
-    int blocks = (N * M + threads - 1) / threads;
+    const int threads = cuda_launch::kDefaultLinearThreads;
+    const int blocks = cuda_launch::linear_blocks_for(N * M, threads);
 
     AT_DISPATCH_FLOATING_TYPES(boxes1.scalar_type(), "generalized_box_iou_cuda", ([&] {
         generalized_box_iou_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getCurrentCUDAStream()>>>(

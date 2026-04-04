@@ -19,6 +19,7 @@ public:
     [[nodiscard]] virtual const ModelInfo& info() const = 0;
     virtual OutputTensors run(const torch::Tensor& normalized_input) = 0;
     [[nodiscard]] virtual void* stream() const = 0;
+    [[nodiscard]] virtual std::vector<std::unique_ptr<InferenceBackend>> make_lanes(int count) const = 0;
     virtual void save_engine(const std::filesystem::path& path);
 };
 

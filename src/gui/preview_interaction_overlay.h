@@ -1,12 +1,12 @@
 #pragma once
 
 #include "annotation_core.h"
+#include "cuda_gl_interop_surface_core.h"
 #include "live/live_helpers.h"
 #include "mmltk/live/live_types.h"
 
 #include <cuda.h>
 
-#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
@@ -18,15 +18,6 @@
 #include <thread>
 #include <type_traits>
 #include <vector>
-
-#ifndef GL_GLEXT_PROTOTYPES
-#define GL_GLEXT_PROTOTYPES
-#endif
-#include <GL/gl.h>
-#include <GL/glext.h>
-#include <cuda_gl_interop.h>
-#include <cuda_runtime_api.h>
-#include <imgui.h>
 
 struct GLFWwindow;
 
@@ -178,16 +169,8 @@ private:
     int worker_cuda_device_index_ = -1;
 
     std::optional<PendingUpload> pending_upload_;
-    std::array<GLuint, 2> textures_{0U, 0U};
-    int front_texture_index_ = 0;
-    int back_texture_index_ = 1;
-    GLuint pixel_buffer_ = 0U;
-    cudaGraphicsResource_t graphics_resource_ = nullptr;
-    cudaStream_t upload_stream_ = nullptr;
-    cudaEvent_t upload_complete_event_ = nullptr;
-    int upload_cuda_device_index_ = -1;
-    std::uint32_t texture_width_ = 0;
-    std::uint32_t texture_height_ = 0;
+    CudaGlInteropSurfaceCore interop_core_{
+        CudaGlInteropSurfaceConfig{GL_RGBA8, GL_RGBA, 4U, "interaction overlay dimensions must be non-zero"}};
     mmltk::live::PinnedUploadBuffer<int> host_points_upload_;
     mmltk::live::DeviceUploadBuffer<int> device_points_upload_;
     mmltk::live::PinnedUploadBuffer<std::uint32_t> host_edges_upload_;

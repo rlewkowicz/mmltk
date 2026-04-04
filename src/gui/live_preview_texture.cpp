@@ -1,7 +1,6 @@
 #include "live_preview_texture.h"
 
 #include "cuda_gl_interop_utils.h"
-#include "cuda_priority.h"
 #include "mmltk/live/live_session_controller.h"
 #include "mmltk_logging.h"
 
@@ -14,8 +13,6 @@
 namespace mmltk::gui {
 
 namespace {
-
-constexpr std::size_t kBgr3BytesPerPixel = 3U;
 
 void release_controller_output_silently(mmltk::live::LiveSessionController& controller,
                                         const std::uint32_t slot_index) {
@@ -75,18 +72,7 @@ void LivePreviewTexture::shutdown() {
     destroy_gl_resources();
 
     std::lock_guard<std::mutex> lock(mutex_);
-    state_ = {};
-    initialized_ = false;
-    live_source_kind_ = LiveSourceKind::None;
-    live_controller_ = nullptr;
-    live_cuda_device_index_ = 0;
-    host_frame_generation_ = 1;
-    pending_host_frame_.reset();
-    pending_live_frame_.reset();
-    width_ = 0;
-    height_ = 0;
-    front_texture_index_ = 0;
-    back_texture_index_ = 1;
+    reset_runtime_state_locked();
 }
 
 void LivePreviewTexture::begin_live_stream(mmltk::live::LiveSessionController& controller,
@@ -94,10 +80,9 @@ void LivePreviewTexture::begin_live_stream(mmltk::live::LiveSessionController& c
     end_live_stream();
 #if MMLTK_RFDETR_LIVE_CAPTURE
     std::lock_guard<std::mutex> lock(mutex_);
+    reset_live_stream_state_locked();
     state_.last_error.clear();
     state_.interop_failed = false;
-    ++host_frame_generation_;
-    pending_host_frame_.reset();
     live_source_kind_ = LiveSourceKind::ControllerOutput;
     live_controller_ = &controller;
     live_cuda_device_index_ = cuda_device_index;
@@ -112,26 +97,16 @@ void LivePreviewTexture::end_live_stream() {
     std::optional<PendingLiveFrame> pending_live_frame;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        ++host_frame_generation_;
-        live_source_kind_ = LiveSourceKind::None;
-        live_controller_ = nullptr;
-        pending_host_frame_.reset();
-        if (pending_live_frame_.has_value()) {
-            pending_live_frame = *pending_live_frame_;
-            pending_live_frame_.reset();
-        }
+        reset_live_stream_state_locked();
+        pending_live_frame = take_pending_live_frame_locked();
     }
 
     if (!pending_live_frame.has_value()) {
         return;
     }
 
-    if (current_cuda_device_index_ >= 0) {
-        (void)cudaSetDevice(current_cuda_device_index_);
-    }
-    if (stream_ != nullptr) {
-        (void)cudaStreamSynchronize(stream_);
-    }
+    (void)interop_core_.set_cuda_device(nullptr);
+    interop_core_.synchronize_stream();
     release_pending_live_frame_silently(*pending_live_frame);
 }
 
@@ -274,16 +249,18 @@ bool LivePreviewTexture::submit_host_bgr(std::vector<std::uint8_t> pixels,
 }
 
 void LivePreviewTexture::clear_frame() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    ++host_frame_generation_;
-    pending_host_frame_.reset();
-    state_.has_frame = false;
-    state_.displayed_region = {};
-    state_.last_frame_id = 0;
-    state_.live_frame_id.reset();
-    state_.texture_id = {};
-    state_.last_error.clear();
-    state_.interop_failed = false;
+    std::optional<PendingLiveFrame> pending_live_frame;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++host_frame_generation_;
+        pending_host_frame_.reset();
+        pending_live_frame = take_pending_live_frame_locked();
+        reset_frame_state_locked();
+    }
+    if (!pending_live_frame.has_value()) {
+        return;
+    }
+    release_pending_live_frame_silently(*pending_live_frame);
 }
 
 LivePreviewTextureState LivePreviewTexture::snapshot() const {
@@ -300,137 +277,70 @@ ImVec2 LivePreviewTexture::uv1() {
 }
 
 bool LivePreviewTexture::initialize_gl_resources(std::string* error_message) {
-    destroy_gl_resources();
-    initialize_gui_texture_pair(textures_);
-
-    if (error_message != nullptr) {
-        error_message->clear();
-    }
-    return true;
+    return interop_core_.initialize(error_message);
 }
 
 void LivePreviewTexture::destroy_gl_resources() {
-    destroy_gui_texture_pair(textures_);
+    interop_core_.shutdown();
 }
 
 bool LivePreviewTexture::ensure_texture_storage(const std::uint32_t width,
                                                 const std::uint32_t height,
                                                 std::string* error_message) {
-    return ensure_gui_texture_storage(textures_,
-                                      width,
-                                      height,
-                                      GL_RGB8,
-                                      GL_RGB,
-                                      "preview dimensions must be non-zero",
-                                      width_,
-                                      height_,
-                                      error_message);
+    return interop_core_.ensure_texture_storage(width, height, error_message);
 }
 
 bool LivePreviewTexture::ensure_live_resources(const std::uint32_t width,
                                                const std::uint32_t height,
                                                const int cuda_device_index,
                                                std::string* error_message) {
-    const bool storage_changed = width_ != width || height_ != height;
-    if (current_cuda_device_index_ >= 0 && current_cuda_device_index_ != cuda_device_index) {
-        destroy_live_resources();
-    }
-
-    if (!ensure_texture_storage(width, height, error_message)) {
-        return false;
-    }
-
-    cudaError_t cuda_status = cudaSetDevice(cuda_device_index);
-    if (cuda_status != cudaSuccess) {
-        if (error_message != nullptr) {
-            *error_message = cuda_gl_interop_error_message(cuda_status, "cudaSetDevice");
-        }
-        return false;
-    }
-
-    if (stream_ == nullptr) {
-        cuda_status = mmltk::cuda_stream_create_with_highest_priority(&stream_, cudaStreamNonBlocking);
-        if (cuda_status != cudaSuccess) {
-            if (error_message != nullptr) {
-                *error_message = cuda_gl_interop_error_message(cuda_status, "cudaStreamCreateWithPriority");
-            }
-            return false;
-        }
-    }
-
-    if (copy_complete_event_ == nullptr) {
-        cuda_status = cudaEventCreateWithFlags(&copy_complete_event_, cudaEventDisableTiming);
-        if (cuda_status != cudaSuccess) {
-            if (error_message != nullptr) {
-                *error_message = cuda_gl_interop_error_message(cuda_status, "cudaEventCreateWithFlags");
-            }
-            return false;
-        }
-    }
-
-    if (pixel_buffer_ == 0U) {
-        glGenBuffers(1, &pixel_buffer_);
-    }
-
-    if (graphics_resource_ != nullptr && storage_changed) {
-        cuda_status = cudaGraphicsUnregisterResource(graphics_resource_);
-        if (cuda_status != cudaSuccess) {
-            if (error_message != nullptr) {
-                *error_message = cuda_gl_interop_error_message(cuda_status, "cudaGraphicsUnregisterResource");
-            }
-            return false;
-        }
-        graphics_resource_ = nullptr;
-    }
-
-    if (graphics_resource_ == nullptr) {
-        const std::size_t required_bytes =
-            static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * kBgr3BytesPerPixel;
-        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pixel_buffer_);
-        glBufferData(GL_PIXEL_UNPACK_BUFFER, static_cast<GLsizeiptr>(required_bytes), nullptr, GL_STREAM_DRAW);
-        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-
-        cuda_status =
-            cudaGraphicsGLRegisterBuffer(&graphics_resource_, pixel_buffer_, cudaGraphicsRegisterFlagsWriteDiscard);
-        if (cuda_status != cudaSuccess) {
-            if (error_message != nullptr) {
-                *error_message = cuda_gl_interop_error_message(cuda_status, "cudaGraphicsGLRegisterBuffer");
-            }
-            return false;
-        }
-    }
-
-    current_cuda_device_index_ = cuda_device_index;
-    if (error_message != nullptr) {
-        error_message->clear();
-    }
-    return true;
+    return interop_core_.ensure_upload_resources(width,
+                                                 height,
+                                                 cuda_device_index,
+                                                 error_message);
 }
 
 void LivePreviewTexture::destroy_live_resources() {
-    if (current_cuda_device_index_ >= 0) {
-        (void)cudaSetDevice(current_cuda_device_index_);
+    interop_core_.reset_upload_resources();
+}
+
+std::optional<LivePreviewTexture::PendingLiveFrame>
+LivePreviewTexture::take_pending_live_frame_locked() noexcept {
+    if (!pending_live_frame_.has_value()) {
+        return std::nullopt;
     }
-    if (stream_ != nullptr) {
-        (void)cudaStreamSynchronize(stream_);
-    }
-    if (graphics_resource_ != nullptr) {
-        (void)cudaGraphicsUnregisterResource(graphics_resource_);
-        graphics_resource_ = nullptr;
-    }
-    if (copy_complete_event_ != nullptr) {
-        (void)cudaEventDestroy(copy_complete_event_);
-        copy_complete_event_ = nullptr;
-    }
-    if (stream_ != nullptr) {
-        (void)cudaStreamDestroy(stream_);
-        stream_ = nullptr;
-    }
-    if (pixel_buffer_ != 0U) {
-        glDeleteBuffers(1, &pixel_buffer_);
-        pixel_buffer_ = 0U;
-    }
-    current_cuda_device_index_ = -1;
+    std::optional<PendingLiveFrame> pending_live_frame = pending_live_frame_;
+    pending_live_frame_.reset();
+    return pending_live_frame;
+}
+
+void LivePreviewTexture::reset_live_stream_state_locked() noexcept {
+    ++host_frame_generation_;
+    live_source_kind_ = LiveSourceKind::None;
+    live_controller_ = nullptr;
+    live_cuda_device_index_ = 0;
+    pending_host_frame_.reset();
+}
+
+void LivePreviewTexture::reset_frame_state_locked() noexcept {
+    state_.has_frame = false;
+    state_.displayed_region = {};
+    state_.last_frame_id = 0;
+    state_.live_frame_id.reset();
+    state_.texture_id = {};
+    state_.last_error.clear();
+    state_.interop_failed = false;
+}
+
+void LivePreviewTexture::reset_runtime_state_locked() noexcept {
+    state_ = {};
+    initialized_ = false;
+    live_source_kind_ = LiveSourceKind::None;
+    live_controller_ = nullptr;
+    live_cuda_device_index_ = 0;
+    host_frame_generation_ = 1;
+    pending_host_frame_.reset();
+    pending_live_frame_.reset();
 }
 
 bool LivePreviewTexture::stage_live_preview_copy(const CUdeviceptr source_data,
@@ -464,39 +374,36 @@ bool LivePreviewTexture::stage_live_preview_copy(const CUdeviceptr source_data,
         release_pending_live_frame_silently(pending_frame);
         return false;
     }
-
-    if (current_cuda_device_index_ >= 0) {
-        const cudaError_t set_device_status = cudaSetDevice(current_cuda_device_index_);
-        if (set_device_status != cudaSuccess) {
-            release_pending_live_frame_silently(pending_frame);
-            if (error_message != nullptr) {
-                *error_message = cuda_gl_interop_error_message(set_device_status, "cudaSetDevice");
-            }
-            return false;
-        }
+    if (!interop_core_.set_cuda_device(error_message)) {
+        release_pending_live_frame_silently(pending_frame);
+        return false;
     }
 
     cudaError_t cuda_status = cudaSuccess;
     const char* failed_cuda_label = nullptr;
     if (ready_event != nullptr) {
         failed_cuda_label = "cudaStreamWaitEvent";
-        cuda_status = cudaStreamWaitEvent(stream_, ready_event, 0);
+        cuda_status = cudaStreamWaitEvent(interop_core_.stream(), ready_event, 0);
     }
 
     bool mapped = false;
     void* pixel_buffer_ptr = nullptr;
-    std::size_t mapped_size = 0;
+    std::size_t mapped_size = 0U;
     if (cuda_status == cudaSuccess) {
         failed_cuda_label = "cudaGraphicsMapResources";
-        cuda_status = cudaGraphicsMapResources(1, &graphics_resource_, stream_);
+        cuda_status =
+            cudaGraphicsMapResources(1, interop_core_.graphics_resource_ptr(), interop_core_.stream());
         mapped = cuda_status == cudaSuccess;
     }
     if (cuda_status == cudaSuccess) {
         failed_cuda_label = "cudaGraphicsResourceGetMappedPointer";
-        cuda_status = cudaGraphicsResourceGetMappedPointer(&pixel_buffer_ptr, &mapped_size, graphics_resource_);
+        cuda_status = cudaGraphicsResourceGetMappedPointer(
+            &pixel_buffer_ptr,
+            &mapped_size,
+            interop_core_.graphics_resource());
     }
 
-    const std::size_t copy_width_bytes = static_cast<std::size_t>(width) * kBgr3BytesPerPixel;
+    const std::size_t copy_width_bytes = static_cast<std::size_t>(width) * 3U;
     const auto copy_height = static_cast<std::size_t>(height);
     const std::size_t required_bytes = copy_width_bytes * copy_height;
     if (cuda_status == cudaSuccess && mapped_size < required_bytes) {
@@ -512,11 +419,14 @@ bool LivePreviewTexture::stage_live_preview_copy(const CUdeviceptr source_data,
                                         copy_width_bytes,
                                         copy_height,
                                         cudaMemcpyDeviceToDevice,
-                                        stream_);
+                                        interop_core_.stream());
     }
 
     const cudaError_t unmap_status =
-        mapped ? cudaGraphicsUnmapResources(1, &graphics_resource_, stream_) : cudaSuccess;
+        mapped ? cudaGraphicsUnmapResources(1,
+                                            interop_core_.graphics_resource_ptr(),
+                                            interop_core_.stream())
+               : cudaSuccess;
 
     if (cuda_status != cudaSuccess) {
         release_pending_live_frame_silently(pending_frame);
@@ -533,7 +443,8 @@ bool LivePreviewTexture::stage_live_preview_copy(const CUdeviceptr source_data,
         return false;
     }
 
-    cuda_status = cudaEventRecord(copy_complete_event_, stream_);
+    cuda_status = cudaEventRecord(interop_core_.completion_event(),
+                                  interop_core_.stream());
     if (cuda_status != cudaSuccess) {
         release_pending_live_frame_silently(pending_frame);
         if (error_message != nullptr) {
@@ -562,20 +473,14 @@ bool LivePreviewTexture::finalize_live_preview_copy(std::string* error_message) 
             }
             return true;
         }
-        pending_live_frame = pending_live_frame_;
+        pending_live_frame = *pending_live_frame_;
     }
 
-    if (current_cuda_device_index_ >= 0) {
-        const cudaError_t set_device_status = cudaSetDevice(current_cuda_device_index_);
-        if (set_device_status != cudaSuccess) {
-            if (error_message != nullptr) {
-                *error_message = cuda_gl_interop_error_message(set_device_status, "cudaSetDevice");
-            }
-            return false;
-        }
+    if (!interop_core_.set_cuda_device(error_message)) {
+        return false;
     }
 
-    const cudaError_t query_status = cudaEventQuery(copy_complete_event_);
+    const cudaError_t query_status = cudaEventQuery(interop_core_.completion_event());
     if (query_status == cudaErrorNotReady) {
         if (error_message != nullptr) {
             error_message->clear();
@@ -586,8 +491,7 @@ bool LivePreviewTexture::finalize_live_preview_copy(std::string* error_message) 
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (pending_live_frame_.has_value()) {
-                pending_live_frame = *pending_live_frame_;
-                pending_live_frame_.reset();
+                pending_live_frame = take_pending_live_frame_locked();
             }
         }
         if (pending_live_frame.has_value()) {
@@ -602,8 +506,7 @@ bool LivePreviewTexture::finalize_live_preview_copy(std::string* error_message) 
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (pending_live_frame_.has_value()) {
-            pending_live_frame = *pending_live_frame_;
-            pending_live_frame_.reset();
+            pending_live_frame = take_pending_live_frame_locked();
         }
     }
     if (!pending_live_frame.has_value()) {
@@ -613,21 +516,13 @@ bool LivePreviewTexture::finalize_live_preview_copy(std::string* error_message) 
         return true;
     }
 
-    glBindTexture(GL_TEXTURE_2D, textures_[back_texture_index_]);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pixel_buffer_);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexSubImage2D(GL_TEXTURE_2D,
-                    0,
-                    0,
-                    0,
-                    static_cast<GLsizei>(pending_live_frame->width),
-                    static_cast<GLsizei>(pending_live_frame->height),
-                    GL_BGR,
-                    GL_UNSIGNED_BYTE,
-                    nullptr);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-    glBindTexture(GL_TEXTURE_2D, 0);
-    glFlush();
+    if (!interop_core_.update_back_texture_from_pixel_buffer(
+            pending_live_frame->width,
+            pending_live_frame->height,
+            error_message)) {
+        release_pending_live_frame_silently(*pending_live_frame);
+        return false;
+    }
 
     release_pending_live_frame_silently(*pending_live_frame);
 
@@ -655,11 +550,11 @@ void LivePreviewTexture::publish_ready_texture(const std::uint32_t width,
                                                const mmltk::live::LiveCaptureRegion& region,
                                                const std::uint64_t frame_id,
                                                std::optional<mmltk::live::LiveFrameId> live_frame_id) {
-    std::swap(front_texture_index_, back_texture_index_);
+    interop_core_.swap_ready_texture();
 
     std::lock_guard<std::mutex> lock(mutex_);
     state_.has_frame = true;
-    state_.texture_id = imgui_texture_id_from_gl_name(textures_[front_texture_index_]);
+    state_.texture_id = interop_core_.front_texture_id();
     state_.displayed_region = region;
     state_.last_frame_id = frame_id;
     state_.live_frame_id = live_frame_id;
@@ -694,7 +589,7 @@ bool LivePreviewTexture::upload_host_preview(const PendingHostFrame& frame, std:
         return false;
     }
 
-    glBindTexture(GL_TEXTURE_2D, textures_[back_texture_index_]);
+    glBindTexture(GL_TEXTURE_2D, interop_core_.back_texture());
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
     glTexSubImage2D(GL_TEXTURE_2D,
                     0,

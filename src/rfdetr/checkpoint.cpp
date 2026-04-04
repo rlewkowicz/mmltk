@@ -2,6 +2,7 @@
 
 #include "mmltk/rfdetr/model_config.h"
 #include "profile_utils.h"
+#include "rfdetr/archive_utils.h"
 #include "rfdetr/checkpoint_internal.h"
 #include "rfdetr/python_checkpoint_bridge.h"
 
@@ -11,10 +12,8 @@
 #include <cstdint>
 #include <algorithm>
 #include <filesystem>
-#include <iomanip>
 #include <mutex>
 #include <optional>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -23,107 +22,6 @@
 namespace mmltk::rfdetr {
 
 namespace {
-
-std::string archive_entry_name(size_t index) {
-    std::ostringstream stream;
-    stream << "entry_" << std::setw(6) << std::setfill('0') << index;
-    return stream.str();
-}
-
-std::optional<std::string> read_optional_string(torch::serialize::InputArchive& archive, const char* key) {
-    c10::IValue value;
-    if (!archive.try_read(key, value)) {
-        return std::nullopt;
-    }
-    if (!value.isString()) {
-        throw std::runtime_error(std::string("RF-DETR checkpoint metadata key is not a string: ") + key);
-    }
-    return value.toStringRef();
-}
-
-std::optional<int64_t> read_optional_int(torch::serialize::InputArchive& archive, const char* key) {
-    c10::IValue value;
-    if (!archive.try_read(key, value)) {
-        return std::nullopt;
-    }
-    if (!value.isInt()) {
-        throw std::runtime_error(std::string("RF-DETR checkpoint metadata key is not an int: ") + key);
-    }
-    return value.toInt();
-}
-
-std::optional<bool> read_optional_bool(torch::serialize::InputArchive& archive, const char* key) {
-    c10::IValue value;
-    if (!archive.try_read(key, value)) {
-        return std::nullopt;
-    }
-    if (!value.isBool()) {
-        throw std::runtime_error(std::string("RF-DETR checkpoint metadata key is not a bool: ") + key);
-    }
-    return value.toBool();
-}
-
-std::optional<double> read_optional_double(torch::serialize::InputArchive& archive, const char* key) {
-    c10::IValue value;
-    if (!archive.try_read(key, value)) {
-        return std::nullopt;
-    }
-    if (!value.isDouble() && !value.isInt()) {
-        throw std::runtime_error(std::string("RF-DETR checkpoint metadata key is not numeric: ") + key);
-    }
-    return value.isDouble() ? value.toDouble() : static_cast<double>(value.toInt());
-}
-
-std::string require_string(torch::serialize::InputArchive& archive, const char* key) {
-    const auto value = read_optional_string(archive, key);
-    if (!value.has_value()) {
-        throw std::runtime_error(std::string("RF-DETR checkpoint is missing metadata key: ") + key);
-    }
-    return *value;
-}
-
-int64_t require_int(torch::serialize::InputArchive& archive, const char* key) {
-    c10::IValue value;
-    archive.read(key, value);
-    if (!value.isInt()) {
-        throw std::runtime_error(std::string("RF-DETR checkpoint metadata key is not an int: ") + key);
-    }
-    return value.toInt();
-}
-
-void write_string(torch::serialize::OutputArchive& archive, const char* key, std::string_view value) {
-    archive.write(key, c10::IValue(std::string(value)));
-}
-
-void write_int(torch::serialize::OutputArchive& archive, const char* key, int64_t value) {
-    archive.write(key, c10::IValue(value));
-}
-
-void write_bool(torch::serialize::OutputArchive& archive, const char* key, bool value) {
-    archive.write(key, c10::IValue(value));
-}
-
-void write_double(torch::serialize::OutputArchive& archive, const char* key, double value) {
-    archive.write(key, c10::IValue(value));
-}
-
-void write_optional_bool(torch::serialize::OutputArchive& archive, const char* key, const std::optional<bool>& value) {
-    if (value.has_value()) {
-        write_bool(archive, key, *value);
-    }
-}
-
-void write_optional_int(torch::serialize::OutputArchive& archive, const char* key, const std::optional<int64_t>& value) {
-    if (value.has_value()) {
-        write_int(archive, key, *value);
-    }
-}
-
-void write_optional_double(torch::serialize::OutputArchive& archive, const char* key, const std::optional<double>& value) {
-    if (value.has_value()) {
-        write_double(archive, key, *value);
-    }
-}
 
 void write_metadata(torch::serialize::OutputArchive& archive, const NativeCheckpointMetadata& metadata) {
     write_string(archive, "format", kNativeCheckpointFormat);
@@ -355,9 +253,9 @@ StateDictLoadSummary apply_checkpoint_to_module(torch::nn::Module& module,
     }
 
     summary.missing_names.assign(expected_names.begin(), expected_names.end());
-    std::sort(summary.missing_names.begin(), summary.missing_names.end());
-    std::sort(summary.unexpected_names.begin(), summary.unexpected_names.end());
-    std::sort(summary.incompatible_names.begin(), summary.incompatible_names.end());
+    std::ranges::sort(summary.missing_names);
+    std::ranges::sort(summary.unexpected_names);
+    std::ranges::sort(summary.incompatible_names);
 
     if (strict &&
         (!summary.missing_names.empty() || !summary.unexpected_names.empty() || !summary.incompatible_names.empty())) {

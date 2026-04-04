@@ -1,10 +1,10 @@
 #include "mmltk_logging.h"
 
+#include "rfdetr/backends_internal.h"
 #include "runtime_paths.h"
+#include "string_utils.h"
 
-#include <algorithm>
 #include <array>
-#include <cctype>
 #include <cstdlib>
 #include <mutex>
 #include <stdexcept>
@@ -30,17 +30,8 @@ std::vector<spdlog::sink_ptr> g_sinks;
 std::string g_app_name;
 spdlog::level::level_enum g_level = spdlog::level::info;
 
-std::string lower_copy(std::string_view value) {
-    std::string lowered(value);
-    std::transform(lowered.begin(),
-                   lowered.end(),
-                   lowered.begin(),
-                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
-    return lowered;
-}
-
 bool is_known_level_name(std::string_view value) {
-    const std::string lowered = lower_copy(value);
+    const std::string lowered = strings::to_lower(value);
     return lowered == "trace" || lowered == "debug" || lowered == "info" ||
            lowered == "warn" || lowered == "warning" || lowered == "error" ||
            lowered == "err" || lowered == "critical" || lowered == "off";

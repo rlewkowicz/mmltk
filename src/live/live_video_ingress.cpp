@@ -83,7 +83,7 @@ void LiveVideoIngress::start() {
         throw status_error("failed to start live ingress", status);
     }
 
-    session_nonce_ = generate_session_nonce();
+    session_nonce_.store(generate_session_nonce(), std::memory_order_release);
     session_ = std::move(session);
     running_.store(true, std::memory_order_release);
     log_live_ingress_message(
@@ -126,8 +126,9 @@ bool LiveVideoIngress::try_acquire_latest_source(SourceFrameView* out) {
     if (!running()) {
         return false;
     }
-    if (!session_) {
-        throw std::runtime_error("live ingress has no active capture session");
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    if (!session_ || !running_.load(std::memory_order_acquire)) {
+        return false;
     }
 
     frameshow::InferenceFrameView frame{};
@@ -141,7 +142,7 @@ bool LiveVideoIngress::try_acquire_latest_source(SourceFrameView* out) {
 
     *out = SourceFrameView{
         frame.buffer_index,
-        LiveFrameId{session_nonce_, frame.frame_id},
+        LiveFrameId{session_nonce_.load(std::memory_order_acquire), frame.frame_id},
         frame.buffer.data,
         frame.buffer.pitch_bytes,
         frame.buffer.width_px,
@@ -159,6 +160,7 @@ bool LiveVideoIngress::try_acquire_latest_source(SourceFrameView* out) {
 }
 
 void LiveVideoIngress::release_source(std::uint32_t buffer_index) {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
     if (!session_) {
         throw std::runtime_error("live ingress cannot release a source buffer without an active session");
     }
@@ -169,7 +171,9 @@ void LiveVideoIngress::release_source(std::uint32_t buffer_index) {
 }
 
 void LiveVideoIngress::set_capture_region(const LiveCaptureRegion& region) {
-    config_.initial_region = to_frameshow_region(region);
+    const frameshow::CaptureRegion next_region = to_frameshow_region(region);
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    config_.initial_region = next_region;
     if (!session_) {
         return;
     }
@@ -186,6 +190,7 @@ void LiveVideoIngress::set_capture_region(const LiveCaptureRegion& region) {
 }
 
 LiveCaptureRegion LiveVideoIngress::snapshot_capture_region() const {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
     if (session_) {
         return to_live_region(session_->snapshot_capture_region());
     }
@@ -193,10 +198,12 @@ LiveCaptureRegion LiveVideoIngress::snapshot_capture_region() const {
 }
 
 frameshow::CaptureFormatInfo LiveVideoIngress::snapshot_format() const {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
     return session_ ? session_->snapshot_format() : frameshow::CaptureFormatInfo{};
 }
 
 std::string LiveVideoIngress::last_error() const {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
     return session_ ? session_->last_error() : std::string{};
 }
 
@@ -209,7 +216,7 @@ std::uint32_t LiveVideoIngress::max_inflight_sources() const noexcept {
 }
 
 std::uint64_t LiveVideoIngress::session_nonce() const noexcept {
-    return session_nonce_;
+    return session_nonce_.load(std::memory_order_acquire);
 }
 
 } // namespace mmltk::live

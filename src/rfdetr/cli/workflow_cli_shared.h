@@ -2,11 +2,13 @@
 
 #include "CLI11.hpp"
 
+#include "rfdetr/backends_internal.h"
 #include "mmltk/rfdetr/artifacts.h"
 #include "mmltk/rfdetr/checkpoint.h"
 #include "mmltk/rfdetr/model_config.h"
 #include "mmltk/rfdetr/train_types.h"
 #include "mmltk/rfdetr/workflow_requests.h"
+#include "string_utils.h"
 
 #include <algorithm>
 #include <cctype>
@@ -69,13 +71,6 @@ enum class TrainUnsupportedOptionMode : std::uint8_t {
     AllowAll = 0,
     RejectGuiUnsupported = 1,
 };
-
-inline std::string lower_copy(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](const unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
-    });
-    return value;
-}
 
 inline CLI::Option* add_path_option(CLI::App* command,
                                     const std::string& name,
@@ -348,7 +343,7 @@ inline CompilationMode parse_compilation_mode(const std::string& value) {
 }
 
 inline TrainOptimizerKind parse_train_optimizer_kind(std::string value) {
-    value = lower_copy(std::move(value));
+    value = strings::to_lower(std::move(value));
     if (value == "adamw") {
         return TrainOptimizerKind::AdamW;
     }

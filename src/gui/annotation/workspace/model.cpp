@@ -50,8 +50,7 @@ AnnotationWorkspaceViewModel AnnotationWorkspaceModelBuilder::build(
 
     if (model.selection.selected_object_index.has_value()) {
         const auto visible_it =
-            std::find_if(scene.visible_objects.begin(),
-                         scene.visible_objects.end(),
+            std::ranges::find_if(scene.visible_objects,
                          [&](const AnnotationVisibleObject& object) {
                              return object.index == *model.selection.selected_object_index;
                          });

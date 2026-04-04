@@ -1,5 +1,5 @@
 #include "capture_session_impl.hpp"
-#include "rfdetr/live_preprocess.h"
+#include "rfdetr/cuda_utils.h"
 
 #include <algorithm>
 #include <cstring>

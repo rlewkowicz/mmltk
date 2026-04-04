@@ -147,9 +147,12 @@ public:
     }
 };
 
-class MaskPaintTool final : public AnnotationTool {
+class MaskBrushTool final : public AnnotationTool {
 public:
-    [[nodiscard]] AnnotationToolKind kind() const noexcept override { return AnnotationToolKind::MaskPaint; }
+    explicit MaskBrushTool(const AnnotationToolKind tool_kind, const bool erase) noexcept
+        : tool_kind_(tool_kind), erase_(erase) {}
+
+    [[nodiscard]] AnnotationToolKind kind() const noexcept override { return tool_kind_; }
 
     void reset_active_drawing(AnnotationSession& session) override {
         session.clear_transient_state();
@@ -166,37 +169,15 @@ public:
             event.capture_x,
             event.capture_y,
             std::max(1, event.radius),
-            false,
+            erase_,
             context.capture_width,
             context.capture_height,
         });
     }
-};
 
-class MaskEraseTool final : public AnnotationTool {
-public:
-    [[nodiscard]] AnnotationToolKind kind() const noexcept override { return AnnotationToolKind::MaskErase; }
-
-    void reset_active_drawing(AnnotationSession& session) override {
-        session.clear_transient_state();
-    }
-
-    bool handle_brush_sample(const AnnotationToolContext& context,
-                             const AnnotationToolBrushEvent& event) override {
-        const auto& selected_index = context.session.selected_object_index();
-        if (!selected_index.has_value()) {
-            return false;
-        }
-        return context.document.apply(AnnotationPaintMaskCommand{
-            *selected_index,
-            event.capture_x,
-            event.capture_y,
-            std::max(1, event.radius),
-            true,
-            context.capture_width,
-            context.capture_height,
-        });
-    }
+private:
+    AnnotationToolKind tool_kind_;
+    bool erase_;
 };
 
 class MaskFillTool final : public AnnotationTool {
@@ -286,9 +267,9 @@ std::unique_ptr<AnnotationTool> make_annotation_tool(const AnnotationToolKind ki
     case AnnotationToolKind::Box:
         return std::make_unique<BoxTool>();
     case AnnotationToolKind::MaskPaint:
-        return std::make_unique<MaskPaintTool>();
+        return std::make_unique<MaskBrushTool>(AnnotationToolKind::MaskPaint, false);
     case AnnotationToolKind::MaskErase:
-        return std::make_unique<MaskEraseTool>();
+        return std::make_unique<MaskBrushTool>(AnnotationToolKind::MaskErase, true);
     case AnnotationToolKind::MaskFill:
         return std::make_unique<MaskFillTool>();
     case AnnotationToolKind::Spline:

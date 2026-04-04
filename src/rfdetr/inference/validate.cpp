@@ -3,7 +3,7 @@
 
 #include "dataset_compiler.h"
 #include "dataset_loader.h"
-#include "rfdetr/cuda_utils.h"
+#include "rfdetr/torch_cuda_utils.h"
 #include "rfdetr/postprocess.h"
 #include "spdmon/spdmon.hpp"
 #include "rfdetr/inference/backend_factory.h"
@@ -344,25 +344,6 @@ ValidationBackendResult run_backend_eval_impl(const ValidationOptions& options,
     };
 }
 
-json summary_to_json(const EvalSummary& summary) {
-    return json{
-        {"bbox_ap", summary.bbox.ap},
-        {"bbox_ap50", summary.bbox.ap50},
-        {"bbox_ap75", summary.bbox.ap75},
-        {"mask_ap", summary.mask.ap},
-        {"mask_ap50", summary.mask.ap50},
-        {"mask_ap75", summary.mask.ap75},
-    };
-}
-
-json timing_to_json(const PhaseTiming& timing) {
-    return json{
-        {"seconds", timing.seconds},
-        {"images", timing.images},
-        {"img_per_s", timing.img_per_s},
-    };
-}
-
 json result_to_json(const ValidationOptions& options, const ValidationRunResult& result) {
     json report;
     report["images"] = result.images;
@@ -489,8 +470,7 @@ ValidationRunResult run_validation(const ValidationOptions& options) {
                 run_backend_eval_parallel_impl(
                     options,
                     dataset,
-                    backend_name,
-                    backends.at(backend_name)->info(),
+                    *backends.at(backend_name),
                     mean,
                     std));
         } else {
@@ -500,7 +480,7 @@ ValidationRunResult run_validation(const ValidationOptions& options) {
         }
     }
 
-    if (result.backends.count("onnx") && result.backends.count("tensorrt")) {
+    if (result.backends.contains("onnx") && result.backends.contains("tensorrt")) {
         const EvalSummary& onnx = result.backends.at("onnx").summary;
         const EvalSummary& trt = result.backends.at("tensorrt").summary;
         result.delta_tensorrt_minus_onnx = ValidationDeltaSummary{
@@ -525,8 +505,7 @@ ValidationBackendResult run_validation_backend(const ValidationOptions& options,
         return run_backend_eval_parallel_impl(
             options,
             source_dataset,
-            backend.info().backend,
-            backend.info(),
+            backend,
             mean,
             std);
     }
@@ -554,24 +533,11 @@ void print_validation_run_summary(const ValidationOptions& options, const Valida
         if (found == result.backends.end()) {
             continue;
         }
-        const EvalSummary& summary = found->second.summary;
-        std::ostringstream line;
-        line.setf(std::ios::fixed);
-        line.precision(4);
-        line << backend_name << ": bbox_ap=" << summary.bbox.ap << " bbox_ap50=" << summary.bbox.ap50
-             << " mask_ap=" << summary.mask.ap << " mask_ap50=" << summary.mask.ap50;
-        spdmon::ProgressBar::log(line.str());
+        spdmon::ProgressBar::log(validate_detail::format_validation_summary_line(backend_name, found->second.summary));
     }
     if (result.delta_tensorrt_minus_onnx.has_value()) {
-        const ValidationDeltaSummary& delta = *result.delta_tensorrt_minus_onnx;
-        std::ostringstream line;
-        line.setf(std::ios::fixed);
-        line.precision(4);
-        line << "delta(tensorrt-onnx): bbox_ap=" << delta.bbox_ap
-             << " bbox_ap50=" << delta.bbox_ap50
-             << " mask_ap=" << delta.mask_ap
-             << " mask_ap50=" << delta.mask_ap50;
-        spdmon::ProgressBar::log(line.str());
+        spdmon::ProgressBar::log(
+            validate_detail::format_validation_delta_summary_line(*result.delta_tensorrt_minus_onnx));
     }
     if (options.profile && result.total_timing.has_value()) {
         spdmon::ProgressBar::log("profile: total=" + std::to_string(result.total_timing->seconds) + "s");

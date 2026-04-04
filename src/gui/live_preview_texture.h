@@ -1,26 +1,17 @@
 #pragma once
 
+#include "cuda_gl_interop_surface_core.h"
 #include "mmltk/live/live_capture_region.h"
 #include "mmltk/live/live_frame_id.h"
 
 #include <cuda.h>
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
-
-#ifndef GL_GLEXT_PROTOTYPES
-#define GL_GLEXT_PROTOTYPES
-#endif
-#include <GL/gl.h>
-#include <GL/glext.h>
-#include <cuda_gl_interop.h>
-#include <cuda_runtime_api.h>
-#include <imgui.h>
 
 struct GLFWwindow;
 
@@ -107,6 +98,10 @@ private:
                                  std::string* error_message);
     bool finalize_live_preview_copy(std::string* error_message);
     void release_pending_live_frame_silently(const PendingLiveFrame& pending_frame) noexcept;
+    std::optional<PendingLiveFrame> take_pending_live_frame_locked() noexcept;
+    void reset_live_stream_state_locked() noexcept;
+    void reset_frame_state_locked() noexcept;
+    void reset_runtime_state_locked() noexcept;
     void publish_ready_texture(std::uint32_t width,
                                std::uint32_t height,
                                const mmltk::live::LiveCaptureRegion& region,
@@ -128,16 +123,8 @@ private:
     std::optional<PendingHostFrame> pending_host_frame_;
     std::optional<PendingLiveFrame> pending_live_frame_;
 
-    std::array<GLuint, 2> textures_{0U, 0U};
-    int front_texture_index_ = 0;
-    int back_texture_index_ = 1;
-    GLuint pixel_buffer_ = 0U;
-    cudaGraphicsResource_t graphics_resource_ = nullptr;
-    cudaStream_t stream_ = nullptr;
-    cudaEvent_t copy_complete_event_ = nullptr;
-    int current_cuda_device_index_ = -1;
-    std::uint32_t width_ = 0;
-    std::uint32_t height_ = 0;
+    CudaGlInteropSurfaceCore interop_core_{
+        CudaGlInteropSurfaceConfig{GL_RGB8, GL_BGR, 3U, "preview dimensions must be non-zero"}};
 };
 
 } // namespace mmltk::gui

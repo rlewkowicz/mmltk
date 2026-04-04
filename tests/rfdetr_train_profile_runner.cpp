@@ -1,22 +1,10 @@
+#include "support/profile_runner_common.h"
 #include "dataset_compiler.h"
 #include "execution_policy.h"
-#include "profile_utils.h"
 #include "mmltk/rfdetr/train.h"
 #include "test_fixture.h"
 
-#include <array>
-#include <chrono>
-#include <cmath>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <filesystem>
-#include <stdexcept>
-#include <string>
-#include <vector>
-
-namespace fs = std::filesystem;
+using namespace mmltk::testsupport;
 
 namespace {
 
@@ -26,23 +14,17 @@ using mmltk::rfdetr::TrainOptions;
 using mmltk::rfdetr::TrainRunResult;
 using mmltk::testsupport::FixtureSpec;
 
-struct Options {
+struct Options : CommonProfileOptions {
     std::string test_dir = "/tmp/mmltk_rfdetr_train_profile";
     std::string weights_path;
     bool keep_artifacts = false;
     int width = 432;
     int height = 432;
     int num_images = 24;
-    int batch_size = 6;
     int epochs = 1;
-    int device_id = 0;
-    int workers = 16;
     int lanes = 0;
     int prefetch_factor = 2;
     int compile_workers = -1;
-    int repetitions = 1;
-    int warmup_runs = 0;
-    std::string cpu_affinity;
 };
 
 struct TrainRun {
@@ -54,6 +36,7 @@ struct TrainRun {
 
 Options parse_options(int argc, char** argv) {
     Options options;
+    options.workers = 16;
     for (int index = 1; index < argc; ++index) {
         if (std::strcmp(argv[index], "--test-dir") == 0 && index + 1 < argc) {
             options.test_dir = argv[++index];
@@ -128,18 +111,6 @@ void record_duration_metric(const char* suffix, std::uint64_t elapsed_ns) {
 
 void record_value_metric(const char* suffix, std::uint64_t value) {
     mmltk::profile_add_value(metric_name(suffix).c_str(), value);
-}
-
-std::uint64_t x10000_metric(double value) {
-    return static_cast<std::uint64_t>(std::llround(value * 10000.0));
-}
-
-std::uint64_t img_per_sec_x100(std::uint64_t elapsed_ns, size_t images) {
-    if (elapsed_ns == 0) {
-        return 0;
-    }
-    return static_cast<std::uint64_t>(std::llround(
-        (static_cast<double>(images) * 100.0 * 1.0e9) / static_cast<double>(elapsed_ns)));
 }
 
 std::string compiled_path_for(const FixtureSpec& spec) {

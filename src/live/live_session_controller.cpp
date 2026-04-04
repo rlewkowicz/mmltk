@@ -90,6 +90,7 @@ void LiveSessionController::start() {
         analyzer_worker_->start();
         manual_overlay_worker_->start();
         compositor_->start();
+        compositor_->set_persistent_analysis_overlay(config_.persistent_analysis_overlay);
     } catch (...) {
         stop_component_safely(compositor_.get());
         stop_component_safely(manual_overlay_worker_.get());

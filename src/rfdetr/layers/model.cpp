@@ -1,5 +1,6 @@
 #include "mmltk/rfdetr/model.h"
 
+#include "gui/subprocess_utils.h"
 #include "mmltk/rfdetr/checkpoint.h"
 #include "mmltk/rfdetr/model_config.h"
 #include "mmltk/rfdetr/modules.h"
@@ -88,11 +89,8 @@ void run_onnx_simplify_tool(const std::filesystem::path& model_path) {
         _exit(127);
     }
 
-    int status = 0;
-    while (::waitpid(child_pid, &status, 0) < 0) {
-        if (errno == EINTR) {
-            continue;
-        }
+    const int status = mmltk::gui::subprocess::wait_child_process(child_pid);
+    if (status < 0) {
         throw std::runtime_error(
             std::string("failed to wait for RF-DETR ONNX simplify helper: ") + std::strerror(errno));
     }
@@ -230,7 +228,7 @@ torch::Tensor gen_sineembed_for_position(const torch::Tensor& pos_tensor, int64_
 }
 
 bool is_out_feature_stage(int64_t stage) {
-    return std::find(kOutFeatureStages.begin(), kOutFeatureStages.end(), stage) != kOutFeatureStages.end();
+    return std::ranges::find(kOutFeatureStages, stage) != kOutFeatureStages.end();
 }
 
 class LayerNorm2dImpl : public torch::nn::Module {

@@ -3,7 +3,7 @@
 #include "compiled_format.h"
 #include "mmltk_logging.h"
 #include "profile_utils.h"
-#include "rfdetr/cuda_utils.h"
+#include "rfdetr/torch_cuda_utils.h"
 
 #include <filesystem>
 #include <algorithm>

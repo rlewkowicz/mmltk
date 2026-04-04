@@ -1,7 +1,7 @@
 #include "rfdetr/validate_internal.h"
 
 #include "rfdetr/inference/backend_factory.h"
-#include "rfdetr/cuda_utils.h"
+#include "rfdetr/torch_cuda_utils.h"
 #include "rfdetr/postprocess.h"
 #include "rfdetr/predict_runtime_shared.h"
 #include "spdmon/spdmon.hpp"
@@ -32,11 +32,6 @@ using namespace validate_detail;
 
 namespace {
 
-struct ParallelInferenceLane {
-    std::unique_ptr<InferenceBackend> backend;
-    std::shared_ptr<PredictionBufferSlotPool> slot_pool;
-};
-
 class CudaEvent final {
 public:
     CudaEvent() {
@@ -59,21 +54,21 @@ private:
 } // namespace
 
 ValidationBackendResult run_backend_eval_parallel_impl(const ValidationOptions& options,
-                                                       const CocoDataset& source_dataset,
-                                                       const std::string& backend_name,
-                                                       const ModelInfo& model_info,
+                                                       const CocoDataset& dataset,
+                                                       const InferenceBackend& backend,
                                                        const torch::Tensor& mean,
                                                        const torch::Tensor& std) {
+    const ModelInfo& model_info = backend.info();
     const RuntimeContext runtime(resolve_runtime_config(
         options.workers,
         static_cast<int>(options.batch_size),
         options.cpu_affinity));
     DatasetLoader loader(make_loader_config(options, runtime));
-    CocoDataset dataset = source_dataset;
+    CocoDataset dataset_copy = dataset;
 
     std::unique_ptr<spdmon::ProgressBar> bar;
     if (interactive_logs(options)) {
-        bar = std::make_unique<spdmon::ProgressBar>(model_info.backend, dataset.num_images(), "img");
+        bar = std::make_unique<spdmon::ProgressBar>(model_info.backend, dataset_copy.num_images(), "img");
     }
 
     const auto started = std::chrono::steady_clock::now();
@@ -82,23 +77,12 @@ ValidationBackendResult run_backend_eval_parallel_impl(const ValidationOptions& 
     const auto preprocess_stream =
         get_high_priority_cuda_stream(options.device_id);
 
-    InferenceBackendFactory backend_factory(
-        options.onnx_path,
-        options.tensorrt_path,
-        options.device_id,
-        options.allow_fp16,
-        options.save_engine_path);
-    auto lane_backends = backend_factory.make_backend_lanes(backend_name, runtime.split().lane_threads);
-    std::vector<ParallelInferenceLane> lanes;
-    lanes.reserve(lane_backends.size());
     const size_t slot_count = predict_internal::prediction_lane_slot_count(runtime.split());
-    for (auto& backend : lane_backends) {
-        ParallelInferenceLane lane{
-            std::move(backend),
-            std::make_shared<PredictionBufferSlotPool>(slot_count),
-        };
-        lanes.push_back(std::move(lane));
-    }
+    auto lanes = predict_internal::make_backend_inference_lanes(
+        backend.make_lanes(runtime.split().lane_threads),
+        options.device_id,
+        slot_count,
+        dataset_copy.num_categories());
 
     WorkerPool lane_pool(static_cast<size_t>(lanes.size()),
                          runtime.lane_cpus(),
@@ -120,7 +104,7 @@ ValidationBackendResult run_backend_eval_parallel_impl(const ValidationOptions& 
         MMLTK_PROFILE_SCOPE("rfdetr.native.eval.drain_cpu");
         std::vector<Prediction> predictions = cpu_futures.front().get();
         cpu_futures.pop_front();
-        dataset.add_predictions(std::move(predictions));
+        dataset_copy.add_predictions(std::move(predictions));
         ++processed;
         if (bar) {
             bar->add(1);
@@ -137,13 +121,13 @@ ValidationBackendResult run_backend_eval_parallel_impl(const ValidationOptions& 
     const auto image_height = static_cast<int64_t>(loader.image_height());
     const auto image_width = static_cast<int64_t>(loader.image_width());
     while (loader.next_batch(batch)) {
-        if (submitted_images >= dataset.num_images()) {
+        if (submitted_images >= dataset_copy.num_images()) {
             loader.release_batch(batch);
             break;
         }
         loader.wait_batch(batch);
         const int image_id = static_cast<int>(batch.image_indices[0]) + 1;
-        if (!dataset.has_image(image_id)) {
+        if (!dataset_copy.has_image(image_id)) {
             loader.release_batch(batch);
             continue;
         }
@@ -171,32 +155,30 @@ ValidationBackendResult run_backend_eval_parallel_impl(const ValidationOptions& 
                                                   normalized = std::move(normalized),
                                                   normalized_ready = std::move(normalized_ready),
                                                   image_id,
-                                                  category_count = dataset.num_categories(),
                                                   max_dets = options.eval_max_dets,
                                                   image_height,
                                                   image_width,
                                                   device_id = options.device_id]() mutable {
-            ParallelInferenceLane& lane = lanes[lane_index];
+            auto& lane = lanes[lane_index];
             PredictionBufferLease lease = lane.slot_pool->acquire();
-            const auto lane_stream = backend_cuda_stream(*lane.backend, device_id);
             ensure_cuda_ok(
-                cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(lane_stream.stream()),
+                cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(lane.stream.stream()),
                                     normalized_ready->get(),
                                     0),
                 "cudaStreamWaitEvent for normalized validation batch");
             torch::NoGradGuard lane_no_grad;
             c10::cuda::CUDAGuard lane_device_guard(checked_device_index(device_id));
-            c10::cuda::CUDAStreamGuard stream_guard(lane_stream);
-            normalized.record_stream(lane_stream);
+            c10::cuda::CUDAStreamGuard stream_guard(lane.stream);
+            normalized.record_stream(lane.stream);
             const auto results =
                 postprocess_outputs_fixed_size(lane.backend->run(normalized),
                                                image_height,
                                                image_width,
-                                               lane.backend->info().num_queries > 0 ? lane.backend->info().num_queries : 300);
+                                               lane.num_queries);
             return stage_result_to_predictions(
                 image_id,
                 results.front(),
-                category_count,
+                lane.category_count,
                 max_dets,
                 std::move(lease),
                 device_id,
@@ -226,8 +208,8 @@ ValidationBackendResult run_backend_eval_parallel_impl(const ValidationOptions& 
 
     return ValidationBackendResult{
         model_info,
-        dataset.evaluate(options.eval_max_dets),
-        elapsed_timing(started, dataset.num_images()),
+        dataset_copy.evaluate(options.eval_max_dets),
+        elapsed_timing(started, dataset_copy.num_images()),
     };
 }
 

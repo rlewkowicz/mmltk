@@ -1,8 +1,10 @@
 #include "rfdetr/python_checkpoint_bridge.h"
 
+#include "gui/subprocess_utils.h"
 #include "mmltk_logging.h"
 #include "runtime_paths.h"
 #include "rfdetr/checkpoint_internal.h"
+#include "rfdetr/scalar_type_utils.h"
 
 #include <nlohmann/json.hpp>
 #include <torch/torch.h>
@@ -13,8 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
-#include <iomanip>
-#include <sstream>
+#include <format>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -31,75 +32,12 @@ namespace {
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-std::string scalar_type_name(const torch::ScalarType scalar_type) {
-    switch (scalar_type) {
-    case torch::kFloat16:
-        return "float16";
-    case torch::kBFloat16:
-        return "bfloat16";
-    case torch::kFloat32:
-        return "float32";
-    case torch::kFloat64:
-        return "float64";
-    case torch::kBool:
-        return "bool";
-    case torch::kUInt8:
-        return "uint8";
-    case torch::kInt8:
-        return "int8";
-    case torch::kInt16:
-        return "int16";
-    case torch::kInt32:
-        return "int32";
-    case torch::kInt64:
-        return "int64";
-    default:
-        throw std::runtime_error("unsupported RF-DETR checkpoint tensor dtype");
-    }
-}
-
-torch::ScalarType scalar_type_from_name(const std::string_view name) {
-    if (name == "float16") {
-        return torch::kFloat16;
-    }
-    if (name == "bfloat16") {
-        return torch::kBFloat16;
-    }
-    if (name == "float32") {
-        return torch::kFloat32;
-    }
-    if (name == "float64") {
-        return torch::kFloat64;
-    }
-    if (name == "bool") {
-        return torch::kBool;
-    }
-    if (name == "uint8") {
-        return torch::kUInt8;
-    }
-    if (name == "int8") {
-        return torch::kInt8;
-    }
-    if (name == "int16") {
-        return torch::kInt16;
-    }
-    if (name == "int32") {
-        return torch::kInt32;
-    }
-    if (name == "int64") {
-        return torch::kInt64;
-    }
-    throw std::runtime_error("unsupported RF-DETR checkpoint tensor dtype: " + std::string(name));
-}
-
 size_t tensor_nbytes(const torch::Tensor& tensor) {
     return static_cast<size_t>(tensor.numel()) * static_cast<size_t>(tensor.element_size());
 }
 
 std::string tensor_entry_filename(const size_t index) {
-    std::ostringstream stream;
-    stream << "entry_" << std::setw(6) << std::setfill('0') << index << ".bin";
-    return stream.str();
+    return std::format("entry_{:06}.bin", index);
 }
 
 fs::path make_temp_directory(const char* prefix) {
@@ -255,30 +193,25 @@ void write_raw_tensor_file(const fs::path& path, const torch::Tensor& tensor) {
         }
     }
 }
-
 void wait_for_child(const pid_t child_pid, const char* operation) {
-    int status = 0;
-    while (::waitpid(child_pid, &status, 0) < 0) {
-        if (errno == EINTR) {
-            continue;
-        }
+    const int status = mmltk::gui::subprocess::wait_child_process(child_pid);
+    if (status < 0) {
         throw std::runtime_error(
-            std::string("failed to wait for RF-DETR Python checkpoint bridge during ") + operation + ": " +
-            std::strerror(errno));
+            std::format("failed to wait for RF-DETR Python checkpoint bridge during {}: {}", operation, std::strerror(errno)));
     }
 
     if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
         return;
     }
 
-    std::ostringstream message;
-    message << "RF-DETR Python checkpoint bridge failed during " << operation;
+    std::string detail;
     if (WIFEXITED(status)) {
-        message << " with exit code " << WEXITSTATUS(status);
+        detail = std::format(" with exit code {}", WEXITSTATUS(status));
     } else if (WIFSIGNALED(status)) {
-        message << " with signal " << WTERMSIG(status);
+        detail = std::format(" with signal {}", WTERMSIG(status));
     }
-    throw std::runtime_error(message.str());
+    throw std::runtime_error(
+        std::format("RF-DETR Python checkpoint bridge failed during {}{}", operation, detail));
 }
 
 fs::path checkpoint_bridge_script_path() {

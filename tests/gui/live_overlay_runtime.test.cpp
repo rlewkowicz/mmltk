@@ -5,6 +5,7 @@
 #include "mmltk/live/manual_overlay_document.h"
 #include "overlay_compare_utils.h"
 #include "live/live_helpers.h"
+#include "cuda_test_utils.h"
 
 #include "support/catch2_compat.hpp"
 
@@ -17,6 +18,11 @@ namespace {
 
 using namespace mmltk::gui;
 using namespace mmltk::live;
+
+bool has_cuda_device() {
+    int device_count = 0;
+    return cudaGetDeviceCount(&device_count) == cudaSuccess && device_count > 0;
+}
 
 ManualOverlayDocumentSnapshot make_manual_snapshot() {
     ManualOverlayDocumentSnapshot snapshot;
@@ -252,6 +258,52 @@ void test_annotation_workflow_live_overlay_state_tracks_boundary_changes() {
         make_annotation_workflow_live_overlay_request(&document, &session, &frame)));
 }
 
+void test_live_pitched_buffers_fit_bgr_and_rgba_pixel_rows() {
+    if (!has_cuda_device()) {
+        SKIP("no CUDA device available");
+    }
+
+    constexpr std::uint32_t width = 17U;
+    constexpr std::uint32_t height = 9U;
+    const std::size_t bgr_row_bytes = static_cast<std::size_t>(width) * sizeof(Bgr24Pixel);
+    const std::size_t rgba_row_bytes = static_cast<std::size_t>(width) * sizeof(Rgba32Pixel);
+
+    CUDA_ASSERT_OK(cudaSetDevice(0));
+    cudaStream_t stream = nullptr;
+    CUDA_ASSERT_OK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+
+    BgrPitchedDeviceBuffer bgr_buffer;
+    bgr_buffer.ensure_dimensions(width, height, "cudaMallocPitch for BGR pitched live buffer test");
+    assert(bgr_buffer.width() == width);
+    assert(bgr_buffer.height() == height);
+    assert(bgr_buffer.pitch_bytes() >= bgr_row_bytes);
+
+    std::vector<std::uint8_t> bgr_input(bgr_row_bytes * static_cast<std::size_t>(height), 0x5AU);
+    CUDA_ASSERT_OK(cudaMemcpy2DAsync(device_ptr_as_void(bgr_buffer.data()),
+                                     bgr_buffer.pitch_bytes(),
+                                     bgr_input.data(),
+                                     bgr_row_bytes,
+                                     bgr_row_bytes,
+                                     height,
+                                     cudaMemcpyHostToDevice,
+                                     stream));
+
+    RgbaPitchedDeviceBuffer rgba_buffer;
+    rgba_buffer.ensure_dimensions(width, height, "cudaMallocPitch for RGBA pitched live buffer test");
+    assert(rgba_buffer.width() == width);
+    assert(rgba_buffer.height() == height);
+    assert(rgba_buffer.pitch_bytes() >= rgba_row_bytes);
+    CUDA_ASSERT_OK(cudaMemset2DAsync(device_ptr_as_void(rgba_buffer.data()),
+                                     rgba_buffer.pitch_bytes(),
+                                     0,
+                                     rgba_row_bytes,
+                                     height,
+                                     stream));
+
+    CUDA_ASSERT_OK(cudaStreamSynchronize(stream));
+    CUDA_ASSERT_OK(cudaStreamDestroy(stream));
+}
+
 } // namespace
 
 MMLTK_REGISTER_TEST_CASE("[gui][live_overlay_runtime]", test_overlay_compare_helpers_detect_boundary_changes);
@@ -260,3 +312,4 @@ MMLTK_REGISTER_TEST_CASE("[gui][live_overlay_runtime]", test_gui_interop_helpers
 MMLTK_REGISTER_TEST_CASE("[gui][live_overlay_runtime]", test_live_slot_helpers_prefer_latest_published_slot_and_fall_back);
 MMLTK_REGISTER_TEST_CASE("[gui][live_overlay_runtime]", test_live_slot_helpers_reuse_ready_published_slot_and_reset_latest_index);
 MMLTK_REGISTER_TEST_CASE("[gui][live_overlay_runtime]", test_annotation_workflow_live_overlay_state_tracks_boundary_changes);
+MMLTK_REGISTER_TEST_CASE("[gui][live_overlay_runtime][cuda]", test_live_pitched_buffers_fit_bgr_and_rgba_pixel_rows);

@@ -172,8 +172,8 @@ void LivePredictController::stop(
         },
         [this, on_error = std::move(on_error)](const std::string& error) {
             stopping_ = false;
-            start_error_ = error;
-            action_error_.clear();
+            start_error_.clear();
+            action_error_ = error;
             if (on_error) {
                 on_error(error);
             }

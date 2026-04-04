@@ -8,9 +8,6 @@
 #include "CLI11.hpp"
 
 #include "mmltk/rfdetr/model_config.h"
-#include "mmltk/rfdetr/predict.h"
-#include "mmltk/rfdetr/train.h"
-#include "mmltk/rfdetr/validate.h"
 #include "mmltk/rfdetr/workflow_requests.h"
 #include "mmltk_logging.h"
 #include "rfdetr/cli/workflow_cli_shared.h"
@@ -63,29 +60,6 @@ GuiSettingsSnapshot bind_snapshot(SeedSnapshotState& state) {
     };
 }
 
-int compile_mode_index_from_cli(const std::string& value) {
-    if (value == "none") {
-        return 0;
-    }
-    if (value == "selective") {
-        return 1;
-    }
-    if (value == "full") {
-        return 2;
-    }
-    throw std::runtime_error("unsupported compilation mode: " + value);
-}
-
-TrainOptimizerMode train_optimizer_mode_from_kind(const mmltk::rfdetr::TrainOptimizerKind kind) {
-    switch (kind) {
-    case mmltk::rfdetr::TrainOptimizerKind::AdamW:
-        return TrainOptimizerMode::AdamW;
-    case mmltk::rfdetr::TrainOptimizerKind::Muon:
-        return TrainOptimizerMode::Muon;
-    }
-    return TrainOptimizerMode::AdamW;
-}
-
 
 template <typename AppFactory>
 void parse_cli_app(CLI::App& app,
@@ -131,39 +105,6 @@ std::string choose_seed_preset(const std::string& current_preset,
     return current_preset.empty() ? std::string(kDefaultGuiPresetName) : current_preset;
 }
 
-bool has_current_schema_version(const nlohmann::json& j) {
-    if (!j.is_object()) {
-        return false;
-    }
-
-    const auto schema_it = j.find("schema_version");
-    if (schema_it == j.end()) {
-        return false;
-    }
-    if (!schema_it->is_number_integer() && !schema_it->is_number_unsigned()) {
-        return false;
-    }
-
-    try {
-        return schema_it->get<std::uint32_t>() == kGuiSettingsSchemaVersion;
-    } catch (const nlohmann::json::exception&) {
-        return false;
-    }
-}
-
-ModelInputMode detect_model_input_mode(const mmltk::rfdetr::ModelArtifactRequest& request) {
-    if (!request.weights_path.empty()) {
-        return ModelInputMode::Weights;
-    }
-    if (!request.onnx_path.empty()) {
-        return ModelInputMode::Onnx;
-    }
-    if (!request.tensorrt_path.empty()) {
-        return ModelInputMode::TensorRt;
-    }
-    throw std::runtime_error("missing model input artifact");
-}
-
 SeedSnapshotState load_seed_snapshot(const fs::path& settings_path) {
     SeedSnapshotState state;
     apply_default_gui_state(state.selected_preset,
@@ -180,18 +121,12 @@ SeedSnapshotState load_seed_snapshot(const fs::path& settings_path) {
 
     try {
         const nlohmann::json j = nlohmann::json::parse(file);
-        if (!has_current_schema_version(j)) {
-            mmltk::logging::logger("gui")->warn(
-                "[gui] ignoring settings from {} because schema_version is missing or unsupported",
-                settings_path.string());
-            return state;
-        }
         GuiSettingsSnapshot snapshot = bind_snapshot(state);
-        apply_gui_settings(j, snapshot);
+        apply_gui_settings(normalize_gui_settings_document(j), snapshot);
         state.current_view = snapshot.current_view;
         state.selected_preset = snapshot.selected_preset;
         return state;
-    } catch (const nlohmann::json::exception& error) {
+    } catch (const std::exception& error) {
         mmltk::logging::logger("gui")->warn("[gui] ignoring malformed settings from {}: {}",
                                              settings_path.string(),
                                              error.what());
@@ -297,40 +232,7 @@ void apply_predict_seed(SeedSnapshotState& snapshot, const PredictSeedCliState& 
     snapshot.selected_preset = choose_seed_preset(
         snapshot.selected_preset,
         {state.request.weights_path, state.request.onnx_path, state.request.tensorrt_path});
-
-    PredictViewState& predict = snapshot.predict;
-    predict.source = {};
-    predict.source.kind = SourceKind::CompiledDataset;
-    predict.source.compiled_path = state.request.compiled_path.string();
-    predict.weights_path.clear();
-    predict.onnx_path.clear();
-    predict.tensorrt_path.clear();
-    predict.model_input = detect_model_input_mode(state.request);
-    switch (predict.model_input) {
-    case ModelInputMode::Weights:
-        predict.weights_path = state.request.weights_path.string();
-        break;
-    case ModelInputMode::Onnx:
-        predict.onnx_path = state.request.onnx_path.string();
-        break;
-    case ModelInputMode::TensorRt:
-        predict.tensorrt_path = state.request.tensorrt_path.string();
-        break;
-    case ModelInputMode::None:
-        break;
-    }
-    predict.output_path = state.request.output_path.string();
-    predict.backend = state.request.backend;
-    predict.cpu_affinity = state.request.cpu_affinity;
-    predict.batch_size = static_cast<int>(state.request.batch_size);
-    predict.max_dets_per_image = static_cast<int>(state.request.max_dets_per_image);
-    predict.device_id = state.request.device_id;
-    predict.workers = state.request.workers;
-    predict.lanes = state.request.lanes;
-    predict.threshold = state.request.threshold;
-    predict.allow_fp16 = state.request.allow_fp16;
-    predict.progress_bar = state.request.progress_bar;
-    predict.compile_mode = compile_mode_index_from_cli(state.compile_mode);
+    rfdetr_workflows::apply_predict_request(snapshot.predict, state.request);
 }
 
 void apply_validate_seed(SeedSnapshotState& snapshot, const ValidateSeedCliState& state) {
@@ -338,29 +240,7 @@ void apply_validate_seed(SeedSnapshotState& snapshot, const ValidateSeedCliState
     snapshot.selected_preset = choose_seed_preset(
         snapshot.selected_preset,
         {state.request.onnx_path, state.request.tensorrt_path});
-
-    ValidateViewState& validate = snapshot.validate;
-    validate.compiled_path = state.request.compiled_path.string();
-    validate.source_dir = state.request.source_dir.string();
-    validate.onnx_path = state.request.onnx_path.string();
-    validate.tensorrt_path = state.request.tensorrt_path.string();
-    validate.save_engine_path = state.request.save_engine_path.string();
-    validate.report_json_path = state.request.report_json_path.string();
-    validate.split = state.request.split;
-    validate.eval_order = state.request.eval_order;
-    validate.resolution = static_cast<int>(state.request.resolution);
-    validate.limit_images = static_cast<int>(state.request.limit_images);
-    validate.alignment_images = static_cast<int>(state.request.alignment_images);
-    validate.eval_max_dets = static_cast<int>(state.request.eval_max_dets);
-    validate.batch_size = static_cast<int>(state.request.batch_size);
-    validate.prefetch_factor = static_cast<int>(state.request.prefetch_factor);
-    validate.device_id = state.request.device_id;
-    validate.workers = state.request.workers;
-    validate.cpu_affinity = state.request.cpu_affinity;
-    validate.recompile = state.request.recompile;
-    validate.profile = state.request.profile;
-    validate.allow_fp16 = state.request.allow_fp16;
-    validate.write_report_json = state.request.write_report_json;
+    rfdetr_workflows::apply_validate_request(snapshot.validate, state.request);
 }
 
 void apply_train_seed(SeedSnapshotState& snapshot, const TrainSeedCliState& state) {
@@ -372,49 +252,7 @@ void apply_train_seed(SeedSnapshotState& snapshot, const TrainSeedCliState& stat
     } else if (snapshot.selected_preset.empty()) {
         snapshot.selected_preset = kDefaultGuiPresetName;
     }
-
-    TrainViewState& train = snapshot.train;
-    train.execution_target = TrainExecutionTarget::Local;
-    train.train_compiled_path = state.request.train_compiled_path.string();
-    train.val_compiled_path = state.request.val_compiled_path.string();
-    train.test_compiled_path = state.request.test_compiled_path.string();
-    train.output_dir = state.request.output_dir.string();
-    train.weights_path = state.request.weights_path.string();
-    train.resume_path = state.request.resume_path.string();
-    train.cpu_affinity = state.request.cpu_affinity;
-    train.input_mode = state.request.resume_path.empty() ? TrainInputMode::Weights : TrainInputMode::Resume;
-    train.batch_size = static_cast<int>(state.request.batch_size);
-    train.val_batch_size = static_cast<int>(state.request.val_batch_size);
-    train.epochs = state.request.epochs;
-    train.grad_accum_steps = state.request.grad_accum_steps;
-    train.eval_max_dets = static_cast<int>(state.request.eval_max_dets);
-    train.lr_drop = state.request.lr_drop;
-    train.print_freq = state.request.print_freq;
-    train.prefetch_factor = state.request.prefetch_factor;
-    train.seed = state.request.seed;
-    train.workers = state.request.workers;
-    train.lanes = state.request.lanes;
-    train.lr = state.request.lr;
-    train.lr_encoder = state.request.lr_encoder;
-    train.lr_component_decay = state.request.lr_component_decay;
-    train.encoder_layer_decay = state.request.encoder_layer_decay;
-    train.momentum = state.request.momentum;
-    train.weight_decay = state.request.weight_decay;
-    train.warmup_epochs = state.request.warmup_epochs;
-    train.warmup_momentum = state.request.warmup_momentum;
-    train.lr_min_factor = state.request.lr_min_factor;
-    train.clip_max_norm = state.request.clip_max_norm;
-    train.lr_scheduler = state.request.lr_scheduler;
-    train.use_ema = state.request.use_ema;
-    train.amp = state.request.amp;
-    train.progress_bar = state.request.progress_bar;
-    train.freeze_encoder = state.request.freeze_encoder;
-    train.optimizer = train_optimizer_mode_from_kind(state.request.optimizer);
-    train.compile_mode = compile_mode_index_from_cli(state.compile_mode);
-    train.local_device_ids = !state.request.device_ids.empty()
-                                 ? state.request.device_ids
-                                 : std::vector<int>{state.request.device_id};
-    train.recipe_overrides = state.request.recipe_overrides;
+    rfdetr_workflows::apply_train_request(snapshot.train, state.request);
 }
 
 void apply_build_engine_seed(SeedSnapshotState& snapshot, const mmltk::rfdetr::BuildEngineRequest& request) {

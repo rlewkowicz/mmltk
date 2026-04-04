@@ -68,18 +68,19 @@ void test_train_seed_sets_local_devices_and_overrides() {
 
     const nlohmann::json saved = load_json_file(settings_path);
     const nlohmann::json& workflows = saved.at("workflows");
+    assert(saved.at("schema_version") == mmltk::gui::kGuiSettingsSchemaVersion);
     assert(saved.at("current_view") == 0);
     assert(saved.at("selected_preset") == "rf-detr-seg-medium");
-    assert(workflows.at("train").at("train_compiled_path") == "./compiled/train.bin");
-    assert(workflows.at("train").at("val_compiled_path") == "./compiled/val.bin");
-    assert(workflows.at("train").at("output_dir") == "./engines/out");
-    assert(workflows.at("train").at("weights_path") == "./weights/rf-detr-seg-medium.pt");
-    assert(workflows.at("train").at("local_device_ids") == nlohmann::json::array({2, 4}));
-    assert(workflows.at("train").at("optimizer") == 1);
-    assert(workflows.at("train").at("print_freq") == 3);
-    assert(workflows.at("train").at("amp") == false);
-    assert(workflows.at("train").at("compile_mode") == 2);
-    assert(workflows.at("train").at("recipe_overrides").at("lr") == true);
+    assert(workflows.at("train").at("dataset_paths").at("train_compiled_path") == "./compiled/train.bin");
+    assert(workflows.at("train").at("dataset_paths").at("val_compiled_path") == "./compiled/val.bin");
+    assert(workflows.at("train").at("model_artifacts").at("weights_path") == "./weights/rf-detr-seg-medium.pt");
+    assert(workflows.at("train").at("execution").at("compile_mode") == 2);
+    assert(workflows.at("train").at("training").at("output_dir") == "./engines/out");
+    assert(workflows.at("train").at("training").at("local_device_ids") == nlohmann::json::array({2, 4}));
+    assert(workflows.at("train").at("training").at("amp") == false);
+    assert(workflows.at("train").at("training").at("optimizer") == 1);
+    assert(workflows.at("train").at("training").at("print_freq") == 3);
+    assert(workflows.at("train").at("training").at("recipe_overrides").at("lr") == true);
 
     cleanup_temp_settings_path(settings_path);
 }
@@ -103,7 +104,7 @@ void test_train_seed_progress_flags_round_trip() {
         });
 
     nlohmann::json saved = load_json_file(settings_path);
-    assert(saved.at("workflows").at("train").at("progress_bar") == true);
+    assert(saved.at("workflows").at("train").at("execution").at("progress_bar") == true);
 
     mmltk::gui::apply_gui_cli_seed_file(
         settings_path,
@@ -122,7 +123,7 @@ void test_train_seed_progress_flags_round_trip() {
         });
 
     saved = load_json_file(settings_path);
-    assert(saved.at("workflows").at("train").at("progress_bar") == false);
+    assert(saved.at("workflows").at("train").at("execution").at("progress_bar") == false);
 
     cleanup_temp_settings_path(settings_path);
 }
@@ -142,13 +143,15 @@ void test_validate_seed_applies_cli_defaults() {
 
     const nlohmann::json saved = load_json_file(settings_path);
     const nlohmann::json& workflows = saved.at("workflows");
+    assert(saved.at("schema_version") == mmltk::gui::kGuiSettingsSchemaVersion);
     assert(saved.at("current_view") == 1);
     assert(saved.at("selected_preset") == "rf-detr-seg-medium");
-    assert(workflows.at("validate").at("compiled_path") == "/tmp/datasets/val.bin");
-    assert(workflows.at("validate").at("split") == "val");
-    assert(workflows.at("validate").at("report_json_path") == "/tmp/datasets/rfdetr-validation-report.json");
-    assert(workflows.at("validate").at("onnx_path") == "/tmp/models/rf-detr-seg-medium.onnx");
-    assert(workflows.at("validate").at("tensorrt_path") == "");
+    assert(workflows.at("validate").at("dataset_paths").at("compiled_path") == "/tmp/datasets/val.bin");
+    assert(workflows.at("validate").at("validation").at("split") == "val");
+    assert(workflows.at("validate").at("validation").at("report_json_path") ==
+           "/tmp/datasets/rfdetr-validation-report.json");
+    assert(workflows.at("validate").at("model_artifacts").at("onnx_path") == "/tmp/models/rf-detr-seg-medium.onnx");
+    assert(workflows.at("validate").at("model_artifacts").at("tensorrt_path") == "");
 
     cleanup_temp_settings_path(settings_path);
 }
@@ -170,7 +173,7 @@ void test_predict_seed_progress_flags_round_trip() {
         });
 
     nlohmann::json saved = load_json_file(settings_path);
-    assert(saved.at("workflows").at("predict").at("progress_bar") == true);
+    assert(saved.at("workflows").at("predict").at("execution").at("progress_bar") == true);
 
     mmltk::gui::apply_gui_cli_seed_file(
         settings_path,
@@ -187,7 +190,35 @@ void test_predict_seed_progress_flags_round_trip() {
         });
 
     saved = load_json_file(settings_path);
-    assert(saved.at("workflows").at("predict").at("progress_bar") == false);
+    assert(saved.at("workflows").at("predict").at("execution").at("progress_bar") == false);
+
+    cleanup_temp_settings_path(settings_path);
+}
+
+void test_predict_seed_applies_onnx_model_input() {
+    const fs::path settings_path = make_temp_settings_path("mmltk-gui-seed-predict-onnx");
+    mmltk::gui::apply_gui_cli_seed_file(
+        settings_path,
+        {
+            "rfdetr",
+            "predict",
+            "--compiled",
+            "./compiled/val.bin",
+            "--output",
+            "./predictions.json",
+            "--onnx",
+            "./models/rf-detr-seg-medium.onnx",
+        });
+
+    const nlohmann::json saved = load_json_file(settings_path);
+    assert(saved.at("schema_version") == mmltk::gui::kGuiSettingsSchemaVersion);
+    assert(saved.at("current_view") == 2);
+    assert(saved.at("selected_preset") == "rf-detr-seg-medium");
+    const nlohmann::json& predict = saved.at("workflows").at("predict");
+    assert(predict.at("model_artifacts").at("weights_path") == "");
+    assert(predict.at("model_artifacts").at("onnx_path") == "./models/rf-detr-seg-medium.onnx");
+    assert(predict.at("model_artifacts").at("tensorrt_path") == "");
+    assert(predict.at("predict").at("model_input") == 1);
 
     cleanup_temp_settings_path(settings_path);
 }
@@ -239,15 +270,24 @@ void test_train_seed_preserves_existing_ui_settings() {
     cleanup_temp_settings_path(settings_path);
 }
 
-void test_train_seed_discards_legacy_schema_and_malformed_settings() {
+void test_train_seed_migrates_schema2_and_malformed_settings() {
     const fs::path legacy_settings_path = make_temp_settings_path("mmltk-gui-seed-legacy");
     {
         nlohmann::json legacy;
-        legacy["schema_version"] = 0;
+        legacy["schema_version"] = 2;
         legacy["current_view"] = 4;
         legacy["selected_preset"] = "legacy-preset";
         legacy["ui"] = {
             {"ui_scale", 1.75},
+        };
+        legacy["workflows"] = {
+            {"train",
+             {
+                 {"train_compiled_path", "./compiled/train.bin"},
+                {"val_compiled_path", "./compiled/val.bin"},
+                {"output_dir", "./engines/out"},
+                {"weights_path", "./weights/rf-detr-seg-medium.pt"},
+            }},
         };
 
         std::ofstream stream(legacy_settings_path);
@@ -273,8 +313,10 @@ void test_train_seed_discards_legacy_schema_and_malformed_settings() {
     nlohmann::json saved = load_json_file(legacy_settings_path);
     assert(saved.at("schema_version") == mmltk::gui::kGuiSettingsSchemaVersion);
     assert(saved.at("selected_preset") == "rf-detr-seg-medium");
-    assert(std::abs(saved.at("ui").at("ui_scale").get<double>() - 1.0) < 1e-5);
-    assert(saved.at("workflows").at("train").at("train_compiled_path") == "./compiled/train.bin");
+    assert(std::abs(saved.at("ui").at("ui_scale").get<double>() - 1.75) < 1e-5);
+    assert(saved.at("workflows").at("train").at("dataset_paths").at("train_compiled_path") ==
+           "./compiled/train.bin");
+    assert(saved.at("workflows").at("train").at("training").at("output_dir") == "./engines/out");
 
     cleanup_temp_settings_path(legacy_settings_path);
 
@@ -303,7 +345,7 @@ void test_train_seed_discards_legacy_schema_and_malformed_settings() {
     saved = load_json_file(malformed_settings_path);
     assert(saved.at("schema_version") == mmltk::gui::kGuiSettingsSchemaVersion);
     assert(saved.at("selected_preset") == "rf-detr-seg-medium");
-    assert(saved.at("workflows").at("train").at("output_dir") == "./engines/out");
+    assert(saved.at("workflows").at("train").at("training").at("output_dir") == "./engines/out");
 
     cleanup_temp_settings_path(malformed_settings_path);
 }
@@ -325,13 +367,15 @@ void test_build_engine_seed_updates_export_view() {
         });
 
     const nlohmann::json saved = load_json_file(settings_path);
+    assert(saved.at("schema_version") == mmltk::gui::kGuiSettingsSchemaVersion);
     assert(saved.at("current_view") == 4);
-    assert(saved.at("workflows").at("export").at("weights_path") == "");
-    assert(saved.at("workflows").at("export").at("onnx_path") == "./models/rf-detr-seg-medium.onnx");
-    assert(saved.at("workflows").at("export").at("output_path") == "./engines/model.engine");
-    assert(saved.at("workflows").at("export").at("device_id") == 3);
-    assert(saved.at("workflows").at("export").at("allow_fp16") == false);
-    assert(saved.at("workflows").at("export").at("build_tensorrt") == true);
+    assert(saved.at("workflows").at("export").at("model_artifacts").at("weights_path") == "");
+    assert(saved.at("workflows").at("export").at("model_artifacts").at("onnx_path") ==
+           "./models/rf-detr-seg-medium.onnx");
+    assert(saved.at("workflows").at("export").at("execution").at("device_id") == 3);
+    assert(saved.at("workflows").at("export").at("execution").at("allow_fp16") == false);
+    assert(saved.at("workflows").at("export").at("export").at("output_path") == "./engines/model.engine");
+    assert(saved.at("workflows").at("export").at("export").at("build_tensorrt") == true);
 
     cleanup_temp_settings_path(settings_path);
 }
@@ -392,8 +436,9 @@ MMLTK_REGISTER_TEST_CASE("[gui][cli_seed]", test_train_seed_sets_local_devices_a
 MMLTK_REGISTER_TEST_CASE("[gui][cli_seed]", test_train_seed_progress_flags_round_trip);
 MMLTK_REGISTER_TEST_CASE("[gui][cli_seed]", test_validate_seed_applies_cli_defaults);
 MMLTK_REGISTER_TEST_CASE("[gui][cli_seed]", test_predict_seed_progress_flags_round_trip);
+MMLTK_REGISTER_TEST_CASE("[gui][cli_seed]", test_predict_seed_applies_onnx_model_input);
 MMLTK_REGISTER_TEST_CASE("[gui][cli_seed]", test_train_seed_preserves_existing_ui_settings);
-MMLTK_REGISTER_TEST_CASE("[gui][cli_seed]", test_train_seed_discards_legacy_schema_and_malformed_settings);
+MMLTK_REGISTER_TEST_CASE("[gui][cli_seed]", test_train_seed_migrates_schema2_and_malformed_settings);
 MMLTK_REGISTER_TEST_CASE("[gui][cli_seed]", test_build_engine_seed_updates_export_view);
 MMLTK_REGISTER_TEST_CASE("[gui][cli_seed]", test_unsupported_train_flag_is_rejected);
 MMLTK_REGISTER_TEST_CASE("[gui][cli_seed]", test_unsupported_validate_flag_is_rejected);

@@ -7,10 +7,10 @@
 
 #include <array>
 #include <algorithm>
+#include <format>
 #include <atomic>
 #include <chrono>
 #include <cmath>
-#include <cstdio>
 #include <fstream>
 #include <immintrin.h>
 #include <limits>
@@ -67,12 +67,7 @@ std::uint64_t compute_skew_x1000(std::uint64_t total, std::uint64_t peak, std::u
 std::filesystem::path numbered_path(const std::filesystem::path& dir,
                                     uint32_t one_based_index,
                                     const char* extension) {
-    std::array<char, 32> fname{};
-    const int written = std::snprintf(fname.data(), fname.size(), "%06u%s", one_based_index, extension);
-    if (written <= 0 || static_cast<size_t>(written) >= fname.size()) {
-        throw std::runtime_error("failed to format sequential filename");
-    }
-    return dir / std::string(fname.data(), static_cast<size_t>(written));
+    return dir / std::format("{:06}{}", one_based_index, extension);
 }
 
 uint32_t count_sequential_images(const std::filesystem::path& split_dir) {
@@ -209,7 +204,7 @@ void materialize_mask_row_major(const std::vector<RLEPair>& input_pairs,
     if (source_mask_scratch.size() != source_pixels) {
         source_mask_scratch.resize(source_pixels);
     }
-    std::fill(source_mask_scratch.begin(), source_mask_scratch.end(), uint8_t{0});
+    std::ranges::fill(source_mask_scratch, uint8_t{0});
 
     for (const RLEPair& pair : input_pairs) {
         const size_t start = pair.start;
@@ -430,7 +425,7 @@ std::vector<ParsedInstance> parse_jsonl(const std::filesystem::path& annotation_
                     continue;
                 }
                 instance.rle_pairs = std::move(resized.rle_pairs);
-                std::copy(std::begin(resized.bbox), std::end(resized.bbox), std::begin(instance.bbox));
+                std::ranges::copy(resized.bbox, std::begin(instance.bbox));
             } else {
                 scale_bbox_in_place(instance, source_dims, target_width, target_height);
             }
@@ -698,11 +693,10 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir,
             }
 
             if (!result.labels.empty()) {
-                std::copy(result.labels.begin(), result.labels.end(), blocks.labels.data() + label_cursor);
+                std::ranges::copy(result.labels, blocks.labels.data() + label_cursor);
             }
             if (!result.rle_pairs.empty()) {
-                std::copy(result.rle_pairs.begin(),
-                          result.rle_pairs.end(),
+                std::ranges::copy(result.rle_pairs,
                           blocks.rle_pairs.data() + image_rle_start);
             }
 

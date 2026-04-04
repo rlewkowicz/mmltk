@@ -1,34 +1,15 @@
-#include "profile_utils.h"
+#include "support/profile_runner_common.h"
 #include "execution_policy.h"
 #include "mmltk/rfdetr/predict.h"
 
-#include <algorithm>
-#include <array>
-#include <chrono>
-#include <cstdint>
-#include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <filesystem>
-#include <stdexcept>
-#include <string>
-#include <vector>
-
-namespace fs = std::filesystem;
+using namespace mmltk::testsupport;
 
 namespace {
 
-struct Options {
+struct Options : CommonProfileOptions {
     std::string compiled_path;
     std::string checkpoint_path;
-    int repetitions = 1;
-    int warmup_runs = 0;
-    int device_id = 0;
-    int workers = 0;
-    int batch_size = 1;
     size_t limit_images = 0;
-    std::string cpu_affinity;
 };
 
 struct EvaluateRun {
@@ -37,12 +18,6 @@ struct EvaluateRun {
     double bbox_ap = 0.0;
     double mask_ap = 0.0;
 };
-
-std::string iteration_label_for_run(const char* run_label, int repetition) {
-    std::array<char, 96> buffer{};
-    std::snprintf(buffer.data(), buffer.size(), "%s[%02d]", run_label, repetition);
-    return buffer.data();
-}
 
 Options parse_options(int argc, char** argv) {
     Options options;
@@ -84,28 +59,7 @@ Options parse_options(int argc, char** argv) {
     return options;
 }
 
-void ensure_file_exists(const char* label, const std::string& path) {
-    if (!fs::exists(path)) {
-        throw std::runtime_error(std::string("missing ") + label + ": " + path);
-    }
-}
-
-double seconds_from_ns(std::uint64_t value) {
-    return static_cast<double>(value) / 1.0e9;
-}
-
-std::uint64_t x10000_metric(double value) {
-    return static_cast<std::uint64_t>(std::llround(value * 10000.0));
-}
-
-std::uint64_t img_per_sec_x100(std::uint64_t elapsed_ns, size_t images) {
-    if (elapsed_ns == 0) {
-        return 0;
-    }
-    return static_cast<std::uint64_t>(std::llround(
-        (static_cast<double>(images) * 100.0 * 1.0e9) / static_cast<double>(elapsed_ns)));
-}
-
+struct RunResult {
 std::string metric_name(const char* suffix) {
     return std::string("benchmark.") + suffix;
 }

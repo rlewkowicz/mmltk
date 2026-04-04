@@ -4,6 +4,7 @@
 #include "console_output.h"
 #include "default_state.h"
 #include "file_picker.h"
+#include "layout_primitives.h"
 #include "gui/annotation/annotation_ui.h"
 #include "gui/annotation/editor.h"
 #include "gui/annotation/render/renderer.h"
@@ -20,6 +21,7 @@
 #include "preview_interaction_overlay.h"
 #include "rfdetr_module.h"
 #include "rfdetr_workflows.h"
+#include "shell_contract.h"
 #include "source_runtime.h"
 #include "ui_controls.h"
 #include "ui_style.h"
@@ -43,6 +45,7 @@
 
 #include <array>
 #include <algorithm>
+#include <format>
 #include <cfloat>
 #include <cmath>
 #include <cstddef>
@@ -80,6 +83,74 @@ using namespace mmltk::rfdetr;
 namespace console_output = mmltk::gui::console_output;
 
 constexpr int kWhiteCropStrokeWidth = 2;
+constexpr ImVec4 kWarningBannerBackground{0.33f, 0.17f, 0.12f, 0.95f};
+constexpr ImVec4 kWarningBannerText{0.98f, 0.90f, 0.82f, 1.00f};
+constexpr ImVec4 kInfoBannerBackground{0.20f, 0.24f, 0.18f, 0.95f};
+constexpr ImVec4 kInfoBannerText{0.92f, 0.95f, 0.86f, 1.00f};
+constexpr ImVec4 kErrorTextColor{0.94f, 0.45f, 0.41f, 1.00f};
+
+constexpr auto kValidateWorkspaceGrid =
+    make_two_column_grid_layout("validate_workspace_grid",
+                                "validate_workspace_primary",
+                                "validate_workspace_secondary");
+
+constexpr auto kTrainWorkspaceGrid =
+    make_two_column_grid_layout("train_workspace_grid",
+                                "train_workspace_primary",
+                                "train_workspace_secondary");
+
+constexpr auto kPredictWorkspaceGrid =
+    make_two_column_grid_layout("predict_workspace_grid",
+                                "predict_workspace_primary",
+                                "predict_workspace_secondary");
+
+struct RecentJobTileConfig {
+  std::string_view label;
+  const char *tile_id;
+  const char *heading;
+  const char *output_id;
+  const char *waiting_message;
+  const char *error_banner_id = nullptr;
+};
+
+void draw_banner(const char *id, const ImVec4 &background_color,
+                 const ImVec4 &text_color, const std::string &message);
+
+void draw_recent_job_tile(const JobState &job, std::string_view output_tail,
+                          const RecentJobTileConfig &config) {
+  const bool matching_job = job.label == config.label;
+  if (!matching_job && output_tail.empty()) {
+    return;
+  }
+
+  draw_console_tile(config.tile_id, config.heading, [&]() {
+    if (job.running && matching_job) {
+      ImGui::TextWrapped("Running: %s", job.label.c_str());
+    } else if (matching_job) {
+      ImGui::TextWrapped("Idle after: %s", job.label.c_str());
+    }
+
+    if (matching_job && !job.last_summary.empty()) {
+      ImGui::TextWrapped("%s", job.last_summary.c_str());
+    }
+
+    if (!output_tail.empty() || (job.running && matching_job)) {
+      draw_output_console(config.output_id, output_tail, 180.0f,
+                          job.running && matching_job,
+                          config.waiting_message);
+    }
+
+    if (matching_job && !job.last_error.empty()) {
+      if (config.error_banner_id != nullptr) {
+        draw_banner(config.error_banner_id, kWarningBannerBackground,
+                    kWarningBannerText, job.last_error);
+      } else {
+        ImGui::TextColored(kErrorTextColor, "Error");
+        ImGui::TextWrapped("%s", job.last_error.c_str());
+      }
+    }
+  });
+}
 
 float crop_edge_hit_half_width_px() {
   return ui_scaled(current_ui_settings().crop_edge_hit_half_width);
@@ -249,25 +320,6 @@ bool draw_lr_scheduler_combo(const char *label, std::string &scheduler) {
   return changed;
 }
 
-template <typename Options>
-void apply_model_input(ModelInputMode mode, const std::string &weights_path,
-                       const std::string &onnx_path,
-                       const std::string &tensorrt_path, Options &options) {
-  switch (mode) {
-  case ModelInputMode::Weights:
-    options.weights_path = weights_path;
-    break;
-  case ModelInputMode::Onnx:
-    options.onnx_path = onnx_path;
-    break;
-  case ModelInputMode::TensorRt:
-    options.tensorrt_path = tensorrt_path;
-    break;
-  case ModelInputMode::None:
-    break;
-  }
-}
-
 std::string annotate_error() {
   return "Annotate saves full-scene PNG + JSONL labels and per-object RGBA "
          "crops. "
@@ -275,15 +327,30 @@ std::string annotate_error() {
 }
 
 std::string annotation_source_signature(const SourceSelectionState &source) {
-  std::ostringstream stream;
-  stream << static_cast<int>(source.kind) << "|" << source.compiled_path << "|"
-         << source.single_image_path << "|" << source.image_directory << "|"
-         << source.recursive << "|" << source.device_index << "|"
-         << source.capture_width << "|" << source.capture_height << "|"
-         << source.capture_fps << "|" << source.v4l2_buffer_count;
-  // Annotate crop is preview state only. Excluding it here keeps live annotate
-  // running when the crop box is committed or the crop fields are edited.
-  return stream.str();
+  return std::format("{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                     static_cast<int>(source.kind),
+                     source.compiled_path,
+                     source.single_image_path,
+                     source.image_directory,
+                     source.recursive,
+                     source.device_index,
+                     source.capture_width,
+                     source.capture_height,
+                     source.capture_fps,
+                     source.v4l2_buffer_count);
+}
+
+std::vector<RemoteGpuFamily> selected_remote_gpu_families(
+    const std::array<bool, 5> &enabled_families) {
+  std::vector<RemoteGpuFamily> families;
+  for (int index = 0; index < static_cast<int>(enabled_families.size());
+       ++index) {
+    if (!enabled_families[static_cast<size_t>(index)]) {
+      continue;
+    }
+    families.push_back(static_cast<RemoteGpuFamily>(index));
+  }
+  return families;
 }
 
 ImVec4 annotation_range_swatch_color(const AnnotationColorRange &range) {
@@ -434,11 +501,7 @@ LivePreviewTextureState snapshot_preview_state(
 }
 
 std::string format_decimal(double value, int precision) {
-  std::ostringstream stream;
-  stream.setf(std::ios::fixed);
-  stream.precision(precision);
-  stream << value;
-  return stream.str();
+  return std::vformat(std::format("{{:.{}f}}", precision), std::make_format_args(value));
 }
 
 TrainRecipeConfig current_train_recipe(const std::string &preset_name,
@@ -481,10 +544,9 @@ std::string local_gpu_selection_summary(const std::vector<LocalGpuInfo> &gpus,
     return "No GPUs selected";
   }
   if (selected_count == gpus.size()) {
-    return std::to_string(selected_count) + " visible GPUs selected";
+    return std::format("{} visible GPUs selected", selected_count);
   }
-  return std::to_string(selected_count) + " / " + std::to_string(gpus.size()) +
-         " GPUs selected";
+  return std::format("{} / {} GPUs selected", selected_count, gpus.size());
 }
 
 std::string format_memory_gib(std::uint64_t bytes) {
@@ -493,12 +555,11 @@ std::string format_memory_gib(std::uint64_t bytes) {
 }
 
 std::string local_gpu_label(const LocalGpuInfo &gpu) {
-  std::ostringstream stream;
-  stream << "GPU " << gpu.device_id << " · " << gpu.name;
+  std::string label = std::format("GPU {} · {}", gpu.device_id, gpu.name);
   if (gpu.total_memory_bytes > 0) {
-    stream << " · " << format_memory_gib(gpu.total_memory_bytes);
+    label += std::format(" · {}", format_memory_gib(gpu.total_memory_bytes));
   }
-  return stream.str();
+  return label;
 }
 
 void draw_remote_offer_card(const VastOfferSummary &offer, bool selected) {
@@ -533,6 +594,296 @@ void draw_remote_offer_card(const VastOfferSummary &offer, bool selected) {
 }
 
 } // namespace
+
+struct WorkspaceToolbarActions;
+
+class AnnotationWorkflowCoordinator {
+public:
+  explicit AnnotationWorkflowCoordinator(App &app) noexcept : app_(app) {}
+
+  void shutdown();
+  void poll();
+  void draw_workspace();
+  void draw_utilities_pane();
+  void invalidate_preview();
+  void cancel_canvas_interactions();
+  void reset_instances();
+  void sync_categories();
+  void prepare_source();
+  void load_current_frame();
+  void step_current_frame(int step);
+  void handle_setup_browse_request(AnnotationSetupBrowseRequest browse_request);
+  void load_frame(AnnotationFrame frame);
+  void submit_preview();
+  void start_live_session();
+  void stop_live_session();
+  [[nodiscard]] bool live_running() const;
+
+private:
+  void draw_workspace_status(bool live_video);
+  void draw_workspace_tool_hints(bool live_video);
+  [[nodiscard]] WorkspaceToolbarActions
+  draw_workspace_toolbar(bool live_video,
+                         const AnnotationWorkspaceViewModel &workspace_view);
+  void draw_workspace_canvas(bool live_video,
+                             const AnnotationWorkspaceViewModel &workspace_view,
+                             const LivePreviewTextureState &preview_state,
+                             const WorkspaceToolbarActions &toolbar_actions);
+  void draw_setup_tab(bool block_actions, bool live_video, bool can_use_video);
+  void draw_save_tab(bool live_video);
+  void apply_sidebar_mutation_result(const AnnotationSidebarMutationResult &result,
+                                     bool allow_assist);
+  void apply_objects_tab_actions(const AnnotationSidebarViewModel &sidebar_model,
+                                 const AnnotationObjectsTabActions &actions,
+                                 bool assist_available);
+  void apply_mask_tab_actions(const AnnotationMaskTabActions &actions);
+
+  App &app_;
+};
+
+struct WorkspaceToolbarActions {
+  bool click_fit = false;
+  bool click_one_to_one = false;
+  bool click_zoom_in = false;
+  bool click_zoom_out = false;
+  bool click_focus_selection = false;
+  bool click_focus_crop = false;
+};
+
+namespace {
+
+struct ViewMenuEntry {
+  View view;
+  const char *label;
+};
+
+constexpr std::array<ViewMenuEntry, 6> kViewMenuEntries{{
+    {View::Train, "Train"},
+    {View::Validate, "Validate"},
+    {View::Predict, "Predict"},
+    {View::Annotate, "Annotate"},
+    {View::Export, "Export"},
+    {View::Live, "LIVE"},
+}};
+
+const char *workflow_view_label(const View view) {
+  for (const ViewMenuEntry &entry : kViewMenuEntries) {
+    if (entry.view == view) {
+      return entry.label;
+    }
+  }
+  return view_label(view);
+}
+
+} // namespace
+
+void App::draw_export_view() {
+  const bool block_actions = job_.running || live_predict_running();
+  ModelArtifactSelectionState artifact_state = model_artifacts(export_);
+  ExecutionTuningState execution_state = execution_tuning(export_);
+
+  const bool weights_browse_busy =
+        file_picker_busy(FileBrowseField::ExportWeights);
+  const bool onnx_browse_busy =
+        file_picker_busy(FileBrowseField::ExportOnnx);
+  const bool engine_browse_busy =
+        file_picker_busy(FileBrowseField::ExportEngine);
+  bool browse_weights = false;
+  bool browse_onnx = false;
+  bool browse_engine = false;
+
+  draw_property_sheet_tile("export_model_input_tile", "Model Input", [&]() {
+    browse_weights = draw_file_picker_input("Weights Path (.pt)",
+                                            artifact_state.weights_path,
+                                            weights_browse_busy);
+    browse_onnx = draw_file_picker_input("ONNX Path", artifact_state.onnx_path,
+                                         onnx_browse_busy);
+  });
+
+  draw_property_sheet_tile("export_onnx_tile", "ONNX Export", [&]() {
+    draw_labeled_int_input("Opset Version (19 only)",
+                           export_.opset_version, 120.0f);
+    draw_labeled_checkbox("Simplify", export_.simplify);
+  });
+
+  draw_property_sheet_tile("export_tensorrt_tile", "TensorRT", [&]() {
+    draw_labeled_checkbox("Build TensorRT Engine", export_.build_tensorrt);
+    if (export_.build_tensorrt) {
+      browse_engine = draw_file_picker_input("Engine Output Path",
+                                             export_.output_path,
+                                             engine_browse_busy);
+      draw_labeled_checkbox("FP16", execution_state.allow_fp16);
+    }
+  });
+
+  draw_property_sheet_tile("export_execution_tile", "Execution", [&]() {
+    draw_execution_tuning_section(
+        execution_state,
+        {.heading = nullptr,
+         .input_width = 120.0f,
+         .show_cpu_affinity = false,
+         .show_device_id = true,
+         .show_workers = false,
+         .show_lanes = false,
+         .show_allow_fp16 = false,
+         .show_progress_bar = false,
+         .show_compile_mode = false});
+  });
+
+  if (browse_weights) {
+    apply_model_artifacts(export_, artifact_state);
+    launch_file_picker(FileBrowseField::ExportWeights, "Select Weights",
+                       &export_.weights_path);
+  }
+  if (browse_onnx) {
+    apply_model_artifacts(export_, artifact_state);
+    launch_file_picker(FileBrowseField::ExportOnnx, "Select ONNX Model",
+                       &export_.onnx_path);
+  }
+  if (browse_engine) {
+    launch_file_picker(FileBrowseField::ExportEngine, "Select Engine Output",
+                       &export_.output_path);
+  }
+
+  apply_model_artifacts(export_, artifact_state);
+  apply_execution_tuning(export_, execution_state);
+
+  ImGui::Spacing();
+  ImGui::BeginDisabled(block_actions);
+  if (ImGui::Button("Export")) {
+    const ExportViewState state = export_;
+    launch_job("export", [this, state]() {
+      append_job_output("[export] start");
+      std::filesystem::path onnx_path = state.onnx_path;
+
+      if (!state.weights_path.empty()) {
+        const ExportOnnxRequest export_request =
+            rfdetr_workflows::build_export_onnx_request(state, onnx_path);
+        append_job_output("[export] writing ONNX: " +
+              export_request.output_path.string());
+        rfdetr::export_weights_to_onnx(export_request.weights_path,
+                                       export_request.output_path,
+                                       export_request.device_id,
+                                       export_request.opset_version,
+                                       export_request.simplify);
+        onnx_path = export_request.output_path;
+      }
+
+      if (onnx_path.empty()) {
+        throw std::runtime_error("Provide weights path or ONNX path");
+      }
+
+      std::string summary = "Exported ONNX: " + onnx_path.string();
+
+      if (state.build_tensorrt) {
+        const BuildEngineRequest build_request =
+            rfdetr_workflows::build_build_engine_request(state, onnx_path);
+        append_job_output("[export] building TensorRT engine: " +
+              build_request.output_path.string());
+        rfdetr::make_tensorrt_backend(build_request.onnx_path,
+                                      build_request.device_id,
+                                      build_request.allow_fp16,
+                                      build_request.output_path);
+        append_job_output("[export] TensorRT engine ready: " +
+              build_request.output_path.string());
+        summary += " | TRT engine: " + build_request.output_path.string();
+      }
+
+      JobOutcome outcome;
+      outcome.summary = std::move(summary);
+      return outcome;
+    });
+  }
+  ImGui::EndDisabled();
+
+  const bool export_job_active_or_recent = job_.label == "export";
+  const std::string export_job_output = snapshot_job_output();
+  if (export_job_active_or_recent || !export_job_output.empty()) {
+    draw_recent_job_tile(job_, export_job_output,
+                         {.label = "export",
+                          .tile_id = "export_job_tile",
+                          .heading = "Export Job",
+                          .output_id = "export_view_job_output_tail",
+                          .waiting_message = "Waiting for export output..."});
+  }
+}
+
+void App::draw_live_view() {
+  if (active_live_mode_ == ActiveLiveMode::Predict &&
+      live_predict_controller_.controller() != nullptr) {
+    const bool is_video_stream =
+        predict_.source.kind == SourceKind::VideoStream;
+    draw_property_sheet_tile("live_preview_controls_tile", "Preview Controls",
+                             [&]() {
+                               draw_labeled_checkbox(
+                                   "Fit To Capture",
+                                   live_preview_fit_to_capture_);
+                               if (is_video_stream) {
+                                 bool was_overlay = live_crop_overlay_mode_;
+                                 draw_labeled_checkbox(
+                                     "Full Frame",
+                                     live_crop_overlay_mode_);
+                                 if (live_crop_overlay_mode_ != was_overlay) {
+                                   live_crop_drag_session_ = {};
+                                 }
+                               }
+                             });
+    draw_live_preview_panel();
+    return;
+  }
+
+  if (live_predict_controller_.starting() ||
+      live_predict_controller_.stopping()) {
+    draw_banner_tile("live_preview_transition_tile", "Live Preview", [&]() {
+      ImGui::TextWrapped(
+          "%s", live_predict_controller_.starting()
+                    ? "Live prediction is starting..."
+                    : "Live prediction is stopping...");
+    });
+    return;
+  }
+
+  if (has_static_preview()) {
+    draw_property_sheet_tile("live_static_preview_tile", "Preview Controls",
+                             [&]() {
+                               draw_labeled_checkbox(
+                                   "Fit To Capture",
+                                   live_preview_fit_to_capture_);
+                               ImGui::TextWrapped(
+                                   "Source: %s",
+                                   live_static_preview_source_name_.c_str());
+                             });
+    draw_live_preview_panel();
+    return;
+  }
+
+  draw_section_tile("live_preview_idle_tile", "Live Preview", [&]() {
+    if (!live_predict_controller_.start_error().empty()) {
+      draw_banner("live_view_start_error_banner",
+                  ImVec4(0.33f, 0.17f, 0.12f, 0.95f),
+                  ImVec4(0.98f, 0.90f, 0.82f, 1.00f),
+                  live_predict_controller_.start_error());
+      ImGui::Spacing();
+    }
+    if (!live_preview_error_.empty()) {
+      draw_banner("live_view_preview_error_banner",
+                  ImVec4(0.33f, 0.17f, 0.12f, 0.95f),
+                  ImVec4(0.98f, 0.90f, 0.82f, 1.00f),
+                  live_preview_error_);
+      ImGui::Spacing();
+    }
+    if (!live_predict_controller_.action_error().empty()) {
+      draw_banner("live_view_action_error_banner",
+                  ImVec4(0.33f, 0.17f, 0.12f, 0.95f),
+                  ImVec4(0.98f, 0.90f, 0.82f, 1.00f),
+                  live_predict_controller_.action_error());
+      ImGui::Spacing();
+    }
+    ImGui::TextWrapped(
+        "Start live prediction from Predict with a video stream source, or run "
+        "single-image predict to push an annotated still here.");
+  });
+}
 
 App::App(GLFWwindow *main_window, std::string vast_api_key,
          std::string settings_path)
@@ -593,6 +944,8 @@ App::App(GLFWwindow *main_window, std::string vast_api_key,
   (void)annotate_controller_.set_active_tool(AnnotationToolKind::Direct,
                                              annotate_document_,
                                              annotate_session_);
+  annotation_workflow_coordinator_ =
+      std::make_unique<AnnotationWorkflowCoordinator>(*this);
 }
 
 App::~App() { shutdown(); }
@@ -609,16 +962,11 @@ void App::shutdown() {
   }
   shutting_down_ = true;
   stop_live_predict_session();
+  annotation_workflow_coordinator_->shutdown();
   local_train_controller_.shutdown();
   settings_persistence_.flush();
   background_executor_.wait_idle();
   ui_callbacks_.drain();
-  reset_annotation_workflow_live_session_shell(
-      annotate_workflow_, &live_controller_, &live_session_status_,
-      &annotate_frame_, &annotate_resolved_instances_,
-      live_preview_texture_.get(),
-      [this]() { cancel_annotation_canvas_interactions(); });
-  active_live_mode_ = ActiveLiveMode::None;
   if (live_preview_texture_) {
     live_preview_texture_->shutdown();
   }
@@ -823,274 +1171,283 @@ void App::draw_annotation_range_controls(const char *label,
   ImGui::PopID();
 }
 
-void App::invalidate_annotation_preview() {
-  invalidate_annotation_workflow_preview(annotate_workflow_);
+void AnnotationWorkflowCoordinator::invalidate_preview() {
+  invalidate_annotation_workflow_preview(app_.annotate_workflow_);
 }
 
-void App::cancel_annotation_canvas_interactions() {
-  (void)cancel_active_grouped_edit(annotate_document_, annotate_session_);
-  annotate_controller_.reset_active_drawing(annotate_session_);
-  annotate_document_.cancel_transaction();
+void AnnotationWorkflowCoordinator::cancel_canvas_interactions() {
+  (void)cancel_active_grouped_edit(app_.annotate_document_,
+                                   app_.annotate_session_);
+  app_.annotate_controller_.reset_active_drawing(app_.annotate_session_);
+  app_.annotate_document_.cancel_transaction();
 }
 
-void App::reset_annotation_instances() {
-  reset_annotation_workflow_runtime(annotate_workflow_);
-  annotate_document_.clear();
-  annotate_document_.clear_history();
-  annotate_resolved_instances_.clear();
-  select_object(annotate_session_, annotate_document_, std::nullopt);
-  cancel_annotation_canvas_interactions();
-  invalidate_annotation_preview();
+void AnnotationWorkflowCoordinator::reset_instances() {
+  reset_annotation_workflow_runtime(app_.annotate_workflow_);
+  app_.annotate_document_.clear();
+  app_.annotate_document_.clear_history();
+  app_.annotate_resolved_instances_.clear();
+  select_object(app_.annotate_session_, app_.annotate_document_,
+                std::nullopt);
+  cancel_canvas_interactions();
+  invalidate_preview();
 }
 
-void App::sync_annotation_categories() {
-  if (annotate_.output_dir.empty()) {
-    annotate_categories_loaded_ = false;
-    annotate_categories_output_dir_.clear();
+void AnnotationWorkflowCoordinator::sync_categories() {
+  if (app_.annotate_.output_dir.empty()) {
+    app_.annotate_categories_loaded_ = false;
+    app_.annotate_categories_output_dir_.clear();
     return;
   }
-  if (annotate_categories_loaded_ &&
-      annotate_categories_output_dir_ == annotate_.output_dir) {
+  if (app_.annotate_categories_loaded_ &&
+      app_.annotate_categories_output_dir_ == app_.annotate_.output_dir) {
     return;
   }
   try {
     AnnotationCategories loaded_categories =
-        load_annotation_categories(annotate_.output_dir);
-    annotate_categories_ = std::move(loaded_categories);
-    annotate_categories_loaded_ = true;
-    annotate_categories_output_dir_ = annotate_.output_dir;
-    (void)AnnotationEditor::repair_object_category_indices(annotate_document_,
-                                                           annotate_categories_);
+        load_annotation_categories(app_.annotate_.output_dir);
+    app_.annotate_categories_ = std::move(loaded_categories);
+    app_.annotate_categories_loaded_ = true;
+    app_.annotate_categories_output_dir_ = app_.annotate_.output_dir;
+    (void)AnnotationEditor::repair_object_category_indices(
+        app_.annotate_document_, app_.annotate_categories_);
   } catch (const std::exception &error) {
-    annotate_categories_loaded_ = true;
-    annotate_categories_output_dir_ = annotate_.output_dir;
-    annotate_save_error_ = error.what();
-    log_gui_error("annotate categories error", annotate_save_error_);
+    app_.annotate_categories_loaded_ = true;
+    app_.annotate_categories_output_dir_ = app_.annotate_.output_dir;
+    app_.annotate_save_error_ = error.what();
+    log_gui_error("annotate categories error", app_.annotate_save_error_);
   }
 }
 
-void App::prepare_annotation_source() {
-  const std::string signature = annotation_source_signature(annotate_.source);
-  if (signature == annotate_source_signature_) {
+void AnnotationWorkflowCoordinator::prepare_source() {
+  const std::string signature = annotation_source_signature(app_.annotate_.source);
+  if (signature == app_.annotate_source_signature_) {
     return;
   }
 
-  annotate_source_signature_ = signature;
-  ++annotate_prepare_request_id_;
-    annotate_inputs_.clear();
-    annotate_current_input_index_ = 0;
-    annotate_frame_.reset();
-    annotate_prepare_running_ = false;
-    annotate_frame_load_running_ = false;
-  annotate_assist_summary_.clear();
-  annotate_assist_error_.clear();
-  annotate_save_summary_.clear();
-  annotate_save_error_.clear();
-  reset_annotation_instances();
+  app_.annotate_source_signature_ = signature;
+  ++app_.annotate_prepare_request_id_;
+  app_.annotate_inputs_.clear();
+  app_.annotate_current_input_index_ = 0;
+  app_.annotate_frame_.reset();
+  app_.annotate_prepare_running_ = false;
+  app_.annotate_frame_load_running_ = false;
+  app_.annotate_assist_summary_.clear();
+  app_.annotate_assist_error_.clear();
+  app_.annotate_save_summary_.clear();
+  app_.annotate_save_error_.clear();
+  reset_instances();
   reset_annotation_workflow_live_session_shell(
-      annotate_workflow_, &live_controller_, &live_session_status_,
-      &annotate_frame_, &annotate_resolved_instances_,
-      live_preview_texture_.get(),
-      [this]() { cancel_annotation_canvas_interactions(); });
-  active_live_mode_ = ActiveLiveMode::None;
-  if (annotate_.source.kind == SourceKind::VideoStream) {
+      app_.annotate_workflow_, &app_.live_controller_,
+      &app_.live_session_status_, &app_.annotate_frame_,
+      &app_.annotate_resolved_instances_, app_.live_preview_texture_.get(),
+      [this]() { cancel_canvas_interactions(); });
+  app_.active_live_mode_ = App::ActiveLiveMode::None;
+  if (app_.annotate_.source.kind == SourceKind::VideoStream) {
     return;
   }
 
-  if (annotate_.source.kind == SourceKind::CompiledDataset) {
-    annotate_save_error_ =
+  if (app_.annotate_.source.kind == SourceKind::CompiledDataset) {
+    app_.annotate_save_error_ =
         "Annotate only supports single images, image folders, and live video.";
     return;
   }
 
-  const SourceSelectionState source = annotate_.source;
-  const std::uint64_t request_id = annotate_prepare_request_id_;
-  annotate_prepare_running_ = true;
+  const SourceSelectionState source = app_.annotate_.source;
+  const std::uint64_t request_id = app_.annotate_prepare_request_id_;
+  app_.annotate_prepare_running_ = true;
   mmltk::runtime::submit_background_task(
-      background_executor_, ui_callbacks_,
+      app_.background_executor_, app_.ui_callbacks_,
       [source]() {
         PreparedPredictSource prepared = prepare_predict_source(source);
         return std::move(prepared.image_inputs);
       },
       [this, request_id,
        signature](std::vector<mmltk::rfdetr::PredictImageInput> inputs) {
-        if (request_id != annotate_prepare_request_id_ ||
-            signature != annotate_source_signature_) {
+        if (request_id != app_.annotate_prepare_request_id_ ||
+            signature != app_.annotate_source_signature_) {
           return;
         }
-        annotate_prepare_running_ = false;
-        annotate_inputs_ = std::move(inputs);
-        annotate_save_error_.clear();
-        if (!annotate_inputs_.empty()) {
-          load_annotation_current_frame();
+        app_.annotate_prepare_running_ = false;
+        app_.annotate_inputs_ = std::move(inputs);
+        app_.annotate_save_error_.clear();
+        if (!app_.annotate_inputs_.empty()) {
+          load_current_frame();
         }
       },
       [this, request_id, signature](const std::string &error) {
-        if (request_id != annotate_prepare_request_id_ ||
-            signature != annotate_source_signature_) {
+        if (request_id != app_.annotate_prepare_request_id_ ||
+            signature != app_.annotate_source_signature_) {
           return;
         }
-        annotate_prepare_running_ = false;
-        annotate_save_error_ = error;
-        log_gui_error("annotate source error", annotate_save_error_);
+        app_.annotate_prepare_running_ = false;
+        app_.annotate_save_error_ = error;
+        log_gui_error("annotate source error", app_.annotate_save_error_);
       });
 }
 
-void App::load_annotation_current_frame() {
-  if (annotate_current_input_index_ >= annotate_inputs_.size()) {
-    annotate_frame_.reset();
-    annotate_resolved_instances_.clear();
-    cancel_annotation_canvas_interactions();
-    invalidate_annotation_preview();
+void AnnotationWorkflowCoordinator::load_current_frame() {
+  if (app_.annotate_current_input_index_ >= app_.annotate_inputs_.size()) {
+    app_.annotate_frame_.reset();
+    app_.annotate_resolved_instances_.clear();
+    cancel_canvas_interactions();
+    invalidate_preview();
     return;
   }
-  ++annotate_frame_request_id_;
-  const std::uint64_t request_id = annotate_frame_request_id_;
+  ++app_.annotate_frame_request_id_;
+  const std::uint64_t request_id = app_.annotate_frame_request_id_;
   const mmltk::rfdetr::PredictImageInput input =
-      annotate_inputs_[annotate_current_input_index_];
-  annotate_frame_load_running_ = true;
+      app_.annotate_inputs_[app_.annotate_current_input_index_];
+  app_.annotate_frame_load_running_ = true;
   mmltk::runtime::submit_background_task(
-      background_executor_, ui_callbacks_,
+      app_.background_executor_, app_.ui_callbacks_,
       [input]() { return mmltk::gui::load_annotation_frame(input); },
       [this, request_id](AnnotationFrame frame) {
-        if (request_id != annotate_frame_request_id_) {
+        if (request_id != app_.annotate_frame_request_id_) {
           return;
         }
-        annotate_frame_load_running_ = false;
-        load_annotation_frame(std::move(frame));
-        annotate_save_error_.clear();
+        app_.annotate_frame_load_running_ = false;
+        load_frame(std::move(frame));
+        app_.annotate_save_error_.clear();
       },
       [this, request_id](const std::string &error) {
-        if (request_id != annotate_frame_request_id_) {
+        if (request_id != app_.annotate_frame_request_id_) {
           return;
         }
-        annotate_frame_load_running_ = false;
-        annotate_frame_.reset();
-        annotate_resolved_instances_.clear();
-        cancel_annotation_canvas_interactions();
-        invalidate_annotation_preview();
-        annotate_save_error_ = error;
+        app_.annotate_frame_load_running_ = false;
+        app_.annotate_frame_.reset();
+        app_.annotate_resolved_instances_.clear();
+        cancel_canvas_interactions();
+        invalidate_preview();
+        app_.annotate_save_error_ = error;
         log_gui_error("annotate frame load error",
-                                annotate_save_error_);
+                      app_.annotate_save_error_);
       });
 }
 
-void App::step_annotation_current_frame(const int step) {
+void AnnotationWorkflowCoordinator::step_current_frame(const int step) {
   if (step == 0) {
-    load_annotation_current_frame();
+    load_current_frame();
     return;
   }
   const auto next_index =
-      static_cast<std::ptrdiff_t>(annotate_current_input_index_) + step;
+      static_cast<std::ptrdiff_t>(app_.annotate_current_input_index_) + step;
   if (next_index < 0) {
     return;
   }
-  annotate_current_input_index_ = static_cast<std::size_t>(next_index);
-  load_annotation_current_frame();
+  app_.annotate_current_input_index_ = static_cast<std::size_t>(next_index);
+  load_current_frame();
 }
 
-void App::handle_annotation_setup_browse_request(
+void AnnotationWorkflowCoordinator::handle_setup_browse_request(
     const AnnotationSetupBrowseRequest browse_request) {
+  if (browse_request == AnnotationSetupBrowseRequest::SingleImage) {
+    app_.launch_file_picker(App::FileBrowseField::AnnotateSingleImage,
+                            "Select Image",
+                            &app_.annotate_.source.single_image_path);
+    return;
+  }
+
+  ModelInputBrowseRequest model_request = ModelInputBrowseRequest::None;
   switch (browse_request) {
-  case AnnotationSetupBrowseRequest::SingleImage:
-    launch_file_picker(FileBrowseField::AnnotateSingleImage, "Select Image",
-                       &annotate_.source.single_image_path);
-    break;
   case AnnotationSetupBrowseRequest::Weights:
-    launch_file_picker(FileBrowseField::AnnotateWeights, "Select Weights",
-                       &annotate_.weights_path);
+    model_request = ModelInputBrowseRequest::Weights;
     break;
   case AnnotationSetupBrowseRequest::Onnx:
-    launch_file_picker(FileBrowseField::AnnotateOnnx, "Select ONNX Model",
-                       &annotate_.onnx_path);
+    model_request = ModelInputBrowseRequest::Onnx;
     break;
   case AnnotationSetupBrowseRequest::TensorRt:
-    launch_file_picker(FileBrowseField::AnnotateTensorRt,
-                       "Select TensorRT Engine", &annotate_.tensorrt_path);
+    model_request = ModelInputBrowseRequest::TensorRt;
     break;
-  case AnnotationSetupBrowseRequest::None:
+  default:
     break;
   }
-}
+  app_.handle_model_input_browse_request(
+      model_request, app_.annotate_, model_artifacts(app_.annotate_),
+      App::FileBrowseField::AnnotateWeights, App::FileBrowseField::AnnotateOnnx,
+      App::FileBrowseField::AnnotateTensorRt);
+};
 
-void App::load_annotation_frame(AnnotationFrame frame) {
+void AnnotationWorkflowCoordinator::load_frame(AnnotationFrame frame) {
   const bool reset_canvas_view = annotation_workflow_should_reset_canvas_view(
-      annotation_frame_ptr(annotate_frame_), frame);
-  if (annotate_.source.kind != SourceKind::VideoStream) {
-    reset_annotation_instances();
+      annotation_frame_ptr(app_.annotate_frame_), frame);
+  if (app_.annotate_.source.kind != SourceKind::VideoStream) {
+    reset_instances();
   } else {
-    annotate_resolved_instances_.clear();
+    app_.annotate_resolved_instances_.clear();
   }
   if (reset_canvas_view) {
-    annotate_canvas_scale_ = 0.0f;
-    annotate_canvas_pan_x_ = 0.0f;
-    annotate_canvas_pan_y_ = 0.0f;
-    annotate_canvas_auto_fit_ = true;
+    app_.annotate_canvas_scale_ = 0.0f;
+    app_.annotate_canvas_pan_x_ = 0.0f;
+    app_.annotate_canvas_pan_y_ = 0.0f;
+    app_.annotate_canvas_auto_fit_ = true;
   }
-  annotate_frame_ = std::move(frame);
-  if (annotate_.source.kind != SourceKind::VideoStream &&
-      annotate_frame_.has_value() && !annotate_.output_dir.empty()) {
-    sync_annotation_categories();
+  app_.annotate_frame_ = std::move(frame);
+  if (app_.annotate_.source.kind != SourceKind::VideoStream &&
+      app_.annotate_frame_.has_value() && !app_.annotate_.output_dir.empty()) {
+    sync_categories();
     try {
       const std::optional<std::vector<AnnotationObject>> loaded_objects =
           load_saved_annotation_scene_for_frame(
-              annotate_.output_dir, *annotate_frame_, &annotate_categories_);
+              app_.annotate_.output_dir, *app_.annotate_frame_,
+              &app_.annotate_categories_);
       if (loaded_objects.has_value()) {
-        annotate_document_.set_objects(*loaded_objects, true);
-        if (!annotate_document_.empty()) {
-          select_object(annotate_session_, annotate_document_, 0U);
+        app_.annotate_document_.set_objects(*loaded_objects, true);
+        if (!app_.annotate_document_.empty()) {
+          select_object(app_.annotate_session_, app_.annotate_document_, 0U);
         }
       }
     } catch (const std::exception &error) {
-      annotate_save_error_ = error.what();
-      log_gui_error("annotate scene load error",
-                              annotate_save_error_);
+      app_.annotate_save_error_ = error.what();
+      log_gui_error("annotate scene load error", app_.annotate_save_error_);
     }
   }
-  invalidate_annotation_preview();
+  invalidate_preview();
 }
 
-void App::submit_annotation_preview() {
-  const AnnotationFrame *frame_ptr = annotation_frame_ptr(annotate_frame_);
-  if (frame_ptr == nullptr || !live_preview_texture_ ||
-      annotation_workflow_preview_running(annotate_workflow_)) {
+void AnnotationWorkflowCoordinator::submit_preview() {
+  const AnnotationFrame *frame_ptr = annotation_frame_ptr(app_.annotate_frame_);
+  if (frame_ptr == nullptr || !app_.live_preview_texture_ ||
+      annotation_workflow_preview_running(app_.annotate_workflow_)) {
     return;
   }
-  const bool live_mode = annotation_live_running();
+  const bool live_mode = live_running();
   if (live_mode) {
     AnnotationWorkflowLivePreviewRefreshResult refreshed =
         refresh_annotation_workflow_live_preview(
-            annotate_workflow_, annotate_document_, annotate_session_,
-            *frame_ptr, annotate_categories_, !frame_ptr->pixels_bgr.empty(),
+            app_.annotate_workflow_, app_.annotate_document_,
+            app_.annotate_session_, *frame_ptr, app_.annotate_categories_,
+            !frame_ptr->pixels_bgr.empty(),
             [this](mmltk::live::ManualOverlayDocumentSnapshot snapshot) {
-              live_controller_->manual_overlay_document().publish_snapshot(
+              app_.live_controller_->manual_overlay_document().publish_snapshot(
                   std::move(snapshot));
             });
     if (refreshed.ok) {
       if (!frame_ptr->pixels_bgr.empty()) {
-        annotate_resolved_instances_ = std::move(refreshed.resolved_objects);
+        app_.annotate_resolved_instances_ = std::move(refreshed.resolved_objects);
       }
-      live_preview_error_.clear();
+      app_.live_preview_error_.clear();
     } else {
-      annotate_save_error_ = std::move(refreshed.error_message);
-      live_preview_error_ = annotate_save_error_;
+      app_.annotate_save_error_ = std::move(refreshed.error_message);
+      app_.live_preview_error_ = app_.annotate_save_error_;
     }
     return;
   }
 
   const AnnotationFrame frame_snapshot = *frame_ptr;
-  const AnnotationCategories categories_snapshot = annotate_categories_;
+  const AnnotationCategories categories_snapshot = app_.annotate_categories_;
   const AnnotationDocumentSnapshot document_snapshot =
-      annotate_document_.snapshot();
+      app_.annotate_document_.snapshot();
   const std::shared_ptr<const AnnotationProjectedScene>
       projected_scene_snapshot =
           resolve_annotation_projected_scene_for_document_generation(
-              annotate_workflow_, annotate_document_, annotate_session_,
-              annotate_frame_, document_snapshot.generation);
+              app_.annotate_workflow_, app_.annotate_document_,
+              app_.annotate_session_, app_.annotate_frame_,
+              document_snapshot.generation);
   const std::uint64_t generation =
-      begin_annotation_workflow_preview(annotate_workflow_);
+      begin_annotation_workflow_preview(app_.annotate_workflow_);
   mmltk::runtime::submit_background_task(
-      background_executor_, ui_callbacks_,
+      app_.background_executor_, app_.ui_callbacks_,
       [frame_snapshot, categories_snapshot, document_snapshot,
        projected_scene_snapshot]() {
         return prepare_annotation_workflow_preview(
@@ -1099,76 +1456,75 @@ void App::submit_annotation_preview() {
       },
       [this,
        generation](AnnotationWorkflowPreparedPreview prepared) mutable {
-        end_annotation_workflow_preview(annotate_workflow_);
-        if (annotation_workflow_preview_generation_matches(annotate_workflow_,
-                                                           generation) &&
-            annotate_frame_.has_value() &&
-            annotate_frame_->frame_id == prepared.frame_id &&
-            live_preview_texture_) {
-          annotate_resolved_instances_ = prepared.preview.resolved_objects;
+        end_annotation_workflow_preview(app_.annotate_workflow_);
+        if (annotation_workflow_preview_generation_matches(
+                app_.annotate_workflow_, generation) &&
+            app_.annotate_frame_.has_value() &&
+            app_.annotate_frame_->frame_id == prepared.frame_id &&
+            app_.live_preview_texture_) {
+          app_.annotate_resolved_instances_ = prepared.preview.resolved_objects;
           const LiveCaptureRegion region{0U, 0U, prepared.width,
                                          prepared.height};
           std::string preview_error;
-          if (!live_preview_texture_->submit_host_bgr(
+          if (!app_.live_preview_texture_->submit_host_bgr(
                   std::move(prepared.preview.preview_bgr), prepared.width,
                   prepared.height, region, prepared.frame_id, &preview_error)) {
-            live_preview_error_ = std::move(preview_error);
-            log_gui_error("annotate preview error",
-                                    live_preview_error_);
+            app_.live_preview_error_ = std::move(preview_error);
+            log_gui_error("annotate preview error", app_.live_preview_error_);
           } else {
-            live_preview_error_.clear();
-            note_annotation_workflow_preview_ready(annotate_workflow_,
-                                                   *annotate_frame_);
+            app_.live_preview_error_.clear();
+            note_annotation_workflow_preview_ready(app_.annotate_workflow_,
+                                                   *app_.annotate_frame_);
           }
         }
         if (annotation_workflow_preview_pending(
-                annotate_workflow_, annotation_frame_ptr(annotate_frame_))) {
-          submit_annotation_preview();
+                app_.annotate_workflow_, annotation_frame_ptr(app_.annotate_frame_))) {
+          submit_preview();
         }
       },
       [this](const std::string &error) {
-        annotate_save_error_ = error;
-        annotate_resolved_instances_.clear();
-        live_preview_error_ = error;
-        note_annotation_workflow_preview_error(annotate_workflow_);
+        app_.annotate_save_error_ = error;
+        app_.annotate_resolved_instances_.clear();
+        app_.live_preview_error_ = error;
+        note_annotation_workflow_preview_error(app_.annotate_workflow_);
         constexpr int kMaxPreviewRetries = 3;
-        if (annotation_workflow_preview_can_retry(annotate_workflow_,
+        if (annotation_workflow_preview_can_retry(app_.annotate_workflow_,
                                                   kMaxPreviewRetries) &&
             annotation_workflow_preview_pending(
-                annotate_workflow_, annotation_frame_ptr(annotate_frame_))) {
-          submit_annotation_preview();
+                app_.annotate_workflow_, annotation_frame_ptr(app_.annotate_frame_))) {
+          submit_preview();
         }
       });
 }
 
-bool App::annotation_live_running() const {
-  return active_live_mode_ == ActiveLiveMode::Annotate &&
-         live_controller_ != nullptr;
+bool AnnotationWorkflowCoordinator::live_running() const {
+  return app_.active_live_mode_ == App::ActiveLiveMode::Annotate &&
+         app_.live_controller_ != nullptr;
 }
 
-void App::poll_annotate_work() {
-  if (annotation_live_running() && live_preview_texture_) {
+void AnnotationWorkflowCoordinator::poll() {
+  if (live_running() && app_.live_preview_texture_) {
     std::optional<AnnotationFrame> synced_frame =
         make_annotation_workflow_live_annotation_frame_from_preview(
-            annotate_.source, annotate_.full_frame, *live_preview_texture_,
-            annotate_frame_);
+            app_.annotate_.source, app_.annotate_.full_frame,
+            *app_.live_preview_texture_, app_.annotate_frame_);
     if (synced_frame.has_value()) {
-      load_annotation_frame(std::move(*synced_frame));
+      load_frame(std::move(*synced_frame));
     }
-    if (live_controller_) {
-      const std::string controller_error = live_controller_->last_error();
+    if (app_.live_controller_) {
+      const std::string controller_error = app_.live_controller_->last_error();
       if (!controller_error.empty()) {
-        annotate_save_error_ = controller_error;
+        app_.annotate_save_error_ = controller_error;
       }
     }
   }
 
   const AnnotationWorkflowSaveRequest save_request =
       make_annotation_workflow_save_request(
-          &annotate_workflow_, annotate_, annotation_live_running(),
-          annotate_save_running_, annotation_frame_ptr(annotate_frame_),
-          !annotate_resolved_instances_.empty(), annotate_current_input_index_,
-          annotate_inputs_.size());
+          &app_.annotate_workflow_, app_.annotate_, live_running(),
+          app_.annotate_save_running_, annotation_frame_ptr(app_.annotate_frame_),
+          !app_.annotate_resolved_instances_.empty(),
+          app_.annotate_current_input_index_, app_.annotate_inputs_.size());
   const AnnotationWorkflowPollPlan workflow_poll =
       plan_annotation_workflow_poll(save_request);
 
@@ -1177,21 +1533,22 @@ void App::poll_annotate_work() {
       [this]() -> std::optional<AnnotationSaveSnapshot> {
         return make_annotation_workflow_current_save_snapshot(
             AnnotationWorkflowCurrentSaveSnapshotRequest{
-                &annotate_workflow_,
-                &annotate_document_,
-                &annotate_session_,
-                &annotate_frame_,
-                &annotate_categories_,
-                &annotate_resolved_instances_,
+                &app_.annotate_workflow_,
+                &app_.annotate_document_,
+                &app_.annotate_session_,
+                &app_.annotate_frame_,
+                &app_.annotate_categories_,
+                &app_.annotate_resolved_instances_,
                 true,
                 true,
-                &annotate_save_error_,
+                &app_.annotate_save_error_,
                 "annotate hold-save resolve error",
             },
             [this](std::string *error_message) {
               return ensure_annotation_workflow_live_annotation_frame_pixels(
-                  annotate_.source, annotate_frame_, annotation_live_running(),
-                  live_controller_.get(), annotate_.full_frame, error_message);
+                  app_.annotate_.source, app_.annotate_frame_, live_running(),
+                  app_.live_controller_.get(), app_.annotate_.full_frame,
+                  error_message);
             },
             [this](const char *error_context, const std::string &error) {
               log_gui_error(
@@ -1202,69 +1559,112 @@ void App::poll_annotate_work() {
       },
       [this](AnnotationSaveSnapshot save_snapshot) {
         queue_annotation_workflow_save(
-            annotate_workflow_, std::move(save_snapshot.frame),
+            app_.annotate_workflow_, std::move(save_snapshot.frame),
             std::move(save_snapshot.objects),
             std::move(save_snapshot.projected_scene));
       },
       [this](AnnotationSaveSnapshot save_snapshot) {
-        sync_annotation_categories();
+        sync_categories();
         (void)launch_annotation_workflow_save(
-            annotate_workflow_, annotate_, annotate_categories_,
+            app_.annotate_workflow_, app_.annotate_, app_.annotate_categories_,
             std::move(save_snapshot), true,
-            AnnotationWorkflowSaveLaunchState{&annotate_save_running_,
-                                              &annotate_save_summary_,
-                                              &annotate_save_error_,
-                                              &annotate_categories_loaded_,
-                                              &annotate_categories_output_dir_},
-            background_executor_, ui_callbacks_,
+            AnnotationWorkflowSaveLaunchState{&app_.annotate_save_running_,
+                                              &app_.annotate_save_summary_,
+                                              &app_.annotate_save_error_,
+                                              &app_.annotate_categories_loaded_,
+                                              &app_.annotate_categories_output_dir_},
+            app_.background_executor_, app_.ui_callbacks_,
             [this](const std::string &error) {
               log_gui_error("annotate save error", error);
             });
       },
-      [this]() { clear_annotation_workflow_save_queue(annotate_workflow_); },
+      [this]() { clear_annotation_workflow_save_queue(app_.annotate_workflow_); },
       [this]() {
-        return take_annotation_workflow_queued_save(annotate_workflow_);
+        return take_annotation_workflow_queued_save(app_.annotate_workflow_);
       },
       [this](AnnotationQueuedSave queued_save) {
-        sync_annotation_categories();
+        sync_categories();
         (void)launch_annotation_workflow_save(
-            annotate_workflow_, annotate_, annotate_categories_,
+            app_.annotate_workflow_, app_.annotate_, app_.annotate_categories_,
             AnnotationSaveSnapshot{
                 std::move(queued_save.frame),
                 std::move(queued_save.objects),
                 std::move(queued_save.projected_scene),
             },
             true,
-            AnnotationWorkflowSaveLaunchState{&annotate_save_running_,
-                                              &annotate_save_summary_,
-                                              &annotate_save_error_,
-                                              &annotate_categories_loaded_,
-                                              &annotate_categories_output_dir_},
-            background_executor_, ui_callbacks_,
+            AnnotationWorkflowSaveLaunchState{&app_.annotate_save_running_,
+                                              &app_.annotate_save_summary_,
+                                              &app_.annotate_save_error_,
+                                              &app_.annotate_categories_loaded_,
+                                              &app_.annotate_categories_output_dir_},
+            app_.background_executor_, app_.ui_callbacks_,
             [this](const std::string &error) {
               log_gui_error("annotate save error", error);
             });
       },
       [this]() {
-        mark_annotation_hold_save_overflow(annotate_workflow_);
-        annotate_save_error_ =
+        mark_annotation_hold_save_overflow(app_.annotate_workflow_);
+        app_.annotate_save_error_ =
             "Hold Save overflowed the single-frame writer queue. Capture "
             "paused to avoid dropping frames silently.";
-        log_gui_error("annotate hold-save overflow",
-                                annotate_save_error_);
+        log_gui_error("annotate hold-save overflow", app_.annotate_save_error_);
       });
 }
 
+void AnnotationWorkflowCoordinator::shutdown() {
+  reset_annotation_workflow_live_session_shell(
+      app_.annotate_workflow_, &app_.live_controller_,
+      &app_.live_session_status_, &app_.annotate_frame_,
+      &app_.annotate_resolved_instances_, app_.live_preview_texture_.get(),
+      [this]() { cancel_canvas_interactions(); });
+  app_.active_live_mode_ = App::ActiveLiveMode::None;
+}
+
+void AnnotationWorkflowCoordinator::start_live_session() {
+  const AnnotationWorkflowLiveSessionShellStartResult start_result =
+      restart_annotation_workflow_live_session_shell(
+          app_.annotate_workflow_, &app_.live_controller_,
+          &app_.live_session_status_, &app_.annotate_frame_,
+          &app_.annotate_resolved_instances_, app_.live_preview_texture_.get(),
+          app_.annotate_.source, app_.annotate_.device_id,
+          [this]() { cancel_canvas_interactions(); });
+  app_.active_live_mode_ =
+      start_result.started ? App::ActiveLiveMode::Annotate
+                           : App::ActiveLiveMode::None;
+  app_.annotate_save_error_ = start_result.error_message;
+}
+
+void AnnotationWorkflowCoordinator::stop_live_session() {
+  reset_annotation_workflow_live_session_shell(
+      app_.annotate_workflow_, &app_.live_controller_,
+      &app_.live_session_status_, &app_.annotate_frame_,
+      &app_.annotate_resolved_instances_, app_.live_preview_texture_.get(),
+      [this]() { cancel_canvas_interactions(); });
+  app_.active_live_mode_ = App::ActiveLiveMode::None;
+}
+
+void App::invalidate_annotation_preview() {
+  annotation_workflow_coordinator_->invalidate_preview();
+}
+
+void App::cancel_annotation_canvas_interactions() {
+  annotation_workflow_coordinator_->cancel_canvas_interactions();
+}
+
+void App::reset_annotation_instances() {
+  annotation_workflow_coordinator_->reset_instances();
+}
+
+bool App::annotation_live_running() const {
+  return annotation_workflow_coordinator_->live_running();
+}
+
+void App::poll_annotate_work() {
+  annotation_workflow_coordinator_->poll();
+}
+
 std::vector<RemoteGpuFamily> App::selected_remote_gpu_families() const {
-  std::vector<RemoteGpuFamily> families;
-  for (int index = 0;
-       index < static_cast<int>(train_.remote_family_enabled.size()); ++index) {
-    if (!train_.remote_family_enabled[static_cast<size_t>(index)]) {
-      continue;
-    }
-    families.push_back(static_cast<RemoteGpuFamily>(index));
-  }
-  return families;
+  return ::mmltk::gui::selected_remote_gpu_families(train_.remote_family_enabled);
 }
 
 void App::render() {
@@ -1298,6 +1698,32 @@ void App::clear_static_preview() {
   live_static_preview_source_name_.clear();
   live_predict_controller_.clear_errors();
   live_preview_error_.clear();
+}
+
+void App::begin_live_predict_preview_stream(const int device_id) {
+  active_live_mode_ = ActiveLiveMode::Predict;
+  if (live_preview_texture_ && live_predict_controller_.controller()) {
+    live_preview_texture_->clear_frame();
+    live_preview_texture_->begin_live_stream(
+        *live_predict_controller_.controller(), device_id);
+  }
+}
+
+void App::end_live_predict_preview_stream() {
+  active_live_mode_ = ActiveLiveMode::None;
+  if (live_preview_texture_) {
+    live_preview_texture_->end_live_stream();
+  }
+}
+
+void App::reset_live_predict_preview_state(const bool clear_frame) {
+  if (clear_frame && live_preview_texture_) {
+    live_preview_texture_->clear_frame();
+  }
+  live_static_preview_source_name_.clear();
+  live_preview_error_.clear();
+  live_crop_overlay_mode_ = false;
+  live_crop_drag_session_ = {};
 }
 
 void App::apply_static_preview(StillImagePreview preview) {
@@ -1337,12 +1763,7 @@ void App::launch_live_predict_session() {
   live_predict_controller_.launch(
       background_executor_, ui_callbacks_, predict_, selected_preset_name_,
       [this](const int device_id) {
-        active_live_mode_ = ActiveLiveMode::Predict;
-        if (live_preview_texture_ && live_predict_controller_.controller()) {
-          live_preview_texture_->clear_frame();
-          live_preview_texture_->begin_live_stream(
-              *live_predict_controller_.controller(), device_id);
-        }
+        begin_live_predict_preview_stream(device_id);
         current_view_ = View::Live;
       },
       [this](const std::string &error) {
@@ -1360,39 +1781,19 @@ void App::stop_live_predict_session() {
   }
   if (active_live_mode_ != ActiveLiveMode::Predict ||
       live_predict_controller_.controller() == nullptr) {
-    if (!live_predict_running() && active_live_mode_ == ActiveLiveMode::None &&
-        live_preview_texture_) {
-      live_preview_texture_->clear_frame();
-    }
-    live_static_preview_source_name_.clear();
-    live_preview_error_.clear();
+    reset_live_predict_preview_state(!live_predict_running() &&
+                                     active_live_mode_ == ActiveLiveMode::None);
     live_predict_controller_.clear_errors();
-    live_crop_overlay_mode_ = false;
-    live_crop_drag_session_ = {};
     return;
   }
 
-  live_static_preview_source_name_.clear();
-  live_crop_overlay_mode_ = false;
-  live_crop_drag_session_ = {};
+  reset_live_predict_preview_state(false);
   live_predict_controller_.stop(
       background_executor_, ui_callbacks_, &predict_.source,
-      [this]() {
-        active_live_mode_ = ActiveLiveMode::None;
-        if (live_preview_texture_) {
-          live_preview_texture_->end_live_stream();
-        }
-      },
-      [this]() {
-        if (live_preview_texture_) {
-          live_preview_texture_->clear_frame();
-        }
-        live_preview_error_.clear();
-      },
+      [this]() { end_live_predict_preview_stream(); },
+      [this]() { reset_live_predict_preview_state(true); },
       [this](const std::string &error) {
-        if (live_preview_texture_) {
-          live_preview_texture_->clear_frame();
-        }
+        reset_live_predict_preview_state(true);
         log_gui_error("live stop error", error);
       });
 }
@@ -1424,14 +1825,13 @@ void App::draw_live_preview_panel() {
   }
 
   if (!preview_state.has_frame) {
-    ImGui::BeginChild(
-        "live_preview_panel",
-        ImVec2(0.0f, live_preview_fit_to_capture_ ? 0.0f : 420.0f), true,
-        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-    ImGui::TextUnformatted(live_predict_running()
-                               ? "Waiting for preview frame..."
-                               : "No preview frame loaded.");
-    ImGui::EndChild();
+    draw_preview_tile(
+        "live_preview_panel_tile", nullptr,
+        ImVec2(0.0f, live_preview_fit_to_capture_ ? 0.0f : 420.0f), [&]() {
+          ImGui::TextUnformatted(live_predict_running()
+                                     ? "Waiting for preview frame..."
+                                     : "No preview frame loaded.");
+        });
     return;
   }
 
@@ -1462,77 +1862,73 @@ void App::draw_live_preview_panel() {
         static_cast<std::uint32_t>(std::max(1, crop_x2 - crop_x1)),
         static_cast<std::uint32_t>(std::max(1, crop_y2 - crop_y1)),
     };
-    const float inv_width = 1.0f / static_cast<float>(texture_region.width);
-    const float inv_height = 1.0f / static_cast<float>(texture_region.height);
-    uv0 = ImVec2(
-        static_cast<float>(display_region.x - texture_region.x) * inv_width,
-        static_cast<float>(display_region.y - texture_region.y) * inv_height);
-    uv1 = ImVec2(static_cast<float>(display_region.x + display_region.width -
-                                    texture_region.x) *
-                     inv_width,
-                 static_cast<float>(display_region.y + display_region.height -
-                                    texture_region.y) *
-                     inv_height);
+    preview_uvs_for_region(texture_region, display_region, &uv0, &uv1);
   }
   const auto width = static_cast<float>(display_region.width);
   const auto height = static_cast<float>(display_region.height);
 
-  ImGui::BeginChild(
-      "live_preview_panel",
-      ImVec2(0.0f, live_preview_fit_to_capture_ ? 0.0f : 420.0f), true,
-      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
-  ImGui::Text("Frame: %llu",
-              static_cast<unsigned long long>(preview_state.last_frame_id));
-  if (predict_.source.kind == SourceKind::VideoStream &&
-      active_live_mode_ == ActiveLiveMode::Predict &&
-      live_predict_controller_.controller() != nullptr) {
-    const AnnotationBox active_box = active_live_crop_box();
+  draw_preview_tile(
+      "live_preview_panel_tile", nullptr,
+      ImVec2(0.0f, live_preview_fit_to_capture_ ? 0.0f : 420.0f), [&]() {
+        ImGui::Text("Frame: %llu",
+                    static_cast<unsigned long long>(preview_state.last_frame_id));
+        if (predict_.source.kind == SourceKind::VideoStream &&
+            active_live_mode_ == ActiveLiveMode::Predict &&
+            live_predict_controller_.controller() != nullptr) {
+          const AnnotationBox active_box = active_live_crop_box();
 #if MMLTK_RFDETR_LIVE_CAPTURE
-    const AnnotationBox committed_box = runtime_crop_box_for_ui_state(
-        live_predict_controller_.controller()->ui_crop_state(), predict_.source);
+          const AnnotationBox committed_box = runtime_crop_box_for_ui_state(
+              live_predict_controller_.controller()->ui_crop_state(),
+              predict_.source);
 #else
-    const AnnotationBox committed_box =
-        resolved_video_crop_box(predict_.source);
+          const AnnotationBox committed_box =
+              resolved_video_crop_box(predict_.source);
 #endif
-    ImGui::TextUnformatted(live_crop_overlay_mode_ ? "Display: full frame"
-                                                   : "Display: crop");
-    ImGui::Text("Crop: x=%d y=%d w=%d h=%d", active_box.x1, active_box.y1,
-                std::max(0, active_box.x2 - active_box.x1),
-                std::max(0, active_box.y2 - active_box.y1));
-    if (live_crop_overlay_mode_ &&
-        !annotation_boxes_equal(active_box, committed_box)) {
-      ImGui::TextDisabled("Committed: x=%d y=%d w=%d h=%d", committed_box.x1,
-                          committed_box.y1,
-                          std::max(0, committed_box.x2 - committed_box.x1),
-                          std::max(0, committed_box.y2 - committed_box.y1));
-    }
-  } else {
-    ImGui::Text("ROI: x=%u y=%u w=%u h=%u", display_region.x, display_region.y,
-                display_region.width, display_region.height);
-  }
-  ImGui::Separator();
+          ImGui::TextUnformatted(live_crop_overlay_mode_ ? "Display: full frame"
+                                                         : "Display: crop");
+          ImGui::Text("Crop: x=%d y=%d w=%d h=%d", active_box.x1, active_box.y1,
+                      std::max(0, active_box.x2 - active_box.x1),
+                      std::max(0, active_box.y2 - active_box.y1));
+          if (live_crop_overlay_mode_ &&
+              !annotation_boxes_equal(active_box, committed_box)) {
+            ImGui::TextDisabled(
+                "Committed: x=%d y=%d w=%d h=%d", committed_box.x1,
+                committed_box.y1,
+                std::max(0, committed_box.x2 - committed_box.x1),
+                std::max(0, committed_box.y2 - committed_box.y1));
+          }
+        } else {
+          ImGui::Text("ROI: x=%u y=%u w=%u h=%u", display_region.x,
+                      display_region.y, display_region.width,
+                      display_region.height);
+        }
+        ImGui::Separator();
 
-  ImVec2 image_size(width, height);
-  if (!live_preview_fit_to_capture_) {
-    const ImVec2 available = ImGui::GetContentRegionAvail();
-    const float scale = std::min(available.x / width, available.y / height);
-    const float clamped_scale = scale > 0.0f ? scale : 1.0f;
-    image_size = ImVec2(width * clamped_scale, height * clamped_scale);
-    const ImVec2 cursor = ImGui::GetCursorPos();
-    const float offset_x = std::max(0.0f, (available.x - image_size.x) * 0.5f);
-    const float offset_y = std::max(0.0f, (available.y - image_size.y) * 0.5f);
-    ImGui::SetCursorPos(ImVec2(cursor.x + offset_x, cursor.y + offset_y));
-  }
-  const ImVec2 image_origin = ImGui::GetCursorScreenPos();
-  ImGui::Image(preview_state.texture_id, image_size, uv0, uv1);
-  if (live_crop_overlay_mode_ && active_live_mode_ == ActiveLiveMode::Predict &&
-      live_predict_controller_.controller() != nullptr &&
-      predict_.source.kind == SourceKind::VideoStream) {
-    draw_crop_overlay(image_origin.x, image_origin.y, image_size.x,
-                      image_size.y, static_cast<float>(texture_region.width),
-                      static_cast<float>(texture_region.height));
-  }
-  ImGui::EndChild();
+        ImVec2 image_size(width, height);
+        if (!live_preview_fit_to_capture_) {
+          const ImVec2 available = ImGui::GetContentRegionAvail();
+          const float scale = std::min(available.x / width, available.y / height);
+          const float clamped_scale = scale > 0.0f ? scale : 1.0f;
+          image_size = ImVec2(width * clamped_scale, height * clamped_scale);
+          const ImVec2 cursor = ImGui::GetCursorPos();
+          const float offset_x =
+              std::max(0.0f, (available.x - image_size.x) * 0.5f);
+          const float offset_y =
+              std::max(0.0f, (available.y - image_size.y) * 0.5f);
+          ImGui::SetCursorPos(ImVec2(cursor.x + offset_x, cursor.y + offset_y));
+        }
+        const ImVec2 image_origin = ImGui::GetCursorScreenPos();
+        ImGui::Image(preview_state.texture_id, image_size, uv0, uv1);
+        if (live_crop_overlay_mode_ &&
+            active_live_mode_ == ActiveLiveMode::Predict &&
+            live_predict_controller_.controller() != nullptr &&
+            predict_.source.kind == SourceKind::VideoStream) {
+          draw_crop_overlay(image_origin.x, image_origin.y, image_size.x,
+                            image_size.y,
+                            static_cast<float>(texture_region.width),
+                            static_cast<float>(texture_region.height));
+        }
+      });
 }
 
 AnnotationBox App::active_live_crop_box() const {
@@ -1692,24 +2088,21 @@ void App::draw_menu_bar() {
   if (!ImGui::BeginMainMenuBar()) {
     return;
   }
-  for (const View view : {View::Train, View::Validate, View::Predict,
-                          View::Annotate, View::Export}) {
-    const bool selected = current_view_ == view;
-    if (ImGui::MenuItem(view_label(view), nullptr, selected)) {
-      current_view_ = view;
+  for (const ViewMenuEntry &entry : kViewMenuEntries) {
+    const bool selected = current_view_ == entry.view;
+    if (entry.view == View::Live) {
+      ImGui::PushStyleColor(
+          ImGuiCol_Text,
+          selected ? ImVec4(0.91f, 0.24f, 0.20f, 1.00f)
+                   : ImVec4(0.47f, 0.49f, 0.52f, 1.00f));
+      if (ImGui::MenuItem(entry.label, nullptr, selected)) {
+        current_view_ = entry.view;
+      }
+      ImGui::PopStyleColor();
+    } else if (ImGui::MenuItem(entry.label, nullptr, selected)) {
+      current_view_ = entry.view;
     }
   }
-  ImGui::SameLine();
-  ImGui::TextDisabled("|");
-  ImGui::SameLine();
-  const bool live_active = live_predict_active();
-  ImGui::PushStyleColor(ImGuiCol_Text,
-                        live_active ? ImVec4(0.91f, 0.24f, 0.20f, 1.00f)
-                                    : ImVec4(0.47f, 0.49f, 0.52f, 1.00f));
-  if (ImGui::MenuItem("LIVE", nullptr, current_view_ == View::Live)) {
-    current_view_ = View::Live;
-  }
-  ImGui::PopStyleColor();
   ImGui::SameLine();
   ImGui::TextDisabled("|");
   ImGui::SameLine();
@@ -1826,53 +2219,64 @@ void App::draw_workflow_window() {
   ImGui::Begin("RF-DETR Studio Shell", nullptr, kShellFlags);
 
   const ImVec2 available = ImGui::GetContentRegionAvail();
-  if (ImGui::BeginTable("studio_shell", 2,
+  const ShellLayoutView shell_layout = shell_layout_for_view(current_view_);
+  if (ImGui::BeginTable(shell_layout.table_id,
+                        static_cast<int>(shell_layout.column_count),
                         ImGuiTableFlags_SizingStretchProp |
                             ImGuiTableFlags_BordersInnerV,
                         available)) {
-    ImGui::TableSetupColumn("workspace", ImGuiTableColumnFlags_WidthStretch,
-                            3.0f);
-    ImGui::TableSetupColumn("sidebar", ImGuiTableColumnFlags_WidthStretch,
-                            1.0f);
+    for (std::size_t column_index = 0; column_index < shell_layout.column_count;
+         ++column_index) {
+      const ShellColumnSpec &column = shell_layout.columns[column_index];
+      ImGui::TableSetupColumn(column.id, ImGuiTableColumnFlags_WidthStretch,
+                              column.stretch);
+    }
     ImGui::TableNextRow(ImGuiTableRowFlags_None, available.y);
 
-    ImGui::TableSetColumnIndex(0);
-    ImGui::BeginChild("workspace_pane", ImVec2(0.0f, 0.0f), false);
-    ImGui::Text("Workflow: %s", view_label(current_view_));
-    ImGui::Separator();
-    if (current_view_ != View::Annotate) {
-      draw_preset_selector();
+    for (std::size_t column_index = 0; column_index < shell_layout.column_count;
+         ++column_index) {
+      const ShellColumnSpec &column = shell_layout.columns[column_index];
+      ImGui::TableSetColumnIndex(static_cast<int>(column_index));
+      ImGui::BeginChild(column.child_id, ImVec2(0.0f, 0.0f), false);
+      switch (column.slot) {
+      case ShellSlot::Workspace:
+        draw_section_tile("workflow_shell_header", "Workflow", [&]() {
+          ImGui::TextUnformatted(workflow_view_label(current_view_));
+          if (current_view_ != View::Annotate) {
+            draw_preset_selector();
+          }
+        });
+        switch (current_view_) {
+        case View::Train:
+          draw_train_view();
+          break;
+        case View::Validate:
+          draw_validate_view();
+          break;
+        case View::Predict:
+          draw_predict_view();
+          break;
+        case View::Annotate:
+          annotation_workflow_coordinator_->draw_workspace();
+          break;
+        case View::Export:
+          draw_export_view();
+          break;
+        case View::Live:
+          draw_live_view();
+          break;
+        }
+        break;
+      case ShellSlot::Sidebar:
+        if (current_view_ == View::Annotate) {
+          annotation_workflow_coordinator_->draw_utilities_pane();
+        } else {
+          draw_info_pane();
+        }
+        break;
+      }
+      ImGui::EndChild();
     }
-    switch (current_view_) {
-    case View::Train:
-      draw_train_view();
-      break;
-    case View::Validate:
-      draw_validate_view();
-      break;
-    case View::Predict:
-      draw_predict_view();
-      break;
-    case View::Annotate:
-      draw_annotate_workspace();
-      break;
-    case View::Export:
-      draw_export_view();
-      break;
-    case View::Live:
-      draw_live_view();
-      break;
-    }
-    ImGui::EndChild();
-
-    ImGui::TableSetColumnIndex(1);
-    ImGui::BeginChild("sidebar_pane", ImVec2(0.0f, 0.0f), false);
-    if (current_view_ == View::Annotate) {
-      draw_annotate_utilities_pane();
-    } else {
-      draw_info_pane();
-    }
-    ImGui::EndChild();
 
     ImGui::EndTable();
   }
@@ -1927,19 +2331,17 @@ void App::draw_info_pane() {
       vast_query_state.last_summary,
       vast_query_state.last_error,
   };
-  draw_training_activity_section(training_view_model);
-  draw_local_train_activity_section(
-      train_state,
-      [this](bool force) { local_train_controller_.request_stop(force); },
-      compact_font_);
   const JobActivityViewModel job_view_model{
       job_.running,      job_.label,       job_.last_summary,
       job_.last_error,   job_output,       picker_error_,
   };
-  draw_job_activity_section(job_view_model, compact_font_);
-
-  if (current_view_ == View::Annotate) {
-    const AnnotateActivityViewModel annotate_view_model{
+  ActivitySidebarTilesViewModel activity_tiles_view_model;
+  activity_tiles_view_model.training = training_view_model;
+  activity_tiles_view_model.local_train = &train_state;
+  activity_tiles_view_model.job = job_view_model;
+  activity_tiles_view_model.show_annotate = current_view_ == View::Annotate;
+  if (activity_tiles_view_model.show_annotate) {
+    activity_tiles_view_model.annotate = AnnotateActivityViewModel{
         annotate_frame_.has_value(),
         annotate_frame_.has_value() ? std::string_view(annotate_frame_->source_name)
                                     : std::string_view(),
@@ -1951,7 +2353,6 @@ void App::draw_info_pane() {
         annotate_save_summary_,
         annotation_live_running(),
     };
-    draw_annotate_activity_section(annotate_view_model, compact_font_);
   }
 
   LivePredictActivityViewModel live_view_model;
@@ -1982,7 +2383,14 @@ void App::draw_info_pane() {
     live_view_model.analyzer_backend_name = live_status.analyzer.backend_name;
     live_view_model.last_error = live_status.last_error;
   }
-  draw_live_predict_activity_section(live_view_model, compact_font_);
+  activity_tiles_view_model.live_predict = live_view_model;
+
+  draw_activity_sidebar_tiles(
+      activity_tiles_view_model,
+      ActivitySidebarTileActions{
+          [this](bool force) { local_train_controller_.request_stop(force); },
+          compact_font_,
+      });
 
   draw_section_heading("Source Notes");
   if (current_view_ == View::Predict) {
@@ -2082,761 +2490,1173 @@ void App::draw_train_view() {
       local_train_controller_.session_state();
   const bool block_actions =
       job_.running || live_predict_running() || train_state.running;
-  draw_section_heading("Datasets");
-  draw_full_width_input("Train Compiled", train_.train_compiled_path);
-  draw_full_width_input("Val Compiled", train_.val_compiled_path);
-  draw_full_width_input("Test Compiled", train_.test_compiled_path);
-  draw_full_width_input("Output Dir", train_.output_dir);
+  DatasetPathState dataset_state = dataset_paths(train_);
+  ModelArtifactSelectionState artifact_state = model_artifacts(train_);
+  ExecutionTuningState execution_state = execution_tuning(train_);
+  TrainPaneState train_pane = train_pane_state(train_);
 
-  draw_section_heading("Initialization");
-  int input_mode =
-      train_.input_mode == TrainInputMode::Resume
-          ? static_cast<int>(TrainInputMode::Resume)
-          : static_cast<int>(TrainInputMode::Weights);
-  if (ImGui::RadioButton(
-          "Weights", input_mode == static_cast<int>(TrainInputMode::Weights))) {
-    input_mode = static_cast<int>(TrainInputMode::Weights);
-  }
-  ImGui::SameLine();
-  if (ImGui::RadioButton(
-          "Resume", input_mode == static_cast<int>(TrainInputMode::Resume))) {
-    input_mode = static_cast<int>(TrainInputMode::Resume);
-  }
-  train_.input_mode = input_mode == static_cast<int>(TrainInputMode::Resume)
-                          ? TrainInputMode::Resume
-                          : TrainInputMode::Weights;
-  if (train_.input_mode == TrainInputMode::Weights) {
-    if (draw_file_picker_input(
-            "Weights Path", train_.weights_path,
-            file_picker_busy(FileBrowseField::TrainWeights))) {
-      launch_file_picker(FileBrowseField::TrainWeights, "Select Weights",
-                         &train_.weights_path);
-    }
-  } else {
-    if (draw_file_picker_input(
-            "Resume Path", train_.resume_path,
-            file_picker_busy(FileBrowseField::TrainResume))) {
-      launch_file_picker(FileBrowseField::TrainResume, "Select Checkpoint",
-                         &train_.resume_path);
-    }
-  }
-
-  draw_section_heading("Execution");
-  draw_labeled_combo(
-      "Train Target", train_execution_target_label(train_.execution_target),
-      140.0f, [&]() {
-        for (const TrainExecutionTarget option :
-             {TrainExecutionTarget::Local, TrainExecutionTarget::Remote}) {
-          const bool selected = option == train_.execution_target;
-          if (ImGui::Selectable(train_execution_target_label(option),
-                                selected)) {
-            train_.execution_target = option;
-          }
-          if (selected) {
-            ImGui::SetItemDefaultFocus();
-          }
-        }
-      });
-  const bool local_target =
-      train_.execution_target == TrainExecutionTarget::Local;
-
-  if (local_target) {
-    const std::vector<int> selected_devices =
-        local_train_controller_.selected_device_ids();
-    const std::string local_preview =
-        local_gpu_selection_summary(local_train_controller_.gpus(),
+  draw_two_column_grid(
+      kTrainWorkspaceGrid, "train_workspace_primary_column",
+      [&]() {
+        draw_column(
+            "train_workspace_primary_column",
+                    [&]() {
+                      draw_property_sheet_tile(
+                          "train_dataset_tile", "Datasets", [&]() {
+                            draw_dataset_paths_section(
+                                dataset_state,
+                                {.heading = nullptr,
+                                 .train_compiled_label = "Train Compiled",
+                                 .val_compiled_label = "Val Compiled",
+                                 .test_compiled_label = "Test Compiled"});
+                            draw_full_width_input("Output Dir",
+                                                  train_pane.output_dir);
+                          });
+                    },
+                    [&]() {
+                      draw_property_sheet_tile(
+                          "train_initialization_tile", "Initialization",
+                          [&]() {
+                            int input_mode =
+                                train_pane.input_mode == TrainInputMode::Resume
+                                    ? static_cast<int>(TrainInputMode::Resume)
+                                    : static_cast<int>(TrainInputMode::Weights);
+                            if (ImGui::RadioButton(
+                                    "Weights",
+                                    input_mode == static_cast<int>(
+                                                      TrainInputMode::Weights))) {
+                              input_mode =
+                                  static_cast<int>(TrainInputMode::Weights);
+                            }
+                            ImGui::SameLine();
+                            if (ImGui::RadioButton(
+                                    "Resume",
+                                    input_mode == static_cast<int>(
+                                                      TrainInputMode::Resume))) {
+                              input_mode =
+                                  static_cast<int>(TrainInputMode::Resume);
+                            }
+                            train_pane.input_mode =
+                                input_mode == static_cast<int>(
+                                                  TrainInputMode::Resume)
+                                    ? TrainInputMode::Resume
+                                    : TrainInputMode::Weights;
+                            if (train_pane.input_mode ==
+                                TrainInputMode::Weights) {
+                              if (draw_file_picker_input(
+                                      "Weights Path",
+                                      artifact_state.weights_path,
+                                      file_picker_busy(
+                                          FileBrowseField::TrainWeights))) {
+                                apply_model_artifacts(train_, artifact_state);
+                                launch_file_picker(
+                                    FileBrowseField::TrainWeights,
+                                    "Select Weights", &train_.weights_path);
+                              }
+                            } else if (draw_file_picker_input(
+                                           "Resume Path",
+                                           train_pane.resume_path,
+                                           file_picker_busy(
+                                               FileBrowseField::TrainResume))) {
+                              apply_train_pane_state(train_, train_pane);
+                              launch_file_picker(
+                                  FileBrowseField::TrainResume,
+                                  "Select Checkpoint", &train_.resume_path);
+                            }
+                          });
+                    },
+                    [&]() {
+                      draw_property_sheet_tile(
+                          "train_optimization_tile", "Optimization", [&]() {
+                            draw_labeled_checkbox("AMP", train_.amp);
+                            draw_labeled_checkbox("EMA", train_.use_ema);
+                            draw_labeled_checkbox("Freeze Encoder",
+                                                  train_.freeze_encoder);
+                            draw_labeled_int_input("Batch Size",
+                                                   train_.batch_size, 120.0f);
+                            draw_labeled_int_input("Val Batch",
+                                                   train_.val_batch_size,
+                                                   120.0f);
+                            draw_labeled_int_input("Epochs", train_.epochs,
+                                                   120.0f);
+                            draw_labeled_int_input(
+                                "Grad Accum", train_.grad_accum_steps,
+                                120.0f);
+                            draw_labeled_int_input("Eval Max Dets",
+                                                   train_.eval_max_dets,
+                                                   120.0f);
+                            draw_labeled_int_input("Print Freq",
+                                                   train_.print_freq, 120.0f);
+                            draw_labeled_int_input("Prefetch",
+                                                   train_.prefetch_factor,
+                                                   120.0f);
+                            if (draw_train_optimizer_combo("Optimizer",
+                                                           train_.optimizer)) {
+                              apply_selected_preset_defaults();
+                            }
+                            const TrainRecipeConfig recipe =
+                                current_train_recipe(selected_preset_name_,
+                                                     train_.optimizer);
+                            if (draw_labeled_double_input(
+                                    "Momentum", train_.momentum, 180.0f,
+                                    "%.4f")) {
+                              update_train_recipe_override(
+                                  train_.recipe_overrides.momentum,
+                                  train_.momentum, recipe.momentum);
+                            }
+                            if (draw_labeled_double_input(
+                                    "Learning Rate", train_.lr, 180.0f,
+                                    "%.6f")) {
+                              update_train_recipe_override(
+                                  train_.recipe_overrides.lr, train_.lr,
+                                  recipe.lr);
+                            }
+                            if (draw_labeled_double_input(
+                                    "LR Encoder", train_.lr_encoder, 180.0f,
+                                    "%.6f")) {
+                              update_train_recipe_override(
+                                  train_.recipe_overrides.lr_encoder,
+                                  train_.lr_encoder, recipe.lr_encoder);
+                            }
+                            if (draw_labeled_double_input(
+                                    "Weight Decay", train_.weight_decay,
+                                    180.0f, "%.6f")) {
+                              update_train_recipe_override(
+                                  train_.recipe_overrides.weight_decay,
+                                  train_.weight_decay,
+                                  recipe.weight_decay);
+                            }
+                            if (draw_labeled_double_input(
+                                    "LR Component Decay",
+                                    train_.lr_component_decay, 180.0f,
+                                    "%.4f")) {
+                              update_train_recipe_override(
+                                  train_.recipe_overrides.lr_component_decay,
+                                  train_.lr_component_decay,
+                                  recipe.lr_component_decay);
+                            }
+                            if (draw_labeled_double_input(
+                                    "Encoder Layer Decay",
+                                    train_.encoder_layer_decay, 180.0f,
+                                    "%.4f")) {
+                              update_train_recipe_override(
+                                  train_.recipe_overrides.encoder_layer_decay,
+                                  train_.encoder_layer_decay,
+                                  recipe.encoder_layer_decay);
+                            }
+                            if (draw_labeled_double_input(
+                                    "Warmup Epochs", train_.warmup_epochs,
+                                    180.0f, "%.4f")) {
+                              update_train_recipe_override(
+                                  train_.recipe_overrides.warmup_epochs,
+                                  train_.warmup_epochs,
+                                  recipe.warmup_epochs);
+                            }
+                            if (draw_labeled_double_input(
+                                    "Warmup Momentum",
+                                    train_.warmup_momentum, 180.0f,
+                                    "%.4f")) {
+                              update_train_recipe_override(
+                                  train_.recipe_overrides.warmup_momentum,
+                                  train_.warmup_momentum,
+                                  recipe.warmup_momentum);
+                            }
+                            if (draw_labeled_double_input(
+                                    "LR Min Factor", train_.lr_min_factor,
+                                    180.0f, "%.4f")) {
+                              update_train_recipe_override(
+                                  train_.recipe_overrides.lr_min_factor,
+                                  train_.lr_min_factor,
+                                  recipe.lr_min_factor);
+                            }
+                            draw_labeled_double_input(
+                                "Clip Max Norm", train_.clip_max_norm,
+                                180.0f, "%.4f");
+                            if (draw_labeled_int_input("LR Drop",
+                                                       train_.lr_drop,
+                                                       120.0f)) {
+                              update_train_recipe_override(
+                                  train_.recipe_overrides.lr_drop,
+                                  train_.lr_drop, recipe.lr_drop);
+                            }
+                            if (draw_lr_scheduler_combo("LR Scheduler",
+                                                        train_.lr_scheduler)) {
+                              update_train_recipe_override(
+                                  train_.recipe_overrides.lr_scheduler,
+                                  train_.lr_scheduler,
+                                  recipe.lr_scheduler);
+                            }
+                          });
+                    });
+      },
+      "train_workspace_secondary_column",
+      [&]() {
+        draw_column(
+            "train_workspace_secondary_column",
+                  [&]() {
+                    draw_property_sheet_tile(
+                        "train_execution_tile", "Execution", [&]() {
+                          draw_execution_tuning_section(
+                              execution_state,
+                              {.heading = nullptr,
+                               .input_width = 120.0f,
+                               .show_cpu_affinity = true,
+                               .show_device_id = false,
+                               .show_workers = true,
+                               .show_lanes = true,
+                               .show_allow_fp16 = false,
+                               .show_progress_bar = true,
+                               .show_compile_mode = true});
+                          draw_labeled_combo(
+                              "Train Target",
+                              train_execution_target_label(
+                                  train_pane.execution_target),
+                              140.0f, [&]() {
+                                for (const TrainExecutionTarget option :
+                                     {TrainExecutionTarget::Local,
+                                      TrainExecutionTarget::Remote}) {
+                                  const bool selected =
+                                      option == train_pane.execution_target;
+                                  if (ImGui::Selectable(
+                                          train_execution_target_label(option),
+                                          selected)) {
+                                    train_pane.execution_target = option;
+                                  }
+                                  if (selected) {
+                                    ImGui::SetItemDefaultFocus();
+                                  }
+                                }
+                              });
+                        });
+                  },
+                  [&]() {
+                    if (train_pane.execution_target ==
+                        TrainExecutionTarget::Local) {
+                      draw_property_sheet_tile(
+                          "train_local_gpu_tile", "Local GPUs", [&]() {
+                            const std::string local_preview =
+                                local_gpu_selection_summary(
+                                    local_train_controller_.gpus(),
                                     local_train_controller_.gpu_selection());
-    draw_labeled_combo("Local GPUs", local_preview.c_str(), 320.0f, [&]() {
-      const auto &local_gpus = local_train_controller_.gpus();
-      const auto &gpu_selection = local_train_controller_.gpu_selection();
-      for (size_t index = 0; index < local_gpus.size(); ++index) {
-        const std::string label = local_gpu_label(local_gpus[index]);
-        const bool selected =
-            index < gpu_selection.size() ? gpu_selection[index] : false;
-        bool enabled = selected;
-        if (ImGui::Checkbox(label.c_str(), &enabled)) {
-          local_train_controller_.set_device_selected(index, enabled);
-          train_.local_device_ids =
-              local_train_controller_.selected_device_ids();
-        }
-      }
-    });
-    ImGui::BeginDisabled(local_train_controller_.gpu_refresh_running());
-    if (ImGui::Button(local_train_controller_.gpu_refresh_running()
-                          ? "Refreshing GPUs..."
-                          : "Refresh Visible GPUs")) {
-      local_train_controller_.refresh_visible_gpus(train_.local_device_ids);
-    }
-    ImGui::EndDisabled();
-    if (!local_train_controller_.gpu_error().empty()) {
-      ImGui::Spacing();
-      draw_banner("train_local_gpu_error_banner",
-                  ImVec4(0.33f, 0.17f, 0.12f, 0.95f),
-                  ImVec4(0.98f, 0.90f, 0.82f, 1.00f),
-                  local_train_controller_.gpu_error());
-    } else if (local_train_controller_.gpus().empty()) {
-      ImGui::Spacing();
-      draw_banner("train_local_gpu_missing_banner",
-                  ImVec4(0.33f, 0.17f, 0.12f, 0.95f),
-                  ImVec4(0.98f, 0.90f, 0.82f, 1.00f),
-                  "No visible CUDA GPUs were found for local training.");
-    } else if (selected_devices.empty()) {
-      ImGui::Spacing();
-      draw_banner("train_local_gpu_select_banner",
-                  ImVec4(0.33f, 0.17f, 0.12f, 0.95f),
-                  ImVec4(0.98f, 0.90f, 0.82f, 1.00f),
-                  "Select at least one local GPU before running training.");
-    }
-  } else {
-    const std::vector<RemoteGpuFamily> selected_families =
-        selected_remote_gpu_families();
-    const std::string remote_preview =
-        summarize_selected_remote_gpu_families(selected_families);
-    draw_labeled_combo(
-        "Remote Families", remote_preview.c_str(), 220.0f, [&]() {
-          for (const RemoteGpuFamily family : kRemoteGpuFamilyOrder) {
-            const auto index = static_cast<size_t>(family);
-            ImGui::Checkbox(remote_gpu_family_label(family),
-                            &train_.remote_family_enabled[index]);
-          }
-        });
-    const bool can_query = !block_actions && !vast_query_state.running &&
-                           !vast_api_key_.empty() && !selected_families.empty();
-    ImGui::BeginDisabled(!can_query);
-    if (ImGui::Button(vast_query_state.running ? "Querying..." : "Query")) {
-      vast_query_controller_.launch(vast_api_key_, selected_families);
-    }
-    ImGui::EndDisabled();
-    if (vast_query_state.running) {
-      ImGui::SameLine();
-      ImGui::TextUnformatted("Fetching top DLPerf/$ offers...");
-    }
-    if (vast_api_key_.empty()) {
-      ImGui::Spacing();
-      draw_banner("train_remote_key_banner", ImVec4(0.33f, 0.17f, 0.12f, 0.95f),
-                  ImVec4(0.98f, 0.90f, 0.82f, 1.00f),
-                  "Remote query requires --vast-api-key or VAST_API_KEY.");
-    } else if (selected_families.empty()) {
-      ImGui::Spacing();
-      draw_banner(
-          "train_remote_family_banner", ImVec4(0.33f, 0.17f, 0.12f, 0.95f),
-          ImVec4(0.98f, 0.90f, 0.82f, 1.00f),
-          "Select at least one remote GPU family before querying Vast.");
-    }
-    if (!vast_query_state.last_error.empty()) {
-      ImGui::Spacing();
-      draw_banner("train_remote_query_error_banner",
-                  ImVec4(0.33f, 0.17f, 0.12f, 0.95f),
-                  ImVec4(0.98f, 0.90f, 0.82f, 1.00f),
-                  vast_query_state.last_error);
-    } else if (!vast_query_state.last_summary.empty()) {
-      ImGui::Spacing();
-      ImGui::TextWrapped("%s", vast_query_state.last_summary.c_str());
-    }
-    if (!vast_query_state.results.empty()) {
-      ImGui::Spacing();
-      draw_section_heading("Remote Offers");
-      for (const VastOfferSummary &offer : vast_query_state.results) {
-        ImGui::PushID(offer.offer_id);
-        draw_remote_offer_card(
-            offer, vast_query_controller_.armed_offer().has_value() &&
-                       vast_query_controller_.armed_offer()->offer_id ==
-                           offer.offer_id);
-        if (ImGui::IsItemHovered() &&
-            ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-          vast_query_controller_.arm_offer(offer);
-        }
-        ImGui::PopID();
-        ImGui::Spacing();
-      }
-    }
-    ImGui::Spacing();
-    draw_banner(
-        "train_remote_launch_banner", ImVec4(0.20f, 0.24f, 0.18f, 0.95f),
-        ImVec4(0.92f, 0.95f, 0.86f, 1.00f),
-        vast_query_controller_.armed_offer().has_value()
-            ? "Remote offer is armed, but launch is intentionally disabled "
-              "until the training container and Vast launch template are "
-              "defined."
-            : "Remote launch is intentionally disabled until the training "
-              "container and Vast launch template are defined.");
-  }
+                            draw_labeled_combo(
+                                "Local GPUs", local_preview.c_str(), 320.0f,
+                                [&]() {
+                                  const auto &local_gpus =
+                                      local_train_controller_.gpus();
+                                  const auto &gpu_selection =
+                                      local_train_controller_.gpu_selection();
+                                  for (size_t index = 0;
+                                       index < local_gpus.size(); ++index) {
+                                    const std::string label =
+                                        local_gpu_label(local_gpus[index]);
+                                    const bool selected =
+                                        index < gpu_selection.size()
+                                            ? gpu_selection[index]
+                                            : false;
+                                    bool enabled = selected;
+                                    if (ImGui::Checkbox(label.c_str(),
+                                                        &enabled)) {
+                                      local_train_controller_
+                                          .set_device_selected(index, enabled);
+                                      train_pane.local_device_ids =
+                                          local_train_controller_
+                                              .selected_device_ids();
+                                    }
+                                  }
+                                });
+                            ImGui::BeginDisabled(
+                                local_train_controller_.gpu_refresh_running());
+                            if (ImGui::Button(
+                                    local_train_controller_
+                                            .gpu_refresh_running()
+                                        ? "Refreshing GPUs..."
+                                        : "Refresh Visible GPUs")) {
+                              local_train_controller_.refresh_visible_gpus(
+                                  train_pane.local_device_ids);
+                            }
+                            ImGui::EndDisabled();
+                            if (!local_train_controller_.gpu_error().empty()) {
+                              ImGui::Spacing();
+                              draw_banner(
+                                  "train_local_gpu_error_banner",
+                                  kWarningBannerBackground,
+                                  kWarningBannerText,
+                                  local_train_controller_.gpu_error());
+                            } else if (local_train_controller_.gpus().empty()) {
+                              ImGui::Spacing();
+                              draw_banner(
+                                  "train_local_gpu_missing_banner",
+                                  kWarningBannerBackground,
+                                  kWarningBannerText,
+                                  "No visible CUDA GPUs were found for local "
+                                  "training.");
+                            } else if (
+                                local_train_controller_.selected_device_ids()
+                                    .empty()) {
+                              ImGui::Spacing();
+                              draw_banner(
+                                  "train_local_gpu_select_banner",
+                                  kWarningBannerBackground,
+                                  kWarningBannerText,
+                                  "Select at least one local GPU before "
+                                  "running training.");
+                            }
+                          });
+                      return;
+                    }
 
-  draw_labeled_int_input("Workers", train_.workers, 120.0f);
-  draw_labeled_int_input("Lanes", train_.lanes, 120.0f);
-  draw_full_width_input("CPU Affinity", train_.cpu_affinity);
-  draw_labeled_checkbox("AMP", train_.amp);
-  draw_labeled_checkbox("EMA", train_.use_ema);
-  draw_labeled_checkbox("Progress", train_.progress_bar);
-  draw_labeled_checkbox("Freeze Encoder", train_.freeze_encoder);
-  (void)draw_compile_mode_combo("Compile Mode", train_.compile_mode);
+                    draw_property_sheet_tile(
+                        "train_remote_query_tile", "Remote Query", [&]() {
+                          const std::vector<RemoteGpuFamily> selected_families =
+                              ::mmltk::gui::selected_remote_gpu_families(
+                                  train_pane.remote_family_enabled);
+                          const std::string remote_preview =
+                              summarize_selected_remote_gpu_families(
+                                  selected_families);
+                          draw_labeled_combo(
+                              "Remote Families", remote_preview.c_str(),
+                              220.0f, [&]() {
+                                for (const RemoteGpuFamily family :
+                                     kRemoteGpuFamilyOrder) {
+                                  const auto index =
+                                      static_cast<size_t>(family);
+                                  ImGui::Checkbox(
+                                      remote_gpu_family_label(family),
+                                      &train_pane.remote_family_enabled[index]);
+                                }
+                              });
+                          const bool can_query =
+                              !block_actions && !vast_query_state.running &&
+                              !vast_api_key_.empty() &&
+                              !selected_families.empty();
+                          ImGui::BeginDisabled(!can_query);
+                          if (ImGui::Button(vast_query_state.running
+                                                ? "Querying..."
+                                                : "Query")) {
+                            vast_query_controller_.launch(vast_api_key_,
+                                                          selected_families);
+                          }
+                          ImGui::EndDisabled();
+                          if (vast_query_state.running) {
+                            ImGui::SameLine();
+                            ImGui::TextUnformatted(
+                                "Fetching top DLPerf/$ offers...");
+                          }
+                          if (vast_api_key_.empty()) {
+                            ImGui::Spacing();
+                            draw_banner(
+                                "train_remote_key_banner",
+                                kWarningBannerBackground,
+                                kWarningBannerText,
+                                "Remote query requires --vast-api-key or "
+                                "VAST_API_KEY.");
+                          } else if (selected_families.empty()) {
+                            ImGui::Spacing();
+                            draw_banner(
+                                "train_remote_family_banner",
+                                kWarningBannerBackground,
+                                kWarningBannerText,
+                                "Select at least one remote GPU family before "
+                                "querying Vast.");
+                          }
+                          if (!vast_query_state.last_error.empty()) {
+                            ImGui::Spacing();
+                            draw_banner(
+                                "train_remote_query_error_banner",
+                                kWarningBannerBackground,
+                                kWarningBannerText,
+                                vast_query_state.last_error);
+                          } else if (!vast_query_state.last_summary.empty()) {
+                            ImGui::Spacing();
+                            ImGui::TextWrapped(
+                                "%s", vast_query_state.last_summary.c_str());
+                          }
+                          ImGui::Spacing();
+                          draw_banner(
+                              "train_remote_launch_banner",
+                              kInfoBannerBackground, kInfoBannerText,
+                              vast_query_controller_.armed_offer().has_value()
+                                  ? "Remote offer is armed, but launch is "
+                                    "intentionally disabled until the "
+                                    "training container and Vast launch "
+                                    "template are defined."
+                                  : "Remote launch is intentionally disabled "
+                                    "until the training container and Vast "
+                                    "launch template are defined.");
+                        });
+                  },
+                  [&]() {
+                    if (train_pane.execution_target !=
+                            TrainExecutionTarget::Remote ||
+                        vast_query_state.results.empty()) {
+                      return;
+                    }
 
-  draw_section_heading("Optimization");
-  draw_labeled_int_input("Batch Size", train_.batch_size, 120.0f);
-  draw_labeled_int_input("Val Batch", train_.val_batch_size, 120.0f);
-  draw_labeled_int_input("Epochs", train_.epochs, 120.0f);
-  draw_labeled_int_input("Grad Accum", train_.grad_accum_steps, 120.0f);
-  draw_labeled_int_input("Eval Max Dets", train_.eval_max_dets, 120.0f);
-  draw_labeled_int_input("Print Freq", train_.print_freq, 120.0f);
-  draw_labeled_int_input("Prefetch", train_.prefetch_factor, 120.0f);
-  if (draw_train_optimizer_combo("Optimizer", train_.optimizer)) {
-    apply_selected_preset_defaults();
-  }
-  const TrainRecipeConfig recipe =
-      current_train_recipe(selected_preset_name_, train_.optimizer);
-  if (draw_labeled_double_input("Momentum", train_.momentum, 180.0f, "%.4f")) {
-    update_train_recipe_override(train_.recipe_overrides.momentum,
-                                 train_.momentum, recipe.momentum);
-  }
-  if (draw_labeled_double_input("Learning Rate", train_.lr, 180.0f, "%.6f")) {
-    update_train_recipe_override(train_.recipe_overrides.lr, train_.lr,
-                                 recipe.lr);
-  }
-  if (draw_labeled_double_input("LR Encoder", train_.lr_encoder, 180.0f,
-                                "%.6f")) {
-    update_train_recipe_override(train_.recipe_overrides.lr_encoder,
-                                 train_.lr_encoder, recipe.lr_encoder);
-  }
-  if (draw_labeled_double_input("Weight Decay", train_.weight_decay, 180.0f,
-                                "%.6f")) {
-    update_train_recipe_override(train_.recipe_overrides.weight_decay,
-                                 train_.weight_decay, recipe.weight_decay);
-  }
-  if (draw_labeled_double_input("LR Component Decay", train_.lr_component_decay,
-                                180.0f, "%.4f")) {
-    update_train_recipe_override(train_.recipe_overrides.lr_component_decay,
-                                 train_.lr_component_decay,
-                                 recipe.lr_component_decay);
-  }
-  if (draw_labeled_double_input("Encoder Layer Decay",
-                                train_.encoder_layer_decay, 180.0f, "%.4f")) {
-    update_train_recipe_override(train_.recipe_overrides.encoder_layer_decay,
-                                 train_.encoder_layer_decay,
-                                 recipe.encoder_layer_decay);
-  }
-  if (draw_labeled_double_input("Warmup Epochs", train_.warmup_epochs, 180.0f,
-                                "%.4f")) {
-    update_train_recipe_override(train_.recipe_overrides.warmup_epochs,
-                                 train_.warmup_epochs, recipe.warmup_epochs);
-  }
-  if (draw_labeled_double_input("Warmup Momentum", train_.warmup_momentum,
-                                180.0f, "%.4f")) {
-    update_train_recipe_override(train_.recipe_overrides.warmup_momentum,
-                                 train_.warmup_momentum,
-                                 recipe.warmup_momentum);
-  }
-  if (draw_labeled_double_input("LR Min Factor", train_.lr_min_factor, 180.0f,
-                                "%.4f")) {
-    update_train_recipe_override(train_.recipe_overrides.lr_min_factor,
-                                 train_.lr_min_factor, recipe.lr_min_factor);
-  }
-  draw_labeled_double_input("Clip Max Norm", train_.clip_max_norm, 180.0f,
-                            "%.4f");
-  if (draw_labeled_int_input("LR Drop", train_.lr_drop, 120.0f)) {
-    update_train_recipe_override(train_.recipe_overrides.lr_drop,
-                                 train_.lr_drop, recipe.lr_drop);
-  }
-  if (draw_lr_scheduler_combo("LR Scheduler", train_.lr_scheduler)) {
-    update_train_recipe_override(train_.recipe_overrides.lr_scheduler,
-                                 train_.lr_scheduler, recipe.lr_scheduler);
-  }
+                    draw_property_sheet_tile(
+                        "train_remote_offers_tile", "Remote Offers",
+                        [&]() {
+                          for (const VastOfferSummary &offer :
+                               vast_query_state.results) {
+                            ImGui::PushID(offer.offer_id);
+                            draw_remote_offer_card(
+                                offer,
+                                vast_query_controller_.armed_offer()
+                                        .has_value() &&
+                                    vast_query_controller_.armed_offer()
+                                            ->offer_id == offer.offer_id);
+                            if (ImGui::IsItemHovered() &&
+                                ImGui::IsMouseClicked(
+                                    ImGuiMouseButton_Left)) {
+                              vast_query_controller_.arm_offer(offer);
+                            }
+                            ImGui::PopID();
+                            ImGui::Spacing();
+                          }
+                        });
+                  },
+                  [&]() {
+                    draw_toolbar_tile("train_actions_tile", "Actions",
+                                      [&]() {
+                                        const std::vector<int>
+                                            selected_devices =
+                                                local_train_controller_
+                                                    .selected_device_ids();
+                                        const bool local_target =
+                                            train_pane.execution_target ==
+                                            TrainExecutionTarget::Local;
+                                        const bool can_run_local =
+                                            local_target && !block_actions &&
+                                            !selected_devices.empty() &&
+                                            local_train_controller_
+                                                .gpu_error()
+                                                .empty();
+                                        ImGui::BeginDisabled(!can_run_local);
+                                        if (ImGui::Button("Run Training")) {
+                                          local_train_controller_.start(
+                                              train_, selected_preset_name_);
+                                        }
+                                        ImGui::EndDisabled();
+                                        if (local_target && train_state.running) {
+                                          ImGui::SameLine();
+                                          if (ImGui::Button(
+                                                  train_state.stop_requested
+                                                      ? "Force Kill"
+                                                      : "Stop Training")) {
+                                            local_train_controller_
+                                                .request_stop(
+                                                    train_state.stop_requested);
+                                          }
+                                          if (train_state.stop_requested) {
+                                            ImGui::SameLine();
+                                            ImGui::TextUnformatted(
+                                                "Stop requested");
+                                          }
+                                        }
+                                      });
+                  },
+                  [&]() {
+                    if (train_pane.execution_target !=
+                            TrainExecutionTarget::Local ||
+                        (!train_state.running && !train_state.progress.has_value() &&
+                         train_state.last_summary.empty() &&
+                         train_state.last_error.empty())) {
+                      return;
+                    }
 
-  const std::vector<int> selected_devices =
-      local_train_controller_.selected_device_ids();
-  const bool can_run_local = local_target && !block_actions &&
-                             !selected_devices.empty() &&
-                             local_train_controller_.gpu_error().empty();
-  ImGui::BeginDisabled(!can_run_local);
-  if (ImGui::Button("Run Training")) {
-    local_train_controller_.start(train_, selected_preset_name_);
-  }
-  ImGui::EndDisabled();
-  if (local_target && train_state.running) {
-    ImGui::SameLine();
-    if (ImGui::Button(train_state.stop_requested ? "Force Kill"
-                                                 : "Stop Training")) {
-      local_train_controller_.request_stop(train_state.stop_requested);
-    }
-    if (train_state.stop_requested) {
-      ImGui::SameLine();
-      ImGui::TextUnformatted("Stop requested");
-    }
-  }
-  if (local_target &&
-      (train_state.running || train_state.progress.has_value() ||
-       !train_state.last_summary.empty() || !train_state.last_error.empty())) {
-    ImGui::Spacing();
-    draw_section_heading("Local Training Status");
-    if (train_state.progress.has_value()) {
-      const TrainArtifactProgress &progress = *train_state.progress;
-      ImGui::TextWrapped("Phase: %s", progress.phase.empty()
-                                          ? "train"
-                                          : progress.phase.c_str());
-      ImGui::Text("Epoch: %d / %d",
-                  progress.epoch >= 0 ? progress.epoch + 1 : 0,
-                  std::max(0, progress.total_epochs));
-      ImGui::SameLine();
-      ImGui::Text("Batches: %d / %d", progress.completed_batches,
-                  progress.total_batches);
-      ImGui::Text("Current Loss: %s  cls %s  box %s",
-                  format_decimal(progress.step_loss, 4).c_str(),
-                  format_decimal(progress.step_class_loss, 4).c_str(),
-                  format_decimal(progress.step_box_loss, 4).c_str());
-      ImGui::Text("Average Loss: %s  cls %s  box %s",
-                  format_decimal(progress.train_loss, 4).c_str(),
-                  format_decimal(progress.class_loss, 4).c_str(),
-                  format_decimal(progress.box_loss, 4).c_str());
-      ImGui::Text("Throughput: %s img/s",
-                  format_decimal(progress.images_per_second, 2).c_str());
-    }
-    if (!train_state.last_summary.empty()) {
-      ImGui::TextWrapped("%s", train_state.last_summary.c_str());
-    }
-    if (!train_state.last_error.empty()) {
-      draw_banner(
-          "train_view_train_error_banner", ImVec4(0.33f, 0.17f, 0.12f, 0.95f),
-          ImVec4(0.98f, 0.90f, 0.82f, 1.00f), train_state.last_error);
-    }
-  }
-  if (local_target &&
-      (train_state.running || !train_state.output_tail.empty())) {
-    ImGui::Spacing();
-    draw_output_console(
-        "train_view_train_output_tail", train_state.output_tail, 180.0f,
-        train_state.running, "Waiting for compiler or training output...");
-  }
+                    draw_property_sheet_tile(
+                        "train_local_status_tile", "Local Training Status",
+                        [&]() {
+                          if (train_state.progress.has_value()) {
+                            const TrainArtifactProgress &progress =
+                                *train_state.progress;
+                            ImGui::TextWrapped(
+                                "Phase: %s",
+                                progress.phase.empty() ? "train"
+                                                       : progress.phase.c_str());
+                            ImGui::Text(
+                                "Epoch: %d / %d",
+                                progress.epoch >= 0 ? progress.epoch + 1 : 0,
+                                std::max(0, progress.total_epochs));
+                            ImGui::SameLine();
+                            ImGui::Text(
+                                "Batches: %d / %d",
+                                progress.completed_batches,
+                                progress.total_batches);
+                            ImGui::Text(
+                                "Current Loss: %s  cls %s  box %s",
+                                format_decimal(progress.step_loss, 4).c_str(),
+                                format_decimal(progress.step_class_loss, 4)
+                                    .c_str(),
+                                format_decimal(progress.step_box_loss, 4)
+                                    .c_str());
+                            ImGui::Text(
+                                "Average Loss: %s  cls %s  box %s",
+                                format_decimal(progress.train_loss, 4).c_str(),
+                                format_decimal(progress.class_loss, 4)
+                                    .c_str(),
+                                format_decimal(progress.box_loss, 4).c_str());
+                            ImGui::Text(
+                                "Throughput: %s img/s",
+                                format_decimal(progress.images_per_second, 2)
+                                    .c_str());
+                          }
+                          if (!train_state.last_summary.empty()) {
+                            ImGui::TextWrapped("%s",
+                                               train_state.last_summary.c_str());
+                          }
+                          if (!train_state.last_error.empty()) {
+                            draw_banner("train_view_train_error_banner",
+                                        kWarningBannerBackground,
+                                        kWarningBannerText,
+                                        train_state.last_error);
+                          }
+                        });
+                  },
+                  [&]() {
+                    if (train_pane.execution_target !=
+                            TrainExecutionTarget::Local ||
+                        (!train_state.running &&
+                         train_state.output_tail.empty())) {
+                      return;
+                    }
+
+                    draw_console_tile(
+                        "train_output_tile", "Local Training Output", [&]() {
+                          draw_output_console(
+                              "train_view_train_output_tail",
+                              train_state.output_tail, 180.0f,
+                              train_state.running,
+                              "Waiting for compiler or training output...");
+                        });
+                  });
+                    });
+
+  apply_dataset_paths(train_, dataset_state);
+  apply_model_artifacts(train_, artifact_state);
+  apply_execution_tuning(train_, execution_state);
+  apply_train_pane_state(train_, train_pane);
 }
 
 void App::draw_validate_view() {
   const bool block_actions = job_.running || live_predict_running();
-  draw_section_heading("Datasets");
-  draw_full_width_input("Compiled Dataset", validate_.compiled_path);
-  draw_full_width_input("Source Root", validate_.source_dir);
-  draw_full_width_input("Report JSON", validate_.report_json_path);
+  DatasetPathState dataset_state = dataset_paths(validate_);
+  ModelArtifactSelectionState artifact_state = model_artifacts(validate_);
+  ExecutionTuningState execution_state = execution_tuning(validate_);
 
-  draw_section_heading("Backends");
-  draw_full_width_input("ONNX Path", validate_.onnx_path);
-  draw_full_width_input("TensorRT Path", validate_.tensorrt_path);
-  draw_full_width_input("Save Engine Path", validate_.save_engine_path);
-  draw_full_width_input("Eval Order", validate_.eval_order);
+  const std::string validate_job_output = snapshot_job_output();
+  draw_two_column_grid(
+      kValidateWorkspaceGrid, "validate_workspace_primary_column",
+      [&]() {
+        draw_column(
+            "validate_workspace_primary_column",
+                    [&]() {
+                      draw_property_sheet_tile(
+                          "validate_dataset_tile", "Datasets", [&]() {
+                            draw_full_width_input("Compiled Dataset",
+                                                  dataset_state.compiled_path);
+                            draw_full_width_input("Source Root",
+                                                  dataset_state.source_dir);
+                            draw_full_width_input("Report JSON",
+                                                  validate_.report_json_path);
+                          });
+                    },
+                    [&]() {
+                      draw_property_sheet_tile(
+                          "validate_backend_tile", "Backends", [&]() {
+                            draw_full_width_input("ONNX Path",
+                                                  artifact_state.onnx_path);
+                            draw_full_width_input("TensorRT Path",
+                                                  artifact_state.tensorrt_path);
+                            draw_full_width_input("Save Engine Path",
+                                                  validate_.save_engine_path);
+                            draw_full_width_input("Eval Order",
+                                                  validate_.eval_order);
+                          });
+                    });
+      },
+      "validate_workspace_secondary_column",
+      [&]() {
+        draw_column(
+            "validate_workspace_secondary_column",
+                  [&]() {
+                    draw_property_sheet_tile(
+                        "validate_execution_tile", "Execution", [&]() {
+                          draw_full_width_input("Split", validate_.split);
+                          draw_execution_tuning_section(
+                              execution_state,
+                              {.heading = nullptr,
+                               .input_width = 120.0f,
+                               .show_cpu_affinity = true,
+                               .show_device_id = true,
+                               .show_workers = true,
+                               .show_lanes = false,
+                               .show_allow_fp16 = true,
+                               .show_progress_bar = false,
+                               .show_compile_mode = false});
+                          draw_labeled_int_input("Resolution",
+                                                 validate_.resolution, 120.0f);
+                          draw_labeled_int_input("Batch Size",
+                                                 validate_.batch_size, 120.0f);
+                          draw_labeled_int_input("Limit Images",
+                                                 validate_.limit_images,
+                                                 120.0f);
+                          draw_labeled_int_input("Alignment Images",
+                                                 validate_.alignment_images,
+                                                 120.0f);
+                          draw_labeled_int_input("Eval Max Dets",
+                                                 validate_.eval_max_dets,
+                                                 120.0f);
+                          draw_labeled_int_input("Prefetch",
+                                                 validate_.prefetch_factor,
+                                                 120.0f);
+                          draw_labeled_checkbox("Recompile From Source",
+                                                validate_.recompile);
+                          draw_labeled_checkbox("Profile", validate_.profile);
+                          draw_labeled_checkbox("Write Report",
+                                                validate_.write_report_json);
+                        });
+                  },
+                  [&]() {
+                    draw_toolbar_tile("validate_actions_tile", "Actions",
+                                      [&]() {
+                                        ImGui::BeginDisabled(block_actions);
+                                        if (ImGui::Button("Run Validation")) {
+                                          const ValidateViewState state =
+                                              validate_;
+                                          launch_job("validate", [state]() {
+                                            const mmltk::rfdetr::ValidateRequest
+                                                request =
+                                                    rfdetr_workflows::build_validate_request(
+                                                        state);
+                                            const ValidationOptions options =
+                                                mmltk::rfdetr::to_validate_options(
+                                                    request);
+                                            const ValidationRunResult result =
+                                                run_validation(options);
+                                            print_validation_run_summary(
+                                                options, result);
+                                            JobOutcome outcome;
+                                            outcome.summary =
+                                                rfdetr_workflows::summarize_validation_result(
+                                                    result);
+                                            return outcome;
+                                          });
+                                        }
+                                        ImGui::EndDisabled();
+                                      });
+                  },
+                  [&]() {
+                    draw_recent_job_tile(
+                        job_, validate_job_output,
+                        {.label = "validate",
+                         .tile_id = "validate_job_tile",
+                         .heading = "Validation Job",
+                         .output_id = "validate_view_job_output_tail",
+                         .waiting_message = "Waiting for validation output...",
+                         .error_banner_id =
+                             "validate_view_job_error_banner"});
+                  });
+      });
 
-  draw_section_heading("Execution");
-  draw_full_width_input("Split", validate_.split);
-  draw_full_width_input("CPU Affinity", validate_.cpu_affinity);
-  draw_labeled_int_input("Resolution", validate_.resolution, 120.0f);
-  draw_labeled_int_input("Batch Size", validate_.batch_size, 120.0f);
-  draw_labeled_int_input("Workers", validate_.workers, 120.0f);
-  draw_labeled_int_input("Device ID", validate_.device_id, 120.0f);
-  draw_labeled_int_input("Limit Images", validate_.limit_images, 120.0f);
-  draw_labeled_int_input("Alignment Images", validate_.alignment_images,
-                         120.0f);
-  draw_labeled_int_input("Eval Max Dets", validate_.eval_max_dets, 120.0f);
-  draw_labeled_int_input("Prefetch", validate_.prefetch_factor, 120.0f);
-  draw_labeled_checkbox("Recompile From Source", validate_.recompile);
-  draw_labeled_checkbox("Profile", validate_.profile);
-  draw_labeled_checkbox("FP16", validate_.allow_fp16);
-  draw_labeled_checkbox("Write Report", validate_.write_report_json);
-
-  ImGui::BeginDisabled(block_actions);
-  if (ImGui::Button("Run Validation")) {
-    const ValidateViewState state = validate_;
-    launch_job("validate", [state]() {
-      const mmltk::rfdetr::ValidateRequest request =
-          rfdetr_workflows::build_validate_request(state);
-      const ValidationOptions options = mmltk::rfdetr::to_validate_options(request);
-      const ValidationRunResult result = run_validation(options);
-      print_validation_run_summary(options, result);
-      JobOutcome outcome;
-      outcome.summary = rfdetr_workflows::summarize_validation_result(result);
-      return outcome;
-    });
-  }
-  ImGui::EndDisabled();
+  apply_dataset_paths(validate_, dataset_state);
+  apply_model_artifacts(validate_, artifact_state);
+  apply_execution_tuning(validate_, execution_state);
 }
 
 void App::draw_predict_view() {
-  draw_section_heading("Source");
-  ImGui::BeginDisabled(live_predict_running());
-  const SourceSelectionUiActions source_actions = draw_source_selection(
-      predict_.source, "predict_source", true, true, true, true,
-      file_picker_busy(FileBrowseField::PredictSingleImage));
-  ImGui::EndDisabled();
-  if (source_actions.browse_single_image) {
+  const bool block_actions = job_.running || live_predict_running();
+  ModelArtifactSelectionState artifact_state = model_artifacts(predict_);
+  ExecutionTuningState execution_state = execution_tuning(predict_);
+  const std::string predict_job_output = snapshot_job_output();
+  bool browse_single_image = false;
+  ModelInputBrowseRequest model_browse = ModelInputBrowseRequest::None;
+  PredictActionFooterResult predict_action = PredictActionFooterResult::None;
+  draw_two_column_grid(
+      kPredictWorkspaceGrid, "predict_workspace_primary_column",
+      [&]() {
+        draw_column(
+            "predict_workspace_primary_column",
+                    [&]() {
+                      draw_property_sheet_tile(
+                          "predict_source_tile", "Source", [&]() {
+                            ImGui::BeginDisabled(live_predict_running());
+                            const SourceSelectionUiActions source_actions =
+                                draw_source_selection(
+                                    predict_.source, "predict_source", true,
+                                    true, true, true,
+                                    file_picker_busy(
+                                        FileBrowseField::PredictSingleImage));
+                            ImGui::EndDisabled();
+                            browse_single_image =
+                                source_actions.browse_single_image;
+                          });
+                    },
+                    [&]() {
+                      draw_property_sheet_tile(
+                          "predict_model_tile", "Model", [&]() {
+                            const bool live_video =
+                                predict_.source.kind ==
+                                SourceKind::VideoStream;
+                            const bool single_image =
+                                predict_.source.kind ==
+                                SourceKind::SingleImage;
+                            if (single_image) {
+                              predict_.batch_size = 1;
+                            }
+
+                            ImGui::BeginDisabled(live_predict_running());
+                            model_browse = draw_model_input_section(
+                                predict_.model_input, artifact_state,
+                                file_picker_busy(
+                                    FileBrowseField::PredictWeights),
+                                file_picker_busy(FileBrowseField::PredictOnnx),
+                                file_picker_busy(
+                                    FileBrowseField::PredictTensorRt),
+                                {.heading = nullptr});
+                            draw_full_width_input("Backend Preference",
+                                                  predict_.backend);
+                            if (!live_video) {
+                              draw_full_width_input("Output JSON",
+                                                    predict_.output_path);
+                            }
+                            ImGui::EndDisabled();
+                          });
+                    });
+      },
+      "predict_workspace_secondary_column",
+      [&]() {
+        draw_column(
+            "predict_workspace_secondary_column",
+                  [&]() {
+                    draw_property_sheet_tile(
+                        "predict_execution_tile", "Execution", [&]() {
+                          const bool live_video =
+                              predict_.source.kind == SourceKind::VideoStream;
+                          const bool single_image =
+                              predict_.source.kind == SourceKind::SingleImage;
+
+                          if (live_video) {
+                            ImGui::BeginDisabled(live_predict_running());
+                            draw_execution_tuning_section(
+                                execution_state,
+                                {.heading = nullptr,
+                                 .input_width = 120.0f,
+                                 .show_cpu_affinity = false,
+                                 .show_device_id = true,
+                                 .show_workers = false,
+                                 .show_lanes = false,
+                                 .show_allow_fp16 = true,
+                                 .show_progress_bar = false,
+                                 .show_compile_mode = true});
+                            draw_labeled_int_input("Live Splits",
+                                                   predict_.live_split_count,
+                                                   120.0f);
+                            draw_labeled_int_input("Max Dets",
+                                                   predict_.max_dets_per_image,
+                                                   120.0f);
+                            draw_labeled_float_input(
+                                "Threshold", predict_.threshold, 120.0f,
+                                0.01f, 0.10f, "%.3f");
+                            ImGui::EndDisabled();
+                            ImGui::TextWrapped(
+                                "Live video predict keeps the selected model "
+                                "hot and runs against the newest available "
+                                "device frame. The active model resolution "
+                                "comes from the selected RF-DETR preset.");
+                            return;
+                          }
+
+                          draw_execution_tuning_section(
+                              execution_state,
+                              {.heading = nullptr,
+                               .input_width = 120.0f,
+                               .show_cpu_affinity = true,
+                               .show_device_id = true,
+                               .show_workers = true,
+                               .show_lanes = true,
+                               .show_allow_fp16 = true,
+                               .show_progress_bar = true,
+                               .show_compile_mode = true});
+                          if (single_image) {
+                            ImGui::BeginDisabled();
+                            draw_labeled_int_input("Batch Size",
+                                                   predict_.batch_size,
+                                                   120.0f);
+                            ImGui::EndDisabled();
+                            ImGui::TextWrapped(
+                                "Single-image predict always uses batch size "
+                                "1.");
+                          } else {
+                            draw_labeled_int_input("Batch Size",
+                                                   predict_.batch_size,
+                                                   120.0f);
+                          }
+                          draw_labeled_int_input("Max Dets",
+                                                 predict_.max_dets_per_image,
+                                                 120.0f);
+                          draw_labeled_float_input("Threshold",
+                                                   predict_.threshold, 120.0f,
+                                                   0.01f, 0.10f, "%.3f");
+                        });
+                  },
+                  [&]() {
+                    draw_property_sheet_tile(
+                        "predict_status_tile", "Status", [&]() {
+                          const bool live_video =
+                              predict_.source.kind == SourceKind::VideoStream;
+                          const std::string source_error =
+                              validate_predict_source(predict_.source);
+                          const std::string combo_error =
+                              live_video ? std::string{}
+                                         : predict_combo_error(predict_);
+                          const std::string live_blocker =
+                              live_video ? live_predict_blocker(predict_, job_)
+                                         : std::string{};
+                          if (source_error.empty() && combo_error.empty() &&
+                              live_blocker.empty() &&
+                              live_predict_controller_.start_error().empty()) {
+                            ImGui::TextUnformatted(
+                                live_video
+                                    ? "Ready to start live prediction."
+                                    : "Ready to run prediction.");
+                          } else {
+                            draw_predict_status_sections(
+                                live_video, source_error, live_blocker,
+                                combo_error,
+                                live_predict_controller_.start_error(),
+                                job_.running);
+                          }
+                        });
+                  },
+                  [&]() {
+                    draw_toolbar_tile("predict_actions_tile", "Actions",
+                                      [&]() {
+                                        const bool live_video =
+                                            predict_.source.kind ==
+                                            SourceKind::VideoStream;
+                                        const std::string source_error =
+                                            validate_predict_source(
+                                                predict_.source);
+                                        const std::string combo_error =
+                                            live_video
+                                                ? std::string{}
+                                                : predict_combo_error(
+                                                      predict_);
+                                        const std::string live_blocker =
+                                            live_video
+                                                ? live_predict_blocker(
+                                                      predict_, job_)
+                                                : std::string{};
+                                        const bool block_live_start =
+                                            !live_blocker.empty() ||
+                                            active_live_mode_ ==
+                                                ActiveLiveMode::Annotate;
+                                        const bool block_prediction =
+                                            block_actions ||
+                                            !source_error.empty() ||
+                                            !combo_error.empty();
+                                        predict_action =
+                                            draw_predict_action_footer(
+                                                live_video,
+                                                active_live_mode_ ==
+                                                    ActiveLiveMode::Predict,
+                                                live_predict_controller_
+                                                    .starting(),
+                                                live_predict_controller_
+                                                    .stopping(),
+                                                block_live_start,
+                                                block_prediction);
+                                      });
+                  },
+                  [&]() {
+                    draw_recent_job_tile(
+                        job_, predict_job_output,
+                        {.label = "predict",
+                         .tile_id = "predict_job_tile",
+                         .heading = "Prediction Job",
+                         .output_id = "predict_view_job_output_tail",
+                         .waiting_message = "Waiting for prediction output...",
+                         .error_banner_id =
+                             "predict_view_job_error_banner"});
+                  });
+      });
+
+  if (browse_single_image) {
     launch_file_picker(FileBrowseField::PredictSingleImage, "Select Image",
                        &predict_.source.single_image_path);
   }
+  handle_model_input_browse_request(model_browse, predict_, artifact_state,
+                                    FileBrowseField::PredictWeights,
+                                    FileBrowseField::PredictOnnx,
+                                    FileBrowseField::PredictTensorRt);
+
+  apply_model_artifacts(predict_, artifact_state);
+  apply_execution_tuning(predict_, execution_state);
+
   const bool live_video = predict_.source.kind == SourceKind::VideoStream;
-  const bool single_image = predict_.source.kind == SourceKind::SingleImage;
-  if (single_image) {
-    predict_.batch_size = 1;
-  }
-
-  draw_section_heading("Model");
-  ImGui::BeginDisabled(live_predict_running());
-  const ModelInputBrowseRequest model_browse = draw_model_input_selector(
-      predict_.model_input, predict_.weights_path, predict_.onnx_path,
-      predict_.tensorrt_path, file_picker_busy(FileBrowseField::PredictWeights),
-      file_picker_busy(FileBrowseField::PredictOnnx),
-      file_picker_busy(FileBrowseField::PredictTensorRt));
-  draw_full_width_input("Backend Preference", predict_.backend);
-  if (!live_video) {
-    draw_full_width_input("Output JSON", predict_.output_path);
-  }
-  ImGui::EndDisabled();
-  switch (model_browse) {
-  case ModelInputBrowseRequest::Weights:
-    launch_file_picker(FileBrowseField::PredictWeights, "Select Weights",
-                       &predict_.weights_path);
+  switch (predict_action) {
+  case PredictActionFooterResult::StartLive:
+    launch_live_predict_session();
     break;
-  case ModelInputBrowseRequest::Onnx:
-    launch_file_picker(FileBrowseField::PredictOnnx, "Select ONNX Model",
-                       &predict_.onnx_path);
+  case PredictActionFooterResult::StopLive:
+    stop_live_predict_session();
     break;
-  case ModelInputBrowseRequest::TensorRt:
-    launch_file_picker(FileBrowseField::PredictTensorRt,
-                       "Select TensorRT Engine", &predict_.tensorrt_path);
-    break;
-  case ModelInputBrowseRequest::None:
-    break;
-  }
-
-  draw_section_heading("Execution");
-  if (live_video) {
-    ImGui::BeginDisabled(live_predict_running());
-    draw_labeled_int_input("Device ID", predict_.device_id, 120.0f);
-    draw_labeled_int_input("Live Splits", predict_.live_split_count, 120.0f);
-    draw_labeled_int_input("Max Dets", predict_.max_dets_per_image, 120.0f);
-    draw_labeled_float_input("Threshold", predict_.threshold, 120.0f, 0.01f,
-                             0.10f, "%.3f");
-    draw_labeled_checkbox("FP16", predict_.allow_fp16);
-    (void)draw_compile_mode_combo("Compile Mode", predict_.compile_mode);
-    ImGui::EndDisabled();
-    ImGui::TextWrapped(
-        "Live video predict keeps the selected model hot and runs against the "
-        "newest available device frame. "
-        "The active model resolution comes from the selected RF-DETR preset.");
-  } else {
-    draw_labeled_int_input("Device ID", predict_.device_id, 120.0f);
-    draw_full_width_input("CPU Affinity", predict_.cpu_affinity);
-    if (single_image) {
-      ImGui::BeginDisabled();
-      draw_labeled_int_input("Batch Size", predict_.batch_size, 120.0f);
-      ImGui::EndDisabled();
-      ImGui::TextWrapped("Single-image predict always uses batch size 1.");
-    } else {
-      draw_labeled_int_input("Batch Size", predict_.batch_size, 120.0f);
-    }
-    draw_labeled_int_input("Workers", predict_.workers, 120.0f);
-    draw_labeled_int_input("Lanes", predict_.lanes, 120.0f);
-    draw_labeled_int_input("Max Dets", predict_.max_dets_per_image, 120.0f);
-    draw_labeled_float_input("Threshold", predict_.threshold, 120.0f, 0.01f,
-                             0.10f, "%.3f");
-    draw_labeled_checkbox("FP16", predict_.allow_fp16);
-    draw_labeled_checkbox("Progress", predict_.progress_bar);
-    (void)draw_compile_mode_combo("Compile Mode", predict_.compile_mode);
-  }
-
-  const std::string source_error = validate_predict_source(predict_.source);
-  const std::string combo_error =
-      live_video ? std::string{} : predict_combo_error(predict_);
-  const std::string live_blocker =
-      live_video ? live_predict_blocker(predict_, job_) : std::string{};
-  if (!source_error.empty()) {
-    ImGui::Spacing();
-    if (live_video) {
-      draw_banner("predict_live_source_error_banner",
-                  ImVec4(0.33f, 0.17f, 0.12f, 0.95f),
-                  ImVec4(0.98f, 0.90f, 0.82f, 1.00f), source_error);
-    } else {
-      ImGui::TextWrapped("%s", source_error.c_str());
-    }
-  }
-  if (!live_blocker.empty() && (source_error.empty() || job_.running)) {
-    ImGui::Spacing();
-    draw_banner("predict_live_blocker_banner",
-                ImVec4(0.33f, 0.17f, 0.12f, 0.95f),
-                ImVec4(0.98f, 0.90f, 0.82f, 1.00f), live_blocker);
-  }
-  if (!combo_error.empty()) {
-    ImGui::Spacing();
-    draw_banner("predict_combo_banner", ImVec4(0.33f, 0.17f, 0.12f, 0.95f),
-                ImVec4(0.98f, 0.90f, 0.82f, 1.00f), combo_error);
-  }
-  if (live_video && !live_predict_controller_.start_error().empty()) {
-    ImGui::Spacing();
-    draw_banner("predict_live_start_error_banner",
-                ImVec4(0.33f, 0.17f, 0.12f, 0.95f),
-                ImVec4(0.98f, 0.90f, 0.82f, 1.00f),
-                live_predict_controller_.start_error());
-  }
-
-  if (live_video) {
-    if (active_live_mode_ != ActiveLiveMode::Predict &&
-        !live_predict_controller_.starting() &&
-        !live_predict_controller_.stopping()) {
-      const bool block_live_start =
-          !live_blocker.empty() ||
-          active_live_mode_ == ActiveLiveMode::Annotate;
-      ImGui::BeginDisabled(block_live_start);
-      if (ImGui::Button("Start Live Prediction")) {
-        launch_live_predict_session();
-      }
-      ImGui::EndDisabled();
-    } else if (live_predict_controller_.starting()) {
-      if (ImGui::Button("Cancel Live Start")) {
-        stop_live_predict_session();
-      }
-      ImGui::SameLine();
-      ImGui::TextUnformatted("Starting live prediction...");
-    } else if (live_predict_controller_.stopping()) {
-      ImGui::BeginDisabled();
-      (void)ImGui::Button("Stopping Live Prediction");
-      ImGui::EndDisabled();
-    } else {
-      if (ImGui::Button("Stop Live Prediction")) {
-        stop_live_predict_session();
-      }
-    }
-  } else {
-    const bool block_prediction = job_.running || live_predict_running() ||
-                                  !source_error.empty() || !combo_error.empty();
-    ImGui::BeginDisabled(block_prediction);
-    if (ImGui::Button("Run Prediction")) {
-      clear_static_preview();
-      const PredictViewState state = predict_;
-      const std::string preset_name = selected_preset_name_;
-      launch_job("predict", [state, preset_name]() {
-        PreparedPredictSource prepared_source =
-            prepare_predict_source(state.source);
-        const mmltk::rfdetr::PredictRequest request =
-            rfdetr_workflows::build_predict_request(
-                state, std::move(prepared_source.image_inputs));
-        PredictOptions options =
-            mmltk::rfdetr::to_predict_options(request, preset_name);
-        const PredictionRunResult result = run_prediction(options);
-        write_prediction_json(options, result);
-        print_prediction_summary(options, result);
-        JobOutcome outcome;
-        outcome.summary = rfdetr_workflows::summarize_prediction_result(result);
-        outcome.preview = rfdetr_workflows::maybe_make_single_image_preview(
-            state, options, result);
-        return outcome;
-      });
-    }
-    ImGui::EndDisabled();
-  }
-}
-
-void App::draw_export_view() {
-  const bool block_actions = job_.running || live_predict_running();
-
-  draw_section_heading("Model Input");
-  if (draw_file_picker_input(
-          "Weights Path (.pt)", export_.weights_path,
-          file_picker_busy(FileBrowseField::ExportWeights))) {
-    launch_file_picker(FileBrowseField::ExportWeights, "Select Weights",
-                       &export_.weights_path);
-  }
-  if (draw_file_picker_input("ONNX Path", export_.onnx_path,
-                             file_picker_busy(FileBrowseField::ExportOnnx))) {
-    launch_file_picker(FileBrowseField::ExportOnnx, "Select ONNX Model",
-                       &export_.onnx_path);
-  }
-
-  draw_section_heading("ONNX Export");
-  draw_labeled_int_input("Opset Version (19 only)", export_.opset_version,
-                         120.0f);
-  draw_labeled_checkbox("Simplify", export_.simplify);
-
-  draw_section_heading("TensorRT");
-  draw_labeled_checkbox("Build TensorRT Engine", export_.build_tensorrt);
-  if (export_.build_tensorrt) {
-    if (draw_file_picker_input(
-            "Engine Output Path", export_.output_path,
-            file_picker_busy(FileBrowseField::ExportEngine))) {
-      launch_file_picker(FileBrowseField::ExportEngine, "Select Engine Output",
-                         &export_.output_path);
-    }
-    draw_labeled_checkbox("FP16", export_.allow_fp16);
-  }
-
-  draw_section_heading("Execution");
-  draw_labeled_int_input("Device ID", export_.device_id, 120.0f);
-
-  ImGui::Spacing();
-  ImGui::BeginDisabled(block_actions);
-  if (ImGui::Button("Export")) {
-    const ExportViewState state = export_;
-    launch_job("export", [this, state]() {
-      append_job_output("[export] start");
-      std::filesystem::path onnx_path = state.onnx_path;
-
-      if (!state.weights_path.empty()) {
-        const ExportOnnxRequest export_request =
-            rfdetr_workflows::build_export_onnx_request(state, onnx_path);
-        append_job_output("[export] writing ONNX: " +
-                          export_request.output_path.string());
-        rfdetr::export_weights_to_onnx(export_request.weights_path,
-                                       export_request.output_path,
-                                       export_request.device_id,
-                                       export_request.opset_version,
-                                       export_request.simplify);
-        onnx_path = export_request.output_path;
-      }
-
-      if (onnx_path.empty()) {
-        throw std::runtime_error("Provide weights path or ONNX path");
-      }
-
-      std::string summary = "Exported ONNX: " + onnx_path.string();
-
-      if (state.build_tensorrt) {
-        const BuildEngineRequest build_request =
-            rfdetr_workflows::build_build_engine_request(state, onnx_path);
-        append_job_output("[export] building TensorRT engine: " +
-                          build_request.output_path.string());
-        rfdetr::make_tensorrt_backend(build_request.onnx_path,
-                                      build_request.device_id,
-                                      build_request.allow_fp16,
-                                      build_request.output_path);
-        append_job_output("[export] TensorRT engine ready: " +
-                          build_request.output_path.string());
-        summary += " | TRT engine: " + build_request.output_path.string();
-      }
-
+  case PredictActionFooterResult::RunBatchPrediction: {
+    clear_static_preview();
+    const PredictViewState state = predict_;
+    const std::string preset_name = selected_preset_name_;
+    launch_job("predict", [state, preset_name]() {
+      PreparedPredictSource prepared_source =
+          prepare_predict_source(state.source);
+      const mmltk::rfdetr::PredictRequest request =
+          rfdetr_workflows::build_predict_request(
+              state, std::move(prepared_source.image_inputs));
+      PredictOptions options =
+          mmltk::rfdetr::to_predict_options(request, preset_name);
+      const PredictionRunResult result = run_prediction(options);
+      write_prediction_json(options, result);
+      print_prediction_summary(options, result);
       JobOutcome outcome;
-      outcome.summary = std::move(summary);
+      outcome.summary = rfdetr_workflows::summarize_prediction_result(result);
+      outcome.preview = rfdetr_workflows::maybe_make_single_image_preview(
+          state, options, result);
       return outcome;
     });
+    break;
   }
-  ImGui::EndDisabled();
-
-  const bool export_job_active_or_recent = job_.label == "export";
-  const std::string export_job_output = snapshot_job_output();
-  if (export_job_active_or_recent || !export_job_output.empty()) {
-    draw_section_heading("Export Job");
-    if (job_.running && job_.label == "export") {
-      ImGui::TextWrapped("Running: %s", job_.label.c_str());
-    } else if (job_.label == "export") {
-      ImGui::TextWrapped("Idle after: %s", job_.label.c_str());
-    }
-    if (job_.label == "export" && !job_.last_summary.empty()) {
-      ImGui::TextWrapped("%s", job_.last_summary.c_str());
-    }
-    if (!export_job_output.empty() ||
-        (job_.running && job_.label == "export")) {
-      draw_output_console("export_view_job_output_tail", export_job_output,
-                          180.0f, job_.running && job_.label == "export",
-                          "Waiting for export output...");
-    }
-    if (job_.label == "export" && !job_.last_error.empty()) {
-      ImGui::TextColored(ImVec4(0.94f, 0.45f, 0.41f, 1.00f), "Error");
-      ImGui::TextWrapped("%s", job_.last_error.c_str());
-    }
+  case PredictActionFooterResult::None:
+    break;
   }
 }
 
-void App::draw_live_view() {
-  if (active_live_mode_ == ActiveLiveMode::Predict &&
-      live_predict_controller_.controller() != nullptr) {
-    const bool is_video_stream =
-        predict_.source.kind == SourceKind::VideoStream;
-    draw_labeled_checkbox("Fit To Capture", live_preview_fit_to_capture_);
-    if (is_video_stream) {
-      bool was_overlay = live_crop_overlay_mode_;
-      draw_labeled_checkbox("Full Frame", live_crop_overlay_mode_);
-      if (live_crop_overlay_mode_ != was_overlay) {
-        live_crop_drag_session_ = {};
-      }
-    }
-    draw_live_preview_panel();
-    return;
-  }
+void AnnotationWorkflowCoordinator::draw_save_tab(const bool live_video) {
+  const AnnotationWorkflowSaveRequest save_request =
+      make_annotation_workflow_save_request(
+          &app_.annotate_workflow_, app_.annotate_, live_running(),
+          app_.annotate_save_running_, annotation_frame_ptr(app_.annotate_frame_),
+          !app_.annotate_resolved_instances_.empty(),
+          app_.annotate_current_input_index_, app_.annotate_inputs_.size());
+  const AnnotationWorkflowSaveTabView save_tab_view =
+      make_annotation_workflow_save_tab_view(
+          save_request, make_annotation_workflow_save_ui_request(
+                            &app_.annotate_, &app_.annotate_categories_,
+                            &app_.annotate_workflow_, live_video,
+                            app_.compact_font_));
+  const AnnotationSaveTabUiActions actions =
+      draw_annotation_save_tab_ui(save_tab_view.ui_state, save_tab_view.plan);
 
-  if (live_predict_controller_.starting() ||
-      live_predict_controller_.stopping()) {
-    draw_section_heading("Live Preview");
-    ImGui::TextWrapped(
-        "%s", live_predict_controller_.starting()
-                  ? "Live prediction is starting..."
-                  : "Live prediction is stopping...");
-    return;
+  sync_categories();
+  (void)apply_annotation_workflow_save_tab_ui_actions(app_.annotate_workflow_,
+                                                      live_video, actions);
+  if (actions.request_save_now) {
+    (void)dispatch_annotation_workflow_save_now(
+        save_tab_view.plan,
+        [this](const bool refresh_live_frame)
+            -> std::optional<AnnotationSaveSnapshot> {
+          return make_annotation_workflow_current_save_snapshot(
+              AnnotationWorkflowCurrentSaveSnapshotRequest{
+                  &app_.annotate_workflow_,
+                  &app_.annotate_document_,
+                  &app_.annotate_session_,
+                  &app_.annotate_frame_,
+                  &app_.annotate_categories_,
+                  &app_.annotate_resolved_instances_,
+                  refresh_live_frame,
+                  true,
+                  &app_.annotate_save_error_,
+                  "annotate live save resolve error",
+              },
+              [this](std::string *error_message) {
+                return ensure_annotation_workflow_live_annotation_frame_pixels(
+                    app_.annotate_.source, app_.annotate_frame_,
+                    live_running(), app_.live_controller_.get(),
+                    app_.annotate_.full_frame, error_message);
+              },
+              [this](const char *error_context, const std::string &error) {
+                log_gui_error(
+                    error_context != nullptr ? error_context
+                                             : "annotate resolve error",
+                    error);
+              });
+        },
+        [this](AnnotationSaveSnapshot save_snapshot, const bool live_mode) {
+          return launch_annotation_workflow_save(
+              app_.annotate_workflow_, app_.annotate_, app_.annotate_categories_,
+              std::move(save_snapshot), live_mode,
+              AnnotationWorkflowSaveLaunchState{
+                  &app_.annotate_save_running_, &app_.annotate_save_summary_,
+                  &app_.annotate_save_error_, &app_.annotate_categories_loaded_,
+                  &app_.annotate_categories_output_dir_},
+              app_.background_executor_, app_.ui_callbacks_,
+              [this](const std::string &error) {
+                log_gui_error("annotate save error", error);
+              });
+        },
+        [this]() { step_current_frame(1); });
   }
-
-  if (has_static_preview()) {
-    draw_labeled_checkbox("Fit To Capture", live_preview_fit_to_capture_);
-    ImGui::TextWrapped("Source: %s", live_static_preview_source_name_.c_str());
-    draw_live_preview_panel();
-    return;
-  }
-
-  draw_section_heading("Live Preview");
-  if (!live_predict_controller_.start_error().empty()) {
-    draw_banner("live_view_start_error_banner",
-                ImVec4(0.33f, 0.17f, 0.12f, 0.95f),
-                ImVec4(0.98f, 0.90f, 0.82f, 1.00f),
-                live_predict_controller_.start_error());
-    ImGui::Spacing();
-  }
-  if (!live_preview_error_.empty()) {
-    draw_banner("live_view_preview_error_banner",
-                ImVec4(0.33f, 0.17f, 0.12f, 0.95f),
-                ImVec4(0.98f, 0.90f, 0.82f, 1.00f), live_preview_error_);
-    ImGui::Spacing();
-  }
-  ImGui::TextWrapped(
-      "Start live prediction from Predict with a video stream source, or run "
-      "single-image predict to push an annotated still here.");
 }
 
-void App::draw_annotate_workspace() {
-  const bool live_video = annotate_.source.kind == SourceKind::VideoStream;
-  if (annotation_workflow_preview_pending(
-          annotate_workflow_, annotation_frame_ptr(annotate_frame_))) {
-    submit_annotation_preview();
-  }
+void AnnotationWorkflowCoordinator::draw_setup_tab(const bool block_actions,
+                                                   const bool live_video,
+                                                   const bool can_use_video) {
+  const AnnotationWorkflowSetupRequest setup_request =
+      make_annotation_workflow_setup_request(
+          &app_.annotate_, live_video, live_running(),
+          block_actions, can_use_video, app_.annotate_prepare_running_,
+          app_.file_picker_busy(App::FileBrowseField::AnnotateSingleImage),
+          app_.file_picker_busy(App::FileBrowseField::AnnotateWeights),
+          app_.file_picker_busy(App::FileBrowseField::AnnotateOnnx),
+          app_.file_picker_busy(App::FileBrowseField::AnnotateTensorRt),
+          app_.annotate_current_input_index_, app_.annotate_inputs_.size(),
+          app_.compact_font_);
+  const AnnotationSetupTabActions actions =
+      draw_annotation_setup_tab(make_annotation_setup_tab_state(setup_request),
+                                [this]() { app_.draw_preset_selector(); });
+  const AnnotationWorkflowSetupDispatchPlan dispatch_plan =
+      plan_annotation_workflow_setup_dispatch(actions,
+                                             app_.annotate_current_input_index_,
+                                             app_.annotate_inputs_.size());
+  dispatch_annotation_workflow_setup(
+      dispatch_plan,
+      [this](const AnnotationSetupBrowseRequest browse_request) {
+        handle_setup_browse_request(browse_request);
+      },
+      [this]() { prepare_source(); },
+      [this]() { cancel_canvas_interactions(); },
+      [this]() { invalidate_preview(); },
+      [this]() { start_live_session(); },
+      [this]() { stop_live_session(); },
+      [this]() { load_current_frame(); },
+      [this](const int step) { step_current_frame(step); });
+}
 
-  draw_section_heading("Workspace");
-  if (annotate_frame_.has_value()) {
-    draw_with_optional_font(compact_font_, [this]() {
-      ImGui::TextWrapped("Frame: %s", annotate_frame_->source_name.c_str());
+void AnnotationWorkflowCoordinator::apply_sidebar_mutation_result(
+    const AnnotationSidebarMutationResult &result, const bool allow_assist) {
+  apply_annotation_sidebar_shell_effects(
+      result, allow_assist,
+      [this]() {
+        (void)launch_annotation_workflow_assist(
+            AnnotationWorkflowAssistLaunchRequest{
+                annotation_frame_ptr(app_.annotate_frame_),
+                app_.annotate_assist_running_,
+                app_.annotate_.model_input,
+            },
+            live_running(),
+            AnnotationWorkflowAssistLaunchState{
+                &app_.annotate_assist_running_, &app_.annotate_assist_summary_,
+                &app_.annotate_assist_error_},
+            app_.background_executor_, app_.ui_callbacks_,
+            [this](std::string *error_message) {
+              return ensure_annotation_workflow_live_annotation_frame_pixels(
+                  app_.annotate_.source, app_.annotate_frame_,
+                  live_running(), app_.live_controller_.get(),
+                  app_.annotate_.full_frame, error_message);
+            },
+            [this]() -> std::optional<AnnotationWorkflowAssistExecutionRequest> {
+              return make_annotation_workflow_assist_execution_request(
+                  *app_.annotate_frame_, app_.annotate_,
+                  app_.selected_preset_name_, &app_.annotate_assist_error_);
+            },
+            [this](const AnnotationWorkflowAssistOutcome &outcome) {
+              if (!annotation_workflow_assist_outcome_matches_frame(
+                      annotation_frame_ptr(app_.annotate_frame_), outcome)) {
+                return;
+              }
+              const AnnotationWorkflowAssistApplyResult apply_result =
+                  apply_annotation_workflow_assist_outcome(
+                      app_.annotate_document_, app_.annotate_session_,
+                      app_.annotate_categories_, outcome);
+              if (!apply_result.changed) {
+                return;
+              }
+              cancel_canvas_interactions();
+              invalidate_preview();
+            },
+            [this](const std::string &error) {
+              log_gui_error("annotate assist error", error);
+            });
+      },
+      [this]() { cancel_canvas_interactions(); },
+      [this](const AnnotationToolKind tool) {
+        (void)app_.annotate_controller_.set_active_tool(
+            tool, app_.annotate_document_, app_.annotate_session_);
+      },
+      [this]() { invalidate_preview(); });
+}
+
+void AnnotationWorkflowCoordinator::apply_objects_tab_actions(
+    const AnnotationSidebarViewModel &sidebar_model,
+    const AnnotationObjectsTabActions &actions, const bool assist_available) {
+  const AnnotationSidebarMutationResult result =
+      mmltk::gui::apply_annotation_objects_tab_actions(
+          mmltk::gui::make_annotation_workflow_objects_tab_apply_context(
+              AnnotationWorkflowObjectsTabRequest{
+                  app_.annotate_controller_,
+                  app_.annotate_document_,
+                  app_.annotate_session_,
+                  app_.annotate_categories_,
+                  annotation_frame_ptr(app_.annotate_frame_),
+                  &app_.annotate_pending_class_name_,
+                  assist_available,
+              }),
+          sidebar_model, actions);
+  apply_sidebar_mutation_result(result, true);
+}
+
+void AnnotationWorkflowCoordinator::apply_mask_tab_actions(
+    const AnnotationMaskTabActions &actions) {
+  const AnnotationSidebarMutationResult result =
+      mmltk::gui::apply_annotation_mask_tab_actions(
+          mmltk::gui::make_annotation_workflow_mask_tab_apply_context(
+              AnnotationWorkflowMaskTabRequest{
+                  app_.annotate_document_,
+                  app_.annotate_session_,
+                  annotation_frame_ptr(app_.annotate_frame_),
+                  &app_.annotate_cleanup_radius_,
+              }),
+          actions);
+  apply_sidebar_mutation_result(result, false);
+}
+
+void AnnotationWorkflowCoordinator::draw_workspace_status(const bool live_video) {
+  if (app_.annotate_frame_.has_value()) {
+    draw_with_optional_font(app_.compact_font_, [this]() {
+      ImGui::TextWrapped("Frame: %s", app_.annotate_frame_->source_name.c_str());
     });
-    ImGui::Text("Size: %u x %u", annotate_frame_->width,
-                annotate_frame_->height);
+    ImGui::Text("Size: %u x %u", app_.annotate_frame_->width,
+                app_.annotate_frame_->height);
     ImGui::SameLine();
-    ImGui::Text("Objects: %zu", annotate_document_.size());
+    ImGui::Text("Objects: %zu", app_.annotate_document_.size());
     ImGui::SameLine();
-    ImGui::Text("Resolved Masks: %zu", annotate_resolved_instances_.size());
-  } else if (annotate_prepare_running_ || annotate_frame_load_running_) {
+    ImGui::Text("Resolved Masks: %zu", app_.annotate_resolved_instances_.size());
+  } else if (app_.annotate_prepare_running_ || app_.annotate_frame_load_running_) {
     ImGui::TextUnformatted("Loading annotation source...");
   } else {
     ImGui::TextUnformatted(live_video
                                ? "Start live annotate to stream frames here."
                                : "Load a source image to begin annotating.");
   }
-  const auto selected_index = [this]() {
-    return normalize_selected_object_index(annotate_document_, annotate_session_);
-  };
+}
+
+void AnnotationWorkflowCoordinator::draw_workspace_tool_hints(const bool live_video) {
   const auto selected_annotation_object = [this]() -> const AnnotationObject * {
-    return mmltk::gui::selected_object(annotate_document_, annotate_session_);
+    return mmltk::gui::selected_object(app_.annotate_document_, app_.annotate_session_);
   };
-  const auto active_tool = [this]() { return annotate_session_.active_tool(); };
+  const auto active_tool = [this]() { return app_.annotate_session_.active_tool(); };
   const auto selected_supports_mask_editing = [&]() {
     const AnnotationObject *object = selected_annotation_object();
-    return object != nullptr &&
-           annotation_object_supports_mask_editing(*object);
+    return object != nullptr && annotation_object_supports_mask_editing(*object);
   };
-  PreviewRectDragSession &create_drag_session =
-      annotate_session_.create_drag_session();
+  PreviewRectDragSession &create_drag_session = app_.annotate_session_.create_drag_session();
 
   if (active_tool() == AnnotationToolKind::Box || create_drag_session.active) {
-    draw_with_optional_font(compact_font_, []() {
+    draw_with_optional_font(app_.compact_font_, []() {
       ImGui::TextWrapped("Box is active. Drag on the image to create a new "
                          "object. Use the mouse wheel to zoom and middle-drag "
                          "to pan for tighter geometry work.");
     });
   } else if (active_tool() == AnnotationToolKind::Direct) {
-    draw_with_optional_font(compact_font_, []() {
+    draw_with_optional_font(app_.compact_font_, []() {
       ImGui::TextWrapped(
           "Direct is active. Drag boxes to move or resize them, and drag "
           "selected point, spline, or skeleton handles for precise native "
@@ -2845,100 +3665,89 @@ void App::draw_annotate_workspace() {
     });
   } else if (active_tool() == AnnotationToolKind::MaskPaint &&
              !selected_supports_mask_editing()) {
-    draw_with_optional_font(compact_font_, []() {
+    draw_with_optional_font(app_.compact_font_, []() {
       ImGui::TextWrapped(
           "Paint is active, but it only applies to box and mask objects. "
           "Select one of those shapes to edit a dense mask.");
     });
   } else if (active_tool() == AnnotationToolKind::MaskPaint) {
-    draw_with_optional_font(compact_font_, [this]() {
+    draw_with_optional_font(app_.compact_font_, [this]() {
       ImGui::TextWrapped("Paint is active. Brush radius: %d px capture-space.",
-                         annotate_brush_radius_);
+                         app_.annotate_brush_radius_);
     });
   } else if (active_tool() == AnnotationToolKind::MaskErase &&
              !selected_supports_mask_editing()) {
-    draw_with_optional_font(compact_font_, []() {
+    draw_with_optional_font(app_.compact_font_, []() {
       ImGui::TextWrapped(
           "Erase is active, but it only applies to box and mask objects. "
           "Select one of those shapes to edit a dense mask.");
     });
   } else if (active_tool() == AnnotationToolKind::MaskErase) {
-    draw_with_optional_font(compact_font_, [this]() {
+    draw_with_optional_font(app_.compact_font_, [this]() {
       ImGui::TextWrapped("Erase is active. Brush radius: %d px capture-space.",
-                         annotate_brush_radius_);
+                         app_.annotate_brush_radius_);
     });
   } else if (active_tool() == AnnotationToolKind::MaskFill &&
              !selected_supports_mask_editing()) {
-    draw_with_optional_font(compact_font_, []() {
+    draw_with_optional_font(app_.compact_font_, []() {
       ImGui::TextWrapped(
           "Fill is active, but it only applies to box and mask objects. Select "
           "one of those shapes to flood-fill a dense mask.");
     });
   } else if (active_tool() == AnnotationToolKind::MaskFill) {
-    draw_with_optional_font(compact_font_, []() {
+    draw_with_optional_font(app_.compact_font_, []() {
       ImGui::TextWrapped("Fill is active. Click a background gap inside the "
                          "selected ROI to flood it.");
     });
   } else if (active_tool() == AnnotationToolKind::Spline) {
-    draw_with_optional_font(compact_font_, []() {
+    draw_with_optional_font(app_.compact_font_, []() {
       ImGui::TextWrapped(
           "Spline is active. Click to add knots to the selected spline. "
           "Double-click to close the current spline, then switch to Direct to "
           "pull out and edit bezier handles.");
     });
   } else if (active_tool() == AnnotationToolKind::Point) {
-    draw_with_optional_font(compact_font_, []() {
+    draw_with_optional_font(app_.compact_font_, []() {
       ImGui::TextWrapped("Point is active. Click to place a point object, or "
                          "reposition the selected point.");
     });
   } else if (active_tool() == AnnotationToolKind::Skeleton) {
-    draw_with_optional_font(compact_font_, []() {
+    draw_with_optional_font(app_.compact_font_, []() {
       ImGui::TextWrapped(
           "Skeleton is active. Click to place the next joint from the selected "
           "skeleton or create a new joint chain.");
     });
-  } else if (annotation_live_running()) {
-    draw_with_optional_font(compact_font_, []() {
+  } else if (app_.annotation_live_running()) {
+    draw_with_optional_font(app_.compact_font_, []() {
       ImGui::TextWrapped(
           "Live annotate is running against the raw capture feed.");
     });
   }
+}
 
-  draw_section_heading("Canvas");
-  const LivePreviewTextureState preview_state =
-      snapshot_preview_state(live_preview_texture_);
-  ImGui::BeginChild("annotate_canvas", ImVec2(0.0f, 0.0f), true,
-                    ImGuiWindowFlags_NoScrollbar |
-                        ImGuiWindowFlags_NoScrollWithMouse);
-  if (!annotate_frame_.has_value()) {
-    ImGui::TextUnformatted(
-        annotate_frame_load_running_ || annotate_prepare_running_
-            ? "Loading annotation source..."
-            : (live_video ? "Start live annotate to stream frames here."
-                          : "Load a source image to begin annotating."));
-    ImGui::EndChild();
-    return;
-  }
-  if (!preview_state.has_frame) {
-    ImGui::TextUnformatted(
-        annotation_workflow_preview_running(annotate_workflow_)
-            ? "Preparing annotation preview..."
-            : "Waiting for preview frame...");
-    ImGui::EndChild();
-    return;
-  }
-
-  const auto width = static_cast<float>(annotate_frame_->width);
-  const auto height = static_cast<float>(annotate_frame_->height);
-  const ImVec2 mouse = ImGui::GetMousePos();
+WorkspaceToolbarActions AnnotationWorkflowCoordinator::draw_workspace_toolbar(
+    const bool live_video,
+    const AnnotationWorkspaceViewModel &workspace_view) {
+  WorkspaceToolbarActions actions{};
+  const auto selected_index = [this]() {
+    return normalize_selected_object_index(app_.annotate_document_, app_.annotate_session_);
+  };
+  const auto selected_annotation_object = [this]() -> const AnnotationObject * {
+    return mmltk::gui::selected_object(app_.annotate_document_, app_.annotate_session_);
+  };
+  const auto active_tool = [this]() { return app_.annotate_session_.active_tool(); };
+  const auto selected_supports_mask_editing = [&]() {
+    const AnnotationObject *object = selected_annotation_object();
+    return object != nullptr && annotation_object_supports_mask_editing(*object);
+  };
 
   const auto set_active_tool_kind = [&](const AnnotationToolKind tool) {
     if (active_tool() == tool) {
       return;
     }
-    (void)annotate_controller_.set_active_tool(tool, annotate_document_,
-                                               annotate_session_);
-    cancel_annotation_canvas_interactions();
+    (void)app_.annotate_controller_.set_active_tool(tool, app_.annotate_document_,
+                                                    app_.annotate_session_);
+    cancel_canvas_interactions();
   };
 
   const auto draw_tool_button = [&](const AnnotationToolKind tool,
@@ -2979,16 +3788,16 @@ void App::draw_annotate_workspace() {
   if (selected_supports_mask_editing() &&
       annotation_tool_kind_uses_brush(active_tool())) {
     ImGui::SameLine();
-    draw_labeled_int_input("Brush", annotate_brush_radius_, 70.0f);
-    annotate_brush_radius_ = std::clamp(annotate_brush_radius_, 1, 128);
+    draw_labeled_int_input("Brush", app_.annotate_brush_radius_, 70.0f);
+    app_.annotate_brush_radius_ = std::clamp(app_.annotate_brush_radius_, 1, 128);
   }
 
   const auto apply_tool_action = [&](const AnnotationToolActionKind action) {
-    const bool changed = annotate_controller_.handle_tool_action(
-        annotate_document_, annotate_session_, *annotate_frame_,
-        annotate_categories_, action);
+    const bool changed = app_.annotate_controller_.handle_tool_action(
+        app_.annotate_document_, app_.annotate_session_, *app_.annotate_frame_,
+        app_.annotate_categories_, action);
     if (changed) {
-      invalidate_annotation_preview();
+      invalidate_preview();
     }
   };
   const std::optional<std::size_t> active_selected_index = selected_index();
@@ -3000,7 +3809,7 @@ void App::draw_annotate_workspace() {
           active_selected_object->shape)) {
     const AnnotationSidebarSelectedSplineViewModel spline_model =
         tool_detail::make_selected_spline_sidebar_view_model(
-            annotate_session_, *active_selected_index,
+            app_.annotate_session_, *active_selected_index,
             std::get<AnnotationSplineShape>(active_selected_object->shape));
     if (annotation_ui::draw_small_button("Close", spline_model.can_close)) {
       apply_tool_action(AnnotationToolActionKind::Confirm);
@@ -3031,7 +3840,7 @@ void App::draw_annotate_workspace() {
                  active_selected_object->shape)) {
     const AnnotationSidebarSelectedSkeletonViewModel skeleton_model =
         tool_detail::make_selected_skeleton_sidebar_view_model(
-            annotate_session_, *active_selected_index,
+            app_.annotate_session_, *active_selected_index,
             std::get<AnnotationSkeletonShape>(active_selected_object->shape));
     if (annotation_ui::draw_small_button("Skip Joint",
                                          skeleton_model.can_skip_joint)) {
@@ -3060,61 +3869,85 @@ void App::draw_annotate_workspace() {
   }
   ImGui::Separator();
 
-  const std::shared_ptr<const AnnotationProjectedScene> projected_scene =
-      resolve_annotation_projected_scene(annotate_workflow_, annotate_document_,
-                                         annotate_session_, annotate_frame_);
-  const AnnotationWorkspaceViewModel workspace_view =
-      AnnotationWorkspaceModelBuilder::build(
-          *annotate_frame_, annotate_document_, annotate_.source,
-          live_video && annotate_.full_frame, projected_scene);
   const std::optional<AnnotationBox> selected_capture_box =
-      workspace_view.selection.selected_capture_box;
+      workspace_view.selection.selected_frame_box;
   const bool has_selected_capture_box = selected_capture_box.has_value();
 
-  const bool click_fit = ImGui::SmallButton("Fit");
+  actions.click_fit = ImGui::SmallButton("Fit");
   ImGui::SameLine();
-  const bool click_one_to_one = ImGui::SmallButton("1:1");
+  actions.click_one_to_one = ImGui::SmallButton("1:1");
   ImGui::SameLine();
-  const bool click_zoom_in = ImGui::SmallButton("Zoom +");
+  actions.click_zoom_in = ImGui::SmallButton("Zoom +");
   ImGui::SameLine();
-  const bool click_zoom_out = ImGui::SmallButton("Zoom -");
-  bool click_focus_selection = false;
+  actions.click_zoom_out = ImGui::SmallButton("Zoom -");
   if (has_selected_capture_box) {
     ImGui::SameLine();
-    click_focus_selection = ImGui::SmallButton("Focus Box");
+    actions.click_focus_selection = ImGui::SmallButton("Focus Box");
   }
-  bool click_focus_crop = false;
-  if (live_video && annotate_.full_frame) {
+  if (live_video && app_.annotate_.full_frame) {
     ImGui::SameLine();
-    click_focus_crop = ImGui::SmallButton("Focus Crop");
+    actions.click_focus_crop = ImGui::SmallButton("Focus Crop");
   }
   ImGui::Separator();
+  return actions;
+}
 
+void AnnotationWorkflowCoordinator::draw_workspace_canvas(
+    const bool live_video,
+    const AnnotationWorkspaceViewModel &workspace_view,
+  const LivePreviewTextureState &preview_state,
+  const WorkspaceToolbarActions &toolbar_actions) {
+  ImGui::BeginChild("annotate_canvas", ImVec2(0.0f, 0.0f), true,
+                    ImGuiWindowFlags_NoScrollbar |
+                        ImGuiWindowFlags_NoScrollWithMouse);
+  if (!app_.annotate_frame_.has_value()) {
+    ImGui::TextUnformatted(
+        app_.annotate_frame_load_running_ || app_.annotate_prepare_running_
+            ? "Loading annotation source..."
+            : (live_video ? "Start live annotate to stream frames here."
+                          : "Load a source image to begin annotating."));
+    ImGui::EndChild();
+    return;
+  }
+  if (!preview_state.has_frame) {
+    ImGui::TextUnformatted(
+        annotation_workflow_preview_running(app_.annotate_workflow_)
+            ? "Preparing annotation preview..."
+            : "Waiting for preview frame...");
+    ImGui::EndChild();
+    return;
+  }
+
+  const auto width = static_cast<float>(app_.annotate_frame_->width);
+  const auto height = static_cast<float>(app_.annotate_frame_->height);
+  const ImVec2 mouse = ImGui::GetMousePos();
+  const auto selected_index = [this]() {
+    return normalize_selected_object_index(app_.annotate_document_, app_.annotate_session_);
+  };
   const ImVec2 available = ImGui::GetContentRegionAvail();
   if (available.x <= 1.0f || available.y <= 1.0f || width <= 0.0f ||
       height <= 0.0f) {
     ImGui::EndChild();
     return;
   }
-
   const ImVec2 viewport_screen_min = ImGui::GetCursorScreenPos();
   const auto current_canvas_state = [this]() {
     return AnnotationCanvasState{
-        annotate_canvas_scale_,
-        annotate_canvas_pan_x_,
-        annotate_canvas_pan_y_,
-        annotate_canvas_auto_fit_,
+        app_.annotate_canvas_scale_,
+        app_.annotate_canvas_pan_x_,
+        app_.annotate_canvas_pan_y_,
+        app_.annotate_canvas_auto_fit_,
     };
   };
   const auto apply_canvas_state = [this](const AnnotationCanvasState &state) {
-    annotate_canvas_scale_ = state.scale;
-    annotate_canvas_pan_x_ = state.pan_x;
-    annotate_canvas_pan_y_ = state.pan_y;
-    annotate_canvas_auto_fit_ = state.auto_fit;
+    app_.annotate_canvas_scale_ = state.scale;
+    app_.annotate_canvas_pan_x_ = state.pan_x;
+    app_.annotate_canvas_pan_y_ = state.pan_y;
+    app_.annotate_canvas_auto_fit_ = state.auto_fit;
   };
   const auto build_canvas_layout = [&, this]() {
     return build_annotation_canvas_layout(
-        *annotate_frame_,
+        *app_.annotate_frame_,
         AnnotationCanvasLayoutInput{
             current_canvas_state(),
             available.x,
@@ -3129,62 +3962,63 @@ void App::draw_annotate_workspace() {
   };
 
   AnnotationCanvasLayout canvas_layout = build_canvas_layout();
-  if (click_fit) {
+
+  if (toolbar_actions.click_fit) {
     apply_canvas_state(annotation_canvas_fit_state(canvas_layout));
     canvas_layout = build_canvas_layout();
-  } else if (click_one_to_one) {
+  } else if (toolbar_actions.click_one_to_one) {
     apply_canvas_state(annotation_canvas_one_to_one_state());
     canvas_layout = build_canvas_layout();
   }
 
-  if (click_zoom_in) {
+  if (toolbar_actions.click_zoom_in) {
     apply_canvas_state(annotation_canvas_zoom_around_point(
         canvas_layout, canvas_layout.state.scale * 1.25f,
         viewport_screen_min.x + available.x * 0.5f,
         viewport_screen_min.y + available.y * 0.5f));
     canvas_layout = build_canvas_layout();
-  } else if (click_zoom_out) {
+  } else if (toolbar_actions.click_zoom_out) {
     apply_canvas_state(annotation_canvas_zoom_around_point(
         canvas_layout, canvas_layout.state.scale / 1.25f,
         viewport_screen_min.x + available.x * 0.5f,
         viewport_screen_min.y + available.y * 0.5f));
     canvas_layout = build_canvas_layout();
   }
-  if (click_focus_selection &&
+  if (toolbar_actions.click_focus_selection &&
       workspace_view.selection.selected_frame_box.has_value()) {
     apply_canvas_state(annotation_canvas_focus_box(
         canvas_layout, *workspace_view.selection.selected_frame_box));
     canvas_layout = build_canvas_layout();
   }
-  if (click_focus_crop && live_video && annotate_.full_frame) {
+  if (toolbar_actions.click_focus_crop && live_video && app_.annotate_.full_frame) {
     apply_canvas_state(annotation_canvas_focus_box(
         canvas_layout,
-        annotation_box_to_frame(*annotate_frame_,
-                                resolved_video_crop_box(annotate_.source))));
+        annotation_box_to_frame(*app_.annotate_frame_,
+                                resolved_video_crop_box(app_.annotate_.source))));
     canvas_layout = build_canvas_layout();
   }
 
-  if (annotate_canvas_panning_) {
+  if (app_.annotate_canvas_panning_) {
     if (ImGui::IsMouseDown(ImGuiMouseButton_Middle)) {
       apply_canvas_state(annotation_canvas_pan_by_delta(
           canvas_layout, ImGui::GetIO().MouseDelta.x,
           ImGui::GetIO().MouseDelta.y));
       canvas_layout = build_canvas_layout();
     } else {
-      annotate_canvas_panning_ = false;
+      app_.annotate_canvas_panning_ = false;
     }
   }
 
   if (canvas_layout.viewport_hovered &&
       ImGui::IsMouseClicked(ImGuiMouseButton_Middle)) {
-    annotate_canvas_panning_ = true;
+    app_.annotate_canvas_panning_ = true;
   }
   if (canvas_layout.viewport_hovered && ImGui::GetIO().MouseWheel != 0.0f) {
     const ImVec2 zoom_anchor =
         canvas_layout.overlay_hovered
             ? mouse
-            : ImVec2(viewport_screen_min.x + available.x * 0.5f,
-                     viewport_screen_min.y + available.y * 0.5f);
+            : ImVec2(viewport_screen_min.x + canvas_layout.viewport.screen_width * 0.5f,
+                     viewport_screen_min.y + canvas_layout.viewport.screen_height * 0.5f);
     apply_canvas_state(annotation_canvas_zoom_around_point(
         canvas_layout,
         canvas_layout.state.scale * std::pow(1.15f, ImGui::GetIO().MouseWheel),
@@ -3211,7 +4045,7 @@ void App::draw_annotate_workspace() {
   draw_list->PushClipRect(viewport_screen_min, viewport_screen_max, true);
   const LiveCaptureRegion texture_region = preview_state.displayed_region;
   const LiveCaptureRegion display_region = preview_region_for_source(
-      texture_region, annotate_.source, annotate_.full_frame);
+      texture_region, app_.annotate_.source, app_.annotate_.full_frame);
   ImVec2 preview_uv0 = LivePreviewTexture::uv0();
   ImVec2 preview_uv1 = LivePreviewTexture::uv1();
   preview_uvs_for_region(texture_region, display_region, &preview_uv0,
@@ -3230,12 +4064,12 @@ void App::draw_annotate_workspace() {
   bool color_sampled = false;
   AnnotationHsv sample_hsv{};
   if (overlay_hovered) {
-    bool sampled_from_pixels = !annotate_frame_->pixels_bgr.empty();
+    bool sampled_from_pixels = !app_.annotate_frame_->pixels_bgr.empty();
     const std::optional<std::size_t> active_index = selected_index();
     const AnnotationObject *active_object =
-        active_index.has_value() ? annotate_document_.object(*active_index)
+        active_index.has_value() ? app_.annotate_document_.object(*active_index)
                                  : nullptr;
-    if (!sampled_from_pixels && annotation_live_running() &&
+    if (!sampled_from_pixels && app_.annotation_live_running() &&
         active_object != nullptr) {
       const AnnotationColorRange *armed_range =
           active_object->sup.sampling     ? &active_object->sup
@@ -3244,17 +4078,17 @@ void App::draw_annotate_workspace() {
       if (armed_range != nullptr) {
         std::string sample_error;
         if (!ensure_annotation_workflow_live_annotation_frame_pixels(
-                annotate_.source, annotate_frame_,
-                annotation_live_running(), live_controller_.get(),
-                annotate_.full_frame, &sample_error)) {
-          annotate_save_error_ = std::move(sample_error);
+                app_.annotate_.source, app_.annotate_frame_,
+                app_.annotation_live_running(), app_.live_controller_.get(),
+                app_.annotate_.full_frame, &sample_error)) {
+          app_.annotate_save_error_ = std::move(sample_error);
         } else {
           sampled_from_pixels = true;
         }
       }
     }
     if (sampled_from_pixels) {
-      sample_hsv = sample_annotation_hsv(*annotate_frame_, image_x, image_y);
+      sample_hsv = sample_annotation_hsv(*app_.annotate_frame_, image_x, image_y);
     }
     if (active_index.has_value() && active_object != nullptr) {
       AnnotationObject updated_object = *active_object;
@@ -3268,9 +4102,9 @@ void App::draw_annotate_workspace() {
         updated_object.sup.sampling = false;
         updated_object.nosup.sampling = false;
         if (AnnotationEditor::update_selected_object_color_ranges(
-                annotate_document_, annotate_session_, updated_object.sup,
+                app_.annotate_document_, app_.annotate_session_, updated_object.sup,
                 updated_object.nosup)) {
-          invalidate_annotation_preview();
+          invalidate_preview();
           color_sampled = true;
         }
       }
@@ -3291,21 +4125,21 @@ void App::draw_annotate_workspace() {
       ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
   const int crop_handle_radius =
       (workspace_view.crop_frame_box.has_value() ||
-       annotate_session_.crop_drag_session().active)
+       app_.annotate_session_.crop_drag_session().active)
           ? crop_handle_radius_pixels(
                 canvas_layout.viewport.screen_width,
                 canvas_layout.viewport.screen_height,
-                static_cast<float>(annotate_frame_->width),
-                static_cast<float>(annotate_frame_->height))
+                static_cast<float>(app_.annotate_frame_->width),
+                static_cast<float>(app_.annotate_frame_->height))
           : 4;
   const AnnotationWorkspaceInteractionResult interaction =
       process_annotation_workspace_interaction(
-          annotate_document_, annotate_session_, annotate_controller_,
-          annotate_categories_, *annotate_frame_, annotate_.source,
+          app_.annotate_document_, app_.annotate_session_, app_.annotate_controller_,
+          app_.annotate_categories_, *app_.annotate_frame_, app_.annotate_.source,
           workspace_view, canvas_layout, canvas_pointer,
           AnnotationWorkspaceInteractionConfig{
               live_video,
-              annotate_.full_frame,
+              app_.annotate_.full_frame,
               overlay_hovered,
               overlay_left_clicked,
               ImGui::IsMouseDown(ImGuiMouseButton_Left),
@@ -3315,19 +4149,19 @@ void App::draw_annotate_workspace() {
               image_y,
               capture_x,
               capture_y,
-              annotate_brush_radius_,
-              annotate_.device_id,
+              app_.annotate_brush_radius_,
+              app_.annotate_.device_id,
               crop_handle_radius,
               crop_edge_hit_half_width_px(),
               crop_corner_hit_size_px(),
           });
   if (interaction.projected_scene != nullptr) {
     store_annotation_projected_scene(
-        annotate_workflow_, interaction.projected_scene, annotate_document_,
-        annotate_session_, annotate_frame_);
+        app_.annotate_workflow_, interaction.projected_scene, app_.annotate_document_,
+        app_.annotate_session_, app_.annotate_frame_);
   }
   if (interaction.preview_invalidated) {
-    invalidate_annotation_preview();
+    invalidate_preview();
   }
   set_rectangle_drag_cursor(interaction.cursor_kind);
 
@@ -3338,12 +4172,12 @@ void App::draw_annotate_workspace() {
   draw_list->AddRect(viewport_screen_min, viewport_screen_max,
                      IM_COL32(74, 80, 88, 255), 0.0f, 0, 1.0f);
   const AnnotationBrushPreview &brush_preview =
-      annotate_session_.brush_preview();
+      app_.annotate_session_.brush_preview();
   if (brush_preview.visible) {
     const auto frame_x = static_cast<float>(
-        brush_preview.capture_x - static_cast<int>(annotate_frame_->view_x));
+        brush_preview.capture_x - static_cast<int>(app_.annotate_frame_->view_x));
     const auto frame_y = static_cast<float>(
-        brush_preview.capture_y - static_cast<int>(annotate_frame_->view_y));
+        brush_preview.capture_y - static_cast<int>(app_.annotate_frame_->view_y));
     draw_list->AddCircle(
         ImVec2(image_min.x + current_scale * frame_x,
                image_min.y + current_scale * frame_y),
@@ -3380,17 +4214,17 @@ void App::draw_annotate_workspace() {
         ImVec2(viewport_screen_min.x + 16.0f, viewport_screen_min.y + 50.0f),
         IM_COL32(255, 220, 96, 255), "Selection clipped by current preview");
   }
-  if (annotate_interaction_overlay_ != nullptr) {
+  if (app_.annotate_interaction_overlay_ != nullptr) {
     PreviewInteractionOverlaySnapshot interaction_snapshot =
         AnnotationRenderer::build_interaction_overlay_snapshot(
             interaction.overlay_request);
-    annotate_interaction_overlay_->publish_snapshot(
+    app_.annotate_interaction_overlay_->publish_snapshot(
         std::move(interaction_snapshot));
     const PreviewInteractionOverlayState overlay_state =
-        annotate_interaction_overlay_->snapshot();
+        app_.annotate_interaction_overlay_->snapshot();
     if (overlay_state.has_frame &&
-        overlay_state.width == annotate_frame_->width &&
-        overlay_state.height == annotate_frame_->height) {
+        overlay_state.width == app_.annotate_frame_->width &&
+        overlay_state.height == app_.annotate_frame_->height) {
       draw_list->AddImage(overlay_state.texture_id, image_min, image_max);
     }
   }
@@ -3398,297 +4232,145 @@ void App::draw_annotate_workspace() {
   ImGui::EndChild();
 }
 
-void App::draw_annotate_save_tab(const bool live_video) {
-  const AnnotationWorkflowSaveRequest save_request =
-      make_annotation_workflow_save_request(
-          &annotate_workflow_, annotate_, annotation_live_running(),
-          annotate_save_running_, annotation_frame_ptr(annotate_frame_),
-          !annotate_resolved_instances_.empty(), annotate_current_input_index_,
-          annotate_inputs_.size());
-  const AnnotationWorkflowSaveTabView save_tab_view =
-      make_annotation_workflow_save_tab_view(
-          save_request, make_annotation_workflow_save_ui_request(
-                            &annotate_, &annotate_categories_,
-                            &annotate_workflow_, live_video, compact_font_));
-  const AnnotationSaveTabUiActions actions =
-      draw_annotation_save_tab_ui(save_tab_view.ui_state, save_tab_view.plan);
-
-  sync_annotation_categories();
-  (void)apply_annotation_workflow_save_tab_ui_actions(annotate_workflow_,
-                                                      live_video, actions);
-  if (actions.request_save_now) {
-    (void)dispatch_annotation_workflow_save_now(
-        save_tab_view.plan,
-        [this](const bool refresh_live_frame)
-            -> std::optional<AnnotationSaveSnapshot> {
-          return make_annotation_workflow_current_save_snapshot(
-              AnnotationWorkflowCurrentSaveSnapshotRequest{
-                  &annotate_workflow_,
-                  &annotate_document_,
-                  &annotate_session_,
-                  &annotate_frame_,
-                  &annotate_categories_,
-                  &annotate_resolved_instances_,
-                  refresh_live_frame,
-                  true,
-                  &annotate_save_error_,
-                  "annotate live save resolve error",
-              },
-              [this](std::string *error_message) {
-                return ensure_annotation_workflow_live_annotation_frame_pixels(
-                    annotate_.source, annotate_frame_,
-                    annotation_live_running(), live_controller_.get(),
-                    annotate_.full_frame, error_message);
-              },
-              [this](const char *error_context, const std::string &error) {
-                log_gui_error(
-                    error_context != nullptr ? error_context
-                                             : "annotate resolve error",
-                    error);
-              });
-        },
-        [this](AnnotationSaveSnapshot save_snapshot, const bool live_mode) {
-          return launch_annotation_workflow_save(
-              annotate_workflow_, annotate_, annotate_categories_,
-              std::move(save_snapshot), live_mode,
-              AnnotationWorkflowSaveLaunchState{
-                  &annotate_save_running_, &annotate_save_summary_,
-                  &annotate_save_error_, &annotate_categories_loaded_,
-                  &annotate_categories_output_dir_},
-              background_executor_, ui_callbacks_,
-              [this](const std::string &error) {
-                log_gui_error("annotate save error", error);
-              });
-        },
-        [this]() { step_annotation_current_frame(1); });
+void AnnotationWorkflowCoordinator::draw_workspace() {
+  const bool live_video = app_.annotate_.source.kind == SourceKind::VideoStream;
+  if (annotation_workflow_preview_pending(
+          app_.annotate_workflow_, annotation_frame_ptr(app_.annotate_frame_))) {
+    submit_preview();
   }
+  const LivePreviewTextureState preview_state =
+      snapshot_preview_state(app_.live_preview_texture_);
+  AnnotationWorkspaceViewModel workspace_view{};
+  if (app_.annotate_frame_.has_value() && preview_state.has_frame) {
+    const std::shared_ptr<const AnnotationProjectedScene> projected_scene =
+        resolve_annotation_projected_scene(app_.annotate_workflow_,
+                                           app_.annotate_document_,
+                                           app_.annotate_session_,
+                                           app_.annotate_frame_);
+    workspace_view = AnnotationWorkspaceModelBuilder::build(
+        *app_.annotate_frame_, app_.annotate_document_, app_.annotate_.source,
+        live_video && app_.annotate_.full_frame, projected_scene);
+  }
+
+  WorkspaceToolbarActions toolbar_actions{};
+  draw_column(
+      "annotate_workspace_tiles",
+      [&]() {
+        draw_property_sheet_tile("annotate_workspace_status_tile", "Workspace",
+                                 [&]() { draw_workspace_status(live_video); });
+      },
+      [&]() { draw_workspace_tool_hints(live_video); },
+      [&]() {
+        if (app_.annotate_frame_.has_value() && preview_state.has_frame) {
+          draw_toolbar_tile("annotate_workspace_toolbar_tile", "Tools",
+                            [&]() {
+                              toolbar_actions =
+                                  draw_workspace_toolbar(live_video,
+                                                         workspace_view);
+                            });
+        }
+      },
+      [&]() {
+        draw_preview_tile("annotate_workspace_canvas_tile", "Canvas",
+                          ImVec2(0.0f, 0.0f),
+                          [&]() {
+                            draw_workspace_canvas(live_video, workspace_view,
+                                                  preview_state,
+                                                  toolbar_actions);
+                          },
+                          ImGuiWindowFlags_NoScrollbar |
+                              ImGuiWindowFlags_NoScrollWithMouse |
+                              ImGuiWindowFlags_NavFlattened);
+      });
 }
 
-void App::draw_annotate_setup_tab(const bool block_actions,
-                                  const bool live_video,
-                                  const bool can_use_video) {
-  const AnnotationWorkflowSetupRequest setup_request =
-      make_annotation_workflow_setup_request(
-          &annotate_, live_video, annotation_live_running(), block_actions,
-          can_use_video, annotate_prepare_running_,
-          file_picker_busy(FileBrowseField::AnnotateSingleImage),
-          file_picker_busy(FileBrowseField::AnnotateWeights),
-          file_picker_busy(FileBrowseField::AnnotateOnnx),
-          file_picker_busy(FileBrowseField::AnnotateTensorRt),
-          annotate_current_input_index_, annotate_inputs_.size(),
-          compact_font_);
-  const AnnotationSetupTabActions actions =
-      draw_annotation_setup_tab(make_annotation_setup_tab_state(setup_request),
-                                [this]() { draw_preset_selector(); });
-  const AnnotationWorkflowSetupDispatchPlan dispatch_plan =
-      plan_annotation_workflow_setup_dispatch(actions,
-                                             annotate_current_input_index_,
-                                             annotate_inputs_.size());
-  dispatch_annotation_workflow_setup(
-      dispatch_plan,
-      [this](const AnnotationSetupBrowseRequest browse_request) {
-        handle_annotation_setup_browse_request(browse_request);
-      },
-      [this]() { prepare_annotation_source(); },
-      [this]() { cancel_annotation_canvas_interactions(); },
-      [this]() { invalidate_annotation_preview(); },
-      [this]() {
-        const AnnotationWorkflowLiveSessionShellStartResult start_result =
-            restart_annotation_workflow_live_session_shell(
-                annotate_workflow_, &live_controller_, &live_session_status_,
-                &annotate_frame_, &annotate_resolved_instances_,
-                live_preview_texture_.get(), annotate_.source,
-                annotate_.device_id,
-                [this]() { cancel_annotation_canvas_interactions(); });
-        active_live_mode_ = start_result.started ? ActiveLiveMode::Annotate
-                                                 : ActiveLiveMode::None;
-        annotate_save_error_ = start_result.error_message;
-      },
-      [this]() {
-        reset_annotation_workflow_live_session_shell(
-            annotate_workflow_, &live_controller_, &live_session_status_,
-            &annotate_frame_, &annotate_resolved_instances_,
-            live_preview_texture_.get(),
-            [this]() { cancel_annotation_canvas_interactions(); });
-        active_live_mode_ = ActiveLiveMode::None;
-      },
-      [this]() { load_annotation_current_frame(); },
-      [this](const int step) { step_annotation_current_frame(step); });
-}
-
-void App::apply_annotation_sidebar_mutation_result(
-    const AnnotationSidebarMutationResult &result, const bool allow_assist) {
-  apply_annotation_sidebar_shell_effects(
-      result, allow_assist,
-      [this]() {
-        (void)launch_annotation_workflow_assist(
-            AnnotationWorkflowAssistLaunchRequest{
-                annotation_frame_ptr(annotate_frame_),
-                annotate_assist_running_,
-                annotate_.model_input,
-            },
-            annotation_live_running(),
-            AnnotationWorkflowAssistLaunchState{
-                &annotate_assist_running_, &annotate_assist_summary_,
-                &annotate_assist_error_},
-            background_executor_, ui_callbacks_,
-            [this](std::string *error_message) {
-              return ensure_annotation_workflow_live_annotation_frame_pixels(
-                  annotate_.source, annotate_frame_,
-                  annotation_live_running(), live_controller_.get(),
-                  annotate_.full_frame, error_message);
-            },
-            [this]() -> std::optional<AnnotationWorkflowAssistExecutionRequest> {
-              return make_annotation_workflow_assist_execution_request(
-                  *annotate_frame_, annotate_, selected_preset_name_,
-                  &annotate_assist_error_);
-            },
-            [this](const AnnotationWorkflowAssistOutcome &outcome) {
-              if (!annotation_workflow_assist_outcome_matches_frame(
-                      annotation_frame_ptr(annotate_frame_), outcome)) {
-                return;
-              }
-              const AnnotationWorkflowAssistApplyResult apply_result =
-                  apply_annotation_workflow_assist_outcome(
-                      annotate_document_, annotate_session_,
-                      annotate_categories_, outcome);
-              if (!apply_result.changed) {
-                return;
-              }
-              cancel_annotation_canvas_interactions();
-              invalidate_annotation_preview();
-            },
-            [this](const std::string &error) {
-              log_gui_error("annotate assist error", error);
-            });
-      },
-      [this]() { cancel_annotation_canvas_interactions(); },
-      [this](const AnnotationToolKind tool) {
-        (void)annotate_controller_.set_active_tool(tool, annotate_document_,
-                                                   annotate_session_);
-      },
-      [this]() { invalidate_annotation_preview(); });
-}
-
-void App::apply_annotation_objects_tab_actions(
-    const AnnotationSidebarViewModel &sidebar_model,
-    const AnnotationObjectsTabActions &actions, const bool assist_available) {
-  const AnnotationSidebarMutationResult result =
-      mmltk::gui::apply_annotation_objects_tab_actions(
-          mmltk::gui::make_annotation_workflow_objects_tab_apply_context(
-              AnnotationWorkflowObjectsTabRequest{
-                  annotate_controller_,
-                  annotate_document_,
-                  annotate_session_,
-                  annotate_categories_,
-                  annotation_frame_ptr(annotate_frame_),
-                  &annotate_pending_class_name_,
-                  assist_available,
-              }),
-          sidebar_model, actions);
-  apply_annotation_sidebar_mutation_result(result, true);
-}
-
-void App::apply_annotation_mask_tab_actions(
-    const AnnotationMaskTabActions &actions) {
-  const AnnotationSidebarMutationResult result =
-      mmltk::gui::apply_annotation_mask_tab_actions(
-          mmltk::gui::make_annotation_workflow_mask_tab_apply_context(
-              AnnotationWorkflowMaskTabRequest{
-                  annotate_document_,
-                  annotate_session_,
-                  annotation_frame_ptr(annotate_frame_),
-                  &annotate_cleanup_radius_,
-              }),
-          actions);
-  apply_annotation_sidebar_mutation_result(result, false);
-}
-
-void App::draw_annotate_utilities_pane() {
-  const bool block_actions = job_.running || live_predict_running() ||
-                             annotate_assist_running_ || annotate_save_running_;
-  const bool live_video = annotate_.source.kind == SourceKind::VideoStream;
+void AnnotationWorkflowCoordinator::draw_utilities_pane() {
+  const bool block_actions = app_.job_.running || app_.live_predict_running() ||
+                             app_.annotate_assist_running_ ||
+                             app_.annotate_save_running_;
+  const bool live_video = app_.annotate_.source.kind == SourceKind::VideoStream;
   const bool can_use_video = live_capture_supported();
-  const bool has_annotation_frame = annotate_frame_.has_value();
-  const bool assist_available = annotate_.model_input != ModelInputMode::None;
+  const bool has_annotation_frame = app_.annotate_frame_.has_value();
+  const bool assist_available =
+      app_.annotate_.model_input != ModelInputMode::None;
 
-  sync_annotation_categories();
-  draw_with_optional_font(compact_font_, []() {
-    ImGui::TextWrapped("%s", annotate_error().c_str());
-  });
-  if (!annotate_save_error_.empty()) {
-    draw_banner("annotate_error_banner", ImVec4(0.33f, 0.17f, 0.12f, 0.95f),
-                ImVec4(0.98f, 0.90f, 0.82f, 1.00f), annotate_save_error_);
-  } else if (!annotate_assist_error_.empty()) {
-    draw_banner("annotate_assist_error_banner",
-                ImVec4(0.33f, 0.17f, 0.12f, 0.95f),
-                ImVec4(0.98f, 0.90f, 0.82f, 1.00f), annotate_assist_error_);
-  } else if (!annotate_save_summary_.empty()) {
-    draw_with_optional_font(compact_font_, [this]() {
-      ImGui::TextWrapped("%s", annotate_save_summary_.c_str());
-    });
-  } else if (!annotate_assist_summary_.empty()) {
-    draw_with_optional_font(compact_font_, [this]() {
-      ImGui::TextWrapped("%s", annotate_assist_summary_.c_str());
-    });
-  }
-
-  if (!ImGui::BeginTabBar("annotate_utilities_tabs",
-                          ImGuiTabBarFlags_FittingPolicyResizeDown)) {
-    return;
-  }
-
-  if (ImGui::BeginTabItem("Setup")) {
-    draw_annotate_setup_tab(block_actions, live_video, can_use_video);
-    ImGui::EndTabItem();
-  }
-
-  if (ImGui::BeginTabItem("Objects")) {
-    const AnnotationSidebarViewModel sidebar_model =
-        AnnotationSidebarModelBuilder::build(
-            annotate_document_, annotate_categories_, annotate_session_,
-            has_annotation_frame);
-    const AnnotationObjectsTabActions actions =
-        draw_annotation_objects_tab(AnnotationObjectsTabState{
-            &sidebar_model,
-            &annotate_categories_,
-            has_annotation_frame,
-            assist_available,
-            annotate_assist_running_,
-            &annotate_pending_class_name_,
-            compact_font_,
+  sync_categories();
+  draw_column(
+      "annotate_utilities_tiles",
+      [&]() {
+        draw_banner_tile("annotate_overview_tile", "Workflow", [&]() {
+          draw_with_optional_font(app_.compact_font_, []() {
+            ImGui::TextWrapped("%s", annotate_error().c_str());
+          });
+          if (!app_.annotate_save_error_.empty()) {
+            draw_banner("annotate_error_banner",
+                        ImVec4(0.33f, 0.17f, 0.12f, 0.95f),
+                        ImVec4(0.98f, 0.90f, 0.82f, 1.00f),
+                        app_.annotate_save_error_);
+          } else if (!app_.annotate_assist_error_.empty()) {
+            draw_banner("annotate_assist_error_banner",
+                        ImVec4(0.33f, 0.17f, 0.12f, 0.95f),
+                        ImVec4(0.98f, 0.90f, 0.82f, 1.00f),
+                        app_.annotate_assist_error_);
+          } else if (!app_.annotate_save_summary_.empty()) {
+            draw_with_optional_font(app_.compact_font_, [this]() {
+              ImGui::TextWrapped("%s", app_.annotate_save_summary_.c_str());
+            });
+          } else if (!app_.annotate_assist_summary_.empty()) {
+            draw_with_optional_font(app_.compact_font_, [this]() {
+              ImGui::TextWrapped("%s", app_.annotate_assist_summary_.c_str());
+            });
+          }
         });
-    apply_annotation_objects_tab_actions(sidebar_model, actions,
-                                         assist_available);
-    ImGui::EndTabItem();
-  }
+      },
+      [&]() {
+        draw_tab_tile("annotate_utilities_tabs_tile", "Utilities", [&]() {
+          (void)draw_tab_item("Setup", [&]() {
+            draw_setup_tab(block_actions, live_video, can_use_video);
+          });
 
-  if (ImGui::BeginTabItem("Mask")) {
-    const AnnotationSidebarViewModel mask_sidebar_model =
-        AnnotationSidebarModelBuilder::build(
-            annotate_document_, annotate_categories_, annotate_session_,
-            annotate_frame_.has_value());
-    const AnnotationMaskTabActions actions = draw_annotation_mask_tab(
-        AnnotationMaskTabState{
-            &mask_sidebar_model,
-            has_annotation_frame,
-            annotate_cleanup_radius_,
-            compact_font_,
-        },
-        [this](const char *label, AnnotationColorRange &range,
-               AnnotationColorRange &sibling_range) {
-          draw_annotation_range_controls(label, range, sibling_range);
-        });
-    apply_annotation_mask_tab_actions(actions);
-    ImGui::EndTabItem();
-  }
+          (void)draw_tab_item("Objects", [&]() {
+            const AnnotationSidebarViewModel sidebar_model =
+                AnnotationSidebarModelBuilder::build(
+                    app_.annotate_document_, app_.annotate_categories_,
+                    app_.annotate_session_, has_annotation_frame);
+            const AnnotationObjectsTabActions actions =
+                draw_annotation_objects_tab(AnnotationObjectsTabState{
+                    &sidebar_model,
+                    &app_.annotate_categories_,
+                    has_annotation_frame,
+                    assist_available,
+                    app_.annotate_assist_running_,
+                    &app_.annotate_pending_class_name_,
+                    app_.compact_font_,
+                });
+            apply_objects_tab_actions(sidebar_model, actions,
+                                      assist_available);
+          });
 
-  if (ImGui::BeginTabItem("Save")) {
-    draw_annotate_save_tab(live_video);
-    ImGui::EndTabItem();
-  }
+          (void)draw_tab_item("Mask", [&]() {
+            const AnnotationSidebarViewModel mask_sidebar_model =
+                AnnotationSidebarModelBuilder::build(
+                    app_.annotate_document_, app_.annotate_categories_,
+                    app_.annotate_session_, app_.annotate_frame_.has_value());
+            const AnnotationMaskTabActions actions = draw_annotation_mask_tab(
+                AnnotationMaskTabState{
+                    &mask_sidebar_model,
+                    has_annotation_frame,
+                    app_.annotate_cleanup_radius_,
+                    app_.compact_font_,
+                },
+                [this](const char *label, AnnotationColorRange &range,
+                       AnnotationColorRange &sibling_range) {
+                  app_.draw_annotation_range_controls(label, range,
+                                                     sibling_range);
+                });
+            apply_mask_tab_actions(actions);
+          });
 
-  ImGui::EndTabBar();
+          (void)draw_tab_item("Save", [&]() { draw_save_tab(live_video); });
+        }, ImGuiTabBarFlags_FittingPolicyResizeDown);
+      });
 }
 
 } // namespace mmltk::gui

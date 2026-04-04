@@ -9,7 +9,7 @@
 */
 
 #include "rfdetr/cuda/ms_deform_im2col_cuda.cuh"
-#include "rfdetr/cuda_utils.h"
+#include "rfdetr/torch_cuda_utils.h"
 #include "rfdetr/ms_deform_attn_cuda_launch.h"
 
 #include <cuda.h>
@@ -18,6 +18,18 @@
 #include <cstdint>
 
 namespace mmltk::rfdetr {
+
+namespace {
+
+template <typename Fn>
+void for_each_ms_deform_attn_batch(const int batch, const int im2col_step, Fn&& fn) {
+    const int chunk_count = batch / im2col_step;
+    for (int chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
+        fn(chunk_index);
+    }
+}
+
+} // namespace
 
 void launch_ms_deform_attn_cuda_forward(const float* value,
                                         const int64_t* spatial_shapes,
@@ -35,11 +47,10 @@ void launch_ms_deform_attn_cuda_forward(const float* value,
                                         float* output,
                                         cudaStream_t stream) {
     const int batch_n = im2col_step;
-    auto per_value_size = spatial_size * num_heads * channels;
-    auto per_sample_loc_size = num_query * num_heads * num_levels * num_point * 2;
-    auto per_attn_weight_size = num_query * num_heads * num_levels * num_point;
-    auto* output_n = output;
-    for (int n = 0; n < batch / im2col_step; ++n) {
+    const auto per_value_size = spatial_size * num_heads * channels;
+    const auto per_sample_loc_size = num_query * num_heads * num_levels * num_point * 2;
+    const auto per_attn_weight_size = num_query * num_heads * num_levels * num_point;
+    for_each_ms_deform_attn_batch(batch, im2col_step, [&](const int n) {
         ms_deformable_im2col_cuda(
             stream,
             value + n * im2col_step * per_value_size,
@@ -54,9 +65,9 @@ void launch_ms_deform_attn_cuda_forward(const float* value,
             num_levels,
             num_query,
             num_point,
-            output_n + static_cast<int64_t>(n) * batch_n * num_query * num_heads * channels);
+            output + static_cast<int64_t>(n) * batch_n * num_query * num_heads * channels);
         ensure_cuda_ok(cudaGetLastError(), "ms_deform_attn forward launch");
-    }
+    });
 }
 
 void launch_ms_deform_attn_cuda_backward(const float* value,
@@ -78,11 +89,11 @@ void launch_ms_deform_attn_cuda_backward(const float* value,
                                          float* grad_attn_weight,
                                          cudaStream_t stream) {
     const int batch_n = im2col_step;
-    auto per_value_size = spatial_size * num_heads * channels;
-    auto per_sample_loc_size = num_query * num_heads * num_levels * num_point * 2;
-    auto per_attn_weight_size = num_query * num_heads * num_levels * num_point;
+    const auto per_value_size = spatial_size * num_heads * channels;
+    const auto per_sample_loc_size = num_query * num_heads * num_levels * num_point * 2;
+    const auto per_attn_weight_size = num_query * num_heads * num_levels * num_point;
     const auto per_grad_output_size = static_cast<int64_t>(batch_n) * num_query * num_heads * channels;
-    for (int n = 0; n < batch / im2col_step; ++n) {
+    for_each_ms_deform_attn_batch(batch, im2col_step, [&](const int n) {
         ms_deformable_col2im_cuda(
             stream,
             grad_output + static_cast<int64_t>(n) * per_grad_output_size,
@@ -102,7 +113,7 @@ void launch_ms_deform_attn_cuda_backward(const float* value,
             grad_sampling_loc + n * im2col_step * per_sample_loc_size,
             grad_attn_weight + n * im2col_step * per_attn_weight_size);
         ensure_cuda_ok(cudaGetLastError(), "ms_deform_attn backward launch");
-    }
+    });
 }
 
 } // namespace mmltk::rfdetr

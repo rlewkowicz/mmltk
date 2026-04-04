@@ -148,7 +148,7 @@ std::vector<int> parse_cpu_list(const std::string& spec) {
         cursor = next + 1;
     }
 
-    std::sort(cpus.begin(), cpus.end());
+    std::ranges::sort(cpus);
     cpus.erase(std::unique(cpus.begin(), cpus.end()), cpus.end());
     if (cpus.empty()) {
         throw std::runtime_error("cpu affinity list must not be empty");

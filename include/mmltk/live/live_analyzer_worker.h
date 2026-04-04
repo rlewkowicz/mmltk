@@ -72,16 +72,51 @@ private:
         AnalyzerResult result{};
         std::vector<torch::Tensor> retained_tensors;
         std::atomic<std::uint32_t> state{to_slot_state_value(SlotState::kFree)};
+
+        [[nodiscard]] AnalyzerResultView make_view() const noexcept {
+            return AnalyzerResultView{slot_index, &result};
+        }
+
+        void reset_for_reuse() noexcept {
+            retained_tensors.clear();
+            result = {};
+        }
+
+        [[nodiscard]] cudaEvent_t ready_event_handle() const noexcept {
+            return result.ready_event;
+        }
     };
 
     struct OverlaySlot {
         std::uint32_t slot_index = 0;
-        PitchedDeviceBuffer<> device_buffer;
+        RgbaPitchedDeviceBuffer device_buffer;
         CudaStreamHandle stream;
         CudaEventHandle ready_event;
         std::atomic<std::uint32_t> state{to_slot_state_value(SlotState::kFree)};
         LiveFrameId frame_id{};
         bool has_content = false;
+
+        [[nodiscard]] AnalysisOverlayView make_view() const noexcept {
+            return AnalysisOverlayView{
+                slot_index,
+                frame_id,
+                device_buffer.data(),
+                device_buffer.pitch_bytes(),
+                device_buffer.width(),
+                device_buffer.height(),
+                ready_event.get(),
+                has_content,
+            };
+        }
+
+        void reset_for_reuse() noexcept {
+            frame_id = {};
+            has_content = false;
+        }
+
+        [[nodiscard]] cudaEvent_t ready_event_handle() const noexcept {
+            return ready_event.get();
+        }
     };
 
     void allocate_resources();
@@ -89,8 +124,6 @@ private:
     void worker_thread_main();
     [[nodiscard]] ResultSlot* reserve_result_slot();
     [[nodiscard]] OverlaySlot* reserve_overlay_slot();
-    [[nodiscard]] bool try_acquire_result_slot(ResultSlot& slot, AnalyzerResultView* out);
-    [[nodiscard]] bool try_acquire_overlay_slot(OverlaySlot& slot, AnalysisOverlayView* out);
     void publish_error(std::string error_message);
 
     LiveFrameFanout& fanout_;

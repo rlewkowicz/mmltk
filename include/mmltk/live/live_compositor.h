@@ -60,7 +60,7 @@ public:
 private:
     struct CompositorSlot {
         std::uint32_t slot_index = 0;
-        PitchedDeviceBuffer<> device_buffer;
+        BgrPitchedDeviceBuffer device_buffer;
         CudaStreamHandle stream;
         CudaEventHandle ready_event;
         std::atomic<std::uint32_t> state{to_slot_state_value(SlotState::kFree)};
@@ -69,25 +69,43 @@ private:
         std::uint64_t capture_ns = 0;
         std::uint64_t ready_ns = 0;
         bool short_frame = false;
+
+        [[nodiscard]] OutputBundle make_view() const noexcept {
+            return OutputBundle{
+                slot_index,
+                frame_id,
+                device_buffer.data(),
+                OutputDimensions{region.width, region.height, device_buffer.pitch_bytes()},
+                ready_event.get(),
+                stream.get(),
+                region,
+                capture_ns,
+                ready_ns,
+                short_frame,
+            };
+        }
+
+        void reset_for_reuse() noexcept {
+            frame_id = {};
+            region = {};
+        }
+
+        [[nodiscard]] cudaEvent_t ready_event_handle() const noexcept {
+            return ready_event.get();
+        }
     };
 
-    struct RawBaseCacheSlot {
-        PitchedDeviceBuffer<> device_buffer;
-        CudaEventHandle ready_event;
-        LiveFrameId frame_id{};
-        LiveCaptureRegion region{};
-        bool occupied = false;
-    };
+    struct RawBaseCacheState;
+    struct RetainedAnalysisState;
+    struct ReadbackState;
 
     void allocate_resources();
-    void destroy_resources() noexcept;
+    void reset_runtime_state() noexcept;
     void compositor_thread_main();
     [[nodiscard]] CompositorSlot* reserve_output_slot();
-    [[nodiscard]] bool try_acquire_output_slot(CompositorSlot& slot, OutputBundle* out);
     void cache_raw_base(cudaStream_t source_stream,
                         const OutputBundle& base,
-                        std::size_t copy_width_bytes,
-                        std::size_t cache_index);
+                        std::size_t copy_width_bytes);
     void publish_error(std::string error_message);
 
     LiveFrameFanout& fanout_;
@@ -103,20 +121,10 @@ private:
     std::shared_ptr<const Status> status_{std::make_shared<Status>()};
     std::shared_ptr<const std::string> last_error_{std::make_shared<std::string>()};
     std::vector<std::unique_ptr<CompositorSlot>> output_slots_;
-    std::vector<RawBaseCacheSlot> raw_base_cache_slots_;
     std::atomic<int> latest_output_index_{-1};
-    std::size_t next_raw_base_cache_index_ = 0;
-
-    PitchedDeviceBuffer<> retained_analysis_overlay_;
-    CudaEventHandle retained_analysis_ready_event_;
-    CudaStreamHandle retained_analysis_stream_;
-    bool retained_analysis_has_content_ = false;
-
-    std::mutex readback_mutex_;
-    CudaStreamHandle readback_stream_;
-    CudaEventHandle readback_ready_event_;
-    PinnedUploadBuffer<std::uint8_t> readback_host_buffer_;
-    int current_cuda_device_index_ = -1;
+    std::unique_ptr<RawBaseCacheState> raw_base_cache_;
+    std::unique_ptr<RetainedAnalysisState> retained_analysis_;
+    std::unique_ptr<ReadbackState> readback_;
 };
 
 } // namespace mmltk::live

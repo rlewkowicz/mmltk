@@ -57,6 +57,12 @@ void apply_build_engine_request(ExportViewState& state,
                                 const mmltk::rfdetr::BuildEngineRequest& request);
 void apply_export_onnx_request(ExportViewState& state,
                                const mmltk::rfdetr::ExportOnnxRequest& request);
+void apply_predict_request(PredictViewState& state,
+                           const mmltk::rfdetr::PredictRequest& request);
+void apply_validate_request(ValidateViewState& state,
+                            const mmltk::rfdetr::ValidateRequest& request);
+void apply_train_request(TrainViewState& state,
+                         const mmltk::rfdetr::TrainRequest& request);
 
 mmltk::rfdetr::PredictOptions build_annotate_predict_options(
     const AnnotateViewState& state,

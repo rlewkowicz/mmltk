@@ -68,12 +68,28 @@ struct LivePredictActivityViewModel {
     bool show_idle_start_error = false;
 };
 
+struct ActivitySidebarTilesViewModel {
+    TrainingActivityViewModel training;
+    const LocalTrainSessionState* local_train = nullptr;
+    JobActivityViewModel job;
+    bool show_annotate = false;
+    AnnotateActivityViewModel annotate;
+    LivePredictActivityViewModel live_predict;
+};
+
+struct ActivitySidebarTileActions {
+    std::function<void(bool)> request_stop_local_training;
+    ImFont* compact_font = nullptr;
+};
+
 void draw_output_console(const char* id,
                          std::string_view output_tail,
                          float height,
                          bool running,
                          const char* waiting_message);
 
+void draw_activity_sidebar_tiles(const ActivitySidebarTilesViewModel& view_model,
+                                 const ActivitySidebarTileActions& actions);
 void draw_training_activity_section(const TrainingActivityViewModel& view_model);
 void draw_local_train_activity_section(const LocalTrainSessionState& state,
                                        const std::function<void(bool)>& request_stop_local_training,

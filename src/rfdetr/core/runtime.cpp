@@ -27,7 +27,7 @@ std::vector<int> take_cpu_slice(const std::vector<int>& cpus, size_t begin, size
     for (size_t index = 0; index < count; ++index) {
         out.push_back(cpus[(begin + index) % cpus.size()]);
     }
-    std::sort(out.begin(), out.end());
+    std::ranges::sort(out);
     out.erase(std::unique(out.begin(), out.end()), out.end());
     return out;
 }

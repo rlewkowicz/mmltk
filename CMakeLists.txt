@@ -4,7 +4,7 @@ if(POLICY CMP0138)
 endif()
 project(mmltk LANGUAGES CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
@@ -167,7 +167,6 @@ target_compile_definitions(mmltk_build_options INTERFACE
 
 add_library(spdlog STATIC
     third_party/spdlog/src/async.cpp
-    third_party/spdlog/src/bundled_fmtlib_format.cpp
     third_party/spdlog/src/cfg.cpp
     third_party/spdlog/src/color_sinks.cpp
     third_party/spdlog/src/file_sinks.cpp
@@ -180,6 +179,7 @@ target_include_directories(spdlog PUBLIC
 target_link_libraries(spdlog PUBLIC Threads::Threads)
 target_compile_definitions(spdlog PUBLIC
     SPDLOG_COMPILED_LIB
+    SPDLOG_USE_STD_FORMAT
     SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_TRACE
 )
 add_library(spdlog::spdlog ALIAS spdlog)
@@ -256,7 +256,10 @@ target_link_libraries(mmltk_runtime PUBLIC
 )
 
 # ---- CLI tool ----
-add_executable(mmltk_cli src/cli.cpp)
+add_executable(mmltk_cli
+    src/cli.cpp
+    src/cli_bundled_tests.cpp
+)
 target_link_libraries(mmltk_cli PRIVATE mmltk_core mmltk_build_options cli11 mmltk_logging)
 target_include_directories(mmltk_cli PRIVATE
     ${CMAKE_SOURCE_DIR}/src
@@ -660,7 +663,7 @@ if(BUILD_RFDETR_NATIVE)
         src/rfdetr/cuda/training_mask_ops_cuda.cu
         src/rfdetr/cuda/detr_ops_cuda.cu
         src/rfdetr/cuda/draw_cuda.cu
-        src/rfdetr/cuda/live_preprocess.cu
+        src/rfdetr/cuda/cuda_utils.cu
     )
     file(MAKE_DIRECTORY
         "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/mmltk_rfdetr_cuda_ops.dir/src/rfdetr"
@@ -1041,11 +1044,13 @@ if(BUILD_RFDETR_NATIVE)
 
     add_library(mmltk_rfdetr_runtime STATIC
         src/rfdetr/cli/cli.cpp
+        src/rfdetr/cli/distributed_train_launcher.cpp
         src/rfdetr/cli/module.cpp
         src/rfdetr/inference/evaluator.cpp
         src/rfdetr/inference/live_predict.cpp
         src/rfdetr/inference/predict.cpp
         src/rfdetr/core/runtime.cpp
+        src/rfdetr/workflow_requests.cpp
         src/rfdetr/inference/validate.cpp
         src/rfdetr/inference/validate_workers.cpp
     )
@@ -1225,6 +1230,7 @@ if(BUILD_MMLTK_GUI)
         src/gui/app_options.cpp
         src/gui/canvas_layers.cpp
         src/gui/cli_seed.cpp
+        src/gui/cuda_gl_interop_surface_core.cpp
         src/gui/default_state.cpp
         src/gui/model_input_ui.cpp
         src/gui/file_picker.cpp
@@ -1486,6 +1492,7 @@ if(BUILD_TESTS)
         src/gui/annotation_core.cpp
         src/gui/app_options.cpp
         src/gui/canvas_layers.cpp
+        src/gui/cuda_gl_interop_surface_core.cpp
         src/gui/gui_settings.cpp
         src/gui/live_session_utils.cpp
         src/gui/vast_query_controller.cpp
@@ -1511,6 +1518,7 @@ if(BUILD_TESTS)
             src/gui/default_state.cpp
             src/gui/local_train_controller.cpp
             src/gui/rfdetr_workflows.cpp
+            src/rfdetr/workflow_requests.cpp
             src/gui/train_process_runtime.cpp
         )
     endif()
@@ -1579,7 +1587,7 @@ if(BUILD_TESTS)
             tests/model/rfdetr/weight_catalog.test.cpp
             tests/model/rfdetr/cli_aliases.test.cpp
             tests/model/rfdetr/eval_sample_writer.test.cpp
-            tests/model/rfdetr/live_preprocess.test.cpp
+            tests/model/rfdetr/cuda_utils.test.cpp
             tests/model/rfdetr/model_trainability.test.cpp
             tests/model/rfdetr/modules.test.cpp
             tests/model/rfdetr/native_ops.test.cpp

@@ -190,21 +190,28 @@ clang_tidy_checks="${MMLTK_CLANG_TIDY_CHECKS:--*,clang-analyzer-*,bugprone-*,-bu
 header_filter="^${repo_root}/(include|src|tests)(/|$)"
 total_units="${#translation_units[@]}"
 
-log "running clang-tidy across ${total_units} translation units"
-for index in "${!translation_units[@]}"; do
-    rel_file="${translation_units[index]}"
+log "running clang-tidy across ${total_units} translation units with $(nproc) workers"
+tidy_errors_log=$(mktemp)
+
+# Use xargs to fan out clang-tidy. We export the variables needed by the subshell.
+export build_dir clang_tidy_checks header_filter repo_root tidy_errors_log
+printf '%s\n' "${translation_units[@]}" | xargs -I {} -P "$(nproc)" bash -c '
+    rel_file="$1"
     abs_file="${repo_root}/${rel_file}"
-    log "clang-tidy [$((index + 1))/${total_units}] ${rel_file}"
     if ! clang-tidy -p "${build_dir}" "${abs_file}" \
         --checks="${clang_tidy_checks}" \
-        --warnings-as-errors='*' \
+        --warnings-as-errors="*" \
         --header-filter="${header_filter}" \
         --quiet; then
-        log "clang-tidy failed at ${rel_file}"
-        log "restart from this file with: ./mmltk --tidy --start-at ${rel_file}"
-        exit 1
+        printf "%s\n" "${rel_file}" >> "${tidy_errors_log}"
     fi
-done
+' -- {}
+
+tidy_failed_units=()
+if [[ -f "${tidy_errors_log}" ]]; then
+    mapfile -t tidy_failed_units < "${tidy_errors_log}"
+    rm "${tidy_errors_log}"
+fi
 
 log "running cppcheck across ${#cppcheck_units[@]} translation units"
 cppcheck_filters=()
@@ -212,7 +219,8 @@ for rel_file in "${cppcheck_units[@]}"; do
     cppcheck_filters+=("--file-filter=*/${rel_file}")
 done
 
-cppcheck \
+cppcheck_failed=0
+if ! cppcheck \
     --project="${compile_db}" \
     --cppcheck-build-dir="${cppcheck_build_dir}" \
     --suppressions-list="${repo_root}/utilities/cppcheck.suppressions" \
@@ -229,6 +237,27 @@ cppcheck \
     --quiet \
     --relative-paths="${repo_root}" \
     -j "$(nproc)" \
-    "${cppcheck_filters[@]}"
+    "${cppcheck_filters[@]}"; then
+    cppcheck_failed=1
+fi
+
+# Final Report
+if ((${#tidy_failed_units[@]} > 0)); then
+    log "--------------------------------------------------------------------------------"
+    log "clang-tidy FAILED for the following ${#tidy_failed_units[@]} units:"
+    for rel_file in "${tidy_failed_units[@]}"; do
+        log "  ${rel_file}"
+    done
+fi
+
+if (( cppcheck_failed )); then
+    log "--------------------------------------------------------------------------------"
+    log "cppcheck FAILED"
+fi
+
+if ((${#tidy_failed_units[@]} > 0 || cppcheck_failed)); then
+    log "--------------------------------------------------------------------------------"
+    die "static analysis failed"
+fi
 
 log "static analysis completed cleanly"

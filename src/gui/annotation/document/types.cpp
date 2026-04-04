@@ -164,7 +164,7 @@ std::vector<std::uint8_t> resize_mask_nearest(const std::vector<std::uint8_t>& s
         0U);
     if (source_width == 0U || source_height == 0U ||
         source.size() != static_cast<std::size_t>(source_width) * static_cast<std::size_t>(source_height)) {
-        std::fill(resized.begin(), resized.end(), 1U);
+        std::ranges::fill(resized, 1U);
         return resized;
     }
 

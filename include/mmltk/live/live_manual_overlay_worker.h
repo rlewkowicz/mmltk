@@ -48,19 +48,41 @@ public:
     void stop();
 
     [[nodiscard]] bool running() const noexcept;
-    [[nodiscard]] bool try_acquire_overlay(OverlayView* out);
+    [[nodiscard]] bool try_acquire_latest_overlay(OverlayView* out);
     void release_overlay(std::uint32_t slot_index);
     [[nodiscard]] Status snapshot_status() const;
 
 private:
     struct OverlaySlot {
         std::uint32_t slot_index = 0;
-        PitchedDeviceBuffer<> device_buffer;
+        RgbaPitchedDeviceBuffer device_buffer;
         CudaStreamHandle stream;
         CudaEventHandle ready_event;
         std::atomic<std::uint32_t> state{to_slot_state_value(SlotState::kFree)};
         std::uint64_t generation = 0;
         bool has_content = false;
+
+        [[nodiscard]] OverlayView make_view() const noexcept {
+            return OverlayView{
+                slot_index,
+                device_buffer.data(),
+                device_buffer.pitch_bytes(),
+                device_buffer.width(),
+                device_buffer.height(),
+                ready_event.get(),
+                has_content,
+                generation,
+            };
+        }
+
+        void reset_for_reuse() noexcept {
+            generation = 0;
+            has_content = false;
+        }
+
+        [[nodiscard]] cudaEvent_t ready_event_handle() const noexcept {
+            return ready_event.get();
+        }
     };
 
     void allocate_resources();
@@ -68,7 +90,6 @@ private:
     void worker_thread_main();
     void render_snapshot(const ManualOverlayDocumentSnapshot& snapshot);
     [[nodiscard]] OverlaySlot* reserve_overlay_slot();
-    [[nodiscard]] bool try_acquire_overlay_slot(OverlaySlot& slot, OverlayView* out);
     void publish_error(std::string error_message);
 
     ManualOverlayDocument& document_;

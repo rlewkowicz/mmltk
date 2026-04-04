@@ -119,7 +119,7 @@ SourceSelectionUiActions draw_source_selection(SourceSelectionState& state,
     SourceSelectionUiActions actions;
     const std::vector<SourceKind> allowed =
         allowed_source_kinds(allow_compiled_dataset, allow_single_image, allow_image_folder, allow_video_stream);
-    if (std::find(allowed.begin(), allowed.end(), state.kind) == allowed.end()) {
+    if (std::ranges::find(allowed, state.kind) == allowed.end()) {
         state.kind = allowed.front();
     }
 

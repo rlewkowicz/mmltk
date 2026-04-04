@@ -3,7 +3,7 @@
 #include "profile_utils.h"
 #include "mmltk_logging.h"
 #include "rfdetr/backends_internal.h"
-#include "rfdetr/cuda_utils.h"
+#include "rfdetr/torch_cuda_utils.h"
 
 #include <c10/cuda/CUDAGuard.h>
 
@@ -88,6 +88,21 @@ size_t trt_dtype_size(nvinfer1::DataType dtype) {
         return sizeof(int32_t);
     case nvinfer1::DataType::kINT64:
         return sizeof(int64_t);
+    default:
+        throw std::runtime_error("unsupported TensorRT tensor dtype");
+    }
+}
+
+torch::ScalarType trt_dtype_to_torch_scalar_type(nvinfer1::DataType dtype) {
+    switch (dtype) {
+    case nvinfer1::DataType::kFLOAT:
+        return torch::kFloat32;
+    case nvinfer1::DataType::kHALF:
+        return torch::kFloat16;
+    case nvinfer1::DataType::kINT32:
+        return torch::kInt32;
+    case nvinfer1::DataType::kINT64:
+        return torch::kInt64;
     default:
         throw std::runtime_error("unsupported TensorRT tensor dtype");
     }
@@ -554,6 +569,18 @@ public:
     [[nodiscard]] const ModelInfo& info() const override { return shared_state_->info(); }
     [[nodiscard]] void* stream() const override { return stream_; }
 
+    [[nodiscard]] std::vector<std::unique_ptr<InferenceBackend>> make_lanes(int count) const override {
+        if (count <= 0) {
+            throw std::runtime_error("TensorRT backend lanes must be greater than zero");
+        }
+        std::vector<std::unique_ptr<InferenceBackend>> lanes;
+        lanes.reserve(static_cast<size_t>(count));
+        for (int lane = 0; lane < count; ++lane) {
+            lanes.push_back(std::make_unique<TensorRtBackend>(shared_state_));
+        }
+        return lanes;
+    }
+
     OutputTensors run(const torch::Tensor& normalized_input) override {
         MMLTK_PROFILE_SCOPE("rfdetr.native.tensorrt.run");
         if (!normalized_input.is_cuda() || !normalized_input.is_contiguous()) {
@@ -626,10 +653,13 @@ private:
 
     torch::Tensor wrap_output(const TensorInfo& output) {
         const auto shape = dims_to_shape(context_->getTensorShape(output.name.c_str()));
+        const auto dtype = shared_state_->engine().getTensorDataType(output.name.c_str());
         return torch::from_blob(
             output_buffers_.at(output.name),
             shape,
-            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, shared_state_->device_id()));
+            torch::TensorOptions()
+                .dtype(trt_dtype_to_torch_scalar_type(dtype))
+                .device(torch::kCUDA, shared_state_->device_id()));
     }
 
     std::shared_ptr<TensorRtSharedState> shared_state_;

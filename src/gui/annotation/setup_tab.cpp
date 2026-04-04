@@ -15,6 +15,8 @@ AnnotationSetupTabActions draw_annotation_setup_tab(
         return actions;
     }
     AnnotateViewState& annotate = *state.annotate;
+    ModelArtifactSelectionState artifact_state = model_artifacts(annotate);
+    ExecutionTuningState execution_state = execution_tuning(annotate);
 
     if (draw_preset_selector) {
         draw_preset_selector();
@@ -43,14 +45,14 @@ AnnotationSetupTabActions draw_annotation_setup_tab(
             state.compact_font,
             "Source and model settings stay locked while live annotate is running.");
     }
-    switch (draw_model_input_selector(annotate.model_input,
-                                      annotate.weights_path,
-                                      annotate.onnx_path,
-                                      annotate.tensorrt_path,
-                                      state.weights_browse_busy,
-                                      state.onnx_browse_busy,
-                                      state.tensorrt_browse_busy,
-                                      true)) {
+    const ModelInputBrowseRequest browse_request = draw_model_input_section(
+        annotate.model_input,
+        artifact_state,
+        state.weights_browse_busy,
+        state.onnx_browse_busy,
+        state.tensorrt_browse_busy,
+        {.heading = nullptr, .allow_none = true});
+    switch (browse_request) {
     case ModelInputBrowseRequest::Weights:
         actions.browse_request = AnnotationSetupBrowseRequest::Weights;
         break;
@@ -84,15 +86,25 @@ AnnotationSetupTabActions draw_annotation_setup_tab(
             "Preview only. Off shows the crop itself. On shows full capture with the crop box overlaid. This does not change runtime capture.");
     }
 
-    draw_section_heading("Execution");
     {
         [[maybe_unused]] const annotation_ui::DisabledScope disabled_scope(state.live_running);
-        draw_labeled_int_input("Device ID", annotate.device_id, 140.0f);
+        draw_execution_tuning_section(
+            execution_state,
+            {.heading = "Execution",
+             .input_width = 140.0f,
+             .show_cpu_affinity = false,
+             .show_device_id = true,
+             .show_workers = false,
+             .show_lanes = false,
+             .show_allow_fp16 = true,
+             .show_progress_bar = false,
+             .show_compile_mode = true});
         draw_labeled_int_input("Max Dets", annotate.max_dets_per_image, 140.0f);
         draw_labeled_float_input("Threshold", annotate.threshold, 140.0f, 0.01f, 0.10f, "%.3f");
-        draw_labeled_checkbox("FP16", annotate.allow_fp16);
-        (void)draw_compile_mode_combo("Compile Mode", annotate.compile_mode);
     }
+
+    apply_model_artifacts(annotate, artifact_state);
+    apply_execution_tuning(annotate, execution_state);
 
     draw_section_heading("Frame");
     if (state.live_video) {

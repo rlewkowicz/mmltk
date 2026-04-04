@@ -37,16 +37,149 @@ struct AnnotationScreenPoint {
     float y = 0.0f;
 };
 
+} // namespace
+
+AnnotationPoint clamp_capture_point_to_bounds(const AnnotationFrame& frame,
+                                              const AnnotationPoint& point) {
+    const float max_x =
+        annotation_frame_capture_width(frame) == 0U
+            ? 0.0f
+            : static_cast<float>(annotation_frame_capture_width(frame) - 1U);
+    const float max_y =
+        annotation_frame_capture_height(frame) == 0U
+            ? 0.0f
+            : static_cast<float>(annotation_frame_capture_height(frame) - 1U);
+    return AnnotationPoint{
+        std::clamp(point.x, 0.0f, max_x),
+        std::clamp(point.y, 0.0f, max_y),
+    };
+}
+
 std::optional<AnnotationPoint> default_spline_handle_capture_point(const AnnotationFrame& frame,
                                                                    const AnnotationSplineShape& spline,
                                                                    std::size_t knot_index,
-                                                                   AnnotationHandleRole role);
+                                                                   AnnotationHandleRole role) {
+    if ((role != AnnotationHandleRole::SplineInHandle &&
+         role != AnnotationHandleRole::SplineOutHandle) ||
+        knot_index >= spline.knots.size() ||
+        spline.knots.size() < 2U) {
+        return std::nullopt;
+    }
+
+    const AnnotationSplineKnot& knot = spline.knots[knot_index];
+    const auto mirrored_from_handle = [&](const AnnotationSplineHandle& opposite)
+        -> std::optional<AnnotationPoint> {
+        if (!opposite.enabled) {
+            return std::nullopt;
+        }
+        const float vx = opposite.position.x - knot.position.x;
+        const float vy = opposite.position.y - knot.position.y;
+        if (std::abs(vx) <= 0.001f && std::abs(vy) <= 0.001f) {
+            return std::nullopt;
+        }
+        return clamp_capture_point_to_bounds(
+            frame,
+            AnnotationPoint{
+                knot.position.x - vx,
+                knot.position.y - vy,
+            });
+    };
+
+    if (role == AnnotationHandleRole::SplineInHandle) {
+        if (const std::optional<AnnotationPoint> mirrored = mirrored_from_handle(knot.out_handle);
+            mirrored.has_value()) {
+            return mirrored;
+        }
+    } else {
+        if (const std::optional<AnnotationPoint> mirrored = mirrored_from_handle(knot.in_handle);
+            mirrored.has_value()) {
+            return mirrored;
+        }
+    }
+
+    const std::optional<std::size_t> prev_index =
+        knot_index > 0U ? std::optional<std::size_t>{knot_index - 1U}
+        : spline.closed ? std::optional<std::size_t>{spline.knots.size() - 1U}
+                        : std::nullopt;
+    const std::optional<std::size_t> next_index =
+        knot_index + 1U < spline.knots.size() ? std::optional<std::size_t>{knot_index + 1U}
+        : spline.closed ? std::optional<std::size_t>{0U}
+                        : std::nullopt;
+
+    if (role == AnnotationHandleRole::SplineInHandle && !prev_index.has_value()) {
+        return std::nullopt;
+    }
+    if (role == AnnotationHandleRole::SplineOutHandle && !next_index.has_value()) {
+        return std::nullopt;
+    }
+
+    float tangent_x = 0.0f;
+    float tangent_y = 0.0f;
+    float handle_length = 0.0f;
+    if (prev_index.has_value() && next_index.has_value()) {
+        const AnnotationPoint& prev = spline.knots[*prev_index].position;
+        const AnnotationPoint& next = spline.knots[*next_index].position;
+        tangent_x = next.x - prev.x;
+        tangent_y = next.y - prev.y;
+        handle_length = std::min(std::hypot(knot.position.x - prev.x, knot.position.y - prev.y),
+                                 std::hypot(next.x - knot.position.x, next.y - knot.position.y)) /
+                        3.0f;
+    } else if (next_index.has_value()) {
+        const AnnotationPoint& next = spline.knots[*next_index].position;
+        tangent_x = next.x - knot.position.x;
+        tangent_y = next.y - knot.position.y;
+        handle_length = std::hypot(tangent_x, tangent_y) / 3.0f;
+    } else if (prev_index.has_value()) {
+        const AnnotationPoint& prev = spline.knots[*prev_index].position;
+        tangent_x = knot.position.x - prev.x;
+        tangent_y = knot.position.y - prev.y;
+        handle_length = std::hypot(tangent_x, tangent_y) / 3.0f;
+    }
+
+    const float tangent_length = std::hypot(tangent_x, tangent_y);
+    if (tangent_length <= 0.001f || handle_length <= 0.001f) {
+        return std::nullopt;
+    }
+
+    const float direction = role == AnnotationHandleRole::SplineInHandle ? -1.0f : 1.0f;
+    const float normalized_x = tangent_x / tangent_length;
+    const float normalized_y = tangent_y / tangent_length;
+    return clamp_capture_point_to_bounds(
+        frame,
+        AnnotationPoint{
+            knot.position.x + normalized_x * handle_length * direction,
+            knot.position.y + normalized_y * handle_length * direction,
+        });
+}
+
+namespace {
 
 bool boxes_equal(const AnnotationBox& lhs, const AnnotationBox& rhs) {
     return lhs.x1 == rhs.x1 &&
            lhs.y1 == rhs.y1 &&
            lhs.x2 == rhs.x2 &&
            lhs.y2 == rhs.y2;
+}
+
+void push_handle(AnnotationProjectedScene* scene,
+                 const std::optional<std::size_t>& selected_object_index,
+                 std::size_t index,
+                 AnnotationHandleRole role,
+                 std::size_t category_index,
+                 const AnnotationPoint& capture_point,
+                 const AnnotationPoint& frame_point,
+                 const AnnotationPoint& tether_frame_point = {},
+                 bool has_tether = false,
+                 bool materialized = true) {
+    scene->editable_handles.push_back(AnnotationEditableHandle{
+        AnnotationHandleId{*selected_object_index, index, role},
+        category_index,
+        capture_point,
+        frame_point,
+        tether_frame_point,
+        has_tether,
+        materialized,
+    });
 }
 
 bool box_contains_point(const AnnotationBox& box, const int x, const int y) {
@@ -312,103 +445,45 @@ void append_selected_object_editable_handles(const AnnotationFrame& frame,
         [&](const auto& shape) {
             using T = std::decay_t<decltype(shape)>;
             if constexpr (std::is_same_v<T, AnnotationPointShape>) {
-                scene->editable_handles.push_back(AnnotationEditableHandle{
-                    AnnotationHandleId{
-                        *selected_object_index,
-                        0U,
-                        AnnotationHandleRole::Point,
-                    },
-                    object->category_index,
-                    shape.point,
-                    capture_point_to_frame_unclipped(frame, shape.point),
-                    {},
-                    false,
-                    true,
-                });
+                push_handle(scene, selected_object_index, 0U, AnnotationHandleRole::Point, object->category_index,
+                            shape.point, capture_point_to_frame_unclipped(frame, shape.point));
             } else if constexpr (std::is_same_v<T, AnnotationSplineShape>) {
                 scene->editable_handles.reserve(shape.knots.size() * 5U);
                 for (std::size_t index = 0; index < shape.knots.size(); ++index) {
                     const AnnotationSplineKnot& knot = shape.knots[index];
-                    scene->editable_handles.push_back(AnnotationEditableHandle{
-                        AnnotationHandleId{
-                            *selected_object_index,
-                            index,
-                            AnnotationHandleRole::SplineKnot,
-                        },
-                        object->category_index,
-                        knot.position,
-                        capture_point_to_frame_unclipped(frame, knot.position),
-                        {},
-                        false,
-                        true,
-                    });
+                    push_handle(scene, selected_object_index, index, AnnotationHandleRole::SplineKnot,
+                                object->category_index, knot.position, capture_point_to_frame_unclipped(frame, knot.position));
                     if (knot.in_handle.enabled) {
-                        scene->editable_handles.push_back(AnnotationEditableHandle{
-                            AnnotationHandleId{
-                                *selected_object_index,
-                                index,
-                                AnnotationHandleRole::SplineInHandle,
-                            },
-                            object->category_index,
-                            knot.in_handle.position,
-                            capture_point_to_frame_unclipped(frame, knot.in_handle.position),
-                            capture_point_to_frame_unclipped(frame, knot.position),
-                            true,
-                            true,
-                        });
+                        push_handle(scene, selected_object_index, index, AnnotationHandleRole::SplineInHandle,
+                                    object->category_index, knot.in_handle.position,
+                                    capture_point_to_frame_unclipped(frame, knot.in_handle.position),
+                                    capture_point_to_frame_unclipped(frame, knot.position), true);
                     } else if (const std::optional<AnnotationPoint> latent_handle =
                                    default_spline_handle_capture_point(frame,
                                                                        shape,
                                                                        index,
                                                                        AnnotationHandleRole::SplineInHandle);
                                latent_handle.has_value()) {
-                        scene->editable_handles.push_back(AnnotationEditableHandle{
-                            AnnotationHandleId{
-                                *selected_object_index,
-                                index,
-                                AnnotationHandleRole::SplineInHandle,
-                            },
-                            object->category_index,
-                            *latent_handle,
-                            capture_point_to_frame_unclipped(frame, *latent_handle),
-                            capture_point_to_frame_unclipped(frame, knot.position),
-                            true,
-                            false,
-                        });
+                        push_handle(scene, selected_object_index, index, AnnotationHandleRole::SplineInHandle,
+                                    object->category_index, *latent_handle,
+                                    capture_point_to_frame_unclipped(frame, *latent_handle),
+                                    capture_point_to_frame_unclipped(frame, knot.position), true, false);
                     }
                     if (knot.out_handle.enabled) {
-                        scene->editable_handles.push_back(AnnotationEditableHandle{
-                            AnnotationHandleId{
-                                *selected_object_index,
-                                index,
-                                AnnotationHandleRole::SplineOutHandle,
-                            },
-                            object->category_index,
-                            knot.out_handle.position,
-                            capture_point_to_frame_unclipped(frame, knot.out_handle.position),
-                            capture_point_to_frame_unclipped(frame, knot.position),
-                            true,
-                            true,
-                        });
+                        push_handle(scene, selected_object_index, index, AnnotationHandleRole::SplineOutHandle,
+                                    object->category_index, knot.out_handle.position,
+                                    capture_point_to_frame_unclipped(frame, knot.out_handle.position),
+                                    capture_point_to_frame_unclipped(frame, knot.position), true);
                     } else if (const std::optional<AnnotationPoint> latent_handle =
                                    default_spline_handle_capture_point(frame,
                                                                        shape,
                                                                        index,
                                                                        AnnotationHandleRole::SplineOutHandle);
                                latent_handle.has_value()) {
-                        scene->editable_handles.push_back(AnnotationEditableHandle{
-                            AnnotationHandleId{
-                                *selected_object_index,
-                                index,
-                                AnnotationHandleRole::SplineOutHandle,
-                            },
-                            object->category_index,
-                            *latent_handle,
-                            capture_point_to_frame_unclipped(frame, *latent_handle),
-                            capture_point_to_frame_unclipped(frame, knot.position),
-                            true,
-                            false,
-                        });
+                        push_handle(scene, selected_object_index, index, AnnotationHandleRole::SplineOutHandle,
+                                    object->category_index, *latent_handle,
+                                    capture_point_to_frame_unclipped(frame, *latent_handle),
+                                    capture_point_to_frame_unclipped(frame, knot.position), true, false);
                     }
                 }
             } else if constexpr (std::is_same_v<T, AnnotationSkeletonShape>) {
@@ -418,19 +493,8 @@ void append_selected_object_editable_handles(const AnnotationFrame& frame,
                     if (!node.visible) {
                         continue;
                     }
-                    scene->editable_handles.push_back(AnnotationEditableHandle{
-                        AnnotationHandleId{
-                            *selected_object_index,
-                            index,
-                            AnnotationHandleRole::SkeletonNode,
-                        },
-                        object->category_index,
-                        node.point,
-                        capture_point_to_frame_unclipped(frame, node.point),
-                        {},
-                        false,
-                        true,
-                    });
+                    push_handle(scene, selected_object_index, index, AnnotationHandleRole::SkeletonNode,
+                                object->category_index, node.point, capture_point_to_frame_unclipped(frame, node.point));
                 }
             }
         },
@@ -509,8 +573,7 @@ bool point_cloud_hit_test(const std::vector<AnnotationPoint>& frame_points,
     }
     const AnnotationScreenPoint pointer_point{pointer.screen_x, pointer.screen_y};
     const float hit_radius_sq = hit_radius_px * hit_radius_px;
-    return std::any_of(frame_points.begin(),
-                       frame_points.end(),
+    return std::ranges::any_of(frame_points,
                        [&](const AnnotationPoint& frame_point) {
                            return squared_distance(pointer_point,
                                                    frame_point_to_screen_point(viewport, frame_point)) <= hit_radius_sq;
@@ -611,124 +674,10 @@ bool geometry_hit_test(const AnnotationVisibleObject& object,
     return false;
 }
 
-AnnotationPoint clamp_capture_point_to_bounds(const AnnotationFrame& frame,
-                                              const AnnotationPoint& point) {
-    const float max_x =
-        annotation_frame_capture_width(frame) == 0U
-            ? 0.0f
-            : static_cast<float>(annotation_frame_capture_width(frame) - 1U);
-    const float max_y =
-        annotation_frame_capture_height(frame) == 0U
-            ? 0.0f
-            : static_cast<float>(annotation_frame_capture_height(frame) - 1U);
-    return AnnotationPoint{
-        std::clamp(point.x, 0.0f, max_x),
-        std::clamp(point.y, 0.0f, max_y),
-    };
-}
-
-std::optional<AnnotationPoint> default_spline_handle_capture_point(const AnnotationFrame& frame,
-                                                                   const AnnotationSplineShape& spline,
-                                                                   const std::size_t knot_index,
-                                                                   const AnnotationHandleRole role) {
-    if ((role != AnnotationHandleRole::SplineInHandle &&
-         role != AnnotationHandleRole::SplineOutHandle) ||
-        knot_index >= spline.knots.size() ||
-        spline.knots.size() < 2U) {
-        return std::nullopt;
-    }
-
-    const AnnotationSplineKnot& knot = spline.knots[knot_index];
-    const auto mirrored_from_handle = [&](const AnnotationSplineHandle& opposite)
-        -> std::optional<AnnotationPoint> {
-        if (!opposite.enabled) {
-            return std::nullopt;
-        }
-        const float vx = opposite.position.x - knot.position.x;
-        const float vy = opposite.position.y - knot.position.y;
-        if (std::abs(vx) <= 0.001f && std::abs(vy) <= 0.001f) {
-            return std::nullopt;
-        }
-        return clamp_capture_point_to_bounds(
-            frame,
-            AnnotationPoint{
-                knot.position.x - vx,
-                knot.position.y - vy,
-            });
-    };
-
-    if (role == AnnotationHandleRole::SplineInHandle) {
-        if (const std::optional<AnnotationPoint> mirrored = mirrored_from_handle(knot.out_handle);
-            mirrored.has_value()) {
-            return mirrored;
-        }
-    } else {
-        if (const std::optional<AnnotationPoint> mirrored = mirrored_from_handle(knot.in_handle);
-            mirrored.has_value()) {
-            return mirrored;
-        }
-    }
-
-    const std::optional<std::size_t> prev_index =
-        knot_index > 0U ? std::optional<std::size_t>{knot_index - 1U}
-        : spline.closed ? std::optional<std::size_t>{spline.knots.size() - 1U}
-                        : std::nullopt;
-    const std::optional<std::size_t> next_index =
-        knot_index + 1U < spline.knots.size() ? std::optional<std::size_t>{knot_index + 1U}
-        : spline.closed ? std::optional<std::size_t>{0U}
-                        : std::nullopt;
-
-    if (role == AnnotationHandleRole::SplineInHandle && !prev_index.has_value()) {
-        return std::nullopt;
-    }
-    if (role == AnnotationHandleRole::SplineOutHandle && !next_index.has_value()) {
-        return std::nullopt;
-    }
-
-    float tangent_x = 0.0f;
-    float tangent_y = 0.0f;
-    float handle_length = 0.0f;
-    if (prev_index.has_value() && next_index.has_value()) {
-        const AnnotationPoint& prev = spline.knots[*prev_index].position;
-        const AnnotationPoint& next = spline.knots[*next_index].position;
-        tangent_x = next.x - prev.x;
-        tangent_y = next.y - prev.y;
-        handle_length = std::min(std::hypot(knot.position.x - prev.x, knot.position.y - prev.y),
-                                 std::hypot(next.x - knot.position.x, next.y - knot.position.y)) /
-                        3.0f;
-    } else if (next_index.has_value()) {
-        const AnnotationPoint& next = spline.knots[*next_index].position;
-        tangent_x = next.x - knot.position.x;
-        tangent_y = next.y - knot.position.y;
-        handle_length = std::hypot(tangent_x, tangent_y) / 3.0f;
-    } else if (prev_index.has_value()) {
-        const AnnotationPoint& prev = spline.knots[*prev_index].position;
-        tangent_x = knot.position.x - prev.x;
-        tangent_y = knot.position.y - prev.y;
-        handle_length = std::hypot(tangent_x, tangent_y) / 3.0f;
-    }
-
-    const float tangent_length = std::hypot(tangent_x, tangent_y);
-    if (tangent_length <= 0.001f || handle_length <= 0.001f) {
-        return std::nullopt;
-    }
-
-    const float direction = role == AnnotationHandleRole::SplineInHandle ? -1.0f : 1.0f;
-    const float normalized_x = tangent_x / tangent_length;
-    const float normalized_y = tangent_y / tangent_length;
-    return clamp_capture_point_to_bounds(
-        frame,
-        AnnotationPoint{
-            knot.position.x + normalized_x * handle_length * direction,
-            knot.position.y + normalized_y * handle_length * direction,
-        });
-}
-
 const AnnotationEditableHandle* find_editable_handle(
     const std::vector<AnnotationEditableHandle>& handles,
     const AnnotationHandleId& id) {
-    const auto it = std::find_if(handles.begin(),
-                                 handles.end(),
+    const auto it = std::ranges::find_if(handles,
                                  [&](const AnnotationEditableHandle& handle) {
                                      return handle.id == id;
                                  });

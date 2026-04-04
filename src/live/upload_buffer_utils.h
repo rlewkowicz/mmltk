@@ -54,4 +54,21 @@ inline std::size_t pack_edge_indices(const std::vector<Edge>& edges, std::uint32
     return write_index;
 }
 
+struct DeviceBufferView {
+    std::uint8_t* data;
+    std::size_t pitch;
+    int width;
+    int height;
+};
+
+template <typename T>
+inline DeviceBufferView view_of(const PitchedDeviceBuffer<T>& buffer) {
+    return {
+        device_ptr_as_bytes(buffer.data()),
+        buffer.pitch_bytes(),
+        static_cast<int>(buffer.width()),
+        static_cast<int>(buffer.height())
+    };
+}
+
 } // namespace mmltk::live

@@ -2,7 +2,7 @@
 
 #include "mmltk/rfdetr/validate.h"
 
-#include "rfdetr/cuda_utils.h"
+#include "rfdetr/torch_cuda_utils.h"
 #include "rfdetr/backends.h"
 #include "rfdetr/evaluator.h"
 #include "rfdetr/runtime.h"
@@ -14,7 +14,9 @@
 #include <chrono>
 #include <filesystem>
 #include <limits>
+#include <nlohmann/json.hpp>
 #include <stdexcept>
+#include <sstream>
 #include <string>
 
 namespace mmltk::rfdetr {
@@ -89,14 +91,53 @@ inline PhaseTiming elapsed_timing(const std::chrono::steady_clock::time_point& s
     };
 }
 
+inline nlohmann::json summary_to_json(const EvalSummary& summary) {
+    return nlohmann::json{
+        {"bbox_ap", summary.bbox.ap},
+        {"bbox_ap50", summary.bbox.ap50},
+        {"bbox_ap75", summary.bbox.ap75},
+        {"mask_ap", summary.mask.ap},
+        {"mask_ap50", summary.mask.ap50},
+        {"mask_ap75", summary.mask.ap75},
+    };
+}
+
+inline nlohmann::json timing_to_json(const PhaseTiming& timing) {
+    return nlohmann::json{
+        {"seconds", timing.seconds},
+        {"images", timing.images},
+        {"img_per_s", timing.img_per_s},
+    };
+}
+
+inline std::string format_validation_summary_line(const std::string& backend_name,
+                                                  const EvalSummary& summary) {
+    std::ostringstream line;
+    line.setf(std::ios::fixed);
+    line.precision(4);
+    line << backend_name << ": bbox_ap=" << summary.bbox.ap << " bbox_ap50=" << summary.bbox.ap50
+         << " mask_ap=" << summary.mask.ap << " mask_ap50=" << summary.mask.ap50;
+    return line.str();
+}
+
+inline std::string format_validation_delta_summary_line(const ValidationDeltaSummary& delta) {
+    std::ostringstream line;
+    line.setf(std::ios::fixed);
+    line.precision(4);
+    line << "delta(tensorrt-onnx): bbox_ap=" << delta.bbox_ap
+         << " bbox_ap50=" << delta.bbox_ap50
+         << " mask_ap=" << delta.mask_ap
+         << " mask_ap50=" << delta.mask_ap50;
+    return line.str();
+}
+
 } // namespace validate_detail
 
 // Parallel validation implementation (defined in validate_workers.cpp).
 ValidationBackendResult run_backend_eval_parallel_impl(
     const ValidationOptions& options,
-    const CocoDataset& source_dataset,
-    const std::string& backend_name,
-    const ModelInfo& model_info,
+    const CocoDataset& dataset,
+    const InferenceBackend& backend,
     const torch::Tensor& mean,
     const torch::Tensor& std);
 

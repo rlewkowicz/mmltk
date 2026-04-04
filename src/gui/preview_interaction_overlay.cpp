@@ -1,7 +1,6 @@
 #include "preview_interaction_overlay.h"
 
 #include "cuda_gl_interop_utils.h"
-#include "cuda_priority.h"
 #include "live/upload_buffer_utils.h"
 #include "mmltk/rfdetr/draw_cuda.h"
 #include "overlay_compare_utils.h"
@@ -25,6 +24,67 @@ using mmltk::live::pack_points_xy;
 
 constexpr std::size_t kRgba4BytesPerPixel = 4U;
 constexpr std::uint32_t kOverlaySlotCount = 2U;
+
+struct OverlayTarget {
+    std::uint8_t* data;
+    std::size_t pitch;
+    int width;
+    int height;
+    cudaStream_t stream;
+};
+
+void draw_box_outline(const OverlayTarget& target, const PreviewInteractionOverlayBox& box) {
+    mmltk::rfdetr::launch_draw_box_outline_rgba_pitched(
+        target.data, target.pitch, target.width, target.height,
+        box.box.x1, box.box.y1, box.box.x2, box.box.y2,
+        box.r, box.g, box.b, std::max(1, box.thickness), target.stream);
+}
+
+void draw_selection_handles(const OverlayTarget& target, const PreviewInteractionOverlayBox& box) {
+    mmltk::rfdetr::launch_draw_selection_handles_rgba_pitched(
+        target.data, target.pitch, target.width, target.height,
+        box.box.x1, box.box.y1, box.box.x2, box.box.y2,
+        std::max(1, box.handle_radius), target.stream);
+}
+
+void draw_polyline(const OverlayTarget& target,
+                   const PreviewInteractionOverlayPolyline& polyline,
+                   const mmltk::live::DeviceUploadBuffer<int>& points_upload) {
+    mmltk::rfdetr::launch_draw_polyline_rgba_pitched(
+        target.data, target.pitch, target.width, target.height,
+        reinterpret_cast<const int*>(mmltk::live::device_ptr_as_void(points_upload.data())),
+        static_cast<int>(polyline.points.size()),
+        polyline.closed,
+        polyline.r, polyline.g, polyline.b, std::max(1, polyline.thickness), target.stream);
+}
+
+void draw_skeleton(const OverlayTarget& target,
+                   const PreviewInteractionOverlaySkeleton& skeleton,
+                   const mmltk::live::DeviceUploadBuffer<int>& points_upload,
+                   const mmltk::live::DeviceUploadBuffer<std::uint32_t>& edges_upload) {
+    mmltk::rfdetr::launch_draw_skeleton_rgba_pitched(
+        target.data, target.pitch, target.width, target.height,
+        reinterpret_cast<const int*>(mmltk::live::device_ptr_as_void(points_upload.data())),
+        static_cast<int>(skeleton.points.size()),
+        reinterpret_cast<const std::uint32_t*>(mmltk::live::device_ptr_as_void(edges_upload.data())),
+        static_cast<int>(skeleton.edges.size()),
+        skeleton.r, skeleton.g, skeleton.b, std::max(1, skeleton.thickness), target.stream);
+}
+
+void draw_points(const OverlayTarget& target,
+                 const PreviewInteractionOverlayMarkerSet& marker_set,
+                 const mmltk::live::DeviceUploadBuffer<int>& points_upload) {
+    mmltk::rfdetr::launch_draw_points_rgba_pitched(
+        target.data, target.pitch, target.width, target.height,
+        reinterpret_cast<const int*>(mmltk::live::device_ptr_as_void(points_upload.data())),
+        static_cast<int>(marker_set.points.size()),
+        std::max(1, marker_set.radius),
+        marker_set.r, marker_set.g, marker_set.b, marker_set.alpha, target.stream);
+}
+
+bool annotation_box_has_area(const mmltk::live::ManualOverlayBox& box) {
+    return box.x2 > box.x1 && box.y2 > box.y1;
+}
 
 } // namespace
 
@@ -84,10 +144,6 @@ void PreviewInteractionOverlaySurface::shutdown() {
         state_ = {};
         initialized_ = false;
         pending_upload_.reset();
-        texture_width_ = 0;
-        texture_height_ = 0;
-        front_texture_index_ = 0;
-        back_texture_index_ = 1;
     }
     {
         std::lock_guard<std::mutex> lock(snapshot_mutex_);
@@ -161,136 +217,28 @@ PreviewInteractionOverlayState PreviewInteractionOverlaySurface::snapshot() cons
 }
 
 bool PreviewInteractionOverlaySurface::initialize_gl_resources(std::string* error_message) {
-    destroy_gl_resources();
-    initialize_gui_texture_pair(textures_);
-    if (error_message != nullptr) {
-        error_message->clear();
-    }
-    return true;
+    return interop_core_.initialize(error_message);
 }
 
 void PreviewInteractionOverlaySurface::destroy_gl_resources() {
-    destroy_gui_texture_pair(textures_);
+    interop_core_.shutdown();
 }
 
 bool PreviewInteractionOverlaySurface::ensure_texture_storage(const std::uint32_t width,
                                                               const std::uint32_t height,
                                                               std::string* error_message) {
-    return ensure_gui_texture_storage(textures_,
-                                      width,
-                                      height,
-                                      GL_RGBA8,
-                                      GL_RGBA,
-                                      "interaction overlay dimensions must be non-zero",
-                                      texture_width_,
-                                      texture_height_,
-                                      error_message);
+    return interop_core_.ensure_texture_storage(width, height, error_message);
 }
 
 bool PreviewInteractionOverlaySurface::ensure_upload_resources(const std::uint32_t width,
                                                                const std::uint32_t height,
                                                                const int cuda_device_index,
                                                                std::string* error_message) {
-    const bool storage_changed = texture_width_ != width || texture_height_ != height;
-    if (upload_cuda_device_index_ >= 0 && upload_cuda_device_index_ != cuda_device_index) {
-        destroy_upload_resources();
-    }
-
-    if (!ensure_texture_storage(width, height, error_message)) {
-        return false;
-    }
-
-    cudaError_t cuda_status = cudaSetDevice(cuda_device_index);
-    if (cuda_status != cudaSuccess) {
-        if (error_message != nullptr) {
-            *error_message = cuda_gl_interop_error_message(cuda_status, "cudaSetDevice");
-        }
-        return false;
-    }
-
-    if (upload_stream_ == nullptr) {
-        cuda_status = mmltk::cuda_stream_create_with_highest_priority(&upload_stream_, cudaStreamNonBlocking);
-        if (cuda_status != cudaSuccess) {
-            if (error_message != nullptr) {
-                *error_message = cuda_gl_interop_error_message(cuda_status, "cudaStreamCreateWithPriority");
-            }
-            return false;
-        }
-    }
-
-    if (upload_complete_event_ == nullptr) {
-        cuda_status = cudaEventCreateWithFlags(&upload_complete_event_, cudaEventDisableTiming);
-        if (cuda_status != cudaSuccess) {
-            if (error_message != nullptr) {
-                *error_message = cuda_gl_interop_error_message(cuda_status, "cudaEventCreateWithFlags");
-            }
-            return false;
-        }
-    }
-
-    if (pixel_buffer_ == 0U) {
-        glGenBuffers(1, &pixel_buffer_);
-    }
-
-    if (graphics_resource_ != nullptr && storage_changed) {
-        cuda_status = cudaGraphicsUnregisterResource(graphics_resource_);
-        if (cuda_status != cudaSuccess) {
-            if (error_message != nullptr) {
-                *error_message = cuda_gl_interop_error_message(cuda_status, "cudaGraphicsUnregisterResource");
-            }
-            return false;
-        }
-        graphics_resource_ = nullptr;
-    }
-
-    if (graphics_resource_ == nullptr) {
-        const std::size_t required_bytes =
-            static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * kRgba4BytesPerPixel;
-        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pixel_buffer_);
-        glBufferData(GL_PIXEL_UNPACK_BUFFER, static_cast<GLsizeiptr>(required_bytes), nullptr, GL_STREAM_DRAW);
-        glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-
-        cuda_status =
-            cudaGraphicsGLRegisterBuffer(&graphics_resource_, pixel_buffer_, cudaGraphicsRegisterFlagsWriteDiscard);
-        if (cuda_status != cudaSuccess) {
-            if (error_message != nullptr) {
-                *error_message = cuda_gl_interop_error_message(cuda_status, "cudaGraphicsGLRegisterBuffer");
-            }
-            return false;
-        }
-    }
-
-    upload_cuda_device_index_ = cuda_device_index;
-    if (error_message != nullptr) {
-        error_message->clear();
-    }
-    return true;
+    return interop_core_.ensure_upload_resources(width, height, cuda_device_index, error_message);
 }
 
 void PreviewInteractionOverlaySurface::destroy_upload_resources() {
-    if (upload_cuda_device_index_ >= 0) {
-        (void)cudaSetDevice(upload_cuda_device_index_);
-    }
-    if (upload_stream_ != nullptr) {
-        (void)cudaStreamSynchronize(upload_stream_);
-    }
-    if (graphics_resource_ != nullptr) {
-        (void)cudaGraphicsUnregisterResource(graphics_resource_);
-        graphics_resource_ = nullptr;
-    }
-    if (upload_complete_event_ != nullptr) {
-        (void)cudaEventDestroy(upload_complete_event_);
-        upload_complete_event_ = nullptr;
-    }
-    if (upload_stream_ != nullptr) {
-        (void)cudaStreamDestroy(upload_stream_);
-        upload_stream_ = nullptr;
-    }
-    if (pixel_buffer_ != 0U) {
-        glDeleteBuffers(1, &pixel_buffer_);
-        pixel_buffer_ = 0U;
-    }
-    upload_cuda_device_index_ = -1;
+    interop_core_.reset_upload_resources();
 }
 
 bool PreviewInteractionOverlaySurface::stage_pending_upload(const OverlaySlot& slot, std::string* error_message) {
@@ -298,38 +246,36 @@ bool PreviewInteractionOverlaySurface::stage_pending_upload(const OverlaySlot& s
         return false;
     }
 
-    if (upload_cuda_device_index_ >= 0) {
-        const cudaError_t set_device_status = cudaSetDevice(upload_cuda_device_index_);
-        if (set_device_status != cudaSuccess) {
-            if (error_message != nullptr) {
-                *error_message = cuda_gl_interop_error_message(set_device_status, "cudaSetDevice");
-            }
-            return false;
-        }
+    if (!interop_core_.set_cuda_device(error_message)) {
+        return false;
     }
 
     cudaError_t cuda_status = cudaSuccess;
     const char* failed_cuda_label = nullptr;
     if (slot.ready_event != nullptr) {
         failed_cuda_label = "cudaStreamWaitEvent";
-        cuda_status = cudaStreamWaitEvent(upload_stream_, slot.ready_event, 0);
+        cuda_status = cudaStreamWaitEvent(interop_core_.stream(), slot.ready_event, 0);
     }
 
     bool mapped = false;
     void* pixel_buffer_ptr = nullptr;
-    std::size_t mapped_size = 0;
+    std::size_t mapped_size = 0U;
     if (cuda_status == cudaSuccess) {
         failed_cuda_label = "cudaGraphicsMapResources";
-        cuda_status = cudaGraphicsMapResources(1, &graphics_resource_, upload_stream_);
+        cuda_status =
+            cudaGraphicsMapResources(1, interop_core_.graphics_resource_ptr(), interop_core_.stream());
         mapped = cuda_status == cudaSuccess;
     }
     if (cuda_status == cudaSuccess) {
         failed_cuda_label = "cudaGraphicsResourceGetMappedPointer";
-        cuda_status = cudaGraphicsResourceGetMappedPointer(&pixel_buffer_ptr, &mapped_size, graphics_resource_);
+        cuda_status = cudaGraphicsResourceGetMappedPointer(
+            &pixel_buffer_ptr,
+            &mapped_size,
+            interop_core_.graphics_resource());
     }
 
     const std::size_t copy_width_bytes = static_cast<std::size_t>(slot.width) * kRgba4BytesPerPixel;
-    const auto copy_height = static_cast<std::size_t>(slot.height);
+    const std::size_t copy_height = static_cast<std::size_t>(slot.height);
     const std::size_t required_bytes = copy_width_bytes * copy_height;
     if (cuda_status == cudaSuccess && mapped_size < required_bytes) {
         cuda_status = cudaErrorInvalidValue;
@@ -344,11 +290,14 @@ bool PreviewInteractionOverlaySurface::stage_pending_upload(const OverlaySlot& s
                                         copy_width_bytes,
                                         copy_height,
                                         cudaMemcpyDeviceToDevice,
-                                        upload_stream_);
+                                        interop_core_.stream());
     }
 
     const cudaError_t unmap_status =
-        mapped ? cudaGraphicsUnmapResources(1, &graphics_resource_, upload_stream_) : cudaSuccess;
+        mapped ? cudaGraphicsUnmapResources(1,
+                                            interop_core_.graphics_resource_ptr(),
+                                            interop_core_.stream())
+               : cudaSuccess;
 
     if (cuda_status != cudaSuccess) {
         if (error_message != nullptr) {
@@ -363,7 +312,8 @@ bool PreviewInteractionOverlaySurface::stage_pending_upload(const OverlaySlot& s
         return false;
     }
 
-    cuda_status = cudaEventRecord(upload_complete_event_, upload_stream_);
+    cuda_status = cudaEventRecord(interop_core_.completion_event(),
+                                  interop_core_.stream());
     if (cuda_status != cudaSuccess) {
         if (error_message != nullptr) {
             *error_message = cuda_gl_interop_error_message(cuda_status, "cudaEventRecord");
@@ -404,17 +354,12 @@ bool PreviewInteractionOverlaySurface::finalize_pending_upload(std::string* erro
         return true;
     }
 
-    if (upload_cuda_device_index_ >= 0) {
-        const cudaError_t set_device_status = cudaSetDevice(upload_cuda_device_index_);
-        if (set_device_status != cudaSuccess) {
-            if (error_message != nullptr) {
-                *error_message = cuda_gl_interop_error_message(set_device_status, "cudaSetDevice");
-            }
-            return false;
-        }
+    if (!interop_core_.set_cuda_device(error_message)) {
+        return false;
     }
 
-    const cudaError_t query_status = cudaEventQuery(upload_complete_event_);
+    const cudaError_t query_status =
+        cudaEventQuery(interop_core_.completion_event());
     if (query_status == cudaErrorNotReady) {
         if (error_message != nullptr) {
             error_message->clear();
@@ -433,21 +378,17 @@ bool PreviewInteractionOverlaySurface::finalize_pending_upload(std::string* erro
         return false;
     }
 
-    glBindTexture(GL_TEXTURE_2D, textures_[back_texture_index_]);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pixel_buffer_);
-    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-    glTexSubImage2D(GL_TEXTURE_2D,
-                    0,
-                    0,
-                    0,
-                    static_cast<GLsizei>(pending_upload->width),
-                    static_cast<GLsizei>(pending_upload->height),
-                    GL_RGBA,
-                    GL_UNSIGNED_BYTE,
-                    nullptr);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-    glBindTexture(GL_TEXTURE_2D, 0);
-    glFlush();
+    if (!interop_core_.update_back_texture_from_pixel_buffer(
+            pending_upload->width,
+            pending_upload->height,
+            error_message)) {
+        release_overlay_slot(pending_upload->slot_index);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pending_upload_.reset();
+        }
+        return false;
+    }
 
     release_overlay_slot(pending_upload->slot_index);
     {
@@ -463,11 +404,11 @@ bool PreviewInteractionOverlaySurface::finalize_pending_upload(std::string* erro
 
 void PreviewInteractionOverlaySurface::publish_ready_texture(const std::uint32_t width,
                                                              const std::uint32_t height) {
-    std::swap(front_texture_index_, back_texture_index_);
+    interop_core_.swap_ready_texture();
 
     std::lock_guard<std::mutex> lock(mutex_);
     state_.has_frame = true;
-    state_.texture_id = imgui_texture_id_from_gl_name(textures_[front_texture_index_]);
+    state_.texture_id = interop_core_.front_texture_id();
     state_.width = width;
     state_.height = height;
 }
@@ -532,45 +473,30 @@ void PreviewInteractionOverlaySurface::render_snapshot(const PreviewInteractionO
         return;
     }
 
+    const OverlayTarget target{
+        mmltk::live::device_ptr_as_bytes(slot->device_ptr),
+        slot->pitch_bytes,
+        static_cast<int>(snapshot.width),
+        static_cast<int>(snapshot.height),
+        slot->stream
+    };
+
     ensure_cuda_ok(cudaMemset2DAsync(mmltk::live::device_ptr_as_void(slot->device_ptr),
-                                     slot->pitch_bytes,
+                                     target.pitch,
                                      0,
-                                     static_cast<std::size_t>(snapshot.width) * kRgba4BytesPerPixel,
-                                     snapshot.height,
-                                     slot->stream),
+                                     static_cast<std::size_t>(target.width) * kRgba4BytesPerPixel,
+                                     target.height,
+                                     target.stream),
                    "cudaMemset2DAsync for interaction overlay clear");
 
     for (const PreviewInteractionOverlayBox& box : snapshot.boxes) {
         if (!annotation_box_has_area(box.box)) {
             continue;
         }
-        mmltk::rfdetr::launch_draw_box_outline_rgba_pitched(
-            mmltk::live::device_ptr_as_bytes(slot->device_ptr),
-            slot->pitch_bytes,
-            static_cast<int>(snapshot.width),
-            static_cast<int>(snapshot.height),
-            box.box.x1,
-            box.box.y1,
-            box.box.x2,
-            box.box.y2,
-            box.r,
-            box.g,
-            box.b,
-            std::max(1, box.thickness),
-            slot->stream);
+        draw_box_outline(target, box);
         ensure_cuda_ok(cudaPeekAtLastError(), "launch_draw_box_outline_rgba_pitched for interaction overlay");
         if (box.draw_handles) {
-            mmltk::rfdetr::launch_draw_selection_handles_rgba_pitched(
-                mmltk::live::device_ptr_as_bytes(slot->device_ptr),
-                slot->pitch_bytes,
-                static_cast<int>(snapshot.width),
-                static_cast<int>(snapshot.height),
-                box.box.x1,
-                box.box.y1,
-                box.box.x2,
-                box.box.y2,
-                std::max(1, box.handle_radius),
-                slot->stream);
+            draw_selection_handles(target, box);
             ensure_cuda_ok(cudaPeekAtLastError(), "launch_draw_selection_handles_rgba_pitched for interaction overlay");
         }
     }
@@ -593,21 +519,9 @@ void PreviewInteractionOverlaySurface::render_snapshot(const PreviewInteractionO
                                        host_points_upload_.data(),
                                        packed_value_count * sizeof(int),
                                        cudaMemcpyHostToDevice,
-                                       slot->stream),
+                                       target.stream),
                        "cudaMemcpyAsync for interaction overlay polyline upload");
-        mmltk::rfdetr::launch_draw_polyline_rgba_pitched(
-            mmltk::live::device_ptr_as_bytes(slot->device_ptr),
-            slot->pitch_bytes,
-            static_cast<int>(snapshot.width),
-            static_cast<int>(snapshot.height),
-            reinterpret_cast<const int*>(mmltk::live::device_ptr_as_void(device_points_upload_.data())),
-            static_cast<int>(polyline.points.size()),
-            polyline.closed,
-            polyline.r,
-            polyline.g,
-            polyline.b,
-            std::max(1, polyline.thickness),
-            slot->stream);
+        draw_polyline(target, polyline, device_points_upload_);
         ensure_cuda_ok(cudaPeekAtLastError(), "launch_draw_polyline_rgba_pitched for interaction overlay");
     }
 
@@ -639,28 +553,15 @@ void PreviewInteractionOverlaySurface::render_snapshot(const PreviewInteractionO
                                        host_points_upload_.data(),
                                        packed_point_values * sizeof(int),
                                        cudaMemcpyHostToDevice,
-                                       slot->stream),
+                                       target.stream),
                        "cudaMemcpyAsync for interaction overlay skeleton point upload");
         ensure_cuda_ok(cudaMemcpyAsync(mmltk::live::device_ptr_as_void(device_edges_upload_.data()),
                                        host_edges_upload_.data(),
                                        packed_edge_values * sizeof(std::uint32_t),
                                        cudaMemcpyHostToDevice,
-                                       slot->stream),
+                                       target.stream),
                        "cudaMemcpyAsync for interaction overlay skeleton edge upload");
-        mmltk::rfdetr::launch_draw_skeleton_rgba_pitched(
-            mmltk::live::device_ptr_as_bytes(slot->device_ptr),
-            slot->pitch_bytes,
-            static_cast<int>(snapshot.width),
-            static_cast<int>(snapshot.height),
-            reinterpret_cast<const int*>(mmltk::live::device_ptr_as_void(device_points_upload_.data())),
-            static_cast<int>(skeleton.points.size()),
-            reinterpret_cast<const std::uint32_t*>(mmltk::live::device_ptr_as_void(device_edges_upload_.data())),
-            static_cast<int>(skeleton.edges.size()),
-            skeleton.r,
-            skeleton.g,
-            skeleton.b,
-            std::max(1, skeleton.thickness),
-            slot->stream);
+        draw_skeleton(target, skeleton, device_points_upload_, device_edges_upload_);
         ensure_cuda_ok(cudaPeekAtLastError(), "launch_draw_skeleton_rgba_pitched for interaction overlay");
     }
 
@@ -682,25 +583,13 @@ void PreviewInteractionOverlaySurface::render_snapshot(const PreviewInteractionO
                                        host_points_upload_.data(),
                                        packed_value_count * sizeof(int),
                                        cudaMemcpyHostToDevice,
-                                       slot->stream),
+                                       target.stream),
                        "cudaMemcpyAsync for interaction overlay marker upload");
-        mmltk::rfdetr::launch_draw_points_rgba_pitched(
-            mmltk::live::device_ptr_as_bytes(slot->device_ptr),
-            slot->pitch_bytes,
-            static_cast<int>(snapshot.width),
-            static_cast<int>(snapshot.height),
-            reinterpret_cast<const int*>(mmltk::live::device_ptr_as_void(device_points_upload_.data())),
-            static_cast<int>(marker_set.points.size()),
-            std::max(1, marker_set.radius),
-            marker_set.r,
-            marker_set.g,
-            marker_set.b,
-            marker_set.alpha,
-            slot->stream);
+        draw_points(target, marker_set, device_points_upload_);
         ensure_cuda_ok(cudaPeekAtLastError(), "launch_draw_points_rgba_pitched for interaction overlay");
     }
 
-    ensure_cuda_ok(cudaEventRecord(slot->ready_event, slot->stream),
+    ensure_cuda_ok(cudaEventRecord(slot->ready_event, target.stream),
                    "cudaEventRecord for interaction overlay");
     slot->width = snapshot.width;
     slot->height = snapshot.height;

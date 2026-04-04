@@ -1,26 +1,13 @@
 #pragma once
 
-#include "cuda_priority.h"
-
-#include <c10/core/Device.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
-
 #include <cuda_runtime.h>
 
-#include <limits>
 #include <stdexcept>
 #include <string>
+#include <cstdint>
+#include <cstddef>
 
 namespace mmltk::rfdetr {
-
-inline c10::DeviceIndex checked_device_index(int device_id) {
-    if (device_id < std::numeric_limits<c10::DeviceIndex>::min() ||
-        device_id > std::numeric_limits<c10::DeviceIndex>::max()) {
-        throw std::runtime_error("device id exceeds c10::DeviceIndex range");
-    }
-    return static_cast<c10::DeviceIndex>(device_id);
-}
 
 inline void ensure_cuda_ok(cudaError_t status, const char* context) {
     if (status != cudaSuccess) {
@@ -28,13 +15,26 @@ inline void ensure_cuda_ok(cudaError_t status, const char* context) {
     }
 }
 
-inline c10::cuda::CUDAStream get_high_priority_cuda_stream(c10::DeviceIndex device_index) {
-    c10::cuda::CUDAGuard device_guard(device_index);
-    return c10::cuda::getStreamFromPool(mmltk::current_cuda_highest_stream_priority(), device_index);
-}
+cudaError_t launch_bgr_split_to_planar_float(const std::uint8_t* src,
+                                             std::size_t src_pitch_bytes,
+                                             std::uint32_t src_width,
+                                             std::uint32_t src_height,
+                                             float* dst,
+                                             std::uint32_t dst_width,
+                                             std::uint32_t dst_height,
+                                             cudaStream_t stream);
 
-inline c10::cuda::CUDAStream get_high_priority_cuda_stream(int device_id) {
-    return get_high_priority_cuda_stream(checked_device_index(device_id));
-}
+cudaError_t launch_bgr_vertical_flip_in_place_pitched(std::uint8_t* buffer,
+                                                      std::size_t pitch_bytes,
+                                                      std::uint32_t width,
+                                                      std::uint32_t height,
+                                                      cudaStream_t stream);
+
+const char* validate_bgr_split_to_planar_float_args(std::size_t src_pitch_bytes,
+                                                    std::uint32_t src_width,
+                                                    std::uint32_t src_height,
+                                                    std::uint32_t dst_width,
+                                                    std::uint32_t dst_height,
+                                                    cudaStream_t stream);
 
 } // namespace mmltk::rfdetr

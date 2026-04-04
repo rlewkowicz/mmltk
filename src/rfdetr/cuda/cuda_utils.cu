@@ -1,4 +1,5 @@
-#include "rfdetr/live_preprocess.h"
+#include "rfdetr/cuda_utils.h"
+#include <cstdint>
 
 #include <cmath>
 

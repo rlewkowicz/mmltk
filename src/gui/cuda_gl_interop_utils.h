@@ -1,8 +1,10 @@
 #pragma once
 
+#include "cuda_priority.h"
 #include "mmltk_logging.h"
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cuda_runtime_api.h>
 #include <imgui.h>

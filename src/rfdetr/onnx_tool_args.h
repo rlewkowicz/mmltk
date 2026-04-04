@@ -16,7 +16,7 @@ struct SingleOnnxToolArgs {
 
 inline bool is_onnx_logging_option(std::string_view arg, std::string_view name) {
     const std::string prefix = std::string(name) + "=";
-    return arg == name || arg.substr(0, prefix.size()) == prefix;
+    return arg == name || arg.starts_with(prefix);
 }
 
 inline SingleOnnxToolArgs parse_single_onnx_tool_args(int argc,

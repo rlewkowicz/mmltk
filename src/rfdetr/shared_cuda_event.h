@@ -1,6 +1,6 @@
 #pragma once
 
-#include "rfdetr/cuda_utils.h"
+#include "rfdetr/torch_cuda_utils.h"
 
 #include <memory>
 

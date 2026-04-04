@@ -1,5 +1,5 @@
 #include "cuda_test_utils.h"
-#include "rfdetr/live_preprocess.h"
+#include "rfdetr/cuda_utils.h"
 
 #include "support/catch2_compat.hpp"
 #include <cmath>

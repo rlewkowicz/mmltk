@@ -41,7 +41,7 @@ private:
     frameshow::CaptureConfig config_{};
     std::unique_ptr<frameshow::CaptureSession> session_;
     std::atomic<bool> running_{false};
-    std::uint64_t session_nonce_ = 0;
+    std::atomic<std::uint64_t> session_nonce_{0};
     mutable std::mutex lifecycle_mutex_;
 };
 

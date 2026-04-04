@@ -46,11 +46,65 @@ TrainOptimizerKind train_optimizer_kind_from_mode(TrainOptimizerMode mode) {
     return TrainOptimizerKind::AdamW;
 }
 
+ModelInputMode model_input_mode_from_request(const mmltk::rfdetr::ModelArtifactRequest& request) {
+    if (!request.weights_path.empty()) {
+        return ModelInputMode::Weights;
+    }
+    if (!request.onnx_path.empty()) {
+        return ModelInputMode::Onnx;
+    }
+    if (!request.tensorrt_path.empty()) {
+        return ModelInputMode::TensorRt;
+    }
+    return ModelInputMode::None;
+}
+
 std::filesystem::path default_export_onnx_output_path(const std::filesystem::path& weights_path) {
     if (weights_path.empty()) {
         return {};
     }
     return weights_path.parent_path() / (weights_path.stem().string() + ".onnx");
+}
+
+} // namespace
+
+namespace {
+
+void apply_execution_tuning_to_request(const ExecutionTuningState& state, const char* context, mmltk::rfdetr::PredictRequest& request) {
+    request.workers = require_non_negative_int(state.workers, (std::string(context) + " workers").c_str());
+    request.lanes = require_non_negative_int(state.lanes, (std::string(context) + " lanes").c_str());
+    request.cpu_affinity = state.cpu_affinity;
+    request.progress_bar = state.progress_bar;
+    request.device_id = require_non_negative_int(state.device_id, (std::string(context) + " device_id").c_str());
+    request.allow_fp16 = state.allow_fp16;
+    request.compilation_mode = compilation_mode_from_index(state.compile_mode);
+}
+
+void apply_execution_tuning_to_request(const ExecutionTuningState& state, const char* context, mmltk::rfdetr::LivePredictOptions& request) {
+    request.device_id = require_non_negative_int(state.device_id, (std::string(context) + " device_id").c_str());
+    request.allow_fp16 = state.allow_fp16;
+    request.compilation_mode = compilation_mode_from_index(state.compile_mode);
+}
+
+void apply_execution_tuning_to_request(const ExecutionTuningState& state, const char* context, mmltk::rfdetr::PredictOptions& request) {
+    request.cpu_affinity = state.cpu_affinity;
+    request.device_id = require_non_negative_int(state.device_id, (std::string(context) + " device_id").c_str());
+    request.allow_fp16 = state.allow_fp16;
+    request.compilation_mode = compilation_mode_from_index(state.compile_mode);
+}
+
+void apply_execution_tuning_to_request(const ExecutionTuningState& state, const char* context, mmltk::rfdetr::ValidateRequest& request) {
+    request.device_id = require_non_negative_int(state.device_id, (std::string(context) + " device_id").c_str());
+    request.workers = require_non_negative_int(state.workers, (std::string(context) + " workers").c_str());
+    request.cpu_affinity = state.cpu_affinity;
+}
+
+void apply_execution_tuning_to_request(const ExecutionTuningState& state, const char* context, mmltk::rfdetr::TrainRequest& request) {
+    request.cpu_affinity = state.cpu_affinity;
+    request.workers = require_non_negative_int(state.workers, (std::string(context) + " workers").c_str());
+    request.lanes = require_non_negative_int(state.lanes, (std::string(context) + " lanes").c_str());
+    request.progress_bar = state.progress_bar;
+    request.compilation_mode = compilation_mode_from_index(state.compile_mode);
 }
 
 } // namespace
@@ -95,6 +149,20 @@ mmltk::rfdetr::CompilationMode compilation_mode_from_index(int index) {
     default:
         throw std::runtime_error("invalid compilation mode index");
     }
+}
+
+template <typename Options>
+void apply_predict_runtime_selection(ModelInputMode model_input,
+                                     const ModelArtifactSelectionState& artifacts,
+                                     const std::string& backend,
+                                     const int max_dets_per_image,
+                                     const char* max_dets_field_name,
+                                     const float threshold,
+                                     Options& options) {
+    options.backend = backend;
+    options.max_dets_per_image = require_positive_size(max_dets_per_image, max_dets_field_name);
+    options.threshold = threshold;
+    apply_model_input(model_input, artifacts.weights_path, artifacts.onnx_path, artifacts.tensorrt_path, options);
 }
 
 mmltk::rfdetr::BuildEngineRequest build_build_engine_request(const ExportViewState& state) {
@@ -189,6 +257,123 @@ void apply_export_onnx_request(ExportViewState& state,
     state.build_tensorrt = false;
 }
 
+void apply_predict_request(PredictViewState& state,
+                           const mmltk::rfdetr::PredictRequest& request) {
+    state.source = {};
+    if (request.source_kind == mmltk::rfdetr::PredictSourceKind::CompiledDataset) {
+        state.source.kind = SourceKind::CompiledDataset;
+        state.source.compiled_path = request.compiled_path.string();
+    } else if (request.image_inputs.size() == 1U) {
+        state.source.kind = SourceKind::SingleImage;
+        state.source.single_image_path = request.image_inputs.front().image_path.string();
+    } else if (!request.image_inputs.empty()) {
+        state.source.kind = SourceKind::ImageFolder;
+        state.source.image_directory = request.image_inputs.front().image_path.parent_path().string();
+    } else {
+        state.source.kind = SourceKind::ImageFolder;
+    }
+
+    state.weights_path.clear();
+    state.onnx_path.clear();
+    state.tensorrt_path.clear();
+    state.model_input = model_input_mode_from_request(request);
+    apply_model_input(state.model_input, request.weights_path.string(),
+                      request.onnx_path.string(), request.tensorrt_path.string(), state);
+    state.output_path = request.output_path.string();
+    state.backend = request.backend;
+    state.cpu_affinity = request.cpu_affinity;
+    state.batch_size = static_cast<int>(request.batch_size);
+    state.max_dets_per_image = static_cast<int>(request.max_dets_per_image);
+    state.device_id = request.device_id;
+    state.workers = request.workers;
+    state.lanes = request.lanes;
+    state.threshold = request.threshold;
+    state.allow_fp16 = request.allow_fp16;
+    state.progress_bar = request.progress_bar;
+    state.compile_mode = static_cast<int>(request.compilation_mode);
+}
+
+void apply_validate_request(ValidateViewState& state,
+                            const mmltk::rfdetr::ValidateRequest& request) {
+    state.compiled_path = request.compiled_path.string();
+    state.source_dir = request.source_dir.string();
+    state.onnx_path = request.onnx_path.string();
+    state.tensorrt_path = request.tensorrt_path.string();
+    state.save_engine_path = request.save_engine_path.string();
+    state.report_json_path = request.report_json_path.string();
+    state.split = request.split;
+    state.eval_order = request.eval_order;
+    state.resolution = static_cast<int>(request.resolution);
+    state.limit_images = static_cast<int>(request.limit_images);
+    state.alignment_images = static_cast<int>(request.alignment_images);
+    state.eval_max_dets = static_cast<int>(request.eval_max_dets);
+    state.batch_size = static_cast<int>(request.batch_size);
+    state.prefetch_factor = static_cast<int>(request.prefetch_factor);
+    state.device_id = request.device_id;
+    state.workers = request.workers;
+    state.cpu_affinity = request.cpu_affinity;
+    state.recompile = request.recompile;
+    state.profile = request.profile;
+    state.allow_fp16 = request.allow_fp16;
+    state.write_report_json = request.write_report_json;
+}
+
+void apply_train_request(TrainViewState& state,
+                         const mmltk::rfdetr::TrainRequest& request) {
+    DatasetPathState dataset_state = dataset_paths(state);
+    ModelArtifactSelectionState artifact_state = model_artifacts(state);
+    ExecutionTuningState execution_state = execution_tuning(state);
+    TrainPaneState train_pane = train_pane_state(state);
+    dataset_state.train_compiled_path = request.train_compiled_path.string();
+    dataset_state.val_compiled_path = request.val_compiled_path.string();
+    dataset_state.test_compiled_path = request.test_compiled_path.string();
+    train_pane.output_dir = request.output_dir.string();
+    artifact_state.weights_path = request.weights_path.string();
+    execution_state.cpu_affinity = request.cpu_affinity;
+    train_pane.resume_path = request.resume_path.string();
+    train_pane.input_mode =
+        request.resume_path.empty() ? TrainInputMode::Weights : TrainInputMode::Resume;
+    state.batch_size = static_cast<int>(request.batch_size);
+    state.val_batch_size = static_cast<int>(request.val_batch_size);
+    state.epochs = request.epochs;
+    state.grad_accum_steps = request.grad_accum_steps;
+    state.eval_max_dets = static_cast<int>(request.eval_max_dets);
+    state.lr_drop = request.lr_drop;
+    state.print_freq = request.print_freq;
+    state.prefetch_factor = request.prefetch_factor;
+    state.seed = request.seed;
+    state.lr = request.lr;
+    state.lr_encoder = request.lr_encoder;
+    state.lr_component_decay = request.lr_component_decay;
+    state.encoder_layer_decay = request.encoder_layer_decay;
+    state.momentum = request.momentum;
+    state.weight_decay = request.weight_decay;
+    state.warmup_epochs = request.warmup_epochs;
+    state.warmup_momentum = request.warmup_momentum;
+    state.lr_min_factor = request.lr_min_factor;
+    state.clip_max_norm = request.clip_max_norm;
+    state.lr_scheduler = request.lr_scheduler;
+    state.use_ema = request.use_ema;
+    state.amp = request.amp;
+    state.freeze_encoder = request.freeze_encoder;
+    state.optimizer = request.optimizer == TrainOptimizerKind::Muon ? TrainOptimizerMode::Muon
+                                                                    : TrainOptimizerMode::AdamW;
+    execution_state.workers = request.workers;
+    execution_state.lanes = request.lanes;
+    execution_state.progress_bar = request.progress_bar;
+    execution_state.compile_mode = static_cast<int>(request.compilation_mode);
+    train_pane.execution_target = TrainExecutionTarget::Local;
+    train_pane.local_device_ids = !request.device_ids.empty()
+                                      ? request.device_ids
+                                      : (request.device_id >= 0 ? std::vector<int>{request.device_id}
+                                                                : std::vector<int>{});
+    apply_dataset_paths(state, dataset_state);
+    apply_model_artifacts(state, artifact_state);
+    apply_execution_tuning(state, execution_state);
+    state.recipe_overrides = request.recipe_overrides;
+    apply_train_pane_state(state, train_pane);
+}
+
 mmltk::rfdetr::PredictOptions build_annotate_predict_options(
     const AnnotateViewState& state,
     const std::string& preset_name,
@@ -198,15 +383,16 @@ mmltk::rfdetr::PredictOptions build_annotate_predict_options(
     options.source_kind = mmltk::rfdetr::PredictSourceKind::ImageFiles;
     options.image_inputs.push_back(std::move(input));
     options.output_path = std::filesystem::temp_directory_path() / "mmltk-annotate-predict.json";
-    options.backend = state.backend;
     options.batch_size = 1U;
-    options.max_dets_per_image = require_positive_size(state.max_dets_per_image, "annotate max_dets_per_image");
-    options.device_id = require_non_negative_int(state.device_id, "annotate device_id");
-    options.threshold = state.threshold;
-    options.allow_fp16 = state.allow_fp16;
     options.progress_bar = false;
-    options.compilation_mode = compilation_mode_from_index(state.compile_mode);
-    apply_model_input(state.model_input, state.weights_path, state.onnx_path, state.tensorrt_path, options);
+    apply_execution_tuning_to_request(execution_tuning(state), "annotate", options);
+    apply_predict_runtime_selection(state.model_input,
+                                    model_artifacts(state),
+                                    state.backend,
+                                    state.max_dets_per_image,
+                                    "annotate max_dets_per_image",
+                                    state.threshold,
+                                    options);
     return options;
 }
 
@@ -226,9 +412,7 @@ mmltk::rfdetr::ValidateRequest build_validate_request(const ValidateViewState& s
     request.eval_max_dets = require_positive_size(state.eval_max_dets, "validate eval_max_dets");
     request.batch_size = require_positive_size(state.batch_size, "validate batch_size");
     request.prefetch_factor = require_positive_size(state.prefetch_factor, "validate prefetch_factor");
-    request.device_id = require_non_negative_int(state.device_id, "validate device_id");
-    request.workers = require_non_negative_int(state.workers, "validate workers");
-    request.cpu_affinity = state.cpu_affinity;
+    apply_execution_tuning_to_request(execution_tuning(state), "validate", request);
     request.recompile = state.recompile;
     request.profile = state.profile;
     request.allow_fp16 = state.allow_fp16;
@@ -257,20 +441,17 @@ mmltk::rfdetr::PredictRequest build_predict_request(
         request.image_inputs = std::move(image_inputs);
     }
     request.output_path = state.output_path;
-    request.backend = state.backend;
     request.batch_size = state.source.kind == SourceKind::SingleImage
                              ? 1U
                              : require_positive_size(state.batch_size, "predict batch_size");
-    request.max_dets_per_image = require_positive_size(state.max_dets_per_image, "predict max_dets_per_image");
-    request.device_id = require_non_negative_int(state.device_id, "predict device_id");
-    request.workers = require_non_negative_int(state.workers, "predict workers");
-    request.lanes = require_non_negative_int(state.lanes, "predict lanes");
-    request.threshold = state.threshold;
-    request.cpu_affinity = state.cpu_affinity;
-    request.allow_fp16 = state.allow_fp16;
-    request.progress_bar = state.progress_bar;
-    request.compilation_mode = compilation_mode_from_index(state.compile_mode);
-    apply_model_input(state.model_input, state.weights_path, state.onnx_path, state.tensorrt_path, request);
+    apply_execution_tuning_to_request(execution_tuning(state), "predict", request);
+    apply_predict_runtime_selection(state.model_input,
+                                    model_artifacts(state),
+                                    state.backend,
+                                    state.max_dets_per_image,
+                                    "predict max_dets_per_image",
+                                    state.threshold,
+                                    request);
     finalize_predict_request(request);
     return request;
 }
@@ -295,16 +476,17 @@ mmltk::rfdetr::LivePredictOptions build_live_predict_options(const PredictViewSt
         options.source.width,
         options.source.height,
     };
-    options.backend = state.backend;
-    options.max_dets_per_image = require_positive_size(state.max_dets_per_image, "live max_dets_per_image");
     options.split_count = static_cast<std::uint32_t>(require_positive_size(state.live_split_count, "live split_count"));
-    options.device_id = require_non_negative_int(state.device_id, "live device_id");
-    options.threshold = state.threshold;
     options.include_masks = true;
     options.include_status_detections = false;
-    options.allow_fp16 = state.allow_fp16;
-    options.compilation_mode = compilation_mode_from_index(state.compile_mode);
-    apply_model_input(state.model_input, state.weights_path, state.onnx_path, state.tensorrt_path, options);
+    apply_execution_tuning_to_request(execution_tuning(state), "live", options);
+    apply_predict_runtime_selection(state.model_input,
+                                    model_artifacts(state),
+                                    state.backend,
+                                    state.max_dets_per_image,
+                                    "live max_dets_per_image",
+                                    state.threshold,
+                                    options);
     return options;
 }
 
@@ -324,18 +506,22 @@ mmltk::rfdetr::TrainRequest build_train_request(const TrainViewState& state,
     }
 
     mmltk::rfdetr::TrainRequest request;
-    request.train_compiled_path = state.train_compiled_path;
-    request.val_compiled_path = state.val_compiled_path;
-    request.test_compiled_path = state.test_compiled_path;
-    request.output_dir = state.output_dir;
-    if (state.input_mode == TrainInputMode::Weights) {
-        request.weights_path = state.weights_path;
+    const DatasetPathState dataset_state = dataset_paths(state);
+    const ModelArtifactSelectionState artifact_state = model_artifacts(state);
+    const ExecutionTuningState execution_state = execution_tuning(state);
+    const TrainPaneState train_pane = train_pane_state(state);
+    request.train_compiled_path = dataset_state.train_compiled_path;
+    request.val_compiled_path = dataset_state.val_compiled_path;
+    request.test_compiled_path = dataset_state.test_compiled_path;
+    request.output_dir = train_pane.output_dir;
+    if (train_pane.input_mode == TrainInputMode::Weights) {
+        request.weights_path = artifact_state.weights_path;
         request.resume_path.clear();
     } else {
-        request.resume_path = state.resume_path;
+        request.resume_path = train_pane.resume_path;
         request.weights_path.clear();
     }
-    request.cpu_affinity = state.cpu_affinity;
+    request.cpu_affinity = execution_state.cpu_affinity;
     request.device_id = device_ids.size() == 1U ? device_ids.front() : -1;
     request.device_ids = device_ids;
     request.batch_size = require_positive_size(state.batch_size, "train batch_size");
@@ -347,8 +533,6 @@ mmltk::rfdetr::TrainRequest build_train_request(const TrainViewState& state,
     request.print_freq = state.print_freq;
     request.prefetch_factor = state.prefetch_factor;
     request.seed = state.seed;
-    request.workers = state.workers;
-    request.lanes = state.lanes;
     request.lr = state.lr;
     request.lr_encoder = state.lr_encoder;
     request.lr_component_decay = state.lr_component_decay;
@@ -361,11 +545,10 @@ mmltk::rfdetr::TrainRequest build_train_request(const TrainViewState& state,
     request.clip_max_norm = state.clip_max_norm;
     request.use_ema = state.use_ema;
     request.amp = state.amp;
-    request.progress_bar = state.progress_bar;
     request.freeze_encoder = state.freeze_encoder;
     request.optimizer = train_optimizer_kind_from_mode(state.optimizer);
     request.lr_scheduler = state.lr_scheduler;
-    request.compilation_mode = compilation_mode_from_index(state.compile_mode);
+    apply_execution_tuning_to_request(execution_state, "train", request);
     request.recipe_overrides = state.recipe_overrides;
     validate_train_request(request);
     return request;

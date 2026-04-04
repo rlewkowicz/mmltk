@@ -60,15 +60,13 @@ void LocalTrainController::refresh_visible_gpus(
             for (std::size_t index = 0; index < refreshed.size(); ++index) {
                 if (!preferred_device_ids.empty()) {
                     selected[index] =
-                        std::find(preferred_device_ids.begin(),
-                                  preferred_device_ids.end(),
+                        std::ranges::find(preferred_device_ids,
                                   refreshed[index].device_id) !=
                         preferred_device_ids.end();
                     continue;
                 }
-                const auto found = std::find_if(
-                    gpus_.begin(),
-                    gpus_.end(),
+                const auto found = std::ranges::find_if(
+                    gpus_,
                     [&](const LocalGpuInfo& info) {
                         return info.device_id == refreshed[index].device_id;
                     });

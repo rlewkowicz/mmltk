@@ -32,6 +32,23 @@ inline bool event_ready(const cudaEvent_t event,
     return true;
 }
 
+struct Bgr24Pixel {
+    std::uint8_t b = 0;
+    std::uint8_t g = 0;
+    std::uint8_t r = 0;
+};
+
+static_assert(sizeof(Bgr24Pixel) == 3U, "Bgr24Pixel must stay tightly packed");
+
+struct Rgba32Pixel {
+    std::uint8_t r = 0;
+    std::uint8_t g = 0;
+    std::uint8_t b = 0;
+    std::uint8_t a = 0;
+};
+
+static_assert(sizeof(Rgba32Pixel) == 4U, "Rgba32Pixel must stay tightly packed");
+
 template <typename T>
 class PinnedUploadBuffer {
 public:
@@ -227,6 +244,9 @@ private:
     std::uint32_t width_ = 0;
     std::uint32_t height_ = 0;
 };
+
+using BgrPitchedDeviceBuffer = PitchedDeviceBuffer<Bgr24Pixel>;
+using RgbaPitchedDeviceBuffer = PitchedDeviceBuffer<Rgba32Pixel>;
 
 class CudaStreamHandle {
 public:

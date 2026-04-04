@@ -4,10 +4,12 @@
 #include "cpu_affinity.h"
 #include "dataset_loader.h"
 #include "profile_utils.h"
-#include "rfdetr/cuda_utils.h"
+#include "rfdetr/torch_cuda_utils.h"
 
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/torch.h>
+
+#include <algorithm>
 
 namespace mmltk::rfdetr {
 
@@ -323,8 +325,7 @@ MetricSummary compute_metric_summary(const std::vector<GroundTruthAnnotation>& g
                 ++seen;
                 preds.push_back(prediction);
             }
-            std::sort(preds.begin(),
-                      preds.end(),
+            std::ranges::sort(preds,
                       [](const Prediction* lhs, const Prediction* rhs) { return lhs->score > rhs->score; });
 
             for (size_t threshold_index = 0; threshold_index < std::size(kIouThresholds); ++threshold_index) {
@@ -382,7 +383,7 @@ std::vector<Prediction> valid_predictions(const TensorMap& result,
         labels = result.at("labels").to(torch::kCPU).contiguous();
         boxes = result.at("boxes").to(torch::kCPU).contiguous();
     }
-    const bool has_masks = result.find("masks") != result.end();
+    const bool has_masks = result.contains("masks");
     SelectedPredictions selected =
         select_predictions(image_id, scores, labels, boxes, category_count, max_dets_per_image);
     if (!has_masks || selected.predictions.empty()) {
@@ -561,7 +562,7 @@ StagedPredictionBatch stage_result_to_predictions(int image_id,
 
     SelectedPredictions selected =
         select_predictions(image_id, score_view, label_view, box_view, category_count, max_dets_per_image);
-    if (selected.predictions.empty() || result.find("masks") == result.end()) {
+    if (selected.predictions.empty() || !result.contains("masks")) {
         return StagedPredictionBatch{
             std::move(selected.predictions),
             torch::Tensor(),
@@ -729,22 +730,14 @@ void CocoDataset::limit_images(size_t limit) {
     for (size_t index = 0; index < image_ids_.size(); ++index) {
         image_id_to_index_[image_ids_[index]] = index;
     }
-    ground_truths_.erase(
-        std::remove_if(
-            ground_truths_.begin(),
-            ground_truths_.end(),
-            [&keep](const GroundTruthAnnotation& gt) { return keep.find(gt.image_id) == keep.end(); }),
-        ground_truths_.end());
-    predictions_.erase(
-        std::remove_if(
-            predictions_.begin(),
-            predictions_.end(),
-            [&keep](const Prediction& prediction) { return keep.find(prediction.image_id) == keep.end(); }),
-        predictions_.end());
+    std::erase_if(ground_truths_,
+            [&keep](const GroundTruthAnnotation& gt) { return !keep.contains(gt.image_id); });
+    std::erase_if(predictions_,
+            [&keep](const Prediction& prediction) { return !keep.contains(prediction.image_id); });
 }
 
 bool CocoDataset::has_image(int image_id) const {
-    return image_id_to_index_.find(image_id) != image_id_to_index_.end();
+    return image_id_to_index_.contains(image_id);
 }
 
 void CocoDataset::add_predictions(const std::vector<Prediction>& predictions) {

@@ -1,13 +1,14 @@
 #include "rfdetr/backends.h"
 
 #include "profile_utils.h"
-#include "rfdetr/cuda_utils.h"
+#include "rfdetr/torch_cuda_utils.h"
 
 #include <c10/cuda/CUDAGuard.h>
 #include <onnxruntime_cxx_api.h>
 
 #include <cuda_runtime.h>
 
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -22,11 +23,28 @@ std::string ort_type_name(ONNXTensorElementDataType dtype) {
     switch (dtype) {
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
         return "float32";
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+        return "float16";
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
+        return "int32";
     case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
         return "int64";
+    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:
+        return "bool";
     default:
         return "unsupported";
     }
+}
+
+template <typename T>
+torch::Tensor wrap_ort_output_tensor(Ort::Value& value,
+                                     const std::vector<int64_t>& shape,
+                                     const torch::ScalarType dtype,
+                                     const int device_id) {
+    return torch::from_blob(
+        value.GetTensorMutableData<T>(),
+        shape,
+        torch::TensorOptions().dtype(dtype).device(torch::kCUDA, device_id));
 }
 
 void infer_output_layout(ModelInfo& info) {
@@ -174,6 +192,10 @@ public:
     [[nodiscard]] const ModelInfo& info() const override { return info_; }
     [[nodiscard]] void* stream() const override { return stream_; }
 
+    [[nodiscard]] std::vector<std::unique_ptr<InferenceBackend>> make_lanes(int count) const override {
+        return make_onnx_backend_lanes(model_path_, device_id_, count);
+    }
+
     OutputTensors run(const torch::Tensor& normalized_input) override {
         MMLTK_PROFILE_SCOPE("rfdetr.native.onnx.run");
         if (!normalized_input.is_cuda() || !normalized_input.is_contiguous()) {
@@ -231,11 +253,22 @@ private:
     }
 
     torch::Tensor wrap_output(Ort::Value& value) const {
-        auto shape = value.GetTensorTypeAndShapeInfo().GetShape();
-        return torch::from_blob(
-            value.GetTensorMutableData<float>(),
-            shape,
-            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, device_id_));
+        const auto type_info = value.GetTensorTypeAndShapeInfo();
+        const auto shape = type_info.GetShape();
+        switch (type_info.GetElementType()) {
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+            return wrap_ort_output_tensor<float>(value, shape, torch::kFloat32, device_id_);
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+            return wrap_ort_output_tensor<std::uint16_t>(value, shape, torch::kFloat16, device_id_);
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
+            return wrap_ort_output_tensor<int32_t>(value, shape, torch::kInt32, device_id_);
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
+            return wrap_ort_output_tensor<int64_t>(value, shape, torch::kInt64, device_id_);
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:
+            return wrap_ort_output_tensor<bool>(value, shape, torch::kBool, device_id_);
+        default:
+            throw std::runtime_error("unsupported ONNX Runtime output tensor dtype");
+        }
     }
 
     std::filesystem::path model_path_;

@@ -47,6 +47,7 @@ namespace mmltk::gui {
 
 class LivePreviewTexture;
 class PreviewInteractionOverlaySurface;
+class AnnotationWorkflowCoordinator;
 struct AnnotationSidebarMutationResult;
 struct AnnotationSidebarViewModel;
 struct AnnotationMaskTabActions;
@@ -107,6 +108,32 @@ private:
     void launch_job(const std::string& label, std::function<JobOutcome()> fn);
     void launch_file_picker(FileBrowseField field, const char* dialog_title, std::string* target);
     bool file_picker_busy(FileBrowseField field) const;
+
+    template <typename State>
+    void handle_model_input_browse_request(ModelInputBrowseRequest browse_request,
+                                           State& state,
+                                           const ModelArtifactSelectionState& artifact_state,
+                                           FileBrowseField weights_field,
+                                           FileBrowseField onnx_field,
+                                           FileBrowseField tensorrt_field) {
+        switch (browse_request) {
+        case ModelInputBrowseRequest::Weights:
+            apply_model_artifacts(state, artifact_state);
+            launch_file_picker(weights_field, "Select Weights", &state.weights_path);
+            break;
+        case ModelInputBrowseRequest::Onnx:
+            apply_model_artifacts(state, artifact_state);
+            launch_file_picker(onnx_field, "Select ONNX Model", &state.onnx_path);
+            break;
+        case ModelInputBrowseRequest::TensorRt:
+            apply_model_artifacts(state, artifact_state);
+            launch_file_picker(tensorrt_field, "Select TensorRT Engine", &state.tensorrt_path);
+            break;
+        case ModelInputBrowseRequest::None:
+            break;
+        }
+    }
+
     void draw_menu_bar();
     void draw_settings_window();
     void draw_workflow_window();
@@ -114,16 +141,6 @@ private:
     void draw_train_view();
     void draw_validate_view();
     void draw_predict_view();
-    void draw_annotate_workspace();
-    void draw_annotate_utilities_pane();
-    void draw_annotate_setup_tab(bool block_actions, bool live_video, bool can_use_video);
-    void draw_annotate_save_tab(bool live_video);
-    void apply_annotation_sidebar_mutation_result(const AnnotationSidebarMutationResult& result,
-                                                  bool allow_assist);
-    void apply_annotation_objects_tab_actions(const AnnotationSidebarViewModel& sidebar_model,
-                                              const AnnotationObjectsTabActions& actions,
-                                              bool assist_available);
-    void apply_annotation_mask_tab_actions(const AnnotationMaskTabActions& actions);
     void draw_export_view();
     void draw_live_view();
     void draw_live_preview_panel();
@@ -136,14 +153,6 @@ private:
     void invalidate_annotation_preview();
     void cancel_annotation_canvas_interactions();
     void reset_annotation_instances();
-    void sync_annotation_categories();
-    void prepare_annotation_source();
-    void load_annotation_current_frame();
-    void step_annotation_current_frame(int step);
-    void handle_annotation_setup_browse_request(
-        AnnotationSetupBrowseRequest browse_request);
-    void load_annotation_frame(AnnotationFrame frame);
-    void submit_annotation_preview();
     void launch_live_predict_session();
     bool annotation_live_running() const;
     bool live_predict_running() const;
@@ -152,6 +161,9 @@ private:
     void clear_static_preview();
     void apply_static_preview(StillImagePreview preview);
     void stop_live_predict_session();
+    void begin_live_predict_preview_stream(int device_id);
+    void end_live_predict_preview_stream();
+    void reset_live_predict_preview_state(bool clear_frame);
     void append_job_output(std::string_view chunk);
     std::string snapshot_job_output();
     void apply_ui_settings_now(bool rebuild_font_texture);
@@ -222,6 +234,9 @@ private:
     GuiSettingsPersistence settings_persistence_;
     bool ui_settings_window_open_ = false;
     bool ui_settings_apply_pending_ = false;
+    std::unique_ptr<AnnotationWorkflowCoordinator> annotation_workflow_coordinator_;
+
+    friend class AnnotationWorkflowCoordinator;
 };
 
 } // namespace mmltk::gui

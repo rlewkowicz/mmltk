@@ -1,7 +1,8 @@
 #include "source_runtime.h"
 
-#include <algorithm>
-#include <cctype>
+#include "rfdetr/backends_internal.h"
+#include "string_utils.h"
+
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -15,15 +16,8 @@ using mmltk::rfdetr::PredictImageInput;
 
 namespace {
 
-std::string lowercase_copy(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
-    });
-    return value;
-}
-
 bool has_supported_image_extension(const fs::path& path) {
-    const std::string extension = lowercase_copy(path.extension().string());
+    const std::string extension = strings::to_lower(path.extension().string());
     return extension == ".jpg" ||
            extension == ".jpeg" ||
            extension == ".png" ||
@@ -49,7 +43,7 @@ std::vector<fs::path> collect_image_paths(const fs::path& root, bool recursive) 
             }
         }
     }
-    std::sort(images.begin(), images.end());
+    std::ranges::sort(images);
     return images;
 }
 

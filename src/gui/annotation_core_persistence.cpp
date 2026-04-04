@@ -5,9 +5,9 @@
 
 #include <algorithm>
 #include <array>
+#include <format>
 #include <charconv>
 #include <cctype>
-#include <cstdio>
 #include <fstream>
 #include <limits>
 #include <stdexcept>
@@ -84,7 +84,7 @@ void validate_annotation_categories_meta(const json& meta) {
 
 bool all_digits(std::string_view value) {
     return !value.empty() &&
-           std::all_of(value.begin(), value.end(), [](const unsigned char ch) { return std::isdigit(ch) != 0; });
+           std::ranges::all_of(value, [](const unsigned char ch) { return std::isdigit(ch) != 0; });
 }
 
 std::uint32_t next_scene_index(const std::filesystem::path& split_dir) {
@@ -106,12 +106,7 @@ std::uint32_t next_scene_index(const std::filesystem::path& split_dir) {
 }
 
 std::string format_scene_name(const std::uint32_t scene_index) {
-    std::array<char, 32> buffer{};
-    const int written = std::snprintf(buffer.data(), buffer.size(), "%06u", scene_index);
-    if (written <= 0) {
-        throw std::runtime_error("failed to format annotation scene index");
-    }
-    return {buffer.data(), static_cast<std::size_t>(written)};
+    return std::format("{:06}", scene_index);
 }
 
 json category_json(const AnnotationCategory& category) {
@@ -606,7 +601,7 @@ AnnotationCategories load_annotation_categories(const std::filesystem::path& out
 }
 
 std::size_t ensure_annotation_category(AnnotationCategories& categories, const std::string& class_name) {
-    const auto found = std::find_if(categories.items.begin(), categories.items.end(), [&](const AnnotationCategory& item) {
+    const auto found = std::ranges::find_if(categories.items, [&](const AnnotationCategory& item) {
         return item.name == class_name;
     });
     if (found != categories.items.end()) {
@@ -798,12 +793,8 @@ AnnotationSaveResult save_annotation_scene(const AnnotationSaveConfig& config,
         if (resolved.crop_width > 0U && resolved.crop_height > 0U && !resolved.crop_rgba.empty()) {
             const std::filesystem::path class_dir = entity_dir / category.name;
             std::filesystem::create_directories(class_dir);
-            const std::array<char, 64> suffix = [] (const std::uint32_t scene_id, const std::size_t object_id) {
-                std::array<char, 64> buffer{};
-                std::snprintf(buffer.data(), buffer.size(), "%06u_%03zu.png", scene_id, object_id + 1U);
-                return buffer;
-            }(scene_index, index);
-            const std::filesystem::path entity_path = class_dir / (config.split + "_" + std::string(suffix.data()));
+            const auto suffix = std::format("{:06}_{:03}.png", scene_index, index + 1U);
+            const std::filesystem::path entity_path = class_dir / (config.split + "_" + suffix);
             write_annotation_png(entity_path,
                                  static_cast<int>(resolved.crop_width),
                                  static_cast<int>(resolved.crop_height),

@@ -1,4 +1,4 @@
-#include "rfdetr/cuda_utils.h"
+#include "rfdetr/torch_cuda_utils.h"
 #include "rfdetr/training_mask_ops_cuda_launch.h"
 
 #include <cuda_runtime.h>

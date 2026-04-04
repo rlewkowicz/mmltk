@@ -1,5 +1,6 @@
 #include "mmltk/rfdetr/model_config.h"
 #include "mmltk/rfdetr/weight_catalog.h"
+#include "string_utils.h"
 
 #include <algorithm>
 #include <cctype>
@@ -16,13 +17,7 @@ std::string_view url_basename(std::string_view url) {
     return slash == std::string_view::npos ? url : url.substr(slash + 1);
 }
 
-std::string lowercase_copy(std::string_view value) {
-    std::string lowered(value);
-    std::transform(lowered.begin(), lowered.end(), lowered.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
-    });
-    return lowered;
-}
+
 
 bool is_match_boundary(char ch) {
     return !std::isalnum(static_cast<unsigned char>(ch));
@@ -48,7 +43,7 @@ bool contains_path_token(std::string_view normalized_path, std::string_view cand
 
 std::string_view preset_suffix(std::string_view preset_name) {
     constexpr std::string_view kPrefix = "rf-detr-";
-    if (preset_name.substr(0, kPrefix.size()) == kPrefix) {
+    if (preset_name.starts_with(kPrefix)) {
         return preset_name.substr(kPrefix.size());
     }
     return {};
@@ -79,7 +74,7 @@ void consider_preset_aliases(const ModelPresetConfig& preset,
         return;
     }
 
-    consider_match_candidate(preset, normalized_path, lowercase_copy(suffix), 1500, best_match, best_score);
+    consider_match_candidate(preset, normalized_path, strings::to_lower(suffix), 1500, best_match, best_score);
 
     if (suffix == "seg-nano") {
         consider_match_candidate(preset, normalized_path, "seg-n", 1400, best_match, best_score);
@@ -163,29 +158,29 @@ const ModelPresetConfig* infer_model_preset_from_path(const std::filesystem::pat
         return preset;
     }
 
-    const std::string normalized_path = lowercase_copy(path.lexically_normal().string());
+    const std::string normalized_path = strings::to_lower(path.lexically_normal().string());
     const ModelPresetConfig* best_match = nullptr;
     size_t best_score = 0;
 
     for (const auto& preset : preset_table()) {
-        const std::string canonical_name = lowercase_copy(preset.canonical_weight_filename);
+        const std::string canonical_name = strings::to_lower(preset.canonical_weight_filename);
         consider_match_candidate(preset, normalized_path, canonical_name, 3000, best_match, best_score);
 
         const std::string canonical_stem =
-            lowercase_copy(std::filesystem::path(std::string(preset.canonical_weight_filename)).stem().string());
+            strings::to_lower(std::filesystem::path(std::string(preset.canonical_weight_filename)).stem().string());
         consider_match_candidate(preset, normalized_path, canonical_stem, 2900, best_match, best_score);
 
-        const std::string preset_name = lowercase_copy(preset.preset_name);
+        const std::string preset_name = strings::to_lower(preset.preset_name);
         consider_match_candidate(preset, normalized_path, preset_name, 2800, best_match, best_score);
 
         if (const auto* asset = find_weight_asset(preset.canonical_weight_filename)) {
             const std::string_view basename = url_basename(asset->download_url);
             if (find_model_preset_by_weight_filename(basename) == &preset) {
-                const std::string upstream_name = lowercase_copy(basename);
+                const std::string upstream_name = strings::to_lower(basename);
                 consider_match_candidate(preset, normalized_path, upstream_name, 2700, best_match, best_score);
 
                 const std::string upstream_stem =
-                    lowercase_copy(std::filesystem::path(std::string(basename)).stem().string());
+                    strings::to_lower(std::filesystem::path(std::string(basename)).stem().string());
                 consider_match_candidate(preset, normalized_path, upstream_stem, 2600, best_match, best_score);
             }
         }

@@ -63,6 +63,30 @@ void finish_grouped_skeleton_edit_if_complete(const AnnotationToolContext& conte
     }
 }
 
+/// Apply a document command, then re-read the SkeletonShape and call a
+/// user-supplied callback to refresh the edit state.  Returns \c true when
+/// the command changed the document.
+///
+/// \p refresh_fn signature:
+///   void(const AnnotationSkeletonShape& updated_skeleton)
+template <typename ApplyFn, typename RefreshFn>
+bool apply_and_refresh_skeleton_state(AnnotationDocument& document,
+                                      AnnotationSession& session,
+                                      const std::size_t selected_index,
+                                      ApplyFn&& apply_fn,
+                                      RefreshFn&& refresh_fn) {
+    const bool changed = std::forward<ApplyFn>(apply_fn)();
+    if (changed) {
+        const AnnotationSkeletonShape* updated_skeleton =
+            std::get_if<AnnotationSkeletonShape>(
+                &document.object(selected_index)->shape);
+        if (updated_skeleton != nullptr) {
+            std::forward<RefreshFn>(refresh_fn)(*updated_skeleton);
+        }
+    }
+    return changed;
+}
+
 AnnotationToolMutation handle_skeleton_new_object_click(const AnnotationToolContext& context,
                                                         const AnnotationToolCanvasClickEvent& event,
                                                         const AnnotationPoint& point) {
@@ -301,29 +325,28 @@ AnnotationToolMutation handle_skeleton_canvas_click(const AnnotationToolContext&
                                              selected_index)) {
                     return {};
                 }
-                const bool changed = context.document.apply(AnnotationPlaceSkeletonNodeAtCommand{
-                    *selected_index,
-                    *current_state.active_joint_index,
-                    point,
-                });
-                if (changed) {
-                    const AnnotationSkeletonShape* updated_skeleton =
-                        std::get_if<AnnotationSkeletonShape>(
-                            &context.document.object(*selected_index)->shape);
-                    if (updated_skeleton != nullptr) {
+                const bool changed = apply_and_refresh_skeleton_state(
+                    context.document, context.session, *selected_index,
+                    [&] {
+                        return context.document.apply(AnnotationPlaceSkeletonNodeAtCommand{
+                            *selected_index,
+                            *current_state.active_joint_index,
+                            point,
+                        });
+                    },
+                    [&](const AnnotationSkeletonShape& updated) {
                         set_active_skeleton_edit_state(context.session,
                                                        *selected_index,
-                                                       *updated_skeleton,
+                                                       updated,
                                                        next_skeleton_node_index(
-                                                           updated_skeleton,
+                                                           &updated,
                                                            current_state.active_joint_index),
                                                        current_state.active_joint_index,
                                                        false);
                         finish_grouped_skeleton_edit_if_complete(
                             context,
                             context.session.skeleton_edit_state());
-                    }
-                }
+                    });
                 return make_skeleton_tool_mutation(changed);
             }
 
@@ -333,27 +356,26 @@ AnnotationToolMutation handle_skeleton_canvas_click(const AnnotationToolContext&
                                          selected_index)) {
                 return {};
             }
-            const bool changed = context.document.apply(AnnotationPlaceSkeletonNodeCommand{
-                *selected_index,
-                point,
-            });
-            if (changed) {
-                const AnnotationSkeletonShape* updated_skeleton =
-                    std::get_if<AnnotationSkeletonShape>(
-                        &context.document.object(*selected_index)->shape);
-                if (updated_skeleton != nullptr) {
+            const bool changed = apply_and_refresh_skeleton_state(
+                context.document, context.session, *selected_index,
+                [&] {
+                    return context.document.apply(AnnotationPlaceSkeletonNodeCommand{
+                        *selected_index,
+                        point,
+                    });
+                },
+                [&](const AnnotationSkeletonShape& updated) {
                     set_active_skeleton_edit_state(context.session,
                                                    *selected_index,
-                                                   *updated_skeleton,
+                                                   updated,
                                                    next_skeleton_node_index(
-                                                       updated_skeleton,
+                                                       &updated,
                                                        current_state.active_joint_index),
                                                    current_state.active_joint_index,
                                                    false);
                     finish_grouped_skeleton_edit_if_complete(context,
                                                              context.session.skeleton_edit_state());
-                }
-            }
+                });
             return make_skeleton_tool_mutation(changed);
         }
     }
@@ -389,76 +411,47 @@ AnnotationToolMutation handle_skeleton_action(const AnnotationToolContext& conte
         if (!state.active_joint_index.has_value()) {
             return {};
         }
-        {
-            const bool changed = context.document.apply(AnnotationSetSkeletonNodeVisibilityCommand{
-                *selected_index,
-                *state.active_joint_index,
-                false,
-            });
-            if (changed) {
-                const AnnotationSkeletonShape* updated_skeleton =
-                    std::get_if<AnnotationSkeletonShape>(
-                        &context.document.object(*selected_index)->shape);
-                if (updated_skeleton != nullptr) {
-                    set_active_skeleton_edit_state(context.session,
-                                                   *selected_index,
-                                                   *updated_skeleton,
-                                                   state.active_joint_index,
-                                                   state.last_placed_joint_index,
-                                                   false);
-                }
-            }
-            return make_skeleton_tool_mutation(changed);
-        }
+        return make_skeleton_tool_mutation(apply_and_refresh_skeleton_state(
+            context.document, context.session, *selected_index,
+            [&] {
+                return context.document.apply(AnnotationSetSkeletonNodeVisibilityCommand{
+                    *selected_index, *state.active_joint_index, false});
+            },
+            [&](const AnnotationSkeletonShape& updated) {
+                set_active_skeleton_edit_state(context.session, *selected_index, updated,
+                                               state.active_joint_index,
+                                               state.last_placed_joint_index, false);
+            }));
     case AnnotationToolActionKind::ReactivateJoint:
         if (!state.active_joint_index.has_value()) {
             return {};
         }
-        {
-            const bool changed = context.document.apply(AnnotationSetSkeletonNodeVisibilityCommand{
-                *selected_index,
-                *state.active_joint_index,
-                true,
-            });
-            if (changed) {
-                const AnnotationSkeletonShape* updated_skeleton =
-                    std::get_if<AnnotationSkeletonShape>(
-                        &context.document.object(*selected_index)->shape);
-                if (updated_skeleton != nullptr) {
-                    set_active_skeleton_edit_state(context.session,
-                                                   *selected_index,
-                                                   *updated_skeleton,
-                                                   state.active_joint_index,
-                                                   state.last_placed_joint_index,
-                                                   false);
-                }
-            }
-            return make_skeleton_tool_mutation(changed);
-        }
+        return make_skeleton_tool_mutation(apply_and_refresh_skeleton_state(
+            context.document, context.session, *selected_index,
+            [&] {
+                return context.document.apply(AnnotationSetSkeletonNodeVisibilityCommand{
+                    *selected_index, *state.active_joint_index, true});
+            },
+            [&](const AnnotationSkeletonShape& updated) {
+                set_active_skeleton_edit_state(context.session, *selected_index, updated,
+                                               state.active_joint_index,
+                                               state.last_placed_joint_index, false);
+            }));
     case AnnotationToolActionKind::ReseedJoint:
         if (!state.active_joint_index.has_value()) {
             return {};
         }
-        {
-            const bool changed = context.document.apply(AnnotationResetSkeletonNodeCommand{
-                *selected_index,
-                *state.active_joint_index,
-            });
-            if (changed) {
-                const AnnotationSkeletonShape* updated_skeleton =
-                    std::get_if<AnnotationSkeletonShape>(
-                        &context.document.object(*selected_index)->shape);
-                if (updated_skeleton != nullptr) {
-                    set_active_skeleton_edit_state(context.session,
-                                                   *selected_index,
-                                                   *updated_skeleton,
-                                                   state.active_joint_index,
-                                                   state.last_placed_joint_index,
-                                                   true);
-                }
-            }
-            return make_skeleton_tool_mutation(changed);
-        }
+        return make_skeleton_tool_mutation(apply_and_refresh_skeleton_state(
+            context.document, context.session, *selected_index,
+            [&] {
+                return context.document.apply(AnnotationResetSkeletonNodeCommand{
+                    *selected_index, *state.active_joint_index});
+            },
+            [&](const AnnotationSkeletonShape& updated) {
+                set_active_skeleton_edit_state(context.session, *selected_index, updated,
+                                               state.active_joint_index,
+                                               state.last_placed_joint_index, true);
+            }));
     case AnnotationToolActionKind::Cancel:
         if (cancel_grouped_tool_edit(context, AnnotationToolKind::Skeleton)) {
             return make_skeleton_tool_mutation(true);

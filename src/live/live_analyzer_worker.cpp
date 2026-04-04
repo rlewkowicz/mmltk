@@ -1,6 +1,7 @@
 #include "mmltk/live/live_analyzer_worker.h"
 
 #include "live/live_helpers.h"
+#include "mmltk/live/live_worker_runtime.h"
 #include "mmltk/rfdetr/draw_cuda.h"
 #include "mmltk_logging.h"
 
@@ -67,23 +68,33 @@ LiveAnalyzerWorker::~LiveAnalyzerWorker() {
 }
 
 void LiveAnalyzerWorker::start() {
-    if (running()) {
+    if (running_.load(std::memory_order_acquire)) {
         throw std::runtime_error("live analyzer worker is already running");
     }
     if (thread_.joinable()) {
         throw std::runtime_error("live analyzer worker must be stopped before restart");
     }
-    stop_requested_.store(false, std::memory_order_release);
-    running_.store(true, std::memory_order_release);
-    thread_ = std::thread(&LiveAnalyzerWorker::worker_thread_main, this);
+
+    publish_error({});
+    worker_runtime::publish_status(&status_, Status{});
+    ensure_cuda_ok(cudaSetDevice(cuda_device_index_), "cudaSetDevice for live analyzer start");
+    worker_runtime::reset_slot_views_for_restart(result_slots_,
+                                                 latest_result_index_,
+                                                 "cudaEventSynchronize for live analyzer result slot restart");
+    worker_runtime::reset_slot_views_for_restart(overlay_slots_,
+                                                 latest_overlay_index_,
+                                                 "cudaEventSynchronize for live analyzer overlay slot restart");
+    worker_runtime::start_worker_thread(
+        thread_,
+        stop_requested_,
+        running_,
+        [this]() { worker_thread_main(); },
+        "live analyzer worker is already running",
+        "live analyzer worker must be stopped before restart");
 }
 
 void LiveAnalyzerWorker::stop() {
-    stop_requested_.store(true, std::memory_order_release);
-    if (thread_.joinable()) {
-        thread_.join();
-    }
-    running_.store(false, std::memory_order_release);
+    worker_runtime::stop_worker_thread(thread_, stop_requested_, running_);
 }
 
 void LiveAnalyzerWorker::set_analyzer(std::unique_ptr<FrameAnalyzer> analyzer) {
@@ -100,17 +111,20 @@ bool LiveAnalyzerWorker::try_acquire_latest_result(AnalyzerResultView* out) {
         throw std::runtime_error("live analyzer worker requires a result output");
     }
     *out = {};
-    return try_acquire_latest_published_slot(result_slots_, latest_result_index_, out, [](ResultSlot& slot) {
-        return AnalyzerResultView{slot.slot_index, &slot.result};
-    });
+    if (!running()) {
+        return false;
+    }
+    return worker_runtime::try_acquire_latest_published_slot_view(result_slots_,
+                                                                   latest_result_index_,
+                                                                   out);
 }
 
 void LiveAnalyzerWorker::release_result(const std::uint32_t slot_index) {
-    if (slot_index >= result_slots_.size()) {
-        throw std::runtime_error("live analyzer worker result release index out of range");
-    }
-    ResultSlot& slot = *result_slots_[slot_index];
-    release_acquired_slot(slot, "live analyzer worker result slot release called for a slot that is not acquired");
+    worker_runtime::release_slot_by_index(
+        result_slots_,
+        slot_index,
+        "live analyzer worker result release index out of range",
+        "live analyzer worker result slot release called for a slot that is not acquired");
 }
 
 bool LiveAnalyzerWorker::try_acquire_latest_overlay(AnalysisOverlayView* out) {
@@ -118,54 +132,42 @@ bool LiveAnalyzerWorker::try_acquire_latest_overlay(AnalysisOverlayView* out) {
         throw std::runtime_error("live analyzer worker requires an overlay output");
     }
     *out = {};
-    return try_acquire_latest_published_slot(overlay_slots_, latest_overlay_index_, out, [](OverlaySlot& slot) {
-        return AnalysisOverlayView{
-            slot.slot_index,
-            slot.frame_id,
-            slot.device_buffer.data(),
-            slot.device_buffer.pitch_bytes(),
-            slot.device_buffer.width(),
-            slot.device_buffer.height(),
-            slot.ready_event.get(),
-            slot.has_content,
-        };
-    });
+    if (!running()) {
+        return false;
+    }
+    return worker_runtime::try_acquire_latest_published_slot_view(overlay_slots_,
+                                                                   latest_overlay_index_,
+                                                                   out);
 }
 
 void LiveAnalyzerWorker::release_overlay(const std::uint32_t slot_index) {
-    if (slot_index >= overlay_slots_.size()) {
-        throw std::runtime_error("live analyzer worker overlay release index out of range");
-    }
-    OverlaySlot& slot = *overlay_slots_[slot_index];
-    release_acquired_slot(slot, "live analyzer worker overlay slot release called for a slot that is not acquired");
+    worker_runtime::release_slot_by_index(
+        overlay_slots_,
+        slot_index,
+        "live analyzer worker overlay release index out of range",
+        "live analyzer worker overlay slot release called for a slot that is not acquired");
 }
 
 LiveAnalyzerWorker::Status LiveAnalyzerWorker::snapshot_status() const {
-    const std::shared_ptr<const Status> current =
-        std::atomic_load_explicit(&status_, std::memory_order_acquire);
-    return current ? *current : Status{};
+    return worker_runtime::snapshot_status(status_);
 }
 
 void LiveAnalyzerWorker::allocate_resources() {
     ensure_cuda_ok(cudaSetDevice(cuda_device_index_), "cudaSetDevice for live analyzer resource allocation");
 
     try {
-        for (std::uint32_t slot_index = 0; slot_index < result_slots_.capacity(); ++slot_index) {
-            auto slot = std::make_unique<ResultSlot>();
-            slot->slot_index = slot_index;
-            result_slots_.push_back(std::move(slot));
-        }
-
-        for (std::uint32_t slot_index = 0; slot_index < overlay_slots_.capacity(); ++slot_index) {
-            auto slot = std::make_unique<OverlaySlot>();
-            slot->slot_index = slot_index;
-            slot->device_buffer.ensure_dimensions(max_capture_width_, max_capture_height_,
-                                                  "cudaMallocPitch for live analyzer overlay");
-            slot->stream.create_with_highest_priority("cudaStreamCreateWithPriority for live analyzer overlay");
-            slot->ready_event.create(cudaEventDisableTiming,
-                                     "cudaEventCreateWithFlags for live analyzer overlay");
-            overlay_slots_.push_back(std::move(slot));
-        }
+        worker_runtime::allocate_unique_slots(result_slots_, static_cast<std::uint32_t>(result_slots_.capacity()),
+                                              [](ResultSlot& slot, std::uint32_t slot_index) {
+                                                  slot.slot_index = slot_index;
+                                              });
+        worker_runtime::allocate_pitched_device_slots(
+            overlay_slots_,
+            static_cast<std::uint32_t>(overlay_slots_.capacity()),
+            max_capture_width_,
+            max_capture_height_,
+            "cudaMallocPitch for live analyzer overlay",
+            "cudaStreamCreateWithPriority for live analyzer overlay",
+            "cudaEventCreateWithFlags for live analyzer overlay");
     } catch (...) {
         destroy_resources();
         throw;
@@ -179,17 +181,22 @@ void LiveAnalyzerWorker::destroy_resources() noexcept {
 }
 
 void LiveAnalyzerWorker::worker_thread_main() {
-    Status status;
-    status.running = true;
-
-    try {
-        ensure_cuda_ok(cudaSetDevice(cuda_device_index_), "cudaSetDevice for live analyzer thread");
-        while (!stop_requested_.load(std::memory_order_acquire)) {
+    worker_runtime::run_worker_thread_main(
+        running_,
+        stop_requested_,
+        status_,
+        cuda_device_index_,
+        "cudaSetDevice for live analyzer thread",
+        "live.analyzer",
+        [this](Status& status) {
             DetectBundle bundle{};
             if (!fanout_.try_acquire_detect(&bundle)) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                continue;
+                return;
             }
+            auto detect_release = worker_runtime::make_scoped_rollback([this, slot_index = bundle.slot_index]() noexcept {
+                fanout_.release_detect(slot_index);
+            });
 
             const std::shared_ptr<FrameAnalyzer> analyzer =
                 std::atomic_load_explicit(&analyzer_, std::memory_order_acquire);
@@ -197,12 +204,11 @@ void LiveAnalyzerWorker::worker_thread_main() {
             status.model_hot = static_cast<bool>(analyzer);
             status.backend_name = analyzer ? analyzer->backend_name() : std::string{};
             if (!analyzer) {
-                fanout_.release_detect(bundle.slot_index);
+                detect_release.run_and_dismiss();
                 status.frames_skipped += 1U;
                 status.last_error.clear();
-                std::shared_ptr<const Status> immutable = std::make_shared<Status>(status);
-                std::atomic_store_explicit(&status_, std::move(immutable), std::memory_order_release);
-                continue;
+                worker_runtime::publish_status(&status_, status);
+                return;
             }
 
             const auto started_at = Clock::now();
@@ -210,17 +216,26 @@ void LiveAnalyzerWorker::worker_thread_main() {
             try {
                 result = analyzer->analyze(bundle);
             } catch (const std::exception& error) {
-                fanout_.release_detect(bundle.slot_index);
+                detect_release.run_and_dismiss();
                 status.last_error = error.what();
-                std::shared_ptr<const Status> immutable = std::make_shared<Status>(status);
-                std::atomic_store_explicit(&status_, std::move(immutable), std::memory_order_release);
-                continue;
+                worker_runtime::publish_status(&status_, status);
+                return;
             }
 
             ResultSlot* result_slot = reserve_result_slot();
             OverlaySlot* overlay_slot = reserve_overlay_slot();
+            auto result_slot_release = worker_runtime::make_scoped_rollback([result_slot]() noexcept {
+                if (result_slot != nullptr) {
+                    worker_runtime::release_writing_slot(*result_slot);
+                }
+            });
             bool overlay_has_content = false;
             if (overlay_slot != nullptr) {
+                auto overlay_slot_release = worker_runtime::make_scoped_rollback([overlay_slot]() noexcept {
+                    if (overlay_slot != nullptr) {
+                        worker_runtime::release_writing_slot(*overlay_slot);
+                    }
+                });
                 try {
                     ensure_cuda_ok(cudaMemset2DAsync(device_ptr_as_void(overlay_slot->device_buffer.data()),
                                                      overlay_slot->device_buffer.pitch_bytes(),
@@ -275,11 +290,10 @@ void LiveAnalyzerWorker::worker_thread_main() {
                                    "cudaEventRecord for live analyzer overlay");
                     overlay_slot->frame_id = result.frame_id;
                     overlay_slot->has_content = overlay_has_content;
-                    overlay_slot->state.store(to_slot_state_value(SlotState::kPublished), std::memory_order_release);
-                    latest_overlay_index_.store(static_cast<int>(overlay_slot->slot_index), std::memory_order_release);
+                    worker_runtime::publish_latest_slot(*overlay_slot, latest_overlay_index_);
+                    overlay_slot_release.dismiss();
                 } catch (...) {
                     overlay_slot->has_content = false;
-                    overlay_slot->state.store(to_slot_state_value(SlotState::kFree), std::memory_order_release);
                     throw;
                 }
             }
@@ -304,79 +318,38 @@ void LiveAnalyzerWorker::worker_thread_main() {
                         result_slot->retained_tensors.push_back(split.masks);
                     }
                 }
-                result_slot->state.store(to_slot_state_value(SlotState::kPublished), std::memory_order_release);
-                latest_result_index_.store(static_cast<int>(result_slot->slot_index), std::memory_order_release);
+                worker_runtime::publish_latest_slot(*result_slot, latest_result_index_);
+                result_slot_release.dismiss();
             }
 
-            fanout_.release_detect(bundle.slot_index);
+            detect_release.run_and_dismiss();
 
             status.frames_analyzed += 1U;
             status.last_completed_frame_id = result.frame_id;
             status.last_latency_ms =
                 std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(Clock::now() - started_at).count();
             status.last_error.clear();
-            std::shared_ptr<const Status> immutable = std::make_shared<Status>(status);
-            std::atomic_store_explicit(&status_, std::move(immutable), std::memory_order_release);
-        }
-    } catch (const std::exception& error) {
-        publish_error(error.what());
-        status.last_error = error.what();
-        log_live_analyzer_message("error", error.what());
-    }
-
-    status.running = false;
-    std::shared_ptr<const Status> immutable = std::make_shared<Status>(status);
-    std::atomic_store_explicit(&status_, std::move(immutable), std::memory_order_release);
-    running_.store(false, std::memory_order_release);
+            worker_runtime::publish_status(&status_, status);
+        },
+        [this](const char* error_message) {
+            publish_error(error_message);
+        });
 }
 
 LiveAnalyzerWorker::ResultSlot* LiveAnalyzerWorker::reserve_result_slot() {
-    return reserve_writable_slot(
-        result_slots_,
-        latest_result_index_,
-        [](ResultSlot& slot) {
-            slot.retained_tensors.clear();
-            slot.result = {};
-        },
-        [](ResultSlot& slot) { return slot.result.ready_event; },
-        "cudaEventQuery for live analyzer slot reuse");
+    return worker_runtime::reserve_writable_slot_view(result_slots_,
+                                                      latest_result_index_,
+                                                      "cudaEventQuery for live analyzer slot reuse");
 }
 
 LiveAnalyzerWorker::OverlaySlot* LiveAnalyzerWorker::reserve_overlay_slot() {
-    return reserve_writable_slot(
-        overlay_slots_,
-        latest_overlay_index_,
-        [](OverlaySlot& slot) {
-            slot.frame_id = {};
-            slot.has_content = false;
-        },
-        [](OverlaySlot& slot) { return slot.ready_event.get(); },
-        "cudaEventQuery for live analyzer slot reuse");
-}
-
-bool LiveAnalyzerWorker::try_acquire_result_slot(ResultSlot& slot, AnalyzerResultView* out) {
-    return try_acquire_published_slot(slot, out, [](ResultSlot& published) {
-        return AnalyzerResultView{published.slot_index, &published.result};
-    });
-}
-
-bool LiveAnalyzerWorker::try_acquire_overlay_slot(OverlaySlot& slot, AnalysisOverlayView* out) {
-    return try_acquire_published_slot(slot, out, [](OverlaySlot& published) {
-        return AnalysisOverlayView{
-            published.slot_index,
-            published.frame_id,
-            published.device_buffer.data(),
-            published.device_buffer.pitch_bytes(),
-            published.device_buffer.width(),
-            published.device_buffer.height(),
-            published.ready_event.get(),
-            published.has_content,
-        };
-    });
+    return worker_runtime::reserve_writable_slot_view(overlay_slots_,
+                                                      latest_overlay_index_,
+                                                      "cudaEventQuery for live analyzer slot reuse");
 }
 
 void LiveAnalyzerWorker::publish_error(std::string error_message) {
-    store_error_message(&last_error_, std::move(error_message));
+    worker_runtime::publish_error(&last_error_, std::move(error_message));
 }
 
 } // namespace mmltk::live

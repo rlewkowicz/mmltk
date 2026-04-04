@@ -1,12 +1,12 @@
 #include "mmltk/rfdetr/draw_cuda.h"
-#include "rfdetr/cuda_utils.h"
+#include "rfdetr/backends_internal.h"
+#include "rfdetr/torch_cuda_utils.h"
+#include "string_utils.h"
 #include "worker_pool.h"
 
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 
-#include <algorithm>
-#include <cctype>
 #include <deque>
 #include <cmath>
 #include <filesystem>
@@ -62,16 +62,9 @@ EvalSampleWriterState& eval_sample_writer_state() {
     return state;
 }
 
-std::string lowercase_copy(std::string value) {
-    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
-        return static_cast<char>(std::tolower(ch));
-    });
-    return value;
-}
-
 void write_eval_sample_image(const PendingEvalSampleWrite& pending) {
     const std::string extension =
-        lowercase_copy(std::filesystem::path(pending.output_path).extension().string());
+        strings::to_lower(std::filesystem::path(pending.output_path).extension().string());
     if (extension == ".jpg" || extension == ".jpeg") {
         if (stbi_write_jpg(pending.output_path.c_str(),
                            pending.width,

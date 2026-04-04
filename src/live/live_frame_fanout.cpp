@@ -1,6 +1,7 @@
 #include "mmltk/live/live_frame_fanout.h"
 
 #include "live/live_helpers.h"
+#include "mmltk/live/live_worker_runtime.h"
 #include "mmltk_logging.h"
 
 #include <algorithm>
@@ -51,8 +52,6 @@ LiveFrameFanout::LiveFrameFanout(LiveVideoIngress& ingress,
                                  std::uint32_t output_slot_count)
     : ingress_(ingress),
       ui_crop_state_(ui_crop_state),
-      detect_slot_count_(detect_slot_count),
-      output_slot_count_(output_slot_count),
       max_capture_width_(std::max<std::uint32_t>(1U, ingress.config().width)),
       max_capture_height_(std::max<std::uint32_t>(1U, ingress.config().height)) {
     if (detect_slot_count == 0U) {
@@ -61,10 +60,7 @@ LiveFrameFanout::LiveFrameFanout(LiveVideoIngress& ingress,
     if (output_slot_count == 0U) {
         throw std::runtime_error("live fanout requires at least one output slot");
     }
-
-    detect_slots_.reserve(detect_slot_count);
-    output_slots_.reserve(output_slot_count);
-    allocate_resources();
+    allocate_resources(detect_slot_count, output_slot_count);
 }
 
 LiveFrameFanout::~LiveFrameFanout() {
@@ -77,25 +73,34 @@ LiveFrameFanout::~LiveFrameFanout() {
 }
 
 void LiveFrameFanout::start() {
-    if (running()) {
+    if (running_.load(std::memory_order_acquire)) {
         throw std::runtime_error("live fanout is already running");
     }
     if (thread_.joinable()) {
         throw std::runtime_error("live fanout must be stopped before it can be restarted");
     }
-    publish_error({});
-    stop_requested_.store(false, std::memory_order_release);
-    running_.store(true, std::memory_order_release);
-    thread_ = std::thread(&LiveFrameFanout::fanout_thread_main, this);
+
+    publish_error("");
+    worker_runtime::publish_status(&status_, Status{});
+    ensure_cuda_ok(cudaSetDevice(ingress_.config().cuda_device_index), "cudaSetDevice for live fanout start");
+    worker_runtime::reset_slot_views_for_restart(detect_slots_,
+                                                 latest_detect_index_,
+                                                 "cudaEventSynchronize for live detect slot restart");
+    worker_runtime::reset_slot_views_for_restart(output_slots_,
+                                                 latest_output_index_,
+                                                 "cudaEventSynchronize for live output slot restart");
+    worker_runtime::start_worker_thread(
+        thread_,
+        stop_requested_,
+        running_,
+        [this]() { fanout_thread_main(); },
+        "live fanout is already running",
+        "live fanout must be stopped before it can be restarted");
     log_live_fanout_message("info", "fanout thread started");
 }
 
 void LiveFrameFanout::stop() {
-    stop_requested_.store(true, std::memory_order_release);
-    if (thread_.joinable()) {
-        thread_.join();
-    }
-    running_.store(false, std::memory_order_release);
+    worker_runtime::stop_worker_thread(thread_, stop_requested_, running_);
 }
 
 bool LiveFrameFanout::running() const noexcept {
@@ -103,9 +108,11 @@ bool LiveFrameFanout::running() const noexcept {
 }
 
 std::string LiveFrameFanout::last_error() const {
-    const std::shared_ptr<const std::string> current =
-        std::atomic_load_explicit(&last_error_, std::memory_order_acquire);
-    return current ? *current : std::string{};
+    return snapshot_status().last_error;
+}
+
+LiveFrameFanout::Status LiveFrameFanout::snapshot_status() const {
+    return worker_runtime::snapshot_status(status_);
 }
 
 bool LiveFrameFanout::try_acquire_detect(DetectBundle* out) {
@@ -113,20 +120,10 @@ bool LiveFrameFanout::try_acquire_detect(DetectBundle* out) {
         throw std::runtime_error("live fanout requires a detect bundle output");
     }
     *out = {};
-    return try_acquire_latest_published_slot(detect_slots_, latest_detect_index_, out, [](DetectSlot& slot) {
-        return DetectBundle{
-            slot.slot_index,
-            slot.frame_id,
-            slot.device_buffer.data(),
-            DetectDimensions{slot.region.width, slot.region.height, slot.device_buffer.pitch_bytes()},
-            slot.ready_event.get(),
-            slot.stream.get(),
-            slot.region,
-            slot.capture_ns,
-            slot.ready_ns,
-            slot.short_frame,
-        };
-    });
+    if (!running()) {
+        return false;
+    }
+    return try_acquire_live_frame_slot(detect_slots_, latest_detect_index_, out);
 }
 
 void LiveFrameFanout::release_detect(std::uint32_t slot_index) {
@@ -134,7 +131,7 @@ void LiveFrameFanout::release_detect(std::uint32_t slot_index) {
         throw std::runtime_error("live fanout detect release index out of range");
     }
     DetectSlot& slot = *detect_slots_[slot_index];
-    release_acquired_slot(slot, "live fanout detect slot release called for a slot that is not acquired");
+    release_live_frame_slot(slot, "live fanout detect slot release called for a slot that is not acquired");
 }
 
 bool LiveFrameFanout::try_acquire_output(OutputBundle* out) {
@@ -142,20 +139,10 @@ bool LiveFrameFanout::try_acquire_output(OutputBundle* out) {
         throw std::runtime_error("live fanout requires an output bundle output");
     }
     *out = {};
-    return try_acquire_latest_published_slot(output_slots_, latest_output_index_, out, [](OutputSlot& slot) {
-        return OutputBundle{
-            slot.slot_index,
-            slot.frame_id,
-            slot.device_buffer.data(),
-            OutputDimensions{slot.region.width, slot.region.height, slot.device_buffer.pitch_bytes()},
-            slot.ready_event.get(),
-            slot.stream.get(),
-            slot.region,
-            slot.capture_ns,
-            slot.ready_ns,
-            slot.short_frame,
-        };
-    });
+    if (!running()) {
+        return false;
+    }
+    return try_acquire_live_frame_slot(output_slots_, latest_output_index_, out);
 }
 
 void LiveFrameFanout::release_output(std::uint32_t slot_index) {
@@ -163,34 +150,22 @@ void LiveFrameFanout::release_output(std::uint32_t slot_index) {
         throw std::runtime_error("live fanout output release index out of range");
     }
     OutputSlot& slot = *output_slots_[slot_index];
-    release_acquired_slot(slot, "live fanout output slot release called for a slot that is not acquired");
+    release_live_frame_slot(slot, "live fanout output slot release called for a slot that is not acquired");
 }
 
-void LiveFrameFanout::allocate_resources() {
+void LiveFrameFanout::allocate_resources(const std::uint32_t detect_slot_count,
+                                         const std::uint32_t output_slot_count) {
     ensure_cuda_ok(cudaSetDevice(ingress_.config().cuda_device_index), "cudaSetDevice for live fanout resource allocation");
 
     try {
-        for (std::uint32_t slot_index = 0; slot_index < detect_slot_count_; ++slot_index) {
-            auto slot = std::make_unique<DetectSlot>();
-            slot->slot_index = slot_index;
-            slot->device_buffer.ensure_dimensions(max_capture_width_, max_capture_height_,
-                                                  "cudaMallocPitch for live detect bundle");
-            slot->stream.create_with_highest_priority("cudaStreamCreateWithPriority for live detect bundle");
-            slot->ready_event.create(cudaEventDisableTiming,
-                                     "cudaEventCreateWithFlags for live detect bundle");
-            detect_slots_.push_back(std::move(slot));
-        }
-
-        for (std::uint32_t slot_index = 0; slot_index < output_slot_count_; ++slot_index) {
-            auto slot = std::make_unique<OutputSlot>();
-            slot->slot_index = slot_index;
-            slot->device_buffer.ensure_dimensions(max_capture_width_, max_capture_height_,
-                                                  "cudaMallocPitch for live output bundle");
-            slot->stream.create_with_highest_priority("cudaStreamCreateWithPriority for live output bundle");
-            slot->ready_event.create(cudaEventDisableTiming,
-                                     "cudaEventCreateWithFlags for live output bundle");
-            output_slots_.push_back(std::move(slot));
-        }
+        allocate_live_frame_slots(detect_slots_, detect_slot_count, max_capture_width_, max_capture_height_,
+                                  "cudaMallocPitch for live detect bundle",
+                                  "cudaStreamCreateWithPriority for live detect bundle",
+                                  "cudaEventCreateWithFlags for live detect bundle");
+        allocate_live_frame_slots(output_slots_, output_slot_count, max_capture_width_, max_capture_height_,
+                                  "cudaMallocPitch for live output bundle",
+                                  "cudaStreamCreateWithPriority for live output bundle",
+                                  "cudaEventCreateWithFlags for live output bundle");
 
         release_stream_.create_with_highest_priority("cudaStreamCreateWithPriority for live source release stream");
         release_events_.resize(std::max<std::uint32_t>(1U, ingress_.max_inflight_sources()));
@@ -211,20 +186,27 @@ void LiveFrameFanout::destroy_resources() noexcept {
         release_event.in_use = false;
     }
     release_events_.clear();
+    latest_detect_index_.store(-1, std::memory_order_release);
+    latest_output_index_.store(-1, std::memory_order_release);
     detect_slots_.clear();
     output_slots_.clear();
 }
 
 void LiveFrameFanout::fanout_thread_main() {
-    try {
-        ensure_cuda_ok(cudaSetDevice(ingress_.config().cuda_device_index), "cudaSetDevice for live fanout thread");
-        while (!stop_requested_.load(std::memory_order_acquire)) {
+    worker_runtime::run_worker_thread_main(
+        running_,
+        stop_requested_,
+        status_,
+        ingress_.config().cuda_device_index,
+        "cudaSetDevice for live fanout thread",
+        "live.fanout",
+        [this](Status& status) {
             drain_pending_source_releases(false);
 
             SourceFrameView source{};
             if (!ingress_.try_acquire_latest_source(&source)) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                continue;
+                return;
             }
 
             runtime_crop_.sync_from(ui_crop_state_);
@@ -249,13 +231,7 @@ void LiveFrameFanout::fanout_thread_main() {
                                "cudaMemcpy2DAsync for live detect bundle");
                 ensure_cuda_ok(cudaEventRecord(detect_slot->ready_event.get(), detect_slot->stream.get()),
                                "cudaEventRecord for live detect bundle");
-                detect_slot->frame_id = source.frame_id;
-                detect_slot->region = detect_region;
-                detect_slot->capture_ns = source.capture_ns;
-                detect_slot->ready_ns = now_ns();
-                detect_slot->short_frame = source.short_frame;
-                detect_slot->state.store(to_slot_state_value(SlotState::kPublished), std::memory_order_release);
-                latest_detect_index_.store(static_cast<int>(detect_slot->slot_index), std::memory_order_release);
+                publish_live_frame_slot(*detect_slot, latest_detect_index_, source, detect_region, now_ns());
             }
 
             OutputSlot* output_slot = reserve_output_slot();
@@ -275,18 +251,12 @@ void LiveFrameFanout::fanout_thread_main() {
                                "cudaMemcpy2DAsync for live output bundle");
                 ensure_cuda_ok(cudaEventRecord(output_slot->ready_event.get(), output_slot->stream.get()),
                                "cudaEventRecord for live output bundle");
-                output_slot->frame_id = source.frame_id;
-                output_slot->region = source.region;
-                output_slot->capture_ns = source.capture_ns;
-                output_slot->ready_ns = now_ns();
-                output_slot->short_frame = source.short_frame;
-                output_slot->state.store(to_slot_state_value(SlotState::kPublished), std::memory_order_release);
-                latest_output_index_.store(static_cast<int>(output_slot->slot_index), std::memory_order_release);
+                publish_live_frame_slot(*output_slot, latest_output_index_, source, source.region, now_ns());
             }
 
             if (detect_slot == nullptr && output_slot == nullptr) {
                 ingress_.release_source(source.buffer_index);
-                continue;
+                return;
             }
 
             const std::size_t release_event_index = acquire_release_event_index();
@@ -302,26 +272,25 @@ void LiveFrameFanout::fanout_thread_main() {
                            "cudaEventRecord for deferred live source release");
             release_events_[release_event_index].in_use = true;
             pending_source_releases_.push_back(PendingSourceRelease{source.buffer_index, release_event_index});
-        }
-
-        drain_pending_source_releases(true);
-    } catch (const std::exception& error) {
-        publish_error(error.what());
-        log_live_fanout_message("error", error.what());
-        try {
-            drain_pending_source_releases(true);
-        } catch (const std::exception& release_error) {
-            publish_error(std::string(error.what()) + " | cleanup: " + release_error.what());
-            log_live_fanout_message("error", release_error.what());
-        }
-    }
-
-    running_.store(false, std::memory_order_release);
+        },
+        [this](const char* error_message) {
+            publish_error(error_message);
+            try {
+                drain_pending_source_releases(true);
+            } catch (const std::exception& release_error) {
+                Status s = snapshot_status();
+                s.last_error = std::string(error_message) + " | cleanup: " + release_error.what();
+                worker_runtime::publish_status(&status_, s);
+                log_live_fanout_message("error", release_error.what());
+            }
+        });
     log_live_fanout_message("info", "fanout thread stopped");
 }
 
 void LiveFrameFanout::publish_error(std::string error_message) {
-    store_error_message(&last_error_, std::move(error_message));
+    Status s = snapshot_status();
+    s.last_error = std::move(error_message);
+    worker_runtime::publish_status(&status_, s);
 }
 
 void LiveFrameFanout::drain_pending_source_releases(bool wait) {
@@ -357,21 +326,11 @@ void LiveFrameFanout::drain_pending_source_releases(bool wait) {
 }
 
 LiveFrameFanout::DetectSlot* LiveFrameFanout::reserve_detect_slot() {
-    return reserve_writable_slot(
-        detect_slots_,
-        latest_detect_index_,
-        [](DetectSlot&) {},
-        [](DetectSlot& slot) { return slot.ready_event.get(); },
-        "cudaEventQuery for live fanout slot reuse");
+    return reserve_live_frame_slot(detect_slots_, latest_detect_index_);
 }
 
 LiveFrameFanout::OutputSlot* LiveFrameFanout::reserve_output_slot() {
-    return reserve_writable_slot(
-        output_slots_,
-        latest_output_index_,
-        [](OutputSlot&) {},
-        [](OutputSlot& slot) { return slot.ready_event.get(); },
-        "cudaEventQuery for live fanout slot reuse");
+    return reserve_live_frame_slot(output_slots_, latest_output_index_);
 }
 
 std::size_t LiveFrameFanout::acquire_release_event_index() {
@@ -405,40 +364,6 @@ LiveCaptureRegion LiveFrameFanout::resolve_detect_region(const SourceFrameView& 
                                              crop_y1 + 1U,
                                              source_y2);
     return LiveCaptureRegion{crop_x1, crop_y1, crop_x2 - crop_x1, crop_y2 - crop_y1};
-}
-
-bool LiveFrameFanout::try_acquire_detect_slot(DetectSlot& slot, DetectBundle* out) {
-    return try_acquire_published_slot(slot, out, [](DetectSlot& published) {
-        return DetectBundle{
-            published.slot_index,
-            published.frame_id,
-            published.device_buffer.data(),
-            DetectDimensions{published.region.width, published.region.height, published.device_buffer.pitch_bytes()},
-            published.ready_event.get(),
-            published.stream.get(),
-            published.region,
-            published.capture_ns,
-            published.ready_ns,
-            published.short_frame,
-        };
-    });
-}
-
-bool LiveFrameFanout::try_acquire_output_slot(OutputSlot& slot, OutputBundle* out) {
-    return try_acquire_published_slot(slot, out, [](OutputSlot& published) {
-        return OutputBundle{
-            published.slot_index,
-            published.frame_id,
-            published.device_buffer.data(),
-            OutputDimensions{published.region.width, published.region.height, published.device_buffer.pitch_bytes()},
-            published.ready_event.get(),
-            published.stream.get(),
-            published.region,
-            published.capture_ns,
-            published.ready_ns,
-            published.short_frame,
-        };
-    });
 }
 
 } // namespace mmltk::live

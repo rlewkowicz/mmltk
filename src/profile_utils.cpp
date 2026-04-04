@@ -86,7 +86,7 @@ sorted_metric_items(const std::unordered_map<std::string, Metric>& metrics) {
             items.emplace_back(entry.first, entry.second);
         }
     }
-    std::sort(items.begin(), items.end(),
+    std::ranges::sort(items,
               [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
     return items;
 }
@@ -180,7 +180,7 @@ void write_aggregate_block(FILE* out,
     for (const auto& entry : aggregate_metrics) {
         items.emplace_back(entry.first, entry.second);
     }
-    std::sort(items.begin(), items.end(),
+    std::ranges::sort(items,
               [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
 
     std::fprintf(out,
@@ -348,7 +348,7 @@ public:
             for (const auto& entry : grouped_runs) {
                 group_labels.push_back(entry.first);
             }
-            std::sort(group_labels.begin(), group_labels.end());
+            std::ranges::sort(group_labels);
             for (const auto& label : group_labels) {
                 write_aggregate_block(out, label, grouped_runs.at(label), process_total_ns);
             }

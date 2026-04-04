@@ -8,8 +8,9 @@
 #include "mmltk/rfdetr/training_ops.h"
 #include "mmltk_logging.h"
 #include "profile_utils.h"
+#include "rfdetr/archive_utils.h"
 #include "rfdetr/checkpoint_internal.h"
-#include "rfdetr/cuda_utils.h"
+#include "rfdetr/torch_cuda_utils.h"
 #include "rfdetr/native_optimizer.h"
 #include "spdmon/spdmon.hpp"
 #include "rfdetr/runtime.h"
@@ -38,7 +39,7 @@
 #include <deque>
 #include <fstream>
 #include <future>
-#include <iomanip>
+#include <format>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -110,7 +111,7 @@ int checked_inference_batch_size(size_t batch_size) {
 }
 
 std::string phase_progress_label(const char* phase, int epoch, int total_epochs) {
-    return std::string(phase) + " " + std::to_string(epoch + 1) + "/" + std::to_string(total_epochs);
+    return std::format("{} {}/{}", phase, epoch + 1, total_epochs);
 }
 
 size_t eval_prediction_slot_count(const RuntimeSplit& split) {
@@ -328,20 +329,10 @@ std::string train_progress_postfix(double average_class_loss,
                                    double images_per_second,
                                    int64_t optimizer_steps,
                                    int64_t steps_per_epoch) {
-    std::ostringstream stream;
-    stream.setf(std::ios::fixed);
-    stream.precision(4);
-    stream << "cl=" << average_class_loss
-           << ", bl=" << average_box_loss
-           << ", l=" << average_loss
-           << ", scl=" << step_class_loss
-           << ", sbl=" << step_box_loss
-           << ", sl=" << step_loss;
-    stream.precision(2);
-    stream << ", img/s=" << images_per_second;
-    stream.precision(0);
-    stream << ", step=" << optimizer_steps << "/" << steps_per_epoch;
-    return stream.str();
+    return std::format("cl={:.4f}, bl={:.4f}, l={:.4f}, scl={:.4f}, sbl={:.4f}, sl={:.4f}, img/s={:.2f}, step={}/{}",
+                       average_class_loss, average_box_loss, average_loss,
+                       step_class_loss, step_box_loss, step_loss,
+                       images_per_second, optimizer_steps, steps_per_epoch);
 }
 
 torch::Tensor loss_value_or_zero(const TensorMap& loss_dict,
@@ -607,8 +598,7 @@ OptimizerBuildResult build_optimizer(NativeRfDetrModel& model, const TrainOption
         const double lr = parameter_lr(item.key(), options);
         const double weight_decay = parameter_weight_decay(item.key(), options);
         const bool use_muon = options.optimizer == TrainOptimizerKind::Muon && is_muon_hidden_weight(item.key(), param);
-        const std::string key = std::string(use_muon ? "muon:" : "aux:") +
-                                std::to_string(lr) + ":" + std::to_string(weight_decay);
+        const std::string key = std::format("{}{}:{}", use_muon ? "muon:" : "aux:", lr, weight_decay);
         auto found = group_index.find(key);
         if (found == group_index.end()) {
             found = group_index.emplace(key, groups.size()).first;
@@ -671,70 +661,6 @@ OptimizerBuildResult build_optimizer(NativeRfDetrModel& model, const TrainOption
         NativeOptimizer(NativeAdamW(std::move(optimizer_groups), std::move(optimizer_params), backend)),
         std::move(base_lrs),
     };
-}
-
-std::string archive_entry_name(size_t index) {
-    std::ostringstream stream;
-    stream << "entry_" << std::setw(6) << std::setfill('0') << index;
-    return stream.str();
-}
-
-void write_string(torch::serialize::OutputArchive& archive, const char* key, std::string_view value) {
-    archive.write(key, c10::IValue(std::string(value)));
-}
-
-void write_int(torch::serialize::OutputArchive& archive, const char* key, int64_t value) {
-    archive.write(key, c10::IValue(value));
-}
-
-void write_bool(torch::serialize::OutputArchive& archive, const char* key, bool value) {
-    archive.write(key, c10::IValue(value));
-}
-
-void write_double(torch::serialize::OutputArchive& archive, const char* key, double value) {
-    archive.write(key, c10::IValue(value));
-}
-
-std::optional<int64_t> read_optional_int(torch::serialize::InputArchive& archive, const char* key) {
-    c10::IValue value;
-    if (!archive.try_read(key, value)) {
-        return std::nullopt;
-    }
-    if (!value.isInt()) {
-        throw std::runtime_error(std::string("RF-DETR training checkpoint key is not an int: ") + key);
-    }
-    return value.toInt();
-}
-
-std::optional<double> read_optional_double(torch::serialize::InputArchive& archive, const char* key) {
-    c10::IValue value;
-    if (!archive.try_read(key, value)) {
-        return std::nullopt;
-    }
-    if (!value.isDouble() && !value.isInt()) {
-        throw std::runtime_error(std::string("RF-DETR training checkpoint key is not a number: ") + key);
-    }
-    return value.isDouble() ? value.toDouble() : static_cast<double>(value.toInt());
-}
-
-std::optional<std::string> read_optional_string(torch::serialize::InputArchive& archive, const char* key) {
-    c10::IValue value;
-    if (!archive.try_read(key, value)) {
-        return std::nullopt;
-    }
-    if (!value.isString()) {
-        throw std::runtime_error(std::string("RF-DETR training checkpoint key is not a string: ") + key);
-    }
-    return std::string(value.toStringRef());
-}
-
-int64_t require_int(torch::serialize::InputArchive& archive, const char* key) {
-    c10::IValue value;
-    archive.read(key, value);
-    if (!value.isInt()) {
-        throw std::runtime_error(std::string("RF-DETR training checkpoint key is not an int: ") + key);
-    }
-    return value.toInt();
 }
 
 std::vector<StateDictEntry> collect_module_state(
@@ -1481,7 +1407,7 @@ EvalPassResult evaluate_model(const TrainOptions& options,
         RenderSampleOptions render_options;
         render_options.num_classes = model.config().num_classes;
         render_options.output_path =
-            options.output_dir / "eval_samples" / ("epoch_" + std::to_string(*current_epoch + 1) + ".png");
+            options.output_dir / "eval_samples" / std::format("epoch_{}.png", *current_epoch + 1);
         draw_eval_sample_async_gpu(captured_sample->image,
                                    captured_sample->boxes,
                                    captured_sample->labels,
@@ -2251,7 +2177,7 @@ TrainRunResult run_training(const TrainOptions& options) {
                 NativeCheckpoint epoch_checkpoint;
                 epoch_checkpoint.metadata = metadata;
                 epoch_checkpoint.state_dict = collect_module_state(model);
-                auto epoch_path = options.output_dir / ("checkpoint_epoch_" + std::to_string(epoch + 1) + ".pt");
+                auto epoch_path = options.output_dir / std::format("checkpoint_epoch_{}.pt", epoch + 1);
                 save_native_checkpoint(epoch_path, epoch_checkpoint);
             }
 

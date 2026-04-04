@@ -45,6 +45,27 @@ std::optional<std::size_t> clamp_spline_segment_index(const AnnotationSplineShap
     };
 }
 
+/// Apply a document command, then re-read the SplineShape and call a
+/// user-supplied callback to refresh the edit state.  Returns \c true when
+/// the command changed the document.
+template <typename ApplyFn, typename RefreshFn>
+bool apply_and_refresh_spline_state(AnnotationDocument& document,
+                                    AnnotationSession& session,
+                                    const std::size_t selected_index,
+                                    ApplyFn&& apply_fn,
+                                    RefreshFn&& refresh_fn) {
+    const bool changed = std::forward<ApplyFn>(apply_fn)();
+    if (changed) {
+        const AnnotationSplineShape* updated_spline =
+            std::get_if<AnnotationSplineShape>(
+                &document.object(selected_index)->shape);
+        if (updated_spline != nullptr) {
+            std::forward<RefreshFn>(refresh_fn)(*updated_spline);
+        }
+    }
+    return changed;
+}
+
 [[nodiscard]] AnnotationSplineHandleMode next_spline_handle_mode(
     const AnnotationSplineHandleMode mode) noexcept {
     switch (mode) {
@@ -62,42 +83,30 @@ bool apply_selected_spline_close(AnnotationDocument& document,
                                  AnnotationSession& session,
                                  const std::size_t selected_index,
                                  const AnnotationSplineEditState& current_state) {
-    if (!document.apply(AnnotationCloseSplineCommand{selected_index})) {
-        return false;
-    }
-    const AnnotationSplineShape* updated_spline =
-        std::get_if<AnnotationSplineShape>(&document.object(selected_index)->shape);
-    if (updated_spline != nullptr) {
-        set_active_spline_edit_state(session,
-                                     selected_index,
-                                     *updated_spline,
-                                     current_state.active_knot_index,
-                                     current_state.active_segment_index,
-                                     false,
-                                     false);
-    }
-    return true;
+    return apply_and_refresh_spline_state(
+        document, session, selected_index,
+        [&] { return document.apply(AnnotationCloseSplineCommand{selected_index}); },
+        [&](const AnnotationSplineShape& updated) {
+            set_active_spline_edit_state(session, selected_index, updated,
+                                         current_state.active_knot_index,
+                                         current_state.active_segment_index,
+                                         false, false);
+        });
 }
 
 bool apply_selected_spline_reopen(AnnotationDocument& document,
                                   AnnotationSession& session,
                                   const std::size_t selected_index,
                                   const AnnotationSplineEditState& current_state) {
-    if (!document.apply(AnnotationReopenSplineCommand{selected_index})) {
-        return false;
-    }
-    const AnnotationSplineShape* updated_spline =
-        std::get_if<AnnotationSplineShape>(&document.object(selected_index)->shape);
-    if (updated_spline != nullptr) {
-        set_active_spline_edit_state(session,
-                                     selected_index,
-                                     *updated_spline,
-                                     current_state.active_knot_index,
-                                     current_state.active_segment_index,
-                                     false,
-                                     false);
-    }
-    return true;
+    return apply_and_refresh_spline_state(
+        document, session, selected_index,
+        [&] { return document.apply(AnnotationReopenSplineCommand{selected_index}); },
+        [&](const AnnotationSplineShape& updated) {
+            set_active_spline_edit_state(session, selected_index, updated,
+                                         current_state.active_knot_index,
+                                         current_state.active_segment_index,
+                                         false, false);
+        });
 }
 
 bool apply_selected_spline_delete_active_knot(AnnotationDocument& document,
@@ -107,23 +116,16 @@ bool apply_selected_spline_delete_active_knot(AnnotationDocument& document,
     if (!current_state.active_knot_index.has_value()) {
         return false;
     }
-
-    if (!document.apply(AnnotationRemoveSplineKnotCommand{
-            selected_index,
-            *current_state.active_knot_index,
-        })) {
-        return false;
-    }
-
-    const AnnotationSplineShape* updated_spline =
-        std::get_if<AnnotationSplineShape>(&document.object(selected_index)->shape);
-    if (updated_spline != nullptr) {
-        set_active_spline_edit_state(session,
-                                     selected_index,
-                                     *updated_spline,
-                                     current_state.active_knot_index);
-    }
-    return true;
+    return apply_and_refresh_spline_state(
+        document, session, selected_index,
+        [&] {
+            return document.apply(AnnotationRemoveSplineKnotCommand{
+                selected_index, *current_state.active_knot_index});
+        },
+        [&](const AnnotationSplineShape& updated) {
+            set_active_spline_edit_state(session, selected_index, updated,
+                                         current_state.active_knot_index);
+        });
 }
 
 bool apply_selected_spline_cycle_handle_mode(AnnotationDocument& document,
@@ -192,16 +194,14 @@ AnnotationToolMutation handle_spline_existing_object_click(
     const std::size_t selected_index,
     const AnnotationSplineEditState& current_state) {
     if (event.double_click || current_state.close_intent) {
-        const bool changed = context.document.apply(AnnotationCloseSplineCommand{selected_index});
-        if (changed) {
-            const AnnotationSplineShape* updated_spline =
-                std::get_if<AnnotationSplineShape>(&context.document.object(selected_index)->shape);
-            if (updated_spline != nullptr) {
-                set_active_spline_edit_state(context.session,
-                                             selected_index,
-                                             *updated_spline,
+        const bool changed = apply_and_refresh_spline_state(
+            context.document, context.session, selected_index,
+            [&] { return context.document.apply(AnnotationCloseSplineCommand{selected_index}); },
+            [&](const AnnotationSplineShape& updated) {
+                set_active_spline_edit_state(context.session, selected_index, updated,
                                              current_state.active_knot_index);
-            }
+            });
+        if (changed) {
             (void)commit_grouped_tool_edit(context, AnnotationToolKind::Spline);
         }
         return make_spline_tool_mutation(changed);
@@ -214,21 +214,18 @@ AnnotationToolMutation handle_spline_existing_object_click(
                                      selected_index)) {
             return {};
         }
-        const bool changed = context.document.apply(AnnotationInsertSplineKnotCommand{
-            selected_index,
-            *current_state.active_segment_index,
-            static_cast<float>(event.capture_x),
-        });
-        if (changed) {
-            const AnnotationSplineShape* updated_spline =
-                std::get_if<AnnotationSplineShape>(&context.document.object(selected_index)->shape);
-            if (updated_spline != nullptr) {
-                set_active_spline_edit_state(context.session,
-                                             selected_index,
-                                             *updated_spline,
+        const bool changed = apply_and_refresh_spline_state(
+            context.document, context.session, selected_index,
+            [&] {
+                return context.document.apply(AnnotationInsertSplineKnotCommand{
+                    selected_index, *current_state.active_segment_index,
+                    static_cast<float>(event.capture_x)});
+            },
+            [&](const AnnotationSplineShape& updated) {
+                set_active_spline_edit_state(context.session, selected_index, updated,
                                              *current_state.active_segment_index + 1U);
-            }
-        } else {
+            });
+        if (!changed) {
             (void)cancel_grouped_tool_edit(context, AnnotationToolKind::Spline);
         }
         return make_spline_tool_mutation(changed);
@@ -240,20 +237,17 @@ AnnotationToolMutation handle_spline_existing_object_click(
                                  selected_index)) {
         return {};
     }
-    const bool changed = context.document.apply(AnnotationAppendSplineKnotCommand{
-        selected_index,
-        static_cast<float>(event.capture_x),
-    });
-    if (changed) {
-        const AnnotationSplineShape* updated_spline =
-            std::get_if<AnnotationSplineShape>(&context.document.object(selected_index)->shape);
-        if (updated_spline != nullptr) {
-            set_active_spline_edit_state(context.session,
-                                         selected_index,
-                                         *updated_spline,
-                                         updated_spline->knots.size() - 1U);
-        }
-    } else {
+    const bool changed = apply_and_refresh_spline_state(
+        context.document, context.session, selected_index,
+        [&] {
+            return context.document.apply(AnnotationAppendSplineKnotCommand{
+                selected_index, static_cast<float>(event.capture_x)});
+        },
+        [&](const AnnotationSplineShape& updated) {
+            set_active_spline_edit_state(context.session, selected_index, updated,
+                                         updated.knots.size() - 1U);
+        });
+    if (!changed) {
         (void)cancel_grouped_tool_edit(context, AnnotationToolKind::Spline);
     }
     return make_spline_tool_mutation(changed);
@@ -529,31 +523,20 @@ bool insert_selected_spline_knot_at_active_segment(AnnotationDocument& document,
                                               return false;
                                           }
 
-                                          const bool changed =
-                                              document.apply(AnnotationInsertSplineKnotCommand{
-                                                  selected_object_index,
-                                                  *current_state.active_segment_index,
-                                                  *insert_point,
+                                          return apply_and_refresh_spline_state(
+                                              document, session, selected_object_index,
+                                              [&] {
+                                                  return document.apply(
+                                                      AnnotationInsertSplineKnotCommand{
+                                                          selected_object_index,
+                                                          *current_state.active_segment_index,
+                                                          *insert_point});
+                                              },
+                                              [&](const AnnotationSplineShape& updated) {
+                                                  set_active_spline_edit_state(
+                                                      session, selected_object_index, updated,
+                                                      *current_state.active_segment_index + 1U);
                                               });
-                                          if (!changed) {
-                                              return false;
-                                          }
-
-                                          const AnnotationObject* updated_object =
-                                              document.object(selected_object_index);
-                                          const AnnotationSplineShape* updated_spline =
-                                              updated_object != nullptr
-                                                  ? std::get_if<AnnotationSplineShape>(
-                                                        &updated_object->shape)
-                                                  : nullptr;
-                                          if (updated_spline != nullptr) {
-                                              set_active_spline_edit_state(
-                                                  session,
-                                                  selected_object_index,
-                                                  *updated_spline,
-                                                  *current_state.active_segment_index + 1U);
-                                          }
-                                          return true;
                                       });
 }
 

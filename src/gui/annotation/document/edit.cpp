@@ -547,10 +547,12 @@ std::uint32_t rect_sum(const std::vector<std::uint32_t>& integral,
     return integral[bottom_right] - integral[top_right] - integral[bottom_left] + integral[top_left];
 }
 
-std::vector<std::uint8_t> dilate_mask_square(const std::vector<std::uint8_t>& mask,
-                                             const std::uint32_t width,
-                                             const std::uint32_t height,
-                                             const int radius) {
+template <typename ThresholdFn>
+std::vector<std::uint8_t> morphological_filter(const std::vector<std::uint8_t>& mask,
+                                               const std::uint32_t width,
+                                               const std::uint32_t height,
+                                               const int radius,
+                                               ThresholdFn threshold_fn) {
     if (width == 0U || height == 0U || mask.empty() || radius <= 0) {
         return mask;
     }
@@ -563,38 +565,61 @@ std::vector<std::uint8_t> dilate_mask_square(const std::vector<std::uint8_t>& ma
         for (int x = 0; x < static_cast<int>(width); ++x) {
             const int x1 = std::max(0, x - radius);
             const int x2 = std::min(static_cast<int>(width), x + radius + 1);
+            const std::uint32_t covered = rect_sum(integral, stride, x1, y1, x2, y2);
+            const auto area = static_cast<std::uint32_t>((x2 - x1) * (y2 - y1));
             output[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)] =
-                rect_sum(integral, stride, x1, y1, x2, y2) > 0U ? 1U : 0U;
+                threshold_fn(covered, area) ? 1U : 0U;
         }
     }
     return output;
+}
+
+std::vector<std::uint8_t> dilate_mask_square(const std::vector<std::uint8_t>& mask,
+                                             const std::uint32_t width,
+                                             const std::uint32_t height,
+                                             const int radius) {
+    return morphological_filter(mask, width, height, radius,
+        [](std::uint32_t covered, std::uint32_t /*area*/) { return covered > 0U; });
 }
 
 std::vector<std::uint8_t> erode_mask_square(const std::vector<std::uint8_t>& mask,
                                             const std::uint32_t width,
                                             const std::uint32_t height,
                                             const int radius) {
-    if (width == 0U || height == 0U || mask.empty() || radius <= 0) {
-        return mask;
+    return morphological_filter(mask, width, height, radius,
+        [](std::uint32_t covered, std::uint32_t area) { return covered == area; });
+}
+
+AnnotationSkeletonNode* get_skeleton_node(AnnotationObject* object, const std::size_t node_index) {
+    if (object == nullptr) {
+        return nullptr;
     }
-    const std::vector<std::uint32_t> integral = build_integral_mask(mask, width, height);
-    const std::uint32_t stride = width + 1U;
-    std::vector<std::uint8_t> output(mask.size(), 0U);
-    for (int y = 0; y < static_cast<int>(height); ++y) {
-        const int y1 = std::max(0, y - radius);
-        const int y2 = std::min(static_cast<int>(height), y + radius + 1);
-        for (int x = 0; x < static_cast<int>(width); ++x) {
-            const int x1 = std::max(0, x - radius);
-            const int x2 = std::min(static_cast<int>(width), x + radius + 1);
-            const std::uint32_t covered =
-                rect_sum(integral, stride, x1, y1, x2, y2);
-            const auto area =
-                static_cast<std::uint32_t>((x2 - x1) * (y2 - y1));
-            output[static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)] =
-                covered == area ? 1U : 0U;
-        }
+    auto* skeleton = std::get_if<AnnotationSkeletonShape>(&object->shape);
+    if (skeleton == nullptr || node_index >= skeleton->nodes.size()) {
+        return nullptr;
     }
-    return output;
+    return &skeleton->nodes[node_index];
+}
+
+AnnotationSplineKnot* get_spline_knot(AnnotationObject* object, const std::size_t knot_index) {
+    if (object == nullptr) {
+        return nullptr;
+    }
+    auto* spline = std::get_if<AnnotationSplineShape>(&object->shape);
+    if (spline == nullptr || knot_index >= spline->knots.size()) {
+        return nullptr;
+    }
+    return &spline->knots[knot_index];
+}
+
+std::optional<EditableMaskState> prepare_mask_edit(const AnnotationObject* object,
+                                                   const std::uint32_t capture_width,
+                                                   const std::uint32_t capture_height) {
+    if (object == nullptr || !annotation_object_supports_mask_editing(*object) ||
+        capture_width == 0U || capture_height == 0U) {
+        return std::nullopt;
+    }
+    return editable_mask_state_from_object(*object, capture_width, capture_height);
 }
 
 } // namespace
@@ -956,15 +981,12 @@ bool reopen_spline_shape(AnnotationObject* object) {
 }
 
 bool cycle_spline_knot_handle_mode(AnnotationObject* object, const std::size_t knot_index) {
-    if (object == nullptr) {
-        return false;
-    }
-    auto* spline = std::get_if<AnnotationSplineShape>(&object->shape);
-    if (spline == nullptr || knot_index >= spline->knots.size()) {
+    AnnotationSplineKnot* knot = get_spline_knot(object, knot_index);
+    if (knot == nullptr) {
         return false;
     }
     AnnotationSplineHandleMode next_mode = AnnotationSplineHandleMode::Corner;
-    switch (spline->knots[knot_index].handle_mode) {
+    switch (knot->handle_mode) {
     case AnnotationSplineHandleMode::Corner:
         next_mode = AnnotationSplineHandleMode::Smooth;
         break;
@@ -981,14 +1003,11 @@ bool cycle_spline_knot_handle_mode(AnnotationObject* object, const std::size_t k
 bool set_spline_knot_handle_mode(AnnotationObject* object,
                                  const std::size_t knot_index,
                                  const AnnotationSplineHandleMode mode) {
-    if (object == nullptr) {
+    AnnotationSplineKnot* knot_ptr = get_spline_knot(object, knot_index);
+    if (knot_ptr == nullptr) {
         return false;
     }
-    auto* spline = std::get_if<AnnotationSplineShape>(&object->shape);
-    if (spline == nullptr || knot_index >= spline->knots.size()) {
-        return false;
-    }
-    AnnotationSplineKnot& knot = spline->knots[knot_index];
+    AnnotationSplineKnot& knot = *knot_ptr;
     if (knot.handle_mode == mode) {
         return false;
     }
@@ -1027,8 +1046,7 @@ bool place_skeleton_node(AnnotationObject* object, const AnnotationPoint& point)
     }
     const bool generated_chain =
         skeleton->nodes.empty() ||
-        std::all_of(skeleton->nodes.begin(),
-                    skeleton->nodes.end(),
+        std::ranges::all_of(skeleton->nodes,
                     [] (const AnnotationSkeletonNode& node) {
                         return node.key.compare(0, 6, "joint-") == 0;
                     });
@@ -1073,54 +1091,42 @@ bool place_skeleton_node(AnnotationObject* object, const AnnotationPoint& point)
 bool place_skeleton_node_at(AnnotationObject* object,
                             const std::size_t node_index,
                             const AnnotationPoint& point) {
-    if (object == nullptr) {
+    AnnotationSkeletonNode* node = get_skeleton_node(object, node_index);
+    if (node == nullptr) {
         return false;
     }
-    auto* skeleton = std::get_if<AnnotationSkeletonShape>(&object->shape);
-    if (skeleton == nullptr || node_index >= skeleton->nodes.size()) {
+    if (node->visible && points_equal(node->point, point)) {
         return false;
     }
-    AnnotationSkeletonNode& node = skeleton->nodes[node_index];
-    if (node.visible && points_equal(node.point, point)) {
-        return false;
-    }
-    node.point = point;
-    node.visible = true;
+    node->point = point;
+    node->visible = true;
     return true;
 }
 
 bool set_skeleton_node_visibility(AnnotationObject* object,
                                   const std::size_t node_index,
                                   const bool visible) {
-    if (object == nullptr) {
+    AnnotationSkeletonNode* node = get_skeleton_node(object, node_index);
+    if (node == nullptr) {
         return false;
     }
-    auto* skeleton = std::get_if<AnnotationSkeletonShape>(&object->shape);
-    if (skeleton == nullptr || node_index >= skeleton->nodes.size()) {
+    if (node->visible == visible) {
         return false;
     }
-    AnnotationSkeletonNode& node = skeleton->nodes[node_index];
-    if (node.visible == visible) {
-        return false;
-    }
-    node.visible = visible;
+    node->visible = visible;
     return true;
 }
 
 bool reset_skeleton_node(AnnotationObject* object, const std::size_t node_index) {
-    if (object == nullptr) {
+    AnnotationSkeletonNode* node = get_skeleton_node(object, node_index);
+    if (node == nullptr) {
         return false;
     }
-    auto* skeleton = std::get_if<AnnotationSkeletonShape>(&object->shape);
-    if (skeleton == nullptr || node_index >= skeleton->nodes.size()) {
+    if (!node->visible && points_equal(node->point, AnnotationPoint{})) {
         return false;
     }
-    AnnotationSkeletonNode& node = skeleton->nodes[node_index];
-    if (!node.visible && points_equal(node.point, AnnotationPoint{})) {
-        return false;
-    }
-    node.point = {};
-    node.visible = false;
+    node->point = {};
+    node->visible = false;
     return true;
 }
 
@@ -1152,8 +1158,7 @@ std::optional<std::size_t> next_skeleton_node_index(const AnnotationSkeletonShap
 }
 
 std::size_t visible_skeleton_node_count(const AnnotationSkeletonShape& shape) {
-    return static_cast<std::size_t>(std::count_if(shape.nodes.begin(),
-                                                  shape.nodes.end(),
+    return static_cast<std::size_t>(std::ranges::count_if(shape.nodes,
                                                   [] (const AnnotationSkeletonNode& node) {
                                                       return node.visible;
                                                   }));
@@ -1182,9 +1187,6 @@ bool paint_annotation_object_mask(AnnotationObject* object,
                                   const bool erase,
                                   const std::uint32_t capture_width,
                                   const std::uint32_t capture_height) {
-    if (object == nullptr || !annotation_object_supports_mask_editing(*object) || capture_width == 0U || capture_height == 0U) {
-        return false;
-    }
     radius = std::max(radius, 1);
     const AnnotationBox stamp_box = normalize_annotation_box(
         AnnotationBox{capture_x - radius, capture_y - radius, capture_x + radius + 1, capture_y + radius + 1},
@@ -1194,7 +1196,7 @@ bool paint_annotation_object_mask(AnnotationObject* object,
         return false;
     }
 
-    std::optional<EditableMaskState> state = editable_mask_state_from_object(*object, capture_width, capture_height);
+    std::optional<EditableMaskState> state = prepare_mask_edit(object, capture_width, capture_height);
     if (!state.has_value()) {
         if (erase) {
             return false;
@@ -1217,10 +1219,7 @@ bool fill_annotation_object_mask(AnnotationObject* object,
                                  const int capture_y,
                                  const std::uint32_t capture_width,
                                  const std::uint32_t capture_height) {
-    if (object == nullptr || !annotation_object_supports_mask_editing(*object) || capture_width == 0U || capture_height == 0U) {
-        return false;
-    }
-    std::optional<EditableMaskState> state = editable_mask_state_from_object(*object, capture_width, capture_height);
+    std::optional<EditableMaskState> state = prepare_mask_edit(object, capture_width, capture_height);
     if (!state.has_value() || !mask_region_valid(state->region) || state->mask.empty()) {
         return false;
     }
@@ -1247,10 +1246,7 @@ bool cleanup_annotation_object_mask(AnnotationObject* object,
                                     int radius,
                                     const std::uint32_t capture_width,
                                     const std::uint32_t capture_height) {
-    if (object == nullptr || !annotation_object_supports_mask_editing(*object) || capture_width == 0U || capture_height == 0U) {
-        return false;
-    }
-    std::optional<EditableMaskState> state = editable_mask_state_from_object(*object, capture_width, capture_height);
+    std::optional<EditableMaskState> state = prepare_mask_edit(object, capture_width, capture_height);
     if (!state.has_value() || !mask_region_valid(state->region) || state->mask.empty()) {
         return false;
     }

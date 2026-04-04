@@ -4,8 +4,7 @@
 #include "mmltk/rfdetr/draw_cuda.h"
 #include "mmltk/rfdetr/model.h"
 
-#include "rfdetr/cuda_utils.h"
-#include "rfdetr/live_preprocess.h"
+#include "rfdetr/torch_cuda_utils.h"
 #include "rfdetr/postprocess.h"
 #include "rfdetr/predict_runtime_internal.h"
 #include "rfdetr/validate_internal.h"
@@ -45,6 +44,48 @@ std::uint64_t now_ns() {
 
 inline std::int64_t live_query_count(const ResolvedModelArtifacts& artifacts) {
     return artifacts.config.num_select > 0 ? artifacts.config.num_select : artifacts.config.num_queries;
+}
+
+struct LiveWeightsRunnerSetup {
+    std::shared_ptr<NativeRfDetrModel> model;
+    LiveRunnerState state;
+    torch::Tensor nested_mask;
+};
+
+LiveWeightsRunnerSetup make_live_weights_runner_setup(const ResolvedModelArtifacts& artifacts,
+                                                      const LivePredictOptions& options) {
+    auto model = predict_internal::load_native_model(artifacts, options.device_id);
+    auto state = make_live_runner_state(artifacts,
+                                        options.device_id,
+                                        get_high_priority_cuda_stream(options.device_id),
+                                        "cudaEventCreateWithFlags for live weights ready event");
+    const auto resolution = static_cast<std::int64_t>(artifacts.config.resolution);
+    model->optimize_for_inference(1, false, options.compilation_mode);
+    c10::cuda::CUDAGuard device_guard(checked_device_index(options.device_id));
+    c10::cuda::CUDAStreamGuard stream_guard(state.stream);
+    auto nested_mask = torch::zeros({1, resolution, resolution},
+                                    torch::TensorOptions().dtype(torch::kBool).device(torch::kCUDA, options.device_id));
+    return LiveWeightsRunnerSetup{std::move(model), std::move(state), std::move(nested_mask)};
+}
+
+struct LiveBackendRunnerSetup {
+    std::unique_ptr<InferenceBackend> backend;
+    LiveRunnerState state;
+    std::int64_t num_queries = 300;
+    std::size_t category_count = 0;
+};
+
+LiveBackendRunnerSetup make_live_backend_runner_setup(const ResolvedModelArtifacts& artifacts,
+                                                      const LivePredictOptions& options,
+                                                      const std::string& backend_name) {
+    auto backend = predict_internal::make_backend(artifacts, backend_name, options.device_id, options.allow_fp16);
+    const predict_internal::BackendExecutionSpec spec =
+        describe_backend_execution(*backend, artifacts, options.device_id);
+    auto state = make_live_runner_state(artifacts,
+                                        options.device_id,
+                                        spec.stream,
+                                        "cudaEventCreateWithFlags for live backend ready event");
+    return LiveBackendRunnerSetup{std::move(backend), std::move(state), spec.num_queries, spec.category_count};
 }
 
 template <typename RunModelFn>
@@ -95,22 +136,21 @@ public:
 class LiveWeightsRunner final : public LiveModelRunner {
 public:
     LiveWeightsRunner(const ResolvedModelArtifacts& artifacts, const LivePredictOptions& options)
-        : artifacts_(artifacts),
-          model_(predict_internal::load_native_model(artifacts, options.device_id)),
-          state_(make_live_runner_state(artifacts_,
-                                        options.device_id,
-                                        get_high_priority_cuda_stream(options.device_id),
-                                        "cudaEventCreateWithFlags for live weights ready event")),
+        : LiveWeightsRunner(artifacts, options, make_live_weights_runner_setup(artifacts, options)) {}
+
+private:
+    LiveWeightsRunner(ResolvedModelArtifacts artifacts,
+                      const LivePredictOptions& options,
+                      LiveWeightsRunnerSetup setup)
+        : artifacts_(std::move(artifacts)),
+          model_(std::move(setup.model)),
+          state_(std::move(setup.state)),
           device_id_(options.device_id),
+          nested_mask_(std::move(setup.nested_mask)),
           include_masks_(options.include_masks),
-          include_status_detections_(options.include_status_detections) {
-        const auto resolution = static_cast<std::int64_t>(artifacts_.config.resolution);
-        model_->optimize_for_inference(1, false, options.compilation_mode);
-        c10::cuda::CUDAGuard device_guard(checked_device_index(device_id_));
-        c10::cuda::CUDAStreamGuard stream_guard(state_.stream);
-        nested_mask_ = torch::zeros({1, resolution, resolution},
-                                    torch::TensorOptions().dtype(torch::kBool).device(torch::kCUDA, device_id_));
-    }
+          include_status_detections_(options.include_status_detections) {}
+
+public:
 
     ~LiveWeightsRunner() override {
         destroy_cuda_event(state_.ready_event);
@@ -157,18 +197,22 @@ public:
     LiveBackendRunner(const ResolvedModelArtifacts& artifacts,
                       const LivePredictOptions& options,
                       const std::string& backend_name)
-        : artifacts_(artifacts),
-          backend_(predict_internal::make_backend(artifacts, backend_name, options.device_id, options.allow_fp16)),
-          state_(make_live_runner_state(
-              artifacts,
-              options.device_id,
-              describe_backend_execution(*backend_, artifacts, options.device_id).stream,
-              "cudaEventCreateWithFlags for live backend ready event")),
+        : LiveBackendRunner(artifacts, options, make_live_backend_runner_setup(artifacts, options, backend_name)) {}
+
+private:
+    LiveBackendRunner(ResolvedModelArtifacts artifacts,
+                      const LivePredictOptions& options,
+                      LiveBackendRunnerSetup setup)
+        : artifacts_(std::move(artifacts)),
+          backend_(std::move(setup.backend)),
+          state_(std::move(setup.state)),
           device_id_(options.device_id),
-          num_queries_(describe_backend_execution(*backend_, artifacts, options.device_id).num_queries),
-          category_count_(describe_backend_execution(*backend_, artifacts, options.device_id).category_count),
+          num_queries_(setup.num_queries),
+          category_count_(setup.category_count),
           include_masks_(options.include_masks),
           include_status_detections_(options.include_status_detections) {}
+
+public:
 
     ~LiveBackendRunner() override {
         destroy_cuda_event(state_.ready_event);

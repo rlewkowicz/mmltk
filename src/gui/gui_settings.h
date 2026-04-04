@@ -15,7 +15,9 @@
 
 namespace mmltk::gui {
 
-inline constexpr std::uint32_t kGuiSettingsSchemaVersion = 2U;
+inline constexpr std::uint32_t kGuiSettingsSchemaVersion = 3U;
+
+[[nodiscard]] nlohmann::json normalize_gui_settings_document(const nlohmann::json& j);
 
 void to_json(nlohmann::json& j, const SourceSelectionState& s);
 void from_json(const nlohmann::json& j, SourceSelectionState& s);

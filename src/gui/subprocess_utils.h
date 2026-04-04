@@ -135,6 +135,20 @@ inline bool set_nonblocking(const int fd) noexcept {
     return ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
 }
 
+inline int wait_child_process(pid_t pid) {
+    int status = 0;
+    while (true) {
+        const pid_t waited = ::waitpid(pid, &status, 0);
+        if (waited < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        return status;
+    }
+}
+
 inline void close_captured_child_process(CapturedChildProcess& process) noexcept {
     if (process.stdout_fd >= 0) {
         ::close(process.stdout_fd);

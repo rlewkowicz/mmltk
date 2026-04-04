@@ -255,7 +255,7 @@ std::vector<VastOfferSummary> rank_vast_offers(const std::vector<VastRawOffer>& 
         if (!family.has_value()) {
             continue;
         }
-        if (std::find(selected_families.begin(), selected_families.end(), *family) == selected_families.end()) {
+        if (std::ranges::find(selected_families, *family) == selected_families.end()) {
             continue;
         }
         VastOfferSummary summary;
@@ -264,7 +264,7 @@ std::vector<VastOfferSummary> rank_vast_offers(const std::vector<VastRawOffer>& 
         filtered.push_back(std::move(summary));
     }
 
-    std::sort(filtered.begin(), filtered.end(), [](const VastOfferSummary& lhs, const VastOfferSummary& rhs) {
+    std::ranges::sort(filtered, [](const VastOfferSummary& lhs, const VastOfferSummary& rhs) {
         if (lhs.dlperf_usd != rhs.dlperf_usd) {
             return lhs.dlperf_usd > rhs.dlperf_usd;
         }

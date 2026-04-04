@@ -2,7 +2,7 @@
 
 #include "mmltk/rfdetr/draw_cuda.h"
 #include "mmltk/rfdetr/predict.h"
-#include "rfdetr/cuda_utils.h"
+#include "rfdetr/torch_cuda_utils.h"
 
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>

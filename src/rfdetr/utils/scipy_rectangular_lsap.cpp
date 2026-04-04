@@ -49,7 +49,7 @@ template <typename T>
 std::vector<intptr_t> argsort_iter(const std::vector<T>& values) {
     std::vector<intptr_t> index(values.size());
     std::iota(index.begin(), index.end(), 0);
-    std::sort(index.begin(), index.end(), [&values](intptr_t lhs, intptr_t rhs) {
+    std::ranges::sort(index, [&values](intptr_t lhs, intptr_t rhs) {
         return values[static_cast<size_t>(lhs)] < values[static_cast<size_t>(rhs)];
     });
     return index;
@@ -142,7 +142,7 @@ RectangularLsApStatus solve_impl(intptr_t num_rows,
             }
             std::swap(num_rows, num_cols);
         } else {
-            std::copy(input_cost, input_cost + num_rows * num_cols, temp.begin());
+            std::ranges::copy_n(input_cost, num_rows * num_cols, temp.begin());
         }
         if (maximize) {
             for (double& value : temp) {
