@@ -8,10 +8,8 @@
 
 namespace mmltk::rfdetr {
 
-
-
 inline bool has_extension(const std::filesystem::path& path, const char* extension) {
     return strings::to_lower(path.extension().string()) == extension;
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

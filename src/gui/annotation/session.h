@@ -50,9 +50,7 @@ struct AnnotationHandleId {
 };
 
 inline bool operator==(const AnnotationHandleId& lhs, const AnnotationHandleId& rhs) {
-    return lhs.object_index == rhs.object_index &&
-           lhs.element_index == rhs.element_index &&
-           lhs.role == rhs.role;
+    return lhs.object_index == rhs.object_index && lhs.element_index == rhs.element_index && lhs.role == rhs.role;
 }
 
 struct AnnotationHandleDragState {
@@ -96,25 +94,61 @@ struct AnnotationGroupedEditTransactionState {
 };
 
 class AnnotationSession {
-public:
-    [[nodiscard]] std::uint64_t revision() const noexcept { return revision_; }
-    [[nodiscard]] std::uint64_t overlay_revision() const noexcept { return overlay_revision_; }
-    [[nodiscard]] AnnotationToolKind active_tool() const noexcept { return active_tool_; }
-    [[nodiscard]] const std::optional<std::size_t>& selected_object_index() const noexcept { return selected_object_index_; }
-    [[nodiscard]] const std::optional<AnnotationHandleId>& hovered_handle() const noexcept { return hovered_handle_; }
-    [[nodiscard]] bool pointer_captured() const noexcept { return pointer_captured_; }
-    [[nodiscard]] const AnnotationBrushPreview& brush_preview() const noexcept { return brush_preview_; }
-    [[nodiscard]] const PreviewRectDragSession& create_drag_session() const noexcept { return create_drag_session_; }
-    [[nodiscard]] PreviewRectDragSession& create_drag_session() noexcept { return create_drag_session_; }
-    [[nodiscard]] const PreviewRectDragSession& crop_drag_session() const noexcept { return crop_drag_session_; }
-    [[nodiscard]] PreviewRectDragSession& crop_drag_session() noexcept { return crop_drag_session_; }
-    [[nodiscard]] const PreviewRectDragSession& direct_drag_session() const noexcept { return direct_drag_session_; }
-    [[nodiscard]] PreviewRectDragSession& direct_drag_session() noexcept { return direct_drag_session_; }
-    [[nodiscard]] const std::optional<std::size_t>& direct_drag_index() const noexcept { return direct_drag_index_; }
-    [[nodiscard]] const std::optional<AnnotationHandleDragState>& handle_drag() const noexcept { return handle_drag_; }
-    [[nodiscard]] const AnnotationPaintStroke& paint_stroke() const noexcept { return paint_stroke_; }
-    [[nodiscard]] const AnnotationSplineEditState& spline_edit_state() const noexcept { return spline_edit_state_; }
-    [[nodiscard]] const AnnotationSkeletonEditState& skeleton_edit_state() const noexcept { return skeleton_edit_state_; }
+   public:
+    [[nodiscard]] std::uint64_t revision() const noexcept {
+        return revision_;
+    }
+    [[nodiscard]] std::uint64_t overlay_revision() const noexcept {
+        return overlay_revision_;
+    }
+    [[nodiscard]] AnnotationToolKind active_tool() const noexcept {
+        return active_tool_;
+    }
+    [[nodiscard]] const std::optional<std::size_t>& selected_object_index() const noexcept {
+        return selected_object_index_;
+    }
+    [[nodiscard]] const std::optional<AnnotationHandleId>& hovered_handle() const noexcept {
+        return hovered_handle_;
+    }
+    [[nodiscard]] bool pointer_captured() const noexcept {
+        return pointer_captured_;
+    }
+    [[nodiscard]] const AnnotationBrushPreview& brush_preview() const noexcept {
+        return brush_preview_;
+    }
+    [[nodiscard]] const PreviewRectDragSession& create_drag_session() const noexcept {
+        return create_drag_session_;
+    }
+    [[nodiscard]] PreviewRectDragSession& create_drag_session() noexcept {
+        return create_drag_session_;
+    }
+    [[nodiscard]] const PreviewRectDragSession& crop_drag_session() const noexcept {
+        return crop_drag_session_;
+    }
+    [[nodiscard]] PreviewRectDragSession& crop_drag_session() noexcept {
+        return crop_drag_session_;
+    }
+    [[nodiscard]] const PreviewRectDragSession& direct_drag_session() const noexcept {
+        return direct_drag_session_;
+    }
+    [[nodiscard]] PreviewRectDragSession& direct_drag_session() noexcept {
+        return direct_drag_session_;
+    }
+    [[nodiscard]] const std::optional<std::size_t>& direct_drag_index() const noexcept {
+        return direct_drag_index_;
+    }
+    [[nodiscard]] const std::optional<AnnotationHandleDragState>& handle_drag() const noexcept {
+        return handle_drag_;
+    }
+    [[nodiscard]] const AnnotationPaintStroke& paint_stroke() const noexcept {
+        return paint_stroke_;
+    }
+    [[nodiscard]] const AnnotationSplineEditState& spline_edit_state() const noexcept {
+        return spline_edit_state_;
+    }
+    [[nodiscard]] const AnnotationSkeletonEditState& skeleton_edit_state() const noexcept {
+        return skeleton_edit_state_;
+    }
     [[nodiscard]] const AnnotationGroupedEditTransactionState& grouped_edit_transaction() const noexcept {
         return grouped_edit_transaction_;
     }
@@ -139,7 +173,11 @@ public:
     void clear_interaction_state();
     void clear_transient_state();
 
-private:
+   private:
+    [[nodiscard]] bool has_active_interaction_state() const;
+    [[nodiscard]] bool has_active_transient_state() const;
+    void reset_interaction_members();
+    void reset_transient_members();
     void mark_dirty();
     void mark_overlay_dirty();
 
@@ -161,4 +199,4 @@ private:
     AnnotationGroupedEditTransactionState grouped_edit_transaction_{};
 };
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

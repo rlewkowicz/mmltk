@@ -8,4 +8,4 @@ namespace mmltk::gui {
 
 std::unique_ptr<AnnotationTool> make_spline_annotation_tool();
 
-} // namespace mmltk::gui
+}

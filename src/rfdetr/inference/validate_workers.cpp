@@ -33,7 +33,7 @@ using namespace validate_detail;
 namespace {
 
 class CudaEvent final {
-public:
+   public:
     CudaEvent() {
         ensure_cuda_ok(cudaEventCreateWithFlags(&event_, cudaEventDisableTiming),
                        "cudaEventCreateWithFlags for validation dispatch");
@@ -45,24 +45,22 @@ public:
         }
     }
 
-    [[nodiscard]] cudaEvent_t get() const { return event_; }
+    [[nodiscard]] cudaEvent_t get() const {
+        return event_;
+    }
 
-private:
+   private:
     cudaEvent_t event_ = nullptr;
 };
 
-} // namespace
+}  // namespace
 
-ValidationBackendResult run_backend_eval_parallel_impl(const ValidationOptions& options,
-                                                       const CocoDataset& dataset,
-                                                       const InferenceBackend& backend,
-                                                       const torch::Tensor& mean,
+ValidationBackendResult run_backend_eval_parallel_impl(const ValidationOptions& options, const CocoDataset& dataset,
+                                                       const InferenceBackend& backend, const torch::Tensor& mean,
                                                        const torch::Tensor& std) {
     const ModelInfo& model_info = backend.info();
-    const RuntimeContext runtime(resolve_runtime_config(
-        options.workers,
-        static_cast<int>(options.batch_size),
-        options.cpu_affinity));
+    const RuntimeContext runtime(
+        resolve_runtime_config(options.workers, static_cast<int>(options.batch_size), options.cpu_affinity));
     DatasetLoader loader(make_loader_config(options, runtime));
     CocoDataset dataset_copy = dataset;
 
@@ -74,19 +72,13 @@ ValidationBackendResult run_backend_eval_parallel_impl(const ValidationOptions& 
     const auto started = std::chrono::steady_clock::now();
     torch::NoGradGuard no_grad;
     c10::cuda::CUDAGuard device_guard(checked_device_index(options.device_id));
-    const auto preprocess_stream =
-        get_high_priority_cuda_stream(options.device_id);
+    const auto preprocess_stream = get_high_priority_cuda_stream(options.device_id);
 
     const size_t slot_count = predict_internal::prediction_lane_slot_count(runtime.split());
     auto lanes = predict_internal::make_backend_inference_lanes(
-        backend.make_lanes(runtime.split().lane_threads),
-        options.device_id,
-        slot_count,
-        dataset_copy.num_categories());
+        backend.make_lanes(runtime.split().lane_threads), options.device_id, slot_count, dataset_copy.num_categories());
 
-    WorkerPool lane_pool(static_cast<size_t>(lanes.size()),
-                         runtime.lane_cpus(),
-                         "rfdlane");
+    WorkerPool lane_pool(static_cast<size_t>(lanes.size()), runtime.lane_cpus(), "rfdlane");
     WorkerPool& cpu_pool = runtime.cpu_pool();
 
     auto drain_lane = [&](std::deque<std::future<StagedPredictionBatch>>& lane_futures,
@@ -95,9 +87,8 @@ ValidationBackendResult run_backend_eval_parallel_impl(const ValidationOptions& 
         MMLTK_PROFILE_SCOPE("rfdetr.native.eval.drain_lane");
         StagedPredictionBatch staged = lane_futures.front().get();
         lane_futures.pop_front();
-        cpu_futures.push_back(cpu_pool.enqueue([staged = std::move(staged)]() mutable {
-            return encode_staged_predictions(std::move(staged));
-        }));
+        cpu_futures.push_back(cpu_pool.enqueue(
+            [staged = std::move(staged)]() mutable { return encode_staged_predictions(std::move(staged)); }));
     };
     auto drain_cpu = [&](std::deque<std::future<std::vector<Prediction>>>& cpu_futures, size_t& processed) {
         MMLTK_NVTX_RANGE("drain_cpu", NVTX_COLOR_GREEN);
@@ -141,48 +132,29 @@ ValidationBackendResult run_backend_eval_parallel_impl(const ValidationOptions& 
                     .contiguous();
         }
         auto normalized_ready = std::make_shared<CudaEvent>();
-        ensure_cuda_ok(
-            cudaEventRecord(
-                normalized_ready->get(),
-                reinterpret_cast<cudaStream_t>(producer_stream)),
-            "cudaEventRecord for normalized validation batch");
+        ensure_cuda_ok(cudaEventRecord(normalized_ready->get(), reinterpret_cast<cudaStream_t>(producer_stream)),
+                       "cudaEventRecord for normalized validation batch");
         loader.release_batch(batch, producer_stream);
         const size_t lane_index = submitted % lanes.size();
         ++submitted;
         ++submitted_images;
-        lane_futures.push_back(lane_pool.enqueue([&lanes,
-                                                  lane_index,
-                                                  normalized = std::move(normalized),
-                                                  normalized_ready = std::move(normalized_ready),
-                                                  image_id,
-                                                  max_dets = options.eval_max_dets,
-                                                  image_height,
-                                                  image_width,
+        lane_futures.push_back(lane_pool.enqueue([&lanes, lane_index, normalized = std::move(normalized),
+                                                  normalized_ready = std::move(normalized_ready), image_id,
+                                                  max_dets = options.eval_max_dets, image_height, image_width,
                                                   device_id = options.device_id]() mutable {
             auto& lane = lanes[lane_index];
             PredictionBufferLease lease = lane.slot_pool->acquire();
             ensure_cuda_ok(
-                cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(lane.stream.stream()),
-                                    normalized_ready->get(),
-                                    0),
+                cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(lane.stream.stream()), normalized_ready->get(), 0),
                 "cudaStreamWaitEvent for normalized validation batch");
             torch::NoGradGuard lane_no_grad;
             c10::cuda::CUDAGuard lane_device_guard(checked_device_index(device_id));
             c10::cuda::CUDAStreamGuard stream_guard(lane.stream);
             normalized.record_stream(lane.stream);
-            const auto results =
-                postprocess_outputs_fixed_size(lane.backend->run(normalized),
-                                               image_height,
-                                               image_width,
-                                               lane.num_queries);
-            return stage_result_to_predictions(
-                image_id,
-                results.front(),
-                lane.category_count,
-                max_dets,
-                std::move(lease),
-                device_id,
-                lane.backend->stream());
+            const auto results = postprocess_outputs_fixed_size(lane.backend->run(normalized), image_height,
+                                                                image_width, lane.num_queries);
+            return stage_result_to_predictions(image_id, results.front(), lane.category_count, max_dets,
+                                               std::move(lease), device_id, lane.backend->stream());
         }));
 
         if (static_cast<int>(lane_futures.size()) >= runtime.split().lane_threads) {
@@ -213,4 +185,4 @@ ValidationBackendResult run_backend_eval_parallel_impl(const ValidationOptions& 
     };
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

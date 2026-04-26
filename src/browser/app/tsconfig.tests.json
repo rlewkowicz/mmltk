@@ -1,0 +1,26 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "lib": [
+      "ES2022",
+      "DOM"
+    ],
+    "noEmitOnError": true,
+    "types": [
+      "node"
+    ],
+    "outDir": "./.test-dist",
+    "rootDir": "."
+  },
+  "include": [
+    "src/app_shared.ts",
+    "src/browser_shell_state.ts",
+    "src/types/wgsl.d.ts",
+    "src/app/workspace/annotation-scene-overlay.ts",
+    "src/host_api.ts",
+    "tests/**/*.ts"
+  ]
+}

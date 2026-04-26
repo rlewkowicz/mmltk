@@ -55,9 +55,7 @@ struct LiveWeightsRunnerSetup {
 LiveWeightsRunnerSetup make_live_weights_runner_setup(const ResolvedModelArtifacts& artifacts,
                                                       const LivePredictOptions& options) {
     auto model = predict_internal::load_native_model(artifacts, options.device_id);
-    auto state = make_live_runner_state(artifacts,
-                                        options.device_id,
-                                        get_high_priority_cuda_stream(options.device_id),
+    auto state = make_live_runner_state(artifacts, options.device_id, get_high_priority_cuda_stream(options.device_id),
                                         "cudaEventCreateWithFlags for live weights ready event");
     const auto resolution = static_cast<std::int64_t>(artifacts.config.resolution);
     model->optimize_for_inference(1, false, options.compilation_mode);
@@ -81,176 +79,138 @@ LiveBackendRunnerSetup make_live_backend_runner_setup(const ResolvedModelArtifac
     auto backend = predict_internal::make_backend(artifacts, backend_name, options.device_id, options.allow_fp16);
     const predict_internal::BackendExecutionSpec spec =
         describe_backend_execution(*backend, artifacts, options.device_id);
-    auto state = make_live_runner_state(artifacts,
-                                        options.device_id,
-                                        spec.stream,
+    auto state = make_live_runner_state(artifacts, options.device_id, spec.stream,
                                         "cudaEventCreateWithFlags for live backend ready event");
     return LiveBackendRunnerSetup{std::move(backend), std::move(state), spec.num_queries, spec.category_count};
 }
 
 template <typename RunModelFn>
-LiveFrameRenderData run_live_runner_frame(const LiveFrameInputs& frame,
-                                          const std::uint32_t split_count,
-                                          const std::size_t max_dets_per_image,
-                                          const float threshold,
-                                          const ResolvedModelArtifacts& artifacts,
-                                          LiveRunnerState& state,
-                                          const int device_id,
-                                          const bool include_masks,
-                                          const bool include_status_detections,
-                                          const std::size_t category_count,
-                                          const int num_classes,
-                                          const std::int64_t max_queries,
-                                          RunModelFn&& run_model,
+LiveFrameRenderData run_live_runner_frame(const LiveFrameInputs& frame, const std::uint32_t split_count,
+                                          const std::size_t max_dets_per_image, const float threshold,
+                                          const ResolvedModelArtifacts& artifacts, LiveRunnerState& state,
+                                          const int device_id, const bool include_masks,
+                                          const bool include_status_detections, const std::size_t category_count,
+                                          const int num_classes, const std::int64_t max_queries, RunModelFn&& run_model,
                                           const char* runtime_label) {
-    return run_live_frame_pipeline(frame,
-                                   split_count,
-                                   max_dets_per_image,
-                                   threshold,
-                                   category_count,
-                                   num_classes,
-                                   artifacts.config.resolution,
-                                   state.stream,
-                                   device_id,
-                                   state.ready_event,
-                                   state.input_gpu,
-                                   state.mean,
-                                   state.std,
-                                   include_masks,
-                                   include_status_detections,
-                                   max_queries,
-                                   std::forward<RunModelFn>(run_model),
-                                   runtime_label);
+    return run_live_frame_pipeline(frame, split_count, max_dets_per_image, threshold, category_count, num_classes,
+                                   artifacts.config.resolution, state.stream, device_id, state.ready_event,
+                                   state.input_gpu, state.mean, state.std, include_masks, include_status_detections,
+                                   max_queries, std::forward<RunModelFn>(run_model), runtime_label);
 }
 
 class LiveModelRunner {
-public:
+   public:
     virtual ~LiveModelRunner() = default;
 
-    [[nodiscard]] virtual LiveFrameRenderData run_frame(const LiveFrameInputs& frame,
-                                                        std::uint32_t split_count,
-                                                        std::size_t max_dets_per_image,
-                                                        float threshold) = 0;
+    [[nodiscard]] virtual LiveFrameRenderData run_frame(const LiveFrameInputs& frame, std::uint32_t split_count,
+                                                        std::size_t max_dets_per_image, float threshold) = 0;
 };
 
-class LiveWeightsRunner final : public LiveModelRunner {
-public:
+class LiveConfiguredRunner : public LiveModelRunner {
+   public:
+    ~LiveConfiguredRunner() override {
+        destroy_cuda_event(state_.ready_event);
+    }
+
+   protected:
+    LiveConfiguredRunner(ResolvedModelArtifacts artifacts, const LivePredictOptions& options, LiveRunnerState state)
+        : artifacts_(std::move(artifacts)),
+          state_(std::move(state)),
+          device_id_(options.device_id),
+          include_masks_(options.include_masks),
+          include_status_detections_(options.include_status_detections) {}
+
+    [[nodiscard]] LiveFrameRenderData run_frame(const LiveFrameInputs& frame, const std::uint32_t split_count,
+                                                const std::size_t max_dets_per_image, const float threshold) override {
+        return run_live_runner_frame(
+            frame, split_count, max_dets_per_image, threshold, artifacts_, state_, device_id_, include_masks_,
+            include_status_detections_, category_count(), num_classes(), max_queries(),
+            [this]() { return run_model_outputs(); }, runtime_label());
+    }
+
+    [[nodiscard]] virtual OutputTensors run_model_outputs() = 0;
+    [[nodiscard]] virtual std::size_t category_count() const = 0;
+    [[nodiscard]] virtual int num_classes() const = 0;
+    [[nodiscard]] virtual std::int64_t max_queries() const = 0;
+    [[nodiscard]] virtual const char* runtime_label() const = 0;
+
+    ResolvedModelArtifacts artifacts_;
+    LiveRunnerState state_;
+    int device_id_ = 0;
+    bool include_masks_ = false;
+    bool include_status_detections_ = false;
+};
+
+class LiveWeightsRunner final : public LiveConfiguredRunner {
+   public:
     LiveWeightsRunner(const ResolvedModelArtifacts& artifacts, const LivePredictOptions& options)
         : LiveWeightsRunner(artifacts, options, make_live_weights_runner_setup(artifacts, options)) {}
 
-private:
-    LiveWeightsRunner(ResolvedModelArtifacts artifacts,
-                      const LivePredictOptions& options,
-                      LiveWeightsRunnerSetup setup)
-        : artifacts_(std::move(artifacts)),
+   private:
+    LiveWeightsRunner(ResolvedModelArtifacts artifacts, const LivePredictOptions& options, LiveWeightsRunnerSetup setup)
+        : LiveConfiguredRunner(std::move(artifacts), options, std::move(setup.state)),
           model_(std::move(setup.model)),
-          state_(std::move(setup.state)),
-          device_id_(options.device_id),
-          nested_mask_(std::move(setup.nested_mask)),
-          include_masks_(options.include_masks),
-          include_status_detections_(options.include_status_detections) {}
+          nested_mask_(std::move(setup.nested_mask)) {}
 
-public:
-
-    ~LiveWeightsRunner() override {
-        destroy_cuda_event(state_.ready_event);
+    [[nodiscard]] OutputTensors run_model_outputs() override {
+        return live_output_tensors(
+            model_->forward(NestedTensor{state_.input_gpu, nested_mask_}, nullptr, include_masks_), include_masks_);
+    }
+    [[nodiscard]] std::size_t category_count() const override {
+        return static_cast<std::size_t>(artifacts_.config.num_classes);
+    }
+    [[nodiscard]] int num_classes() const override {
+        return artifacts_.config.num_classes;
+    }
+    [[nodiscard]] std::int64_t max_queries() const override {
+        return live_query_count(artifacts_);
+    }
+    [[nodiscard]] const char* runtime_label() const override {
+        return "weights";
     }
 
-    [[nodiscard]] LiveFrameRenderData run_frame(const LiveFrameInputs& frame,
-                                                const std::uint32_t split_count,
-                                                const std::size_t max_dets_per_image,
-                                                const float threshold) override {
-        return run_live_runner_frame(frame,
-                                     split_count,
-                                     max_dets_per_image,
-                                     threshold,
-                                     artifacts_,
-                                     state_,
-                                     device_id_,
-                                     include_masks_,
-                                     include_status_detections_,
-                                     static_cast<std::size_t>(artifacts_.config.num_classes),
-                                     artifacts_.config.num_classes,
-                                     live_query_count(artifacts_),
-                                     [this]() {
-                                         return live_output_tensors(
-                                             model_->forward(NestedTensor{state_.input_gpu, nested_mask_},
-                                                             nullptr,
-                                                             include_masks_),
-                                             include_masks_);
-                                     },
-                                     "weights");
-    }
-
-private:
-    ResolvedModelArtifacts artifacts_;
+   private:
     std::shared_ptr<NativeRfDetrModel> model_;
-    LiveRunnerState state_;
-    int device_id_ = 0;
     torch::Tensor nested_mask_;
-    bool include_masks_ = false;
-    bool include_status_detections_ = false;
 };
 
-class LiveBackendRunner final : public LiveModelRunner {
-public:
-    LiveBackendRunner(const ResolvedModelArtifacts& artifacts,
-                      const LivePredictOptions& options,
+class LiveBackendRunner final : public LiveConfiguredRunner {
+   public:
+    LiveBackendRunner(const ResolvedModelArtifacts& artifacts, const LivePredictOptions& options,
                       const std::string& backend_name)
         : LiveBackendRunner(artifacts, options, make_live_backend_runner_setup(artifacts, options, backend_name)) {}
 
-private:
-    LiveBackendRunner(ResolvedModelArtifacts artifacts,
-                      const LivePredictOptions& options,
-                      LiveBackendRunnerSetup setup)
-        : artifacts_(std::move(artifacts)),
+   private:
+    LiveBackendRunner(ResolvedModelArtifacts artifacts, const LivePredictOptions& options, LiveBackendRunnerSetup setup)
+        : LiveConfiguredRunner(std::move(artifacts), options, std::move(setup.state)),
           backend_(std::move(setup.backend)),
-          state_(std::move(setup.state)),
-          device_id_(options.device_id),
           num_queries_(setup.num_queries),
-          category_count_(setup.category_count),
-          include_masks_(options.include_masks),
-          include_status_detections_(options.include_status_detections) {}
+          category_count_(setup.category_count) {}
 
-public:
-
-    ~LiveBackendRunner() override {
-        destroy_cuda_event(state_.ready_event);
+    [[nodiscard]] OutputTensors run_model_outputs() override {
+        return backend_->run(state_.input_gpu);
+    }
+    [[nodiscard]] std::size_t category_count() const override {
+        return category_count_;
+    }
+    [[nodiscard]] int num_classes() const override {
+        return static_cast<int>(category_count_);
+    }
+    [[nodiscard]] std::int64_t max_queries() const override {
+        return num_queries_;
+    }
+    [[nodiscard]] const char* runtime_label() const override {
+        return "backend";
     }
 
-    [[nodiscard]] LiveFrameRenderData run_frame(const LiveFrameInputs& frame,
-                                                const std::uint32_t split_count,
-                                                const std::size_t max_dets_per_image,
-                                                const float threshold) override {
-        return run_live_runner_frame(frame,
-                                     split_count,
-                                     max_dets_per_image,
-                                     threshold,
-                                     artifacts_,
-                                     state_,
-                                     device_id_,
-                                     include_masks_,
-                                     include_status_detections_,
-                                     category_count_,
-                                     static_cast<int>(category_count_),
-                                     num_queries_,
-                                     [this]() { return backend_->run(state_.input_gpu); },
-                                     "backend");
-    }
-
-private:
-    ResolvedModelArtifacts artifacts_;
+   private:
     std::unique_ptr<InferenceBackend> backend_;
-    LiveRunnerState state_;
-    int device_id_ = 0;
     std::int64_t num_queries_ = 300;
     std::size_t category_count_ = 0;
-    bool include_masks_ = false;
-    bool include_status_detections_ = false;
 };
 
 class RfDetrLiveFrameAnalyzer final : public mmltk::live::FrameAnalyzer {
-public:
+   public:
     explicit RfDetrLiveFrameAnalyzer(LivePredictOptions options)
         : options_(std::move(options)),
           artifacts_(resolve_model_artifacts(options_)),
@@ -278,10 +238,8 @@ public:
             bundle.dims.pitch_bytes,
             bundle.region,
         };
-        LiveFrameRenderData render = runner_->run_frame(frame,
-                                                        options_.split_count,
-                                                        options_.max_dets_per_image,
-                                                        options_.threshold);
+        LiveFrameRenderData render =
+            runner_->run_frame(frame, options_.split_count, options_.max_dets_per_image, options_.threshold);
 
         mmltk::live::AnalyzerResult result;
         result.frame_id = bundle.frame_id;
@@ -316,14 +274,14 @@ public:
         return artifacts_.config.num_classes;
     }
 
-private:
+   private:
     LivePredictOptions options_{};
     ResolvedModelArtifacts artifacts_{};
     std::string backend_name_;
     std::unique_ptr<LiveModelRunner> runner_;
 };
 
-} // namespace
+}  // namespace
 
 bool live_capture_supported() {
 #if MMLTK_RFDETR_LIVE_CAPTURE
@@ -337,4 +295,4 @@ std::unique_ptr<mmltk::live::FrameAnalyzer> make_live_rfdetr_frame_analyzer(cons
     return std::make_unique<RfDetrLiveFrameAnalyzer>(options);
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

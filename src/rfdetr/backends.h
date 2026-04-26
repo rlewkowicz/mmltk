@@ -13,7 +13,7 @@
 namespace mmltk::rfdetr {
 
 class InferenceBackend {
-public:
+   public:
     virtual ~InferenceBackend() = default;
 
     [[nodiscard]] virtual const ModelInfo& info() const = 0;
@@ -26,33 +26,26 @@ public:
 using TensorRtLogSink = std::function<void(const std::string&)>;
 
 class ScopedTensorRtLogSink {
-public:
+   public:
     explicit ScopedTensorRtLogSink(TensorRtLogSink sink);
     ~ScopedTensorRtLogSink();
 
     ScopedTensorRtLogSink(const ScopedTensorRtLogSink&) = delete;
     ScopedTensorRtLogSink& operator=(const ScopedTensorRtLogSink&) = delete;
 
-private:
+   private:
     TensorRtLogSink previous_sink_;
 };
 
-std::unique_ptr<InferenceBackend> make_onnx_backend(const std::filesystem::path& model_path,
-                                                    int device_id);
-std::vector<std::unique_ptr<InferenceBackend>> make_onnx_backend_lanes(
-    const std::filesystem::path& model_path,
-    int device_id,
-    int lane_count);
+std::unique_ptr<InferenceBackend> make_onnx_backend(const std::filesystem::path& model_path, int device_id);
+std::vector<std::unique_ptr<InferenceBackend>> make_onnx_backend_lanes(const std::filesystem::path& model_path,
+                                                                       int device_id, int lane_count);
 
-std::unique_ptr<InferenceBackend> make_tensorrt_backend(const std::filesystem::path& model_path,
-                                                        int device_id,
+std::unique_ptr<InferenceBackend> make_tensorrt_backend(const std::filesystem::path& model_path, int device_id,
                                                         bool allow_fp16,
                                                         const std::filesystem::path& save_engine_path = {});
 std::vector<std::unique_ptr<InferenceBackend>> make_tensorrt_backend_lanes(
-    const std::filesystem::path& model_path,
-    int device_id,
-    bool allow_fp16,
-    int lane_count,
+    const std::filesystem::path& model_path, int device_id, bool allow_fp16, int lane_count,
     const std::filesystem::path& save_engine_path = {});
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

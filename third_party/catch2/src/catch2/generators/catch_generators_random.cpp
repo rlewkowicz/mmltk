@@ -12,35 +12,34 @@
 #include <random>
 
 namespace Catch {
-    namespace Generators {
-        namespace Detail {
-            std::uint32_t getSeed() { return sharedRng()(); }
-        } // namespace Detail
+namespace Generators {
+namespace Detail {
+std::uint32_t getSeed() {
+    return sharedRng()();
+}
+}  // namespace Detail
 
-        struct RandomFloatingGenerator<long double>::PImpl {
-            PImpl( long double a, long double b, uint32_t seed ):
-                rng( seed ), dist( a, b ) {}
+struct RandomFloatingGenerator<long double>::PImpl {
+    PImpl(long double a, long double b, uint32_t seed) : rng(seed), dist(a, b) {}
 
-            Catch::SimplePcg32 rng;
-            std::uniform_real_distribution<long double> dist;
-        };
+    Catch::SimplePcg32 rng;
+    std::uniform_real_distribution<long double> dist;
+};
 
-        RandomFloatingGenerator<long double>::RandomFloatingGenerator(
-            long double a, long double b, std::uint32_t seed) :
-            m_pimpl(Catch::Detail::make_unique<PImpl>(a, b, seed)) {
-            static_cast<void>( next() );
-        }
+RandomFloatingGenerator<long double>::RandomFloatingGenerator(long double a, long double b, std::uint32_t seed)
+    : m_pimpl(Catch::Detail::make_unique<PImpl>(a, b, seed)) {
+    static_cast<void>(next());
+}
 
-        RandomFloatingGenerator<long double>::~RandomFloatingGenerator() =
-            default;
-        bool RandomFloatingGenerator<long double>::next() {
-            m_current_number = m_pimpl->dist( m_pimpl->rng );
-            return true;
-        }
+RandomFloatingGenerator<long double>::~RandomFloatingGenerator() = default;
+bool RandomFloatingGenerator<long double>::next() {
+    m_current_number = m_pimpl->dist(m_pimpl->rng);
+    return true;
+}
 
-        bool RandomFloatingGenerator<long double>::isFinite() const {
-            return false;
-        }
+bool RandomFloatingGenerator<long double>::isFinite() const {
+    return false;
+}
 
-    } // namespace Generators
-} // namespace Catch
+}  // namespace Generators
+}  // namespace Catch

@@ -11,14 +11,14 @@
 #include <catch2/internal/catch_enforce.hpp>
 
 namespace Catch {
-    namespace Generators {
-        namespace Detail {
+namespace Generators {
+namespace Detail {
 
-            [[noreturn]]
-            void throw_generator_exception( char const* msg ) {
-                Catch::throw_exception( GeneratorException{ msg } );
-            }
+[[noreturn]]
+void throw_generator_exception(char const* msg) {
+    Catch::throw_exception(GeneratorException{msg});
+}
 
-        } // namespace Detail
-    } // namespace Generators
-} // namespace Catch
+}  // namespace Detail
+}  // namespace Generators
+}  // namespace Catch

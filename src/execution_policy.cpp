@@ -82,19 +82,14 @@ void maximize_current_thread_scheduler(bool prefer_realtime_scheduler) {
             return;
         }
         if (!is_permission_error(rc)) {
-            throw std::system_error(rc,
-                                    std::generic_category(),
-                                    "pthread_setschedparam failed");
+            throw std::system_error(rc, std::generic_category(), "pthread_setschedparam failed");
         }
     }
 }
 
 bool try_set_current_thread_ioprio(int io_class, int io_data) {
     errno = 0;
-    if (::syscall(SYS_ioprio_set,
-                  IOPRIO_WHO_PROCESS,
-                  0,
-                  IOPRIO_PRIO_VALUE(io_class, io_data)) == 0) {
+    if (::syscall(SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, IOPRIO_PRIO_VALUE(io_class, io_data)) == 0) {
         return true;
     }
     if (!is_permission_error(errno)) {
@@ -116,37 +111,37 @@ void maximize_current_thread_ioprio(bool prefer_realtime_io) {
 
 const char* scheduler_policy_name(int policy) {
     switch (policy) {
-    case SCHED_OTHER:
-        return "SCHED_OTHER";
-    case SCHED_FIFO:
-        return "SCHED_FIFO";
-    case SCHED_RR:
-        return "SCHED_RR";
+        case SCHED_OTHER:
+            return "SCHED_OTHER";
+        case SCHED_FIFO:
+            return "SCHED_FIFO";
+        case SCHED_RR:
+            return "SCHED_RR";
 #ifdef SCHED_BATCH
-    case SCHED_BATCH:
-        return "SCHED_BATCH";
+        case SCHED_BATCH:
+            return "SCHED_BATCH";
 #endif
 #ifdef SCHED_IDLE
-    case SCHED_IDLE:
-        return "SCHED_IDLE";
+        case SCHED_IDLE:
+            return "SCHED_IDLE";
 #endif
-    default:
-        return "SCHED_UNKNOWN";
+        default:
+            return "SCHED_UNKNOWN";
     }
 }
 
 const char* ioprio_class_name(int io_class) {
     switch (io_class) {
-    case IOPRIO_CLASS_NONE:
-        return "none";
-    case IOPRIO_CLASS_RT:
-        return "rt";
-    case IOPRIO_CLASS_BE:
-        return "best-effort";
-    case IOPRIO_CLASS_IDLE:
-        return "idle";
-    default:
-        return "unknown";
+        case IOPRIO_CLASS_NONE:
+            return "none";
+        case IOPRIO_CLASS_RT:
+            return "rt";
+        case IOPRIO_CLASS_BE:
+            return "best-effort";
+        case IOPRIO_CLASS_IDLE:
+            return "idle";
+        default:
+            return "unknown";
     }
 }
 
@@ -157,9 +152,8 @@ void verify_pinned_cpu(const std::vector<int>& cpus, size_t worker_index) {
     const std::vector<int> effective = allowed_cpu_set();
     const int expected_cpu = cpus[worker_index % cpus.size()];
     if (effective.size() != 1 || effective.front() != expected_cpu) {
-        throw std::runtime_error("worker affinity verification failed: expected cpu " +
-                                 std::to_string(expected_cpu) + ", got " +
-                                 format_cpu_list(effective));
+        throw std::runtime_error("worker affinity verification failed: expected cpu " + std::to_string(expected_cpu) +
+                                 ", got " + format_cpu_list(effective));
     }
 }
 
@@ -177,7 +171,7 @@ ExecutionPolicySnapshot apply_execution_policy(const ExecutionPolicyRequest& req
     return capture_execution_policy_snapshot();
 }
 
-} // namespace
+}  // namespace
 
 ExecutionPolicySnapshot capture_execution_policy_snapshot() {
     ExecutionPolicySnapshot snapshot;
@@ -189,9 +183,7 @@ ExecutionPolicySnapshot capture_execution_policy_snapshot() {
     int policy = 0;
     const int sched_rc = ::pthread_getschedparam(::pthread_self(), &policy, &param);
     if (sched_rc != 0) {
-        throw std::system_error(sched_rc,
-                                std::generic_category(),
-                                "pthread_getschedparam failed");
+        throw std::system_error(sched_rc, std::generic_category(), "pthread_getschedparam failed");
     }
     snapshot.scheduler_policy = policy;
     snapshot.scheduler_priority = param.sched_priority;
@@ -214,12 +206,8 @@ ExecutionPolicySnapshot apply_worker_execution_policy(const ExecutionPolicyReque
     return apply_execution_policy(request);
 }
 
-// Worker budget inputs mirror the scheduling knobs the callers already hold.
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
-int clamp_worker_count_to_cpus(int requested_workers,
-                               size_t cpu_count,
-                               int reserved_cpus,
-                               int minimum_workers) {
+int clamp_worker_count_to_cpus(int requested_workers, size_t cpu_count, int reserved_cpus, int minimum_workers) {
     if (requested_workers <= 0) {
         throw std::invalid_argument("requested_workers must be positive");
     }
@@ -240,59 +228,39 @@ int clamp_worker_count_to_cpus(int requested_workers,
 }
 // NOLINTEND(bugprone-easily-swappable-parameters)
 
-void log_worker_budget_clamp(const char* subsystem,
-                             int requested_workers,
-                             int applied_workers,
-                             const std::vector<int>& cpus,
-                             int reserved_cpus,
-                             int minimum_workers) {
+void log_worker_budget_clamp(const char* subsystem, int requested_workers, int applied_workers,
+                             const std::vector<int>& cpus, int reserved_cpus, int minimum_workers) {
     if (requested_workers == applied_workers) {
         if (reserved_cpus > 0 && cpus.size() <= static_cast<size_t>(reserved_cpus)) {
             mmltk::logging::logger("exec")->warn(
-                "{} cpuset={} is too small to reserve {} helper cpu(s); helper threads will overlap",
-                subsystem,
-                format_cpu_list(cpus),
-                reserved_cpus);
+                "{} cpuset={} is too small to reserve {} helper cpu(s); helper threads will overlap", subsystem,
+                format_cpu_list(cpus), reserved_cpus);
         }
         return;
     }
 
-    mmltk::logging::logger("exec")->warn("{} workers clamped {}->{} for cpuset={} (reserved={} minimum={})",
-                                         subsystem,
-                                         requested_workers,
-                                         applied_workers,
-                                         format_cpu_list(cpus),
-                                         reserved_cpus,
+    mmltk::logging::logger("exec")->warn("{} workers clamped {}->{} for cpuset={} (reserved={} minimum={})", subsystem,
+                                         requested_workers, applied_workers, format_cpu_list(cpus), reserved_cpus,
                                          minimum_workers);
 }
 
-void log_process_execution_policy(const char* process_label,
-                                  const ExecutionPolicySnapshot& snapshot,
-                                  bool expect_realtime_scheduler,
-                                  bool expect_realtime_io) {
+void log_process_execution_policy(const char* process_label, const ExecutionPolicySnapshot& snapshot,
+                                  bool expect_realtime_scheduler, bool expect_realtime_io) {
     const bool cpuset_restricted =
-        snapshot.online_cpu_count > 0 &&
-        static_cast<int>(snapshot.affinity.size()) < snapshot.online_cpu_count;
-    const bool scheduler_degraded =
-        expect_realtime_scheduler && snapshot.scheduler_policy != SCHED_RR;
+        snapshot.online_cpu_count > 0 && static_cast<int>(snapshot.affinity.size()) < snapshot.online_cpu_count;
+    const bool scheduler_degraded = expect_realtime_scheduler && snapshot.scheduler_policy != SCHED_RR;
     const bool nice_degraded = snapshot.nice_value != kTargetNice;
     const bool io_degraded =
-        expect_realtime_io &&
-        !(snapshot.io_class == IOPRIO_CLASS_RT && snapshot.io_priority_data == 0);
+        expect_realtime_io && !(snapshot.io_class == IOPRIO_CLASS_RT && snapshot.io_priority_data == 0);
 
     if (!cpuset_restricted && !scheduler_degraded && !nice_degraded && !io_degraded) {
         return;
     }
 
-    mmltk::logging::logger("exec")->info("{} cpuset={} online={} scheduler={}/{} nice={} io={}/{}",
-                                         process_label,
-                                         format_cpu_list(snapshot.affinity),
-                                         snapshot.online_cpu_count,
-                                         scheduler_policy_name(snapshot.scheduler_policy),
-                                         snapshot.scheduler_priority,
-                                         snapshot.nice_value,
-                                         ioprio_class_name(snapshot.io_class),
-                                         snapshot.io_priority_data);
+    mmltk::logging::logger("exec")->info(
+        "{} cpuset={} online={} scheduler={}/{} nice={} io={}/{}", process_label, format_cpu_list(snapshot.affinity),
+        snapshot.online_cpu_count, scheduler_policy_name(snapshot.scheduler_policy), snapshot.scheduler_priority,
+        snapshot.nice_value, ioprio_class_name(snapshot.io_class), snapshot.io_priority_data);
 }
 
-} // namespace mmltk
+}  // namespace mmltk

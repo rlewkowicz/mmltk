@@ -14,20 +14,19 @@
 
 namespace Catch {
 
-    struct PathFilter {
-        enum class For {
-            Section,
-            Generator,
-        };
-        PathFilter( For type_, std::string filter_ ):
-            type( type_ ), filter( CATCH_MOVE( filter_ ) ) {}
-
-        For type;
-        std::string filter;
-
-        friend bool operator==( PathFilter const& lhs, PathFilter const& rhs );
+struct PathFilter {
+    enum class For {
+        Section,
+        Generator,
     };
+    PathFilter(For type_, std::string filter_) : type(type_), filter(CATCH_MOVE(filter_)) {}
 
-} // end namespace Catch
+    For type;
+    std::string filter;
 
-#endif // CATCH_PATH_FILTER_HPP_INCLUDED
+    friend bool operator==(PathFilter const& lhs, PathFilter const& rhs);
+};
+
+}  // namespace Catch
+
+#endif  // CATCH_PATH_FILTER_HPP_INCLUDED

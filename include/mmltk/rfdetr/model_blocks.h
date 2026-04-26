@@ -9,4 +9,4 @@ using MLP = Mlp;
 using MLPBlockImpl = MlpBlockImpl;
 using MLPBlock = MlpBlock;
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

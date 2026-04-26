@@ -15,6 +15,28 @@ Build the runtime image once:
 docker build -t mmltk .
 ```
 
+Generate a fresh Clang time-trace build and export the trace artifacts into
+`./.mmltk-data/time-trace`:
+
+```bash
+./utilities/build_time_trace.sh
+```
+
+That helper clears the release and test C++ cache mounts first, runs the traced
+runtime image build, then exports the `time-trace-export` target into the repo's
+local `.mmltk-data` folder.
+
+The packaged `mmltk-browser-host` path builds from
+`BUILD_MMLTK_BROWSER_HOST=ON`. The legacy standalone Dear
+ImGui/GLFW/OpenGL shell has been removed; the browser host is the only
+GUI build path.
+
+For manual CMake work:
+
+- `cmake --preset release` builds the packaged browser-host path.
+- `cmake --preset dev` builds the browser-host development path.
+- `BUILD_MMLTK_BROWSER_HOST` is the only GUI CMake toggle.
+
 ## Usage
 
 Use the repo-root wrapper:
@@ -44,9 +66,10 @@ Run the full Docker-backed static-analysis pass:
 ./mmltk --tidy
 ```
 
-The wrapper rebuilds a cached analysis image from the Docker build stage, regenerates
-`build/docker-dev-tidy/compile_commands.json` inside the container, then runs
-`clang-tidy` followed by `cppcheck`.
+The wrapper rebuilds a cached analysis image from the Docker build stage, runs
+`clang-format` over tracked C/C++/CUDA files using the repo's Google-based
+`.clang-format`, regenerates `build/docker-dev-tidy/compile_commands.json` inside
+the container, then runs `clang-tidy` followed by `cppcheck`.
 
 If `clang-tidy` stops on a file you are fixing, restart from that translation unit:
 
@@ -82,7 +105,7 @@ Forward Catch2 selectors or flags after `--`:
 
 ### GUI
 
-Open the GUI with the existing repo-root `gui.json`:
+Open the browser-host GUI with the existing repo-root `gui.json`:
 
 ```bash
 ./mmltk --gui
@@ -106,14 +129,16 @@ Supported GUI-seeded commands:
 
 Commands or flags without matching GUI fields are rejected instead of being ignored.
 
-Wrapper-managed containers run with `--privileged`. When `--gui` is set, the wrapper also bind-mounts the active UI runtime paths, keeps the container process on your host UID/GID for display auth, prefers `MMLTK_GUI_PLATFORM=x11` when `DISPLAY` is available, and recreates the cached container if that GUI runtime shape changed.
+Wrapper-managed containers run with `--privileged`. When `--gui` is set, the wrapper bind-mounts the active Wayland runtime paths, keeps the container process on your host UID/GID for display auth, and recreates the cached container if that GUI runtime shape changed. The browser host is Wayland-only; missing Wayland runtime state is a hard launch failure instead of falling back to an alternate display backend.
 
-For NVIDIA/Xwayland setups, run the wrapper with the same env you use natively:
+`MMLTK_CEF_WEBGPU_RUNTIME`, `MMLTK_CEF_DISABLE_VULKAN`,
+`MMLTK_CEF_ENABLE_UNSAFE_WEBGPU`, and `MMLTK_CEF_FORCE_HIGH_PERFORMANCE_GPU`
+remain explicit Chromium GPU bring-up overrides.
+
+For NVIDIA Wayland setups, run the wrapper with the same env you use natively:
 
 ```bash
 XDG_RUNTIME_DIR=/run/user/1000 \
-DISPLAY=:0 \
-XAUTHORITY=/run/user/1000/.mutter-Xwaylandauth.G5IRL3 \
 WAYLAND_DISPLAY=wayland-0 \
 __NV_PRIME_RENDER_OFFLOAD=1 \
 __GLX_VENDOR_LIBRARY_NAME=nvidia \

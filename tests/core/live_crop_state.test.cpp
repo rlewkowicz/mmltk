@@ -72,7 +72,7 @@ void test_runtime_state_only_advances_on_new_publications() {
     assert(cleared.generation == 2U);
 }
 
-} // namespace
+}  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[core][live_crop_state]", test_default_snapshot_is_empty);
 MMLTK_REGISTER_TEST_CASE("[core][live_crop_state]", test_set_and_clear_publish_new_generations);

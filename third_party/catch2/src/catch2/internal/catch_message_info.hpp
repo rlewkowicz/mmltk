@@ -17,28 +17,25 @@
 
 namespace Catch {
 
-    struct MessageInfo {
-        MessageInfo(    StringRef _macroName,
-                        SourceLineInfo const& _lineInfo,
-                        ResultWas::OfType _type );
+struct MessageInfo {
+    MessageInfo(StringRef _macroName, SourceLineInfo const& _lineInfo, ResultWas::OfType _type);
 
-        StringRef macroName;
-        std::string message;
-        SourceLineInfo lineInfo;
-        ResultWas::OfType type;
-        // The "ID" of the message, used to know when to remove it from reporter context.
-        unsigned int sequence;
+    StringRef macroName;
+    std::string message;
+    SourceLineInfo lineInfo;
+    ResultWas::OfType type;
+    unsigned int sequence;
 
-        CATCH_DEPRECATED( "Explicitly use the 'sequence' member instead" )
-        bool operator == (MessageInfo const& other) const {
-            return sequence == other.sequence;
-        }
-        CATCH_DEPRECATED( "Explicitly use the 'sequence' member instead" )
-        bool operator < (MessageInfo const& other) const {
-            return sequence < other.sequence;
-        }
-    };
+    CATCH_DEPRECATED("Explicitly use the 'sequence' member instead")
+    bool operator==(MessageInfo const& other) const {
+        return sequence == other.sequence;
+    }
+    CATCH_DEPRECATED("Explicitly use the 'sequence' member instead")
+    bool operator<(MessageInfo const& other) const {
+        return sequence < other.sequence;
+    }
+};
 
-} // end namespace Catch
+}  // namespace Catch
 
-#endif // CATCH_MESSAGE_INFO_HPP_INCLUDED
+#endif  // CATCH_MESSAGE_INFO_HPP_INCLUDED

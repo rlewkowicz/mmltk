@@ -59,19 +59,6 @@ Options parse_options(int argc, char** argv) {
     return options;
 }
 
-struct RunResult {
-std::string metric_name(const char* suffix) {
-    return std::string("benchmark.") + suffix;
-}
-
-void record_duration_metric(const char* suffix, std::uint64_t elapsed_ns) {
-    mmltk::profile_record_duration_ns(metric_name(suffix).c_str(), elapsed_ns);
-}
-
-void record_value_metric(const char* suffix, std::uint64_t value) {
-    mmltk::profile_add_value(metric_name(suffix).c_str(), value);
-}
-
 EvaluateRun run_checkpoint_backend(const Options& options) {
     mmltk::rfdetr::EvaluateOptions evaluate_options;
     evaluate_options.compiled_path = options.compiled_path;
@@ -105,30 +92,20 @@ void record_evaluate_metrics(const EvaluateRun& run) {
 }
 
 void print_iteration_line(const char* phase, int index, int total, const EvaluateRun& run) {
-    std::printf("%s=rfdetr.evaluate.checkpoint %d/%d pt=%.3fs bbox=%.4f mask=%.4f\n",
-                phase,
-                index,
-                total,
-                seconds_from_ns(run.elapsed_ns),
-                run.bbox_ap,
-                run.mask_ap);
+    std::printf("%s=rfdetr.evaluate.checkpoint %d/%d pt=%.3fs bbox=%.4f mask=%.4f\n", phase, index, total,
+                seconds_from_ns(run.elapsed_ns), run.bbox_ap, run.mask_ap);
     std::fflush(stdout);
 }
 
-} // namespace
+}  // namespace
 
 int main(int argc, char** argv) {
     MMLTK_PROFILE_PROCESS_LABEL("profile.rfdetr.evaluate");
     MMLTK_PROFILE_RUN_LABEL("rfdetr.evaluate.checkpoint");
 
     try {
-        const mmltk::ExecutionPolicySnapshot execution_snapshot =
-            mmltk::apply_process_execution_policy();
-        mmltk::log_process_execution_policy(
-            "mmltk_rfdetr_profile_runner",
-            execution_snapshot,
-            false,
-            true);
+        const mmltk::ExecutionPolicySnapshot execution_snapshot = mmltk::apply_process_execution_policy();
+        mmltk::log_process_execution_policy("mmltk_rfdetr_profile_runner", execution_snapshot, false, true);
         const Options options = parse_options(argc, argv);
         ensure_file_exists("compiled dataset", options.compiled_path);
         ensure_file_exists("checkpoint", options.checkpoint_path);
@@ -158,11 +135,8 @@ int main(int argc, char** argv) {
         }
 
         for (int repetition = 0; repetition < options.repetitions; ++repetition) {
-            print_iteration_line(
-                "repetition",
-                repetition + 1,
-                options.repetitions,
-                repetition_runs[static_cast<size_t>(repetition)]);
+            print_iteration_line("repetition", repetition + 1, options.repetitions,
+                                 repetition_runs[static_cast<size_t>(repetition)]);
         }
 
         MMLTK_PROFILE_FLUSH();

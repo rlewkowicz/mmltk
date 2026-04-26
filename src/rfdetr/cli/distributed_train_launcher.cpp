@@ -66,14 +66,8 @@ std::vector<std::string> distributed_worker_base_args(int argc, char** argv) {
     }
 
     const std::map<std::string, bool> filtered = {
-        {"--device-id", true},
-        {"--device-ids", true},
-        {"--workers", true},
-        {"--cpu-affinity", true},
-        {"--dist-rank", true},
-        {"--dist-world-size", true},
-        {"--dist-store-file", true},
-        {"--dist-worker", false},
+        {"--device-id", true}, {"--device-ids", true},      {"--workers", true},         {"--cpu-affinity", true},
+        {"--dist-rank", true}, {"--dist-world-size", true}, {"--dist-store-file", true}, {"--dist-worker", false},
     };
 
     std::vector<std::string> normalized;
@@ -91,7 +85,7 @@ std::vector<std::string> distributed_worker_base_args(int argc, char** argv) {
     return normalized;
 }
 
-} // namespace
+}  // namespace
 
 int spawn_distributed_training_workers(const TrainOptions& options, int argc, char** argv) {
     const int world_size = static_cast<int>(options.device_ids.size());
@@ -101,8 +95,7 @@ int spawn_distributed_training_workers(const TrainOptions& options, int argc, ch
 #if !defined(USE_C10D_NCCL)
     (void)argc;
     (void)argv;
-    throw std::runtime_error(
-        "distributed RF-DETR train requires a LibTorch build with NCCL/c10d enabled");
+    throw std::runtime_error("distributed RF-DETR train requires a LibTorch build with NCCL/c10d enabled");
 #endif
 
     std::set<int> unique_ids(options.device_ids.begin(), options.device_ids.end());
@@ -117,17 +110,15 @@ int spawn_distributed_training_workers(const TrainOptions& options, int argc, ch
     }
     for (const int device_id : options.device_ids) {
         if (device_id < 0 || device_id >= visible_devices) {
-            throw std::runtime_error(
-                "rfdetr train device id is out of range for the visible CUDA device count");
+            throw std::runtime_error("rfdetr train device id is out of range for the visible CUDA device count");
         }
     }
 
     const auto store_path = distributed_store_path_for_parent();
     std::filesystem::remove(store_path);
 
-    const std::vector<int> all_cpus = options.cpu_affinity.empty()
-                                          ? mmltk::allowed_cpu_set()
-                                          : mmltk::resolve_cpu_affinity(options.cpu_affinity);
+    const std::vector<int> all_cpus =
+        options.cpu_affinity.empty() ? mmltk::allowed_cpu_set() : mmltk::resolve_cpu_affinity(options.cpu_affinity);
     const auto base_args = distributed_worker_base_args(argc, argv);
 
     std::vector<pid_t> children;
@@ -142,15 +133,9 @@ int spawn_distributed_training_workers(const TrainOptions& options, int argc, ch
         const auto shard_cpus = shard_cpu_list(all_cpus, rank, world_size);
         int rank_workers = shard_worker_budget(options.workers, rank, world_size);
         if (!shard_cpus.empty() && static_cast<int>(shard_cpus.size()) >= 3) {
-            const int clamped_workers =
-                mmltk::clamp_worker_count_to_cpus(rank_workers, shard_cpus.size(), 0, 3);
+            const int clamped_workers = mmltk::clamp_worker_count_to_cpus(rank_workers, shard_cpus.size(), 0, 3);
             const std::string subsystem = "rfdetr.distributed.rank" + std::to_string(rank);
-            mmltk::log_worker_budget_clamp(subsystem.c_str(),
-                                           rank_workers,
-                                           clamped_workers,
-                                           shard_cpus,
-                                           0,
-                                           3);
+            mmltk::log_worker_budget_clamp(subsystem.c_str(), rank_workers, clamped_workers, shard_cpus, 0, 3);
             rank_workers = clamped_workers;
         }
         worker_args.emplace_back("--workers");
@@ -180,9 +165,8 @@ int spawn_distributed_training_workers(const TrainOptions& options, int argc, ch
             }
             raw_args.push_back(nullptr);
             ::execvp(raw_args.front(), raw_args.data());
-            mmltk::logging::logger("rfdetr.cli")->error(
-                "mmltk rfdetr error: failed to exec distributed worker: {}",
-                std::strerror(errno));
+            mmltk::logging::logger("rfdetr.cli")
+                ->error("mmltk rfdetr error: failed to exec distributed worker: {}", std::strerror(errno));
             std::_Exit(127);
         }
         children.push_back(pid);
@@ -216,4 +200,4 @@ int spawn_distributed_training_workers(const TrainOptions& options, int argc, ch
     return failed ? failed_status : 0;
 }
 
-} // namespace mmltk::rfdetr::cli_support
+}  // namespace mmltk::rfdetr::cli_support

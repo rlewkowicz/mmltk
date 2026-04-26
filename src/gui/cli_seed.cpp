@@ -43,11 +43,7 @@ struct SeedSnapshotState {
 
 WorkflowSettingsSnapshot bind_workflows(SeedSnapshotState& state) {
     return WorkflowSettingsSnapshot{
-        &state.train,
-        &state.validate,
-        &state.predict,
-        &state.annotate,
-        &state.export_state,
+        &state.train, &state.validate, &state.predict, &state.annotate, &state.export_state,
     };
 }
 
@@ -60,12 +56,8 @@ GuiSettingsSnapshot bind_snapshot(SeedSnapshotState& state) {
     };
 }
 
-
 template <typename AppFactory>
-void parse_cli_app(CLI::App& app,
-                   const std::string& app_name,
-                   const std::vector<std::string>& args,
-                   AppFactory&&) {
+void parse_cli_app(CLI::App& app, const std::string& app_name, const std::vector<std::string>& args, AppFactory&&) {
     std::vector<std::string> command_args;
     command_args.reserve(args.size() + 1U);
     command_args.push_back(app_name);
@@ -94,8 +86,7 @@ std::string infer_preset_name_from_path(const fs::path& input_path) {
     return {};
 }
 
-std::string choose_seed_preset(const std::string& current_preset,
-                               const std::initializer_list<fs::path>& candidates) {
+std::string choose_seed_preset(const std::string& current_preset, const std::initializer_list<fs::path>& candidates) {
     for (const fs::path& candidate : candidates) {
         const std::string inferred = infer_preset_name_from_path(candidate);
         if (!inferred.empty()) {
@@ -107,11 +98,7 @@ std::string choose_seed_preset(const std::string& current_preset,
 
 SeedSnapshotState load_seed_snapshot(const fs::path& settings_path) {
     SeedSnapshotState state;
-    apply_default_gui_state(state.selected_preset,
-                            state.train,
-                            state.validate,
-                            state.predict,
-                            state.annotate,
+    apply_default_gui_state(state.selected_preset, state.train, state.validate, state.predict, state.annotate,
                             state.export_state);
 
     std::ifstream file(settings_path);
@@ -127,9 +114,8 @@ SeedSnapshotState load_seed_snapshot(const fs::path& settings_path) {
         state.selected_preset = snapshot.selected_preset;
         return state;
     } catch (const std::exception& error) {
-        mmltk::logging::logger("gui")->warn("[gui] ignoring malformed settings from {}: {}",
-                                             settings_path.string(),
-                                             error.what());
+        mmltk::logging::logger("gui")->warn("[gui] ignoring malformed settings from {}: {}", settings_path.string(),
+                                            error.what());
         return state;
     }
 }
@@ -140,8 +126,8 @@ void save_seed_snapshot(const fs::path& settings_path, SeedSnapshotState& state)
     if (!parent.empty()) {
         fs::create_directories(parent, error);
         if (error) {
-            throw std::runtime_error(
-                "failed to create settings directory `" + parent.string() + "`: " + error.message());
+            throw std::runtime_error("failed to create settings directory `" + parent.string() +
+                                     "`: " + error.message());
         }
     }
 
@@ -158,8 +144,8 @@ void save_seed_snapshot(const fs::path& settings_path, SeedSnapshotState& state)
     if (error) {
         std::error_code cleanup_error;
         fs::remove(tmp_path, cleanup_error);
-        throw std::runtime_error(
-            "failed to rename `" + tmp_path.string() + "` to `" + settings_path.string() + "`: " + error.message());
+        throw std::runtime_error("failed to rename `" + tmp_path.string() + "` to `" + settings_path.string() +
+                                 "`: " + error.message());
     }
 }
 
@@ -178,8 +164,7 @@ ValidateSeedCliState parse_validate_seed(const std::vector<std::string>& args) {
     ValidateSeedCliState state = mmltk::rfdetr::cli_shared::add_validate_command_options(&app, true);
     parse_cli_app(app, "mmltk rfdetr validate", args, []() {});
     mmltk::rfdetr::cli_shared::finalize_validate_command(
-        state,
-        mmltk::rfdetr::cli_shared::ValidateUnsupportedOptionMode::RejectGuiUnsupported);
+        state, mmltk::rfdetr::cli_shared::ValidateUnsupportedOptionMode::RejectGuiUnsupported);
     return state;
 }
 
@@ -189,9 +174,7 @@ TrainSeedCliState parse_train_seed(const std::vector<std::string>& args, const s
     TrainSeedCliState state = mmltk::rfdetr::cli_shared::add_train_command_options(&app, true);
     parse_cli_app(app, "mmltk rfdetr train", args, []() {});
     mmltk::rfdetr::cli_shared::finalize_train_command(
-        state,
-        fallback_preset_name,
-        mmltk::rfdetr::cli_shared::TrainUnsupportedOptionMode::RejectGuiUnsupported);
+        state, fallback_preset_name, mmltk::rfdetr::cli_shared::TrainUnsupportedOptionMode::RejectGuiUnsupported);
     return state;
 }
 
@@ -230,16 +213,14 @@ std::vector<std::string> normalize_seed_cli_args(const std::vector<std::string>&
 void apply_predict_seed(SeedSnapshotState& snapshot, const PredictSeedCliState& state) {
     snapshot.current_view = View::Predict;
     snapshot.selected_preset = choose_seed_preset(
-        snapshot.selected_preset,
-        {state.request.weights_path, state.request.onnx_path, state.request.tensorrt_path});
+        snapshot.selected_preset, {state.request.weights_path, state.request.onnx_path, state.request.tensorrt_path});
     rfdetr_workflows::apply_predict_request(snapshot.predict, state.request);
 }
 
 void apply_validate_seed(SeedSnapshotState& snapshot, const ValidateSeedCliState& state) {
     snapshot.current_view = View::Validate;
-    snapshot.selected_preset = choose_seed_preset(
-        snapshot.selected_preset,
-        {state.request.onnx_path, state.request.tensorrt_path});
+    snapshot.selected_preset =
+        choose_seed_preset(snapshot.selected_preset, {state.request.onnx_path, state.request.tensorrt_path});
     rfdetr_workflows::apply_validate_request(snapshot.validate, state.request);
 }
 
@@ -267,7 +248,7 @@ void apply_export_onnx_seed(SeedSnapshotState& snapshot, const mmltk::rfdetr::Ex
     rfdetr_workflows::apply_export_onnx_request(snapshot.export_state, request);
 }
 
-} // namespace
+}  // namespace
 
 void apply_gui_cli_seed_file(const fs::path& settings_path, const std::vector<std::string>& cli_args) {
     std::vector<std::string> normalized = normalize_seed_cli_args(cli_args);
@@ -276,11 +257,13 @@ void apply_gui_cli_seed_file(const fs::path& settings_path, const std::vector<st
     }
     if (normalized.front() != "rfdetr") {
         throw std::runtime_error(
-            "GUI seeding only supports RF-DETR commands: `mmltk rfdetr train`, `predict`, `validate`, `build-engine`, and `export-onnx`");
+            "GUI seeding only supports RF-DETR commands: `mmltk rfdetr train`, `predict`, `validate`, `build-engine`, "
+            "and `export-onnx`");
     }
     if (normalized.size() < 2U) {
         throw std::runtime_error(
-            "GUI seeding requires one of: `mmltk rfdetr train`, `predict`, `validate`, `build-engine`, or `export-onnx`");
+            "GUI seeding requires one of: `mmltk rfdetr train`, `predict`, `validate`, `build-engine`, or "
+            "`export-onnx`");
     }
 
     SeedSnapshotState snapshot = load_seed_snapshot(settings_path);
@@ -297,14 +280,10 @@ void apply_gui_cli_seed_file(const fs::path& settings_path, const std::vector<st
         apply_build_engine_seed(snapshot, parse_build_engine_seed(command_args));
     } else if (subcommand == "export-onnx") {
         apply_export_onnx_seed(snapshot, parse_export_onnx_seed(command_args));
-    } else if (subcommand == "compile" ||
-               subcommand == "info" ||
-               subcommand == "evaluate" ||
-               subcommand == "eval" ||
-               subcommand == "val" ||
-               subcommand == "normalize-weights") {
-        throw std::runtime_error(
-            "GUI seeding does not support `mmltk rfdetr " + subcommand + "` because the GUI has no matching workflow");
+    } else if (subcommand == "compile" || subcommand == "info" || subcommand == "evaluate" || subcommand == "eval" ||
+               subcommand == "val" || subcommand == "normalize-weights") {
+        throw std::runtime_error("GUI seeding does not support `mmltk rfdetr " + subcommand +
+                                 "` because the GUI has no matching workflow");
     } else {
         throw std::runtime_error(
             "GUI seeding only supports `mmltk rfdetr train`, `predict`, `validate`, `build-engine`, and `export-onnx`");
@@ -313,4 +292,4 @@ void apply_gui_cli_seed_file(const fs::path& settings_path, const std::vector<st
     save_seed_snapshot(settings_path, snapshot);
 }
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

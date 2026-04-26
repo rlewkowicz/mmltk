@@ -4,10 +4,12 @@
 
 #include "rfdetr/backends.h"
 
+#include <array>
 #include <filesystem>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -20,8 +22,7 @@ inline const std::filesystem::path& model_input_path(const ResolvedModelArtifact
     return artifacts.weights_path;
 }
 
-inline std::string choose_backend_name(const std::string& requested_backend,
-                                       const ResolvedModelArtifacts& artifacts) {
+inline std::string choose_backend_name(const std::string& requested_backend, const ResolvedModelArtifacts& artifacts) {
     if (!artifacts.weights_path.empty()) {
         if (requested_backend != "auto") {
             throw std::runtime_error("--backend is only valid with explicit --onnx or --tensorrt inputs");
@@ -47,137 +48,172 @@ inline std::string choose_backend_name(const std::string& requested_backend,
         throw std::runtime_error("unsupported RF-DETR backend: " + requested_backend);
     }
 
-    throw std::runtime_error(
-        "RF-DETR backend " + requested_backend + " is unavailable for " + model_input_path(artifacts).string());
+    throw std::runtime_error("RF-DETR backend " + requested_backend + " is unavailable for " +
+                             model_input_path(artifacts).string());
 }
 
-class InferenceBackendFactory {
-public:
-    InferenceBackendFactory(const ResolvedModelArtifacts& artifacts,
-                            int device_id,
-                            bool allow_fp16,
-                            std::filesystem::path save_engine_path = {})
-        : input_path_(model_input_path(artifacts)),
-          onnx_path_(artifacts.onnx_path),
-          tensorrt_path_(artifacts.tensorrt_path),
-          save_engine_path_(std::move(save_engine_path)),
-          device_id_(device_id),
-          allow_fp16_(allow_fp16) {}
+inline std::filesystem::path default_backend_input_path(const std::filesystem::path& onnx_path,
+                                                        const std::filesystem::path& tensorrt_path) {
+    return onnx_path.empty() ? tensorrt_path : onnx_path;
+}
 
-    InferenceBackendFactory(std::filesystem::path onnx_path,
-                            std::filesystem::path tensorrt_path,
-                            int device_id,
-                            bool allow_fp16,
-                            std::filesystem::path save_engine_path = {})
-        : input_path_(onnx_path.empty() ? tensorrt_path : onnx_path),
-          onnx_path_(std::move(onnx_path)),
-          tensorrt_path_(std::move(tensorrt_path)),
-          save_engine_path_(std::move(save_engine_path)),
-          device_id_(device_id),
-          allow_fp16_(allow_fp16) {}
+struct InferenceBackendFactoryContext {
+    std::filesystem::path input_path;
+    std::filesystem::path onnx_path;
+    std::filesystem::path tensorrt_path;
+    std::filesystem::path save_engine_path;
+    int device_id = 0;
+    bool allow_fp16 = true;
 
-    [[nodiscard]] std::unique_ptr<InferenceBackend> make_backend(const std::string& backend_name) const {
-        const std::filesystem::path model_path = backend_model_path(backend_name);
-        if (backend_name == "onnx") {
-            return make_onnx_backend(model_path, device_id_);
+    [[nodiscard]] std::filesystem::path onnx_model_path() const {
+        if (onnx_path.empty()) {
+            throw std::runtime_error("RF-DETR ONNX artifact is unavailable for " + input_path.string());
         }
-        if (backend_name == "tensorrt") {
-            return make_tensorrt_backend(model_path, device_id_, allow_fp16_, save_engine_path_);
+        return onnx_path;
+    }
+
+    [[nodiscard]] std::filesystem::path tensorrt_model_path() const {
+        if (!tensorrt_path.empty()) {
+            return tensorrt_path;
         }
-        throw std::runtime_error("unsupported RF-DETR backend: " + backend_name);
+        if (!onnx_path.empty()) {
+            return onnx_path;
+        }
+        throw std::runtime_error("RF-DETR TensorRT requires an engine or ONNX artifact for " + input_path.string());
+    }
+};
+
+class InferenceBackendFamilyFactory {
+   public:
+    virtual ~InferenceBackendFamilyFactory() = default;
+
+    [[nodiscard]] virtual std::string_view backend_name() const noexcept = 0;
+    [[nodiscard]] virtual std::unique_ptr<InferenceBackend> make_backend(
+        const InferenceBackendFactoryContext& context) const = 0;
+    [[nodiscard]] virtual std::vector<std::unique_ptr<InferenceBackend>> make_backend_lanes(
+        const InferenceBackendFactoryContext& context, int lane_count) const = 0;
+};
+
+class OnnxInferenceBackendFamilyFactory final : public InferenceBackendFamilyFactory {
+   public:
+    [[nodiscard]] std::string_view backend_name() const noexcept override {
+        return "onnx";
+    }
+
+    [[nodiscard]] std::unique_ptr<InferenceBackend> make_backend(
+        const InferenceBackendFactoryContext& context) const override {
+        return make_onnx_backend(context.onnx_model_path(), context.device_id);
     }
 
     [[nodiscard]] std::vector<std::unique_ptr<InferenceBackend>> make_backend_lanes(
-        const std::string& backend_name,
-        int lane_count) const {
-        const std::filesystem::path model_path = backend_model_path(backend_name);
-        if (backend_name == "onnx") {
-            return make_onnx_backend_lanes(model_path, device_id_, lane_count);
-        }
-        if (backend_name == "tensorrt") {
-            return make_tensorrt_backend_lanes(model_path, device_id_, allow_fp16_, lane_count, save_engine_path_);
-        }
-        throw std::runtime_error("unsupported RF-DETR backend: " + backend_name);
+        const InferenceBackendFactoryContext& context, const int lane_count) const override {
+        return make_onnx_backend_lanes(context.onnx_model_path(), context.device_id, lane_count);
+    }
+};
+
+class TensorRtInferenceBackendFamilyFactory final : public InferenceBackendFamilyFactory {
+   public:
+    [[nodiscard]] std::string_view backend_name() const noexcept override {
+        return "tensorrt";
     }
 
-private:
-    [[nodiscard]] std::filesystem::path backend_model_path(const std::string& backend_name) const {
-        if (backend_name == "onnx") {
-            if (onnx_path_.empty()) {
-                throw std::runtime_error("RF-DETR ONNX artifact is unavailable for " + input_path_.string());
-            }
-            return onnx_path_;
-        }
-        if (backend_name == "tensorrt") {
-            if (!tensorrt_path_.empty()) {
-                return tensorrt_path_;
-            }
-            if (!onnx_path_.empty()) {
-                return onnx_path_;
-            }
-            throw std::runtime_error(
-                "RF-DETR TensorRT requires an engine or ONNX artifact for " + input_path_.string());
-        }
-        throw std::runtime_error("unsupported RF-DETR backend: " + backend_name);
+    [[nodiscard]] std::unique_ptr<InferenceBackend> make_backend(
+        const InferenceBackendFactoryContext& context) const override {
+        return make_tensorrt_backend(context.tensorrt_model_path(), context.device_id, context.allow_fp16,
+                                     context.save_engine_path);
     }
 
-    std::filesystem::path input_path_;
-    std::filesystem::path onnx_path_;
-    std::filesystem::path tensorrt_path_;
-    std::filesystem::path save_engine_path_;
-    int device_id_ = 0;
-    bool allow_fp16_ = true;
+    [[nodiscard]] std::vector<std::unique_ptr<InferenceBackend>> make_backend_lanes(
+        const InferenceBackendFactoryContext& context, const int lane_count) const override {
+        return make_tensorrt_backend_lanes(context.tensorrt_model_path(), context.device_id, context.allow_fp16,
+                                           lane_count, context.save_engine_path);
+    }
+};
+
+inline const std::array<const InferenceBackendFamilyFactory*, 2>& inference_backend_family_factories() {
+    static const OnnxInferenceBackendFamilyFactory onnx_factory;
+    static const TensorRtInferenceBackendFamilyFactory tensorrt_factory;
+    static const std::array<const InferenceBackendFamilyFactory*, 2> factories{{
+        &onnx_factory,
+        &tensorrt_factory,
+    }};
+    return factories;
+}
+
+inline const InferenceBackendFamilyFactory& inference_backend_family_factory(const std::string_view backend_name) {
+    for (const InferenceBackendFamilyFactory* factory : inference_backend_family_factories()) {
+        if (factory->backend_name() == backend_name) {
+            return *factory;
+        }
+    }
+    throw std::runtime_error("unsupported RF-DETR backend: " + std::string(backend_name));
+}
+
+class InferenceBackendFactory {
+   public:
+    InferenceBackendFactory(const ResolvedModelArtifacts& artifacts, int device_id, bool allow_fp16,
+                            std::filesystem::path save_engine_path = {})
+        : context_{
+              model_input_path(artifacts), artifacts.onnx_path, artifacts.tensorrt_path,
+              std::move(save_engine_path), device_id,           allow_fp16,
+          } {}
+
+    InferenceBackendFactory(std::filesystem::path onnx_path, std::filesystem::path tensorrt_path, int device_id,
+                            bool allow_fp16, std::filesystem::path save_engine_path = {})
+        : context_{
+              default_backend_input_path(onnx_path, tensorrt_path),
+              std::move(onnx_path),
+              std::move(tensorrt_path),
+              std::move(save_engine_path),
+              device_id,
+              allow_fp16,
+          } {}
+
+    [[nodiscard]] std::unique_ptr<InferenceBackend> make_backend(const std::string_view backend_name) const {
+        return inference_backend_family_factory(backend_name).make_backend(context_);
+    }
+
+    [[nodiscard]] std::vector<std::unique_ptr<InferenceBackend>> make_backend_lanes(const std::string_view backend_name,
+                                                                                    const int lane_count) const {
+        return inference_backend_family_factory(backend_name).make_backend_lanes(context_, lane_count);
+    }
+
+   private:
+    InferenceBackendFactoryContext context_;
 };
 
 inline std::unique_ptr<InferenceBackend> make_backend(const ResolvedModelArtifacts& artifacts,
-                                                      const std::string& backend_name,
-                                                      int device_id,
-                                                      bool allow_fp16,
+                                                      const std::string& backend_name, int device_id, bool allow_fp16,
                                                       std::filesystem::path save_engine_path = {}) {
-    return InferenceBackendFactory(artifacts, device_id, allow_fp16, std::move(save_engine_path)).make_backend(
-        backend_name);
+    return InferenceBackendFactory(artifacts, device_id, allow_fp16, std::move(save_engine_path))
+        .make_backend(backend_name);
 }
 
-inline std::vector<std::unique_ptr<InferenceBackend>> make_backend_lanes(
-    const ResolvedModelArtifacts& artifacts,
-    const std::string& backend_name,
-    int device_id,
-    bool allow_fp16,
-    int lane_count,
-    std::filesystem::path save_engine_path = {}) {
-    return InferenceBackendFactory(artifacts, device_id, allow_fp16, std::move(save_engine_path)).make_backend_lanes(
-        backend_name,
-        lane_count);
+inline std::vector<std::unique_ptr<InferenceBackend>> make_backend_lanes(const ResolvedModelArtifacts& artifacts,
+                                                                         const std::string& backend_name, int device_id,
+                                                                         bool allow_fp16, int lane_count,
+                                                                         std::filesystem::path save_engine_path = {}) {
+    return InferenceBackendFactory(artifacts, device_id, allow_fp16, std::move(save_engine_path))
+        .make_backend_lanes(backend_name, lane_count);
 }
 
 inline std::unique_ptr<InferenceBackend> make_backend(std::filesystem::path onnx_path,
                                                       std::filesystem::path tensorrt_path,
-                                                      const std::string& backend_name,
-                                                      int device_id,
-                                                      bool allow_fp16,
+                                                      const std::string& backend_name, int device_id, bool allow_fp16,
                                                       std::filesystem::path save_engine_path = {}) {
-    return InferenceBackendFactory(std::move(onnx_path),
-                                   std::move(tensorrt_path),
-                                   device_id,
-                                   allow_fp16,
+    return InferenceBackendFactory(std::move(onnx_path), std::move(tensorrt_path), device_id, allow_fp16,
                                    std::move(save_engine_path))
         .make_backend(backend_name);
 }
 
-inline std::vector<std::unique_ptr<InferenceBackend>> make_backend_lanes(
-    std::filesystem::path onnx_path,
-    std::filesystem::path tensorrt_path,
-    const std::string& backend_name,
-    int device_id,
-    bool allow_fp16,
-    int lane_count,
-    std::filesystem::path save_engine_path = {}) {
-    return InferenceBackendFactory(std::move(onnx_path),
-                                   std::move(tensorrt_path),
-                                   device_id,
-                                   allow_fp16,
+inline std::vector<std::unique_ptr<InferenceBackend>> make_backend_lanes(std::filesystem::path onnx_path,
+                                                                         std::filesystem::path tensorrt_path,
+                                                                         const std::string& backend_name, int device_id,
+                                                                         bool allow_fp16, int lane_count,
+                                                                         std::filesystem::path save_engine_path = {}) {
+    return InferenceBackendFactory(std::move(onnx_path), std::move(tensorrt_path), device_id, allow_fp16,
                                    std::move(save_engine_path))
         .make_backend_lanes(backend_name, lane_count);
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

@@ -1,0 +1,413 @@
+diff --git cef/libcef/renderer/frame_impl.h cef/libcef/renderer/frame_impl.h
+--- cef/libcef/renderer/frame_impl.h
++++ cef/libcef/renderer/frame_impl.h
+@@ -88,6 +88,13 @@ class CefFrameImpl
+   void OnContextReleased();
+   void OnDetached();
+ 
++  base::WeakPtr<CefFrameImpl> GetWeakPtr() {
++    return weak_ptr_factory_.GetWeakPtr();
++  }
++  void ReleaseWorkspaceGpuBridgeSurface(const std::string& surface_id,
++                                        const std::string& revision,
++                                        bool renderer_dissociated);
++
+   blink::WebLocalFrame* web_frame() const { return frame_; }
+ 
+  private:
+@@ -163,6 +170,8 @@ class CefFrameImpl
+   void LoadRequest(cef::mojom::RequestParamsPtr params) override;
+   void DidStopLoading() override;
+   void MoveOrResizeStarted() override;
++  void WorkspaceGpuBridgeSurfaceReleased(const std::string& surface_id,
++                                         const std::string& revision) override;
+ 
+   // blink_glue::CefExecutionContextLifecycleStateObserver methods:
+   void ContextLifecycleStateChanged(
+diff --git cef/libcef/renderer/frame_impl.cc cef/libcef/renderer/frame_impl.cc
+--- cef/libcef/renderer/frame_impl.cc
++++ cef/libcef/renderer/frame_impl.cc
+@@ -28,6 +28,7 @@
+ #include "cef/libcef/renderer/blink_glue.h"
+ #include "cef/libcef/renderer/browser_impl.h"
+ #include "cef/libcef/renderer/dom_document_impl.h"
++#include "cef/libcef/renderer/workspace_gpu_bridge.h"
+ #include "cef/libcef/renderer/render_frame_util.h"
+ #include "cef/libcef/renderer/thread_util.h"
+ #include "cef/libcef/renderer/v8_impl.h"
+@@ -426,6 +427,7 @@ void CefFrameImpl::OnDetached() {
+   // The browser may hold the last reference to |this|. Take a reference here to
+   // keep |this| alive until after this method returns.
+   CefRefPtr<CefFrameImpl> self = this;
++  workspace_gpu_bridge::ReleaseAllForFrame(this);
+ 
+   browser_->FrameDetached(frame_);
+   frame_ = nullptr;
+@@ -452,6 +454,20 @@ void CefFrameImpl::OnDetached() {
+   }
+ }
+ 
++void CefFrameImpl::ReleaseWorkspaceGpuBridgeSurface(
++    const std::string& surface_id,
++    const std::string& revision,
++    bool renderer_dissociated) {
++  CEF_REQUIRE_RT_RETURN_VOID();
++  if (surface_id.empty() || revision.empty() ||
++      browser_connection_state_ != ConnectionState::CONNECTION_ACKED ||
++      !browser_frame_.is_bound()) {
++    return;
++  }
++  GetBrowserFrame()->ReleaseWorkspaceGpuBridgeSurface(
++      surface_id, revision, renderer_dissociated);
++}
++
+ void CefFrameImpl::ExecuteOnLocalFrame(const std::string& function_name,
+                                        LocalFrameAction action) {
+   CEF_REQUIRE_RT_RETURN_VOID();
+@@ -922,6 +938,12 @@ void CefFrameImpl::MoveOrResizeStarted() {
+   }
+ }
+ 
++void CefFrameImpl::WorkspaceGpuBridgeSurfaceReleased(
++    const std::string& surface_id,
++    const std::string& revision) {
++  workspace_gpu_bridge::ForgetReleasedSurface(this, surface_id, revision);
++}
++
+ void CefFrameImpl::ContextLifecycleStateChanged(
+     blink::mojom::blink::FrameLifecycleState state) {
+   if (state == blink::mojom::FrameLifecycleState::kFrozen && IsMain() &&
+diff --git cef/libcef/renderer/workspace_gpu_bridge.h cef/libcef/renderer/workspace_gpu_bridge.h
+new file mode 100644
+--- /dev/null
++++ cef/libcef/renderer/workspace_gpu_bridge.h
+@@ -0,0 +1,39 @@
++// Copyright 2026 The Chromium Embedded Framework Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CEF_LIBCEF_RENDERER_WORKSPACE_GPU_BRIDGE_H_
++#define CEF_LIBCEF_RENDERER_WORKSPACE_GPU_BRIDGE_H_
++#pragma once
++
++#include <string>
++#include <string_view>
++
++#include "base/memory/weak_ptr.h"
++#include "cef/include/cef_frame.h"
++#include "cef/include/internal/cef_string.h"
++#include "cef/include/cef_v8.h"
++
++class CefFrameImpl;
++
++namespace workspace_gpu_bridge {
++
++bool ImportTexture(CefRefPtr<CefFrame> frame,
++                   CefRefPtr<CefV8Value> device,
++                   const std::string& surface_id,
++                   const std::string& revision,
++                   std::string_view exported_shared_image_json,
++                   CefRefPtr<CefV8Value>* texture_out,
++                   CefString* exception);
++
++void ReleaseTexture(CefRefPtr<CefFrame> frame,
++                    const std::string& surface_id,
++                    const std::string& revision);
++void ReleaseAllForFrame(CefRefPtr<CefFrame> frame);
++void ForgetReleasedSurface(CefRefPtr<CefFrame> frame,
++                           const std::string& surface_id,
++                           const std::string& revision);
++
++}  // namespace workspace_gpu_bridge
++
++#endif  // CEF_LIBCEF_RENDERER_WORKSPACE_GPU_BRIDGE_H_
+diff --git cef/libcef/renderer/workspace_gpu_bridge.cc cef/libcef/renderer/workspace_gpu_bridge.cc
+new file mode 100644
+--- /dev/null
++++ cef/libcef/renderer/workspace_gpu_bridge.cc
+@@ -0,0 +1,285 @@
++// Copyright 2026 The Chromium Embedded Framework Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "cef/libcef/renderer/workspace_gpu_bridge.h"
++
++#include <map>
++#include <string>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/no_destructor.h"
++#include "base/task/single_thread_task_runner.h"
++#include "cef/libcef/renderer/blink_glue.h"
++#include "cef/libcef/renderer/frame_impl.h"
++#include "cef/libcef/renderer/v8_impl.h"
++#include "include/wrapper/cef_helpers.h"
++#include "third_party/blink/renderer/modules/webgpu/gpu_texture.h"
++#include "third_party/blink/renderer/platform/heap/persistent.h"
++#include "v8/include/v8.h"
++
++namespace workspace_gpu_bridge {
++
++namespace {
++
++using SurfaceKey = std::pair<std::string, std::string>;
++using ImportedTextureMap =
++    std::map<SurfaceKey, blink::Persistent<blink::GPUTexture>>;
++using ImportedTextureRegistry = std::map<const CefFrameImpl*, ImportedTextureMap>;
++
++ImportedTextureRegistry& GetImportedTextureRegistry() {
++  static base::NoDestructor<ImportedTextureRegistry> registry;
++  return *registry;
++}
++
++void ForgetTrackedTexture(CefFrameImpl* frame_impl,
++                          const std::string& surface_id,
++                          const std::string& revision) {
++  auto& registry = GetImportedTextureRegistry();
++  auto frame_it = registry.find(frame_impl);
++  if (frame_it == registry.end()) {
++    return;
++  }
++
++  frame_it->second.erase(SurfaceKey(surface_id, revision));
++  if (frame_it->second.empty()) {
++    registry.erase(frame_it);
++  }
++}
++
++blink::Persistent<blink::GPUTexture> TakeTrackedTexture(
++    CefFrameImpl* frame_impl,
++    const std::string& surface_id,
++    const std::string& revision) {
++  blink::Persistent<blink::GPUTexture> texture;
++
++  auto& registry = GetImportedTextureRegistry();
++  auto frame_it = registry.find(frame_impl);
++  if (frame_it == registry.end()) {
++    return texture;
++  }
++
++  auto texture_it = frame_it->second.find(SurfaceKey(surface_id, revision));
++  if (texture_it == frame_it->second.end()) {
++    return texture;
++  }
++
++  texture = std::move(texture_it->second);
++  frame_it->second.erase(texture_it);
++  if (frame_it->second.empty()) {
++    registry.erase(frame_it);
++  }
++  return texture;
++}
++
++void PostReleaseAfterDestroy(base::WeakPtr<CefFrameImpl> frame_impl,
++                             std::string surface_id,
++                             std::string revision) {
++  auto* task_runner = base::SingleThreadTaskRunner::GetCurrentDefault().get();
++  if (!task_runner) {
++    if (frame_impl) {
++      frame_impl->ReleaseWorkspaceGpuBridgeSurface(surface_id, revision, true);
++    }
++    return;
++  }
++
++  task_runner->PostTask(
++      FROM_HERE,
++      base::BindOnce(
++          [](base::WeakPtr<CefFrameImpl> frame_impl,
++             std::string surface_id,
++             std::string revision) {
++            if (frame_impl) {
++              frame_impl->ReleaseWorkspaceGpuBridgeSurface(
++                  surface_id, revision, true);
++            }
++          },
++          std::move(frame_impl), std::move(surface_id), std::move(revision)));
++}
++
++void OnImportedTextureDestroyed(base::WeakPtr<CefFrameImpl> frame_impl,
++                                std::string surface_id,
++                                std::string revision) {
++  if (!frame_impl) {
++    return;
++  }
++
++  ForgetTrackedTexture(frame_impl.get(), surface_id, revision);
++  PostReleaseAfterDestroy(std::move(frame_impl), std::move(surface_id),
++                          std::move(revision));
++}
++
++void TrackImportedTexture(CefFrameImpl* frame_impl,
++                          const std::string& surface_id,
++                          const std::string& revision,
++                          blink::GPUTexture* texture) {
++  if (!texture) {
++    return;
++  }
++
++  blink::Persistent<blink::GPUTexture> existing =
++      TakeTrackedTexture(frame_impl, surface_id, revision);
++  if (existing.Get()) {
++    existing->ClearBeforeDestroyCallback();
++    if (!existing->IsDestroyed()) {
++      existing->destroy();
++    }
++    frame_impl->ReleaseWorkspaceGpuBridgeSurface(surface_id, revision, true);
++  }
++
++  texture->SetBeforeDestroyCallback(base::BindOnce(
++      &OnImportedTextureDestroyed, frame_impl->GetWeakPtr(), surface_id,
++      revision));
++  GetImportedTextureRegistry()[frame_impl].insert_or_assign(
++      SurfaceKey(surface_id, revision), blink::Persistent(texture));
++}
++
++void ReleaseTrackedTexture(CefFrameImpl* frame_impl,
++                           const std::string& surface_id,
++                           const std::string& revision) {
++  blink::Persistent<blink::GPUTexture> texture =
++      TakeTrackedTexture(frame_impl, surface_id, revision);
++  bool renderer_dissociated = false;
++  if (texture.Get()) {
++    texture->ClearBeforeDestroyCallback();
++    if (!texture->IsDestroyed()) {
++      texture->destroy();
++      renderer_dissociated = true;
++    }
++  }
++
++  frame_impl->ReleaseWorkspaceGpuBridgeSurface(surface_id, revision,
++                                               renderer_dissociated);
++}
++
++}  // namespace
++
++bool ImportTexture(CefRefPtr<CefFrame> frame,
++                   CefRefPtr<CefV8Value> device,
++                   const std::string& surface_id,
++                   const std::string& revision,
++                   std::string_view exported_shared_image_json,
++                   CefRefPtr<CefV8Value>* texture_out,
++                   CefString* exception) {
++  CEF_REQUIRE_RENDERER_THREAD();
++  if (!texture_out) {
++    if (exception) {
++      *exception = "workspace GPU bridge requires a texture output slot";
++    }
++    return false;
++  }
++  *texture_out = nullptr;
++  if (!frame || !device || !device->IsObject()) {
++    if (exception) {
++      *exception =
++          "workspace GPU bridge requires the current frame and a GPUDevice";
++    }
++    return false;
++  }
++
++  auto* frame_impl = static_cast<CefFrameImpl*>(frame.get());
++  std::string serialized_json(exported_shared_image_json.begin(),
++                              exported_shared_image_json.end());
++  if (serialized_json.empty()) {
++    if (exception) {
++      *exception =
++          "workspace GPU bridge importTexture requires delivered exported "
++          "SharedImage metadata";
++    }
++    return false;
++  }
++
++  CefRefPtr<CefV8Context> context = CefV8Context::GetCurrentContext();
++  auto* context_impl = context ? static_cast<CefV8ContextImpl*>(context.get()) : nullptr;
++  auto* device_impl = static_cast<CefV8ValueImpl*>(device.get());
++  if (!context_impl || !device_impl || !device_impl->IsValid()) {
++    if (exception) {
++      *exception =
++          "workspace GPU bridge could not unwrap the renderer V8 context";
++    }
++    return false;
++  }
++
++  v8::Isolate* isolate = v8::Isolate::GetCurrent();
++  v8::Local<v8::Context> v8_context = context_impl->GetV8Context();
++  v8::Local<v8::Value> device_value = device_impl->GetV8Value(true);
++  if (!isolate || v8_context.IsEmpty() || device_value.IsEmpty() ||
++      !device_value->IsObject()) {
++    if (exception) {
++      *exception = "workspace GPU bridge could not resolve the current isolate";
++    }
++    return false;
++  }
++  v8::HandleScope handle_scope(isolate);
++
++  blink::GPUTexture* imported_texture = nullptr;
++  v8::TryCatch try_catch(isolate);
++  v8::MaybeLocal<v8::Value> maybe_texture =
++      blink_glue::ImportWorkspaceGpuBridgeTexture(
++          v8_context, device_value.As<v8::Object>(), serialized_json, try_catch,
++          isolate, &imported_texture);
++  v8::Local<v8::Value> texture_value;
++  if (!maybe_texture.ToLocal(&texture_value) || !imported_texture) {
++    if (exception) {
++      *exception =
++          "workspace GPU bridge renderer import did not return a GPUTexture";
++    }
++    return false;
++  }
++  TrackImportedTexture(frame_impl, surface_id, revision, imported_texture);
++
++  *texture_out = new CefV8ValueImpl(isolate, v8_context, texture_value);
++  return *texture_out != nullptr;
++}
++
++void ReleaseTexture(CefRefPtr<CefFrame> frame,
++                    const std::string& surface_id,
++                    const std::string& revision) {
++  CEF_REQUIRE_RENDERER_THREAD();
++  if (!frame) {
++    return;
++  }
++  ReleaseTrackedTexture(static_cast<CefFrameImpl*>(frame.get()), surface_id,
++                        revision);
++}
++
++void ReleaseAllForFrame(CefRefPtr<CefFrame> frame) {
++  CEF_REQUIRE_RENDERER_THREAD();
++  if (!frame) {
++    return;
++  }
++
++  auto* frame_impl = static_cast<CefFrameImpl*>(frame.get());
++  auto& registry = GetImportedTextureRegistry();
++  auto frame_it = registry.find(frame_impl);
++  if (frame_it == registry.end()) {
++    return;
++  }
++
++  ImportedTextureMap textures = std::move(frame_it->second);
++  registry.erase(frame_it);
++  for (auto& [surface_key, texture] : textures) {
++    if (texture.Get()) {
++      texture->ClearBeforeDestroyCallback();
++      if (!texture->IsDestroyed()) {
++        texture->destroy();
++      }
++    }
++    frame_impl->ReleaseWorkspaceGpuBridgeSurface(surface_key.first,
++                                                 surface_key.second, true);
++  }
++}
++
++void ForgetReleasedSurface(CefRefPtr<CefFrame> frame,
++                           const std::string& surface_id,
++                           const std::string& revision) {
++  CEF_REQUIRE_RENDERER_THREAD();
++  if (!frame) {
++    return;
++  }
++  ForgetTrackedTexture(static_cast<CefFrameImpl*>(frame.get()), surface_id,
++                       revision);
++}
++
++}  // namespace workspace_gpu_bridge

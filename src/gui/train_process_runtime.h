@@ -50,15 +50,14 @@ struct LocalTrainSessionState {
 };
 
 class LocalTrainSession {
-public:
+   public:
     LocalTrainSession();
     ~LocalTrainSession();
 
     LocalTrainSession(const LocalTrainSession&) = delete;
     LocalTrainSession& operator=(const LocalTrainSession&) = delete;
 
-    void start(const mmltk::rfdetr::TrainRequest& request,
-               const std::filesystem::path& cli_path,
+    void start(const mmltk::rfdetr::TrainRequest& request, const std::filesystem::path& cli_path,
                std::string fallback_preset_name);
     void request_stop(bool force);
     void shutdown();
@@ -66,9 +65,9 @@ public:
     [[nodiscard]] LocalTrainSessionState snapshot() const;
     [[nodiscard]] bool running() const;
 
-private:
+   private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

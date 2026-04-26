@@ -63,51 +63,34 @@ struct TargetScratch {
 };
 
 class LoaderBatchGuard {
-public:
-    LoaderBatchGuard(mmltk::DatasetLoader& loader,
-                     const mmltk::Batch& batch,
-                     int device_id);
+   public:
+    LoaderBatchGuard(mmltk::DatasetLoader& loader, const mmltk::Batch& batch, int device_id);
     ~LoaderBatchGuard();
 
     LoaderBatchGuard(const LoaderBatchGuard&) = delete;
     LoaderBatchGuard& operator=(const LoaderBatchGuard&) = delete;
 
-private:
+   private:
     mmltk::DatasetLoader* loader_ = nullptr;
     mmltk::Batch batch_{};
     int device_id_ = 0;
     void* consumer_stream_ = nullptr;
 };
 
-torch::Tensor make_size_tensor(int64_t batch_size,
-                               int64_t image_height,
-                               int64_t image_width,
+torch::Tensor make_size_tensor(int64_t batch_size, int64_t image_height, int64_t image_width,
                                const torch::Device& device);
 
-torch::Tensor make_device_batch_tensor(const mmltk::Batch& batch,
-                                       int device_id,
-                                       int64_t image_height,
+torch::Tensor make_device_batch_tensor(const mmltk::Batch& batch, int device_id, int64_t image_height,
                                        int64_t image_width);
 
-PreparedTargets build_targets(const mmltk::Batch& batch,
-                              int image_height,
-                              int image_width,
-                              bool include_masks,
-                              bool require_masks,
-                              int device_id,
-                              TargetScratch& scratch);
+PreparedTargets build_targets(const mmltk::Batch& batch, int image_height, int image_width, bool include_masks,
+                              bool require_masks, int device_id, TargetScratch& scratch);
 
 std::string resolve_path(const std::string& path);
 
-mmltk::DatasetLoader::Config make_loader_config(const std::string& compiled_path,
-                                                     size_t batch_size,
-                                                     bool shuffle,
-                                                     int prefetch_factor,
-                                                     int gather_workers,
-                                                     const std::string& cpu_affinity,
-                                                     int device_id,
-                                                     uint64_t seed,
-                                                     uint32_t batch_shard_rank = 0,
-                                                     uint32_t batch_shard_count = 1);
+mmltk::DatasetLoader::Config make_loader_config(const std::string& compiled_path, size_t batch_size, bool shuffle,
+                                                int prefetch_factor, int gather_workers,
+                                                const std::string& cpu_affinity, int device_id, uint64_t seed,
+                                                uint32_t batch_shard_rank = 0, uint32_t batch_shard_count = 1);
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

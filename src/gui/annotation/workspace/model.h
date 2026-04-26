@@ -108,25 +108,19 @@ struct AnnotationSidebarViewModel {
 };
 
 class AnnotationWorkspaceModelBuilder {
-public:
-    static AnnotationWorkspaceViewModel build(const AnnotationFrame& frame,
-                                              const AnnotationDocument& document,
-                                              const AnnotationSession& session,
-                                              const SourceSelectionState& source,
+   public:
+    static AnnotationWorkspaceViewModel build(const AnnotationFrame& frame, const AnnotationDocument& document,
+                                              const AnnotationSession& session, const SourceSelectionState& source,
                                               bool include_crop_box);
-    static AnnotationWorkspaceViewModel build(const AnnotationFrame& frame,
-                                              const AnnotationDocument& document,
-                                              const SourceSelectionState& source,
-                                              bool include_crop_box,
+    static AnnotationWorkspaceViewModel build(const AnnotationFrame& frame, const AnnotationDocument& document,
+                                              const SourceSelectionState& source, bool include_crop_box,
                                               std::shared_ptr<const AnnotationProjectedScene> projected_scene);
 };
 
 class AnnotationSidebarModelBuilder {
-public:
-    static AnnotationSidebarViewModel build(const AnnotationDocument& document,
-                                            const AnnotationCategories& categories,
-                                            const AnnotationSession& session,
-                                            bool has_annotation_frame = true);
+   public:
+    static AnnotationSidebarViewModel build(const AnnotationDocument& document, const AnnotationCategories& categories,
+                                            const AnnotationSession& session, bool has_annotation_frame = true);
 };
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

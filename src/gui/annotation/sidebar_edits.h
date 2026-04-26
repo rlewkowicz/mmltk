@@ -1,8 +1,8 @@
 #pragma once
 
 #include "gui/annotation/controller.h"
-#include "gui/annotation/document/edit.h"
 #include "gui/annotation/editor.h"
+#include "gui/annotation/sidebar_action_payloads.h"
 #include "gui/annotation/tools/skeleton_tool_helpers.h"
 #include "gui/annotation/tools/spline_tool_helpers.h"
 #include "gui/annotation_core.h"
@@ -29,6 +29,7 @@ struct AnnotationObjectsTabApplyContext {
     const AnnotationFrame* frame = nullptr;
     std::string* pending_class_name = nullptr;
     bool assist_available = false;
+    std::size_t preferred_new_object_category_index = 0;
 };
 
 struct AnnotationMaskTabApplyContext {
@@ -38,40 +39,8 @@ struct AnnotationMaskTabApplyContext {
     int* cleanup_radius = nullptr;
 };
 
-struct AnnotationSelectedObjectSidebarEditRequest {
-    std::optional<std::size_t> selected_object_index;
-    std::size_t preferred_new_object_category_index = 0;
-    bool request_add_class = false;
-    std::optional<AnnotationToolKind> create_object_tool;
-    bool request_assist = false;
-    bool request_undo = false;
-    bool request_redo = false;
-    bool request_delete_selected = false;
-    bool update_selected_metadata = false;
-    bool selected_enabled = true;
-    std::size_t selected_category_index = 0;
-    bool request_redraw_box = false;
-    bool request_insert_active_spline_knot = false;
-    bool update_spline_active_segment = false;
-    std::optional<std::size_t> spline_active_segment_index;
-    std::optional<AnnotationSplineHandleMode> spline_handle_mode;
-    std::optional<AnnotationToolActionKind> spline_action;
-    bool update_skeleton_active_joint = false;
-    std::optional<std::size_t> skeleton_active_joint_index;
-    std::optional<AnnotationToolActionKind> skeleton_action;
-};
-
-struct AnnotationMaskSidebarEditRequest {
-    int cleanup_radius = 1;
-    bool request_redraw_box = false;
-    std::optional<AnnotationMaskCleanupOp> cleanup_op;
-    bool update_color_ranges = false;
-    AnnotationColorRange sup{};
-    AnnotationColorRange nosup{};
-};
-
 [[nodiscard]] inline std::size_t selected_object_sidebar_core_change_count(
-    const AnnotationSelectedObjectSidebarEditRequest& request) noexcept {
+    const AnnotationSelectedObjectSidebarActionPayload& request) noexcept {
     std::size_t action_count = 0U;
     action_count += request.update_selected_metadata ? 1U : 0U;
     action_count += request.request_redraw_box ? 1U : 0U;
@@ -79,7 +48,7 @@ struct AnnotationMaskSidebarEditRequest {
 }
 
 [[nodiscard]] inline std::size_t mask_sidebar_semantic_change_count(
-    const AnnotationMaskSidebarEditRequest& request) noexcept {
+    const AnnotationMaskSidebarActionPayload& request) noexcept {
     std::size_t action_count = 0U;
     action_count += request.request_redraw_box ? 1U : 0U;
     action_count += request.cleanup_op.has_value() ? 1U : 0U;
@@ -87,38 +56,44 @@ struct AnnotationMaskSidebarEditRequest {
     return action_count;
 }
 
-inline AnnotationSidebarMutationResult apply_annotation_selected_object_sidebar_edit(
-    const AnnotationObjectsTabApplyContext& context,
-    const AnnotationSelectedObjectSidebarEditRequest& request) {
+inline void apply_sidebar_redraw_box_request(AnnotationDocument& document, AnnotationSession& session,
+                                             const AnnotationFrame* frame, AnnotationSidebarMutationResult& result) {
+    if (frame == nullptr) {
+        return;
+    }
+    if (AnnotationEditor::reset_selected_object_box(document, session, *frame)) {
+        result.preview_invalidated = true;
+        result.reset_canvas_interactions = true;
+        result.next_tool = AnnotationToolKind::Box;
+    }
+}
+
+inline AnnotationSidebarMutationResult apply_annotation_selected_object_sidebar_payload(
+    const AnnotationObjectsTabApplyContext& context, const AnnotationSelectedObjectSidebarActionPayload& request) {
     AnnotationSidebarMutationResult result;
 
     if (request.selected_object_index.has_value()) {
         select_object(context.session, context.document, request.selected_object_index);
     }
 
-    if (request.request_add_class &&
-        context.pending_class_name != nullptr &&
+    if (request.request_add_class && context.pending_class_name != nullptr &&
         AnnotationEditor::add_category(context.categories, *context.pending_class_name)) {
         context.pending_class_name->clear();
     }
 
     if (request.create_object_tool.has_value() && context.frame != nullptr) {
         AnnotationEditor::ensure_default_category(context.categories);
-        if (context.controller.create_object(*request.create_object_tool,
-                                             context.document,
-                                             context.session,
-                                             *context.frame,
-                                             context.categories,
-                                             request.preferred_new_object_category_index)
+        if (context.controller
+                .create_object(*request.create_object_tool, context.document, context.session, *context.frame,
+                               context.categories, context.preferred_new_object_category_index)
                 .has_value()) {
             result.preview_invalidated = true;
-            result.reset_canvas_interactions =
-                *request.create_object_tool == AnnotationToolKind::Box;
+            result.reset_canvas_interactions = *request.create_object_tool == AnnotationToolKind::Box;
             result.next_tool = request.create_object_tool;
         }
     }
 
-    if (request.request_assist) {
+    if (request.request_assist && context.assist_available) {
         result.request_assist = true;
     }
 
@@ -140,28 +115,17 @@ inline AnnotationSidebarMutationResult apply_annotation_selected_object_sidebar_
     {
         const bool grouped_selected_object_edits =
             !context.document.transaction_active() &&
-            should_group_transaction_for_change_count(
-                selected_object_sidebar_core_change_count(request));
-        AnnotationEditorTransactionScope transaction(context.document,
-                                                     grouped_selected_object_edits);
+            should_group_transaction_for_change_count(selected_object_sidebar_core_change_count(request));
+        AnnotationEditorTransactionScope transaction(context.document, grouped_selected_object_edits);
 
-        if (request.update_selected_metadata &&
-            tool_detail::update_selected_skeleton_object_metadata(context.document,
-                                                                  context.session,
-                                                                  context.categories,
-                                                                  request.selected_enabled,
-                                                                  request.selected_category_index)) {
+        if (request.update_selected_metadata && tool_detail::update_selected_skeleton_object_metadata(
+                                                    context.document, context.session, context.categories,
+                                                    request.selected_enabled, request.selected_category_index)) {
             result.preview_invalidated = true;
         }
 
-        if (request.request_redraw_box && context.frame != nullptr) {
-            if (AnnotationEditor::reset_selected_object_box(context.document,
-                                                            context.session,
-                                                            *context.frame)) {
-                result.preview_invalidated = true;
-                result.reset_canvas_interactions = true;
-                result.next_tool = AnnotationToolKind::Box;
-            }
+        if (request.request_redraw_box) {
+            apply_sidebar_redraw_box_request(context.document, context.session, context.frame, result);
         }
 
         transaction.finish();
@@ -175,14 +139,10 @@ inline AnnotationSidebarMutationResult apply_annotation_selected_object_sidebar_
         request.spline_action,
     };
     const tool_detail::AnnotationSplineSidebarMutationResult spline_result =
-        tool_detail::apply_annotation_spline_sidebar_edit(context.document,
-                                                          context.session,
-                                                          context.frame,
-                                                          context.categories,
-                                                          spline_request);
+        tool_detail::apply_annotation_spline_sidebar_edit(context.document, context.session, context.frame,
+                                                          context.categories, spline_request);
     result.preview_invalidated = result.preview_invalidated || spline_result.preview_invalidated;
-    result.reset_canvas_interactions =
-        result.reset_canvas_interactions || spline_result.reset_canvas_interactions;
+    result.reset_canvas_interactions = result.reset_canvas_interactions || spline_result.reset_canvas_interactions;
     if (spline_result.next_tool.has_value()) {
         result.next_tool = spline_result.next_tool;
     }
@@ -193,16 +153,10 @@ inline AnnotationSidebarMutationResult apply_annotation_selected_object_sidebar_
         request.skeleton_action,
     };
     const tool_detail::AnnotationSkeletonSidebarMutationResult skeleton_result =
-        tool_detail::apply_annotation_skeleton_sidebar_edit(context.document,
-                                                            context.session,
-                                                            context.frame,
-                                                            context.categories,
-                                                            skeleton_request);
-    result.preview_invalidated =
-        result.preview_invalidated || skeleton_result.preview_invalidated;
-    result.reset_canvas_interactions =
-        result.reset_canvas_interactions ||
-        skeleton_result.reset_canvas_interactions;
+        tool_detail::apply_annotation_skeleton_sidebar_edit(context.document, context.session, context.frame,
+                                                            context.categories, skeleton_request);
+    result.preview_invalidated = result.preview_invalidated || skeleton_result.preview_invalidated;
+    result.reset_canvas_interactions = result.reset_canvas_interactions || skeleton_result.reset_canvas_interactions;
     if (skeleton_result.next_tool.has_value()) {
         result.next_tool = skeleton_result.next_tool;
     }
@@ -211,44 +165,29 @@ inline AnnotationSidebarMutationResult apply_annotation_selected_object_sidebar_
 }
 
 inline AnnotationSidebarMutationResult apply_annotation_mask_sidebar_edit(
-    const AnnotationMaskTabApplyContext& context,
-    const AnnotationMaskSidebarEditRequest& request) {
+    const AnnotationMaskTabApplyContext& context, const AnnotationMaskSidebarActionPayload& request) {
     AnnotationSidebarMutationResult result;
     if (context.cleanup_radius != nullptr) {
         *context.cleanup_radius = std::clamp(request.cleanup_radius, 1, 32);
     }
 
-    const bool grouped_mask_edits = !context.document.transaction_active() &&
-                                    should_group_transaction_for_change_count(
-                                        mask_sidebar_semantic_change_count(request));
+    const bool grouped_mask_edits =
+        !context.document.transaction_active() &&
+        should_group_transaction_for_change_count(mask_sidebar_semantic_change_count(request));
     AnnotationEditorTransactionScope transaction(context.document, grouped_mask_edits);
 
-    if (request.request_redraw_box && context.frame != nullptr) {
-        if (AnnotationEditor::reset_selected_object_box(context.document,
-                                                        context.session,
-                                                        *context.frame)) {
-            result.preview_invalidated = true;
-            result.reset_canvas_interactions = true;
-            result.next_tool = AnnotationToolKind::Box;
-        }
+    if (request.request_redraw_box) {
+        apply_sidebar_redraw_box_request(context.document, context.session, context.frame, result);
     }
 
-    if (request.cleanup_op.has_value() &&
-        context.frame != nullptr &&
-        context.cleanup_radius != nullptr &&
-        AnnotationEditor::cleanup_selected_mask(context.document,
-                                                context.session,
-                                                *context.frame,
-                                                *request.cleanup_op,
+    if (request.cleanup_op.has_value() && context.frame != nullptr && context.cleanup_radius != nullptr &&
+        AnnotationEditor::cleanup_selected_mask(context.document, context.session, *context.frame, *request.cleanup_op,
                                                 *context.cleanup_radius)) {
         result.preview_invalidated = true;
     }
 
-    if (request.update_color_ranges &&
-        AnnotationEditor::update_selected_object_color_ranges(context.document,
-                                                              context.session,
-                                                              request.sup,
-                                                              request.nosup)) {
+    if (request.update_color_ranges && AnnotationEditor::update_selected_object_color_ranges(
+                                           context.document, context.session, request.sup, request.nosup)) {
         result.preview_invalidated = true;
     }
 
@@ -256,4 +195,4 @@ inline AnnotationSidebarMutationResult apply_annotation_mask_sidebar_edit(
     return result;
 }
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

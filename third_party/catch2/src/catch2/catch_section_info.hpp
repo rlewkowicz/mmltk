@@ -17,26 +17,20 @@
 
 namespace Catch {
 
-    struct SectionInfo {
-        // The last argument is ignored, so that people can write
-        // SECTION("ShortName", "Proper description that is long") and
-        // still use the `-c` flag comfortably.
-        SectionInfo( SourceLineInfo const& _lineInfo, std::string _name,
-                    const char* const = nullptr ):
-            name(CATCH_MOVE(_name)),
-            lineInfo(_lineInfo)
-            {}
+struct SectionInfo {
+    SectionInfo(SourceLineInfo const& _lineInfo, std::string _name, const char* const = nullptr)
+        : name(CATCH_MOVE(_name)), lineInfo(_lineInfo) {}
 
-        std::string name;
-        SourceLineInfo lineInfo;
-    };
+    std::string name;
+    SourceLineInfo lineInfo;
+};
 
-    struct SectionEndInfo {
-        SectionInfo sectionInfo;
-        Counts prevAssertions;
-        double durationInSeconds;
-    };
+struct SectionEndInfo {
+    SectionInfo sectionInfo;
+    Counts prevAssertions;
+    double durationInSeconds;
+};
 
-} // end namespace Catch
+}  // namespace Catch
 
-#endif // CATCH_SECTION_INFO_HPP_INCLUDED
+#endif  // CATCH_SECTION_INFO_HPP_INCLUDED

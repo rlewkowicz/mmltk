@@ -19,8 +19,7 @@ die() {
 }
 
 # When running as root, resolve the first real (login-capable) user on the box
-# and import their graphical session environment so the container can access the
-# display, runtime dir, Xauthority, etc.
+# so the container uses that uid/gid for mounts and device access.
 resolve_real_user() {
     if (( uid != 0 )); then
         return 0
@@ -53,63 +52,6 @@ resolve_real_user() {
         return 0
     fi
     log "running as root, resolved container user to ${target_user} (${uid}:${gid})"
-
-    # Import display/session env vars from the user's active graphical session.
-    local user_pid
-    user_pid="$(loginctl list-sessions --no-legend 2>/dev/null \
-        | awk -v user="${target_user}" '$3 == user {print $0; exit}' \
-        | awk '{print $NF}')" || true
-
-    if [[ -z "${user_pid}" ]]; then
-        # Fallback: grab the leader PID of the user's systemd slice
-        user_pid="$(loginctl show-user "${target_user}" --property=Slice --value 2>/dev/null | xargs -I{} systemctl show {} --property=MainPID --value 2>/dev/null)" || true
-    fi
-
-    local env_source=""
-    if [[ -n "${user_pid}" && -r "/proc/${user_pid}/environ" ]]; then
-        env_source="/proc/${user_pid}/environ"
-    else
-        # Fallback: any process owned by the target user that has DISPLAY set
-        local candidate_pid
-        candidate_pid="$(find /proc -maxdepth 2 -name environ -user "${target_user}" 2>/dev/null \
-            | head -20 \
-            | while read -r ef; do
-                if tr '\0' '\n' < "${ef}" 2>/dev/null | grep -q '^DISPLAY='; then
-                    dirname "${ef}" | xargs basename
-                    break
-                fi
-            done)" || true
-        if [[ -n "${candidate_pid}" && -r "/proc/${candidate_pid}/environ" ]]; then
-            env_source="/proc/${candidate_pid}/environ"
-        fi
-    fi
-
-    if [[ -z "${env_source}" ]]; then
-        log "warning: could not find a graphical session for ${target_user}; display vars will be unset"
-        return 0
-    fi
-
-    local var_name
-    for var_name in \
-        XDG_RUNTIME_DIR \
-        XDG_SESSION_TYPE \
-        XDG_CURRENT_DESKTOP \
-        XDG_SESSION_DESKTOP \
-        DESKTOP_SESSION \
-        DBUS_SESSION_BUS_ADDRESS \
-        DISPLAY \
-        XAUTHORITY \
-        WAYLAND_DISPLAY \
-        __NV_PRIME_RENDER_OFFLOAD \
-        __GLX_VENDOR_LIBRARY_NAME; do
-        if [[ -z "${!var_name:-}" ]]; then
-            local val
-            val="$(tr '\0' '\n' < "${env_source}" | grep "^${var_name}=" | head -1 | cut -d= -f2-)" || true
-            if [[ -n "${val}" ]]; then
-                export "${var_name}=${val}"
-            fi
-        fi
-    done
 }
 resolve_real_user
 
@@ -179,6 +121,21 @@ container_runtime_label() {
 
 bind_mount_specs=()
 desired_runtime_label=""
+gui_platform=""
+gui_runtime_dir_container="/tmp/mmltk-gui-runtime"
+gui_wayland_socket_host_path=""
+gui_wayland_socket_container_path=""
+gui_x11_display=""
+gui_x11_socket_host_path=""
+gui_x11_socket_container_path=""
+gui_xauthority_host_path=""
+gui_xauthority_container_path=""
+gui_dbus_socket_host_path=""
+gui_dbus_socket_container_path=""
+
+gui_runtime_tmpfs_spec() {
+    printf '%s' "${gui_runtime_dir_container}:rw,mode=700,uid=${uid},gid=${gid}"
+}
 
 path_is_covered_by_bind_mount() {
     local source_path="$1"
@@ -202,22 +159,301 @@ append_bind_mount() {
     bind_mount_specs+=("${source_path}:${target_path}:${mode}")
 }
 
+extract_dbus_session_bus_path() {
+    local address="$1"
+    if [[ "${address}" =~ ^unix:path=([^,]+) ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    fi
+}
+
+default_xdg_runtime_dir() {
+    local candidate="/run/user/${uid}"
+    [[ -d "${candidate}" ]] || return 1
+    printf '%s' "${candidate}"
+}
+
+env_value_from_text() {
+    local text="$1"
+    local name="$2"
+    printf '%s\n' "${text}" | sed -n "s/^${name}=//p" | head -n 1
+}
+
+infer_gui_environment_from_target_processes() {
+    local proc_env proc_dir owner env_text value
+    for proc_env in /proc/[0-9]*/environ; do
+        proc_dir="${proc_env%/environ}"
+        [[ -r "${proc_env}" ]] || continue
+        owner="$(stat -c %u "${proc_dir}" 2>/dev/null || true)"
+        [[ "${owner}" == "${uid}" ]] || continue
+        env_text="$(tr '\0' '\n' < "${proc_env}" 2>/dev/null)" || continue
+
+        if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+            value="$(env_value_from_text "${env_text}" XDG_RUNTIME_DIR)"
+            if [[ -n "${value}" ]]; then
+                XDG_RUNTIME_DIR="${value}"
+                log "assuming XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}"
+            fi
+        fi
+        if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
+            value="$(env_value_from_text "${env_text}" WAYLAND_DISPLAY)"
+            if [[ -n "${value}" ]]; then
+                WAYLAND_DISPLAY="${value}"
+                log "assuming WAYLAND_DISPLAY=${WAYLAND_DISPLAY}"
+            fi
+        fi
+        if [[ -z "${DISPLAY:-}" ]]; then
+            value="$(env_value_from_text "${env_text}" DISPLAY)"
+            if [[ -n "${value}" ]]; then
+                DISPLAY="${value}"
+                log "assuming DISPLAY=${DISPLAY}"
+            fi
+        fi
+        if [[ -z "${XAUTHORITY:-}" ]]; then
+            value="$(env_value_from_text "${env_text}" XAUTHORITY)"
+            if [[ -n "${value}" ]]; then
+                XAUTHORITY="${value}"
+                log "assuming XAUTHORITY=${XAUTHORITY}"
+            fi
+        fi
+        if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+            value="$(env_value_from_text "${env_text}" DBUS_SESSION_BUS_ADDRESS)"
+            if [[ -n "${value}" ]]; then
+                DBUS_SESSION_BUS_ADDRESS="${value}"
+                log "assuming DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS}"
+            fi
+        fi
+
+        if [[ -n "${XDG_RUNTIME_DIR:-}" && -n "${WAYLAND_DISPLAY:-}" && \
+              -n "${DISPLAY:-}" && -n "${XAUTHORITY:-}" && \
+              -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+            return 0
+        fi
+    done
+}
+
+infer_gui_common_environment() {
+    infer_gui_environment_from_target_processes
+
+    if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+        local runtime_dir=""
+        runtime_dir="$(default_xdg_runtime_dir)" || true
+        if [[ -n "${runtime_dir}" ]]; then
+            XDG_RUNTIME_DIR="${runtime_dir}"
+            log "assuming XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}"
+        fi
+    fi
+
+    if [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" && -n "${XDG_RUNTIME_DIR:-}" ]]; then
+        local dbus_socket_path="${XDG_RUNTIME_DIR}/bus"
+        if [[ -S "${dbus_socket_path}" || -e "${dbus_socket_path}" ]]; then
+            DBUS_SESSION_BUS_ADDRESS="unix:path=${dbus_socket_path}"
+            log "assuming DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS}"
+        fi
+    fi
+}
+
+find_wayland_display_in_runtime_dir() {
+    local runtime_dir="$1"
+    local candidate="${runtime_dir}/wayland-0"
+    if [[ -S "${candidate}" || -e "${candidate}" ]]; then
+        printf 'wayland-0'
+        return 0
+    fi
+
+    for candidate in "${runtime_dir}"/wayland-*; do
+        [[ "${candidate}" == *.lock ]] && continue
+        [[ -S "${candidate}" || -e "${candidate}" ]] || continue
+        basename "${candidate}"
+        return 0
+    done
+
+    return 1
+}
+
+infer_gui_wayland_environment() {
+    infer_gui_common_environment
+
+    if [[ -z "${XDG_RUNTIME_DIR:-}" ]]; then
+        local runtime_dir=""
+        runtime_dir="$(default_xdg_runtime_dir)" || true
+        if [[ -n "${runtime_dir}" ]]; then
+            XDG_RUNTIME_DIR="${runtime_dir}"
+            log "assuming XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}"
+        elif [[ "${WAYLAND_DISPLAY:-}" == /* ]]; then
+            XDG_RUNTIME_DIR="${WAYLAND_DISPLAY%/*}"
+            log "assuming XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}"
+        fi
+    fi
+
+    if [[ -z "${WAYLAND_DISPLAY:-}" ]]; then
+        local display_name=""
+        if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+            display_name="$(find_wayland_display_in_runtime_dir "${XDG_RUNTIME_DIR}")" || true
+        fi
+
+        if [[ -n "${display_name}" ]]; then
+            WAYLAND_DISPLAY="${display_name}"
+            log "assuming WAYLAND_DISPLAY=${WAYLAND_DISPLAY} from ${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}"
+        else
+            WAYLAND_DISPLAY="wayland-0"
+            log "assuming WAYLAND_DISPLAY=${WAYLAND_DISPLAY}"
+        fi
+    fi
+}
+
+infer_gui_x11_environment() {
+    infer_gui_common_environment
+
+    if [[ -z "${XAUTHORITY:-}" ]]; then
+        local home_dir=""
+        home_dir="$(getent passwd "${uid}" 2>/dev/null | cut -d: -f6)" || true
+        if [[ -n "${home_dir}" && -e "${home_dir}/.Xauthority" ]]; then
+            XAUTHORITY="${home_dir}/.Xauthority"
+            log "assuming XAUTHORITY=${XAUTHORITY}"
+        fi
+    fi
+}
+
+resolve_wayland_socket_host_path() {
+    [[ -n "${WAYLAND_DISPLAY:-}" ]] || return 1
+    [[ -n "${XDG_RUNTIME_DIR:-}" ]] || return 1
+
+    local candidate=""
+    if [[ "${WAYLAND_DISPLAY}" == /* ]]; then
+        candidate="${WAYLAND_DISPLAY}"
+    elif [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
+        candidate="${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}"
+    else
+        return 1
+    fi
+
+    [[ -S "${candidate}" || -e "${candidate}" ]] || return 1
+    printf '%s' "${candidate}"
+}
+
+resolve_x11_socket_host_path() {
+    [[ -n "${DISPLAY:-}" ]] || return 1
+    if [[ "${DISPLAY}" =~ ^:([0-9]+)(\..*)?$ ]]; then
+        local candidate="/tmp/.X11-unix/X${BASH_REMATCH[1]}"
+        [[ -S "${candidate}" || -e "${candidate}" ]] || return 1
+        printf '%s' "${candidate}"
+        return 0
+    fi
+    return 1
+}
+
+resolve_gui_dbus_forwarding() {
+    gui_dbus_socket_host_path=""
+    gui_dbus_socket_container_path=""
+    local dbus_socket_path=""
+    dbus_socket_path="$(extract_dbus_session_bus_path "${DBUS_SESSION_BUS_ADDRESS:-}")"
+    if [[ -n "${dbus_socket_path}" ]]; then
+        if [[ -S "${dbus_socket_path}" || -e "${dbus_socket_path}" ]]; then
+            gui_dbus_socket_host_path="${dbus_socket_path}"
+            gui_dbus_socket_container_path="${gui_runtime_dir_container}/$(basename "${dbus_socket_path}")"
+        else
+            log "warning: DBUS session bus socket '${dbus_socket_path}' is unavailable; skipping DBUS session bus forwarding"
+        fi
+    fi
+}
+
+resolve_wayland_gui_session() {
+    infer_gui_wayland_environment
+
+    [[ -n "${WAYLAND_DISPLAY:-}" ]] \
+        || die "--gui requires WAYLAND_DISPLAY to be set on the host"
+    [[ -n "${XDG_RUNTIME_DIR:-}" ]] \
+        || die "--gui requires XDG_RUNTIME_DIR to be set on the host"
+
+    local wayland_socket_host_path=""
+    wayland_socket_host_path="$(resolve_wayland_socket_host_path)" \
+        || die "--gui requires the Wayland socket '${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}' to exist on the host"
+
+    gui_platform="wayland"
+
+    gui_wayland_socket_host_path="${wayland_socket_host_path}"
+    gui_wayland_socket_container_path="${gui_runtime_dir_container}/$(basename "${wayland_socket_host_path}")"
+    gui_x11_display=""
+    gui_x11_socket_host_path=""
+    gui_x11_socket_container_path=""
+    gui_xauthority_host_path=""
+    gui_xauthority_container_path=""
+
+    resolve_gui_dbus_forwarding
+}
+
+resolve_x11_gui_session() {
+    infer_gui_x11_environment
+
+    [[ -n "${DISPLAY:-}" ]] \
+        || die "--gui with MMLTK_GUI_PLATFORM=x11 requires DISPLAY to be set on the host"
+
+    local x11_socket_host_path=""
+    x11_socket_host_path="$(resolve_x11_socket_host_path)" \
+        || die "--gui with MMLTK_GUI_PLATFORM=x11 requires a local X11 socket for DISPLAY='${DISPLAY}'"
+
+    gui_platform="x11"
+    gui_wayland_socket_host_path=""
+    gui_wayland_socket_container_path=""
+    gui_x11_display="${DISPLAY}"
+    gui_x11_socket_host_path="$(dirname "${x11_socket_host_path}")"
+    gui_x11_socket_container_path="/tmp/.X11-unix"
+    gui_xauthority_host_path=""
+    gui_xauthority_container_path=""
+    if [[ -n "${XAUTHORITY:-}" && -e "${XAUTHORITY}" ]]; then
+        gui_xauthority_host_path="${XAUTHORITY}"
+        gui_xauthority_container_path="${gui_runtime_dir_container}/Xauthority"
+    else
+        log "warning: XAUTHORITY is unavailable; X11 may reject the container connection"
+    fi
+
+    resolve_gui_dbus_forwarding
+}
+
+resolve_gui_session() {
+    if (( ! gui_mode )); then
+        return 0
+    fi
+
+    if [[ -n "${gui_platform}" ]]; then
+        return 0
+    fi
+
+    case "${MMLTK_GUI_PLATFORM:-wayland}" in
+        wayland)
+            resolve_wayland_gui_session
+            ;;
+        x11)
+            die "--gui with MMLTK_GUI_PLATFORM=x11 is not supported; Wayland is required"
+            ;;
+        *)
+            die "--gui unsupported MMLTK_GUI_PLATFORM='${MMLTK_GUI_PLATFORM}' (expected wayland)"
+            ;;
+    esac
+}
+
 prepare_bind_mounts() {
     bind_mount_specs=()
     if (( ! gui_mode )); then
         return 0
     fi
 
-    if [[ -d /tmp/.X11-unix ]]; then
-        append_bind_mount /tmp/.X11-unix /tmp/.X11-unix rw
+    resolve_gui_session
+
+    if [[ -n "${gui_wayland_socket_host_path}" ]]; then
+        append_bind_mount "${gui_wayland_socket_host_path}" "${gui_wayland_socket_container_path}" rw
     fi
 
-    if [[ -n "${XDG_RUNTIME_DIR:-}" ]]; then
-        append_bind_mount "${XDG_RUNTIME_DIR}" "${XDG_RUNTIME_DIR}" rw
+    if [[ -n "${gui_x11_socket_host_path}" ]]; then
+        append_bind_mount "${gui_x11_socket_host_path}" "${gui_x11_socket_container_path}" rw
     fi
 
-    if [[ -n "${XAUTHORITY:-}" ]]; then
-        append_bind_mount "${XAUTHORITY}" "${XAUTHORITY}" rw
+    if [[ -n "${gui_xauthority_host_path}" ]]; then
+        append_bind_mount "${gui_xauthority_host_path}" "${gui_xauthority_container_path}" ro
+    fi
+
+    if [[ -n "${gui_dbus_socket_host_path}" ]]; then
+        append_bind_mount "${gui_dbus_socket_host_path}" "${gui_dbus_socket_container_path}" rw
     fi
 }
 
@@ -229,7 +465,10 @@ desired_container_runtime_label() {
         "home=/tmp/mmltk-home"
     )
     if (( gui_mode )); then
+        resolve_gui_session
         spec_parts+=("gui=1")
+        spec_parts+=("gui_platform=${gui_platform}")
+        spec_parts+=("tmpfs=$(gui_runtime_tmpfs_spec)")
     else
         spec_parts+=("gui=0")
     fi
@@ -326,6 +565,10 @@ build_run_args() {
         --workdir "/host${repo_root}"
     )
 
+    if (( gui_mode )); then
+        run_args+=(--tmpfs "$(gui_runtime_tmpfs_spec)")
+    fi
+
     build_common_group_args
     run_args+=("${common_group_args[@]}")
 
@@ -345,7 +588,16 @@ build_common_group_args() {
     common_group_args=()
 
     local -a host_groups=()
-    mapfile -t host_groups < <(id -G | tr ' ' '\n' | sort -u)
+    local group_lookup_user
+    group_lookup_user="${MMLTK_USER:-}"
+    if [[ -z "${group_lookup_user}" && ${uid} -ne $(id -u) ]]; then
+        group_lookup_user="$(getent passwd "${uid}" | cut -d: -f1)"
+    fi
+    if [[ -n "${group_lookup_user}" ]]; then
+        mapfile -t host_groups < <(id -G "${group_lookup_user}" | tr ' ' '\n' | sort -u)
+    else
+        mapfile -t host_groups < <(id -G | tr ' ' '\n' | sort -u)
+    fi
     local group_id
     for group_id in "${host_groups[@]}"; do
         [[ -n "${group_id}" ]] || continue
@@ -360,6 +612,18 @@ build_common_group_args() {
     if [[ -n "${video_gid}" ]]; then
         common_group_args+=(--group-add "${video_gid}")
     fi
+}
+
+ensure_gui_runtime_dir_access() {
+    if (( ! gui_mode )); then
+        return 0
+    fi
+
+    docker exec -u 0 "${container_name}" /bin/sh -lc "
+        mkdir -p '${gui_runtime_dir_container}' &&
+        chown '${uid}:${gid}' '${gui_runtime_dir_container}' &&
+        chmod 700 '${gui_runtime_dir_container}'
+    " >/dev/null
 }
 
 ensure_container() {
@@ -391,6 +655,8 @@ ensure_container() {
         build_run_args
         docker "${run_args[@]}" >/dev/null
     fi
+
+    ensure_gui_runtime_dir_access
 }
 
 ensure_runtime_test_cli_compatibility() {
@@ -417,49 +683,58 @@ build_exec_env_args() {
         exec_env_args+=(-e "MMLTK_LOG_DIR=$(rewrite_host_path "${MMLTK_LOG_DIR}")")
     fi
     if (( gui_mode )); then
-        local gui_platform="${MMLTK_GUI_PLATFORM:-}"
-        if [[ -z "${gui_platform}" ]]; then
-            if [[ -n "${DISPLAY:-}" ]]; then
-                gui_platform="x11"
-            elif [[ -n "${WAYLAND_DISPLAY:-}" ]]; then
-                gui_platform="wayland"
+        resolve_gui_session
+
+        exec_env_args+=(
+            -e "XDG_SESSION_TYPE=${gui_platform}"
+            -e "XDG_RUNTIME_DIR=${gui_runtime_dir_container}"
+            -e "MMLTK_CEF_OZONE_PLATFORM=${gui_platform}"
+            # Force libglvnd to use NVIDIA's EGL ICD only; Mesa's ICD still
+            # runs probes on NVIDIA PCI IDs and emits noise ("pci id ...
+            # driver (null)") but more importantly can win the selection
+            # race on some loaders.
+            -e "__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
+            -e "__GLX_VENDOR_LIBRARY_NAME=nvidia"
+            -e "GBM_BACKEND=nvidia-drm"
+        )
+
+        if [[ "${gui_platform}" == "wayland" ]]; then
+            exec_env_args+=(
+                -e "WAYLAND_DISPLAY=$(basename "${gui_wayland_socket_container_path}")"
+            )
+        elif [[ "${gui_platform}" == "x11" ]]; then
+            exec_env_args+=(
+                -e "DISPLAY=${gui_x11_display}"
+            )
+            if [[ -n "${gui_xauthority_container_path}" ]]; then
+                exec_env_args+=(-e "XAUTHORITY=${gui_xauthority_container_path}")
             fi
         fi
 
+        if [[ -n "${gui_dbus_socket_container_path}" && -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; then
+            exec_env_args+=(
+                -e "DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS/unix:path=${gui_dbus_socket_host_path}/unix:path=${gui_dbus_socket_container_path}}"
+            )
+        fi
+
         local env_name
+        if [[ -n "${__NV_PRIME_RENDER_OFFLOAD:-}" ]]; then
+            exec_env_args+=(-e "__NV_PRIME_RENDER_OFFLOAD=${__NV_PRIME_RENDER_OFFLOAD}")
+        fi
+
         for env_name in \
-            XDG_RUNTIME_DIR \
-            XDG_SESSION_TYPE \
-            XDG_CURRENT_DESKTOP \
-            XDG_SESSION_DESKTOP \
-            DESKTOP_SESSION \
-            DBUS_SESSION_BUS_ADDRESS \
-            DISPLAY \
-            XAUTHORITY \
-            WAYLAND_DISPLAY \
-            GDK_SCALE \
-            GDK_DPI_SCALE \
-            QT_SCALE_FACTOR \
-            QT_SCREEN_SCALE_FACTORS \
-            QT_AUTO_SCREEN_SCALE_FACTOR \
-            XCURSOR_SIZE \
-            XCURSOR_THEME \
-            __NV_PRIME_RENDER_OFFLOAD \
-            __GLX_VENDOR_LIBRARY_NAME; do
-            # Don't leak WAYLAND_DISPLAY into an X11-only container session;
-            # the NVIDIA EGL layer probes the Wayland socket even under GLX,
-            # and credential checks fail across PID namespaces.
-            if [[ "${env_name}" == "WAYLAND_DISPLAY" && "${gui_platform}" == "x11" ]]; then
-                continue
-            fi
+            MMLTK_CEF_WEBGPU_RUNTIME \
+            MMLTK_CEF_ENABLE_UNSAFE_WEBGPU \
+            MMLTK_CEF_FORCE_HIGH_PERFORMANCE_GPU \
+            MMLTK_CEF_ROOT_CACHE_PATH \
+            MMLTK_CEF_VERBOSE_LOGGING \
+            MMLTK_CEF_LOG_VERBOSITY \
+            MMLTK_CEF_VMODULE; do
             if [[ -n "${!env_name:-}" ]]; then
                 exec_env_args+=(-e "${env_name}=${!env_name}")
             fi
         done
 
-        if [[ -n "${gui_platform}" ]]; then
-            exec_env_args+=(-e "MMLTK_GUI_PLATFORM=${gui_platform}")
-        fi
     fi
 }
 
@@ -490,6 +765,62 @@ run_tidy() {
     docker "${docker_args[@]}"
 }
 
+reset_gui_session_resolution() {
+    gui_platform=""
+    gui_wayland_socket_host_path=""
+    gui_wayland_socket_container_path=""
+    gui_x11_display=""
+    gui_x11_socket_host_path=""
+    gui_x11_socket_container_path=""
+    gui_xauthority_host_path=""
+    gui_xauthority_container_path=""
+    gui_dbus_socket_host_path=""
+    gui_dbus_socket_container_path=""
+    bind_mount_specs=()
+    desired_runtime_label=""
+    exec_env_args=()
+}
+
+prepare_container_invocation() {
+    ensure_container
+    ensure_runtime_test_cli_compatibility
+    build_exec_env_args
+
+    container_workdir="/host${host_workdir}"
+    settings_container_path="$(rewrite_host_path "${settings_host_path}")"
+
+    exec_args=(exec -i)
+    interactive_tty=0
+    if [[ -t 0 && -t 1 ]]; then
+        exec_args+=(-t)
+        interactive_tty=1
+    fi
+    exec_args+=("${exec_env_args[@]}" -w "${container_workdir}" "${container_name}")
+
+    if (( gui_mode )); then
+        container_command=(/opt/mmltk/bin/mmltk-browser-host --settings-path "${settings_container_path}")
+        if ((${#rewritten_args[@]} > 0)); then
+            container_command+=(--seed-from-cli -- "${rewritten_args[@]}")
+        fi
+    else
+        container_command=(/opt/mmltk/bin/mmltk "${rewritten_args[@]}")
+    fi
+
+    # When the caller redirects stdout/stderr (e.g. `./mmltk --gui 2>&1 | tee
+    # log`), docker attaches the child process to pipes instead of a pty. glibc
+    # then block-buffers stderr — on a crash the last several KB of Chromium
+    # verbose logs (the interesting ones) disappear. Line-buffer with stdbuf so
+    # every newline flushes. Skip when already on a TTY since a terminal is
+    # line-buffered natively and stdbuf would be a no-op wrapper.
+    if (( ! interactive_tty )); then
+        container_command=(stdbuf -oL -eL "${container_command[@]}")
+    fi
+}
+
+run_prepared_container_invocation() {
+    docker "${exec_args[@]}" "${container_command[@]}"
+}
+
 gui_mode=0
 tidy_mode=0
 passthrough_args=()
@@ -516,26 +847,6 @@ if (( tidy_mode )); then
     exit $?
 fi
 
-ensure_container
-ensure_runtime_test_cli_compatibility
-build_exec_env_args
+prepare_container_invocation
 
-container_workdir="/host${host_workdir}"
-settings_container_path="$(rewrite_host_path "${settings_host_path}")"
-
-exec_args=(exec -i)
-if [[ -t 0 && -t 1 ]]; then
-    exec_args+=(-t)
-fi
-exec_args+=("${exec_env_args[@]}" -w "${container_workdir}" "${container_name}")
-
-if (( gui_mode )); then
-    container_command=(/opt/mmltk/bin/mmltk-gui --settings-path "${settings_container_path}")
-    if ((${#rewritten_args[@]} > 0)); then
-        container_command+=(--seed-from-cli -- "${rewritten_args[@]}")
-    fi
-else
-    container_command=(/opt/mmltk/bin/mmltk "${rewritten_args[@]}")
-fi
-
-docker "${exec_args[@]}" "${container_command[@]}"
+run_prepared_container_invocation

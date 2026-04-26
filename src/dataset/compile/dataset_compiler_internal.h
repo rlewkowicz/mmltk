@@ -64,7 +64,7 @@ struct ProgressCounter {
         return active.load(std::memory_order_acquire);
     }
 
-private:
+   private:
     void wake() noexcept {
         if (wake_cv != nullptr) {
             wake_cv->notify_one();
@@ -98,7 +98,7 @@ struct DroppedAnnotationTracker {
         return samples;
     }
 
-private:
+   private:
     void wake() noexcept {
         if (wake_cv != nullptr) {
             wake_cv->notify_one();
@@ -131,45 +131,38 @@ struct FileLayout {
     size_t total_size = 0;
 };
 
+struct PixelBlobWriteRequest {
+    const std::filesystem::path& split_dir;
+    uint32_t num_images = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    size_t image_stride = 0;
+    int num_workers = 0;
+    bool any_resize = false;
+    bool any_downscale = false;
+    ProgressCounter* completed_images = nullptr;
+    size_t pixel_offset = 0;
+};
+
 int resolve_num_workers(int configured_workers);
 
 std::filesystem::path image_path(const std::filesystem::path& split_dir, uint32_t zero_based_index);
 std::filesystem::path annotation_path(const std::filesystem::path& split_dir, uint32_t zero_based_index);
 
 DatasetScan scan_dataset(const CompilerConfig& config);
-LabelBlocks build_label_blocks(const std::filesystem::path& split_dir,
-                               uint32_t num_images,
-                               const CompilerConfig& config,
-                               const std::unordered_map<std::string, uint8_t>& class_map,
-                               int num_workers,
-                               ProgressCounter* completed_images = nullptr,
+LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t num_images,
+                               const CompilerConfig& config, const std::unordered_map<std::string, uint8_t>& class_map,
+                               int num_workers, ProgressCounter* completed_images = nullptr,
                                DroppedAnnotationTracker* dropped_annotations = nullptr);
 
 FileLayout compute_pixel_layout(uint32_t num_images, size_t image_stride);
 void finalize_layout(FileLayout& layout, const LayoutFinalizeInputs& inputs);
-void assign_pixel_offsets(std::vector<ImageEntry>& index,
-                          size_t pixel_offset,
-                          size_t image_stride);
-FileHeader make_file_header(const FileHeaderInputs& inputs,
-                            const std::unordered_map<std::string, uint8_t>& class_map,
+void assign_pixel_offsets(std::vector<ImageEntry>& index, size_t pixel_offset, size_t image_stride);
+FileHeader make_file_header(const FileHeaderInputs& inputs, const std::unordered_map<std::string, uint8_t>& class_map,
                             const FileLayout& layout);
-void write_metadata_blocks(const FileHandle& fd,
-                           const FileLayout& layout,
-                           const FileHeader& header,
+void write_metadata_blocks(const FileHandle& fd, const FileLayout& layout, const FileHeader& header,
                            const LabelBlocks& label_blocks);
 
-// Pixel emission keeps the on-disk writer API in the same order as the file layout.
-// NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-void write_pixel_blob(const FileHandle& fd,
-                      const std::filesystem::path& split_dir,
-                      uint32_t num_images,
-                      uint32_t width,
-                      uint32_t height,
-                      size_t image_stride,
-                      int num_workers,
-                      bool any_resize,
-                      bool any_downscale,
-                      ProgressCounter* completed_images,
-                      size_t pixel_offset);
+void write_pixel_blob(const FileHandle& fd, const PixelBlobWriteRequest& request);
 
-} // namespace mmltk::compiler_internal
+}  // namespace mmltk::compiler_internal

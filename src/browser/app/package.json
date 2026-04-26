@@ -1,0 +1,32 @@
+{
+  "name": "mmltk-browser-app",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "ng": "ng",
+    "check": "tsc -p tsconfig.app.json --noEmit",
+    "start": "ng serve",
+    "build": "ng build",
+    "watch": "ng build --watch --configuration development",
+    "test": "npm run test:compile && sh -lc 'files=$(find .test-dist/tests -type f -name \"*.test.js\" -print | sort); [ -n \"$files\" ] || { echo \"No compiled test files found\" >&2; exit 1; }; node --disable-warning=ExperimentalWarning --require ./.test-dist/tests/webgpu_shim.js --import=@angular/compiler --test $files'",
+    "test:compile": "node -e \"const fs=require('node:fs');fs.rmSync('.test-dist',{recursive:true,force:true});\" && tsc -p tsconfig.tests.json && node scripts/prepare-test-assets.cjs"
+  },
+  "dependencies": {
+    "@angular/common": "^20.3.0",
+    "@angular/compiler": "^20.3.0",
+    "@angular/core": "^20.3.0",
+    "@angular/forms": "^20.3.0",
+    "@angular/platform-browser": "^20.3.0",
+    "@angular/router": "^20.3.0",
+    "rxjs": "~7.8.0",
+    "tslib": "^2.8.1"
+  },
+  "devDependencies": {
+    "@angular/build": "^20.3.7",
+    "@angular/cli": "^20.3.7",
+    "@angular/compiler-cli": "^20.3.0",
+    "@types/node": "^24.9.1",
+    "@webgpu/types": "^0.1.69",
+    "typescript": "^5.9.3"
+  }
+}

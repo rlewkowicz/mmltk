@@ -69,4 +69,4 @@ inline void critical(spdlog::format_string_t<Args...> fmt, Args&&... args) {
     root_logger()->critical(fmt, std::forward<Args>(args)...);
 }
 
-} // namespace mmltk::logging
+}  // namespace mmltk::logging

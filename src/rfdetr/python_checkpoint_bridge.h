@@ -12,4 +12,4 @@ std::vector<StateDictEntry> load_upstream_python_state_dict(const std::filesyste
 void write_upstream_python_checkpoint(const std::filesystem::path& checkpoint_path,
                                       const std::vector<StateDictEntry>& state_dict);
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

@@ -13,9 +13,7 @@ namespace mmltk {
 namespace {
 
 template <typename SlotCollection>
-auto& checked_out_slot_impl(SlotCollection& slots,
-                            const Batch& batch,
-                            const char* operation) {
+auto& checked_out_slot_impl(SlotCollection& slots, const Batch& batch, const char* operation) {
     if (batch.slot_index >= slots.size()) {
         throw std::runtime_error(std::string(operation) + ": batch slot index out of range");
     }
@@ -39,12 +37,8 @@ bool batch_order_is_contiguous(const uint32_t* batch_order, size_t num_images) {
     return true;
 }
 
-// Batch image count plus stride intentionally track the gathered image layout.
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
-void copy_batch_images(float* dst,
-                       const float* pixels,
-                       const uint32_t* batch_order,
-                       size_t num_images,
+void copy_batch_images(float* dst, const float* pixels, const uint32_t* batch_order, size_t num_images,
                        size_t image_stride) {
     const size_t stride_floats = image_stride / sizeof(float);
     size_t image = 0;
@@ -60,8 +54,7 @@ void copy_batch_images(float* dst,
             ++run_length;
         }
 
-        std::memcpy(dst + run_begin * stride_floats,
-                    pixels + static_cast<size_t>(source_begin) * stride_floats,
+        std::memcpy(dst + run_begin * stride_floats, pixels + static_cast<size_t>(source_begin) * stride_floats,
                     run_length * image_stride);
         ++runs;
         contiguous_images += run_length;
@@ -73,7 +66,7 @@ void copy_batch_images(float* dst,
 }
 // NOLINTEND(bugprone-easily-swappable-parameters)
 
-} // namespace
+}  // namespace
 
 void DatasetLoader::Impl::reset_slot(BatchSlot& slot) {
     slot.batch_id = 0;
@@ -88,8 +81,7 @@ void DatasetLoader::Impl::reset_slot(BatchSlot& slot) {
 void DatasetLoader::Impl::prepare_slot(BatchSlot& slot, size_t batch_id) {
     slot.batch_id = batch_id;
     slot.batch_start = batch_start_for(batch_id);
-    slot.num_images =
-        std::min(config.batch_size, static_cast<size_t>(header.num_images) - slot.batch_start);
+    slot.num_images = std::min(config.batch_size, static_cast<size_t>(header.num_images) - slot.batch_start);
     slot.lease_id = next_lease_id++;
     if (use_gather_path) {
         const bool contiguous = batch_order_is_contiguous(order.data() + slot.batch_start, slot.num_images);
@@ -111,15 +103,13 @@ void DatasetLoader::Impl::prepare_slot(BatchSlot& slot, size_t batch_id) {
     }
 }
 
-DatasetLoader::Impl::BatchSlot& DatasetLoader::Impl::checked_out_slot_locked(
-    const Batch& batch,
-    const char* operation) {
+DatasetLoader::Impl::BatchSlot& DatasetLoader::Impl::checked_out_slot_locked(const Batch& batch,
+                                                                             const char* operation) {
     return checked_out_slot_impl(slots, batch, operation);
 }
 
-const DatasetLoader::Impl::BatchSlot& DatasetLoader::Impl::checked_out_slot_locked(
-    const Batch& batch,
-    const char* operation) const {
+const DatasetLoader::Impl::BatchSlot& DatasetLoader::Impl::checked_out_slot_locked(const Batch& batch,
+                                                                                   const char* operation) const {
     return checked_out_slot_impl(slots, batch, operation);
 }
 
@@ -170,9 +160,7 @@ void DatasetLoader::Impl::prefetch_worker() {
         BatchSlot slot_snapshot;
         {
             std::unique_lock<std::mutex> lock(slot_mtx);
-            gather_cv.wait(lock, [this] {
-                return shutdown.load() || !gather_queue.empty();
-            });
+            gather_cv.wait(lock, [this] { return shutdown.load() || !gather_queue.empty(); });
             if (shutdown.load()) {
                 return;
             }
@@ -191,17 +179,12 @@ void DatasetLoader::Impl::prefetch_worker() {
         float* dst = cuda_mgr->gather_buffer(static_cast<int>(slot_idx));
         MMLTK_PROFILE_ADD("loader.gather.images", slot_snapshot.num_images);
         MMLTK_PROFILE_ADD("loader.gather.bytes", slot_snapshot.num_images * stride);
-        copy_batch_images(dst,
-                          pixels,
-                          order.data() + slot_snapshot.batch_start,
-                          slot_snapshot.num_images,
-                          stride);
+        copy_batch_images(dst, pixels, order.data() + slot_snapshot.batch_start, slot_snapshot.num_images, stride);
 
         {
             std::lock_guard<std::mutex> lock(slot_mtx);
             BatchSlot& ready_slot = slots[slot_idx];
-            if (ready_slot.batch_id != slot_snapshot.batch_id ||
-                ready_slot.state != SlotState::Filling) {
+            if (ready_slot.batch_id != slot_snapshot.batch_id || ready_slot.state != SlotState::Filling) {
                 continue;
             }
             if (ready_slot.host_images == nullptr) {
@@ -221,9 +204,7 @@ void DatasetLoader::Impl::transfer_worker() {
         BatchSlot slot_snapshot;
         {
             std::unique_lock<std::mutex> lock(slot_mtx);
-            transfer_cv.wait(lock, [this] {
-                return shutdown.load() || acquire_transferable_slot_locked() >= 0;
-            });
+            transfer_cv.wait(lock, [this] { return shutdown.load() || acquire_transferable_slot_locked() >= 0; });
             if (shutdown.load()) {
                 return;
             }
@@ -247,8 +228,7 @@ void DatasetLoader::Impl::transfer_worker() {
         {
             std::lock_guard<std::mutex> lock(slot_mtx);
             BatchSlot& slot = slots[static_cast<size_t>(slot_idx)];
-            if (slot.batch_id != slot_snapshot.batch_id ||
-                slot.state != SlotState::TransferSubmitting) {
+            if (slot.batch_id != slot_snapshot.batch_id || slot.state != SlotState::TransferSubmitting) {
                 continue;
             }
             slot.state = SlotState::TransferQueued;
@@ -270,7 +250,7 @@ void DatasetLoader::Impl::start_workers() {
         workers.reserve(gather_worker_count);
         for (size_t i = 0; i < gather_worker_count; ++i) {
             workers.emplace_back([this, i] {
-                apply_worker_execution_policy(ExecutionPolicyRequest{
+                (void)apply_worker_execution_policy(ExecutionPolicyRequest{
                     worker_cpus,
                     "fl_gthr" + std::to_string(i),
                     i,
@@ -284,7 +264,7 @@ void DatasetLoader::Impl::start_workers() {
         MMLTK_PROFILE_SET("loader.gather.worker_count", 0);
     }
     transfer_worker_thread = std::thread([this] {
-        apply_worker_execution_policy(ExecutionPolicyRequest{
+        (void)apply_worker_execution_policy(ExecutionPolicyRequest{
             worker_cpus,
             "fl_h2d",
             gather_worker_count,
@@ -360,8 +340,7 @@ void DatasetLoader::Impl::reclaim_reusable_slots() {
                 if (slot.state != SlotState::Released) {
                     continue;
                 }
-                if (slot.batch_id < batch_slot_by_id.size() &&
-                    batch_slot_by_id[slot.batch_id] == slot_idx) {
+                if (slot.batch_id < batch_slot_by_id.size() && batch_slot_by_id[slot.batch_id] == slot_idx) {
                     batch_slot_by_id[slot.batch_id] = kInvalidSlot;
                 }
                 reset_slot(slot);
@@ -408,4 +387,4 @@ void DatasetLoader::Impl::refill_pipeline_locked() {
     MMLTK_PROFILE_ADD("loader.refill.slots", refilled_slots);
 }
 
-} // namespace mmltk
+}  // namespace mmltk

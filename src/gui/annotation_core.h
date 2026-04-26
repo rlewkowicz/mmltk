@@ -3,7 +3,7 @@
 #include "gui/annotation/common.h"
 #include "gui/annotation/document/types.h"
 
-#include "mmltk/rfdetr/predict.h"
+#include "mmltk/rfdetr/evaluation.h"
 
 #include <algorithm>
 #include <array>
@@ -11,7 +11,14 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
+
+namespace mmltk::rfdetr {
+
+struct PredictImageInput;
+
+}
 
 namespace mmltk::gui {
 
@@ -22,8 +29,6 @@ struct AnnotationVisibleObject;
 struct AnnotationProjectedSceneLookup {
     const AnnotationProjectedScene* projected_scene = nullptr;
     std::size_t object_count = 0;
-    // Cursors make repeated index lookups O(n) over a monotonic object walk without
-    // materializing per-object tables.
     mutable std::size_t visible_object_cursor = 0;
     mutable std::size_t visible_geometry_cursor = 0;
 
@@ -37,6 +42,9 @@ struct AnnotationCategorySkeletonEdge {
 };
 
 struct AnnotationCategory {
+    AnnotationCategory() = default;
+    AnnotationCategory(int id_in, std::string name_in) : id(id_in), name(std::move(name_in)) {}
+
     int id = 1;
     std::string name;
     std::vector<std::string> keypoints;
@@ -78,8 +86,7 @@ struct AnnotationSaveResult {
     return wrapped;
 }
 
-[[nodiscard]] inline AnnotationHsv annotation_bgr_to_hsv(const std::uint8_t b,
-                                                         const std::uint8_t g,
+[[nodiscard]] inline AnnotationHsv annotation_bgr_to_hsv(const std::uint8_t b, const std::uint8_t g,
                                                          const std::uint8_t r) noexcept {
     const float bf = static_cast<float>(b) / 255.0f;
     const float gf = static_cast<float>(g) / 255.0f;
@@ -134,18 +141,16 @@ AnnotationBox annotation_frame_view_box(const AnnotationFrame& frame);
 AnnotationBox annotation_box_to_frame(const AnnotationFrame& frame, const AnnotationBox& capture_box);
 AnnotationBox annotation_box_from_frame(const AnnotationFrame& frame, const AnnotationBox& frame_box);
 [[nodiscard]] inline AnnotationPoint annotation_capture_point_to_frame_unclipped(
-    const AnnotationFrame& frame,
-    const AnnotationPoint& point) noexcept {
+    const AnnotationFrame& frame, const AnnotationPoint& point) noexcept {
     return AnnotationPoint{
         point.x - static_cast<float>(frame.view_x),
         point.y - static_cast<float>(frame.view_y),
     };
 }
 
-[[nodiscard]] inline AnnotationPoint annotation_frame_point_to_capture_unclipped(
-    const AnnotationPoint& point,
-    const std::uint32_t view_x,
-    const std::uint32_t view_y) noexcept {
+[[nodiscard]] inline AnnotationPoint annotation_frame_point_to_capture_unclipped(const AnnotationPoint& point,
+                                                                                 const std::uint32_t view_x,
+                                                                                 const std::uint32_t view_y) noexcept {
     return AnnotationPoint{
         point.x + static_cast<float>(view_x),
         point.y + static_cast<float>(view_y),
@@ -154,50 +159,33 @@ AnnotationBox annotation_box_from_frame(const AnnotationFrame& frame, const Anno
 
 AnnotationMaskRegion annotation_mask_region_from_frame(const AnnotationFrame& frame);
 AnnotationFrame extract_annotation_frame_region(const AnnotationFrame& frame, const AnnotationBox& capture_box);
-std::optional<AnnotationBox> annotation_bbox_from_mask(const std::vector<std::uint8_t>& mask,
-                                                       std::uint32_t width,
+std::optional<AnnotationBox> annotation_bbox_from_mask(const std::vector<std::uint8_t>& mask, std::uint32_t width,
                                                        std::uint32_t height);
-std::vector<std::uint8_t> decode_annotation_prediction_mask(const mmltk::rfdetr::EncodedMask& mask,
-                                                            std::uint32_t width,
+std::vector<std::uint8_t> decode_annotation_prediction_mask(const mmltk::rfdetr::EncodedMask& mask, std::uint32_t width,
                                                             std::uint32_t height);
-std::vector<std::uint8_t> decode_annotation_mask_rle(std::string_view encoded_mask,
-                                                     std::uint32_t width,
+std::vector<std::uint8_t> decode_annotation_mask_rle(std::string_view encoded_mask, std::uint32_t width,
                                                      std::uint32_t height);
 std::string encode_annotation_mask_rle(const std::vector<std::uint8_t>& mask);
 [[nodiscard]] AnnotationProjectedSceneLookup make_annotation_projected_scene_lookup(
-    const AnnotationProjectedScene* projected_scene,
-    std::size_t object_count);
-std::vector<AnnotationResolvedObject> resolve_annotation_objects(const AnnotationFrame& frame,
-                                                                const AnnotationCategories& categories,
-                                                                const std::vector<AnnotationObject>& objects,
-                                                                bool live_mode,
-                                                                const AnnotationProjectedScene* projected_scene = nullptr);
-AnnotationPreviewResult build_annotation_preview(const AnnotationFrame& frame,
-                                                 const AnnotationCategories& categories,
-                                                 const std::vector<AnnotationObject>& objects,
-                                                 bool live_mode,
+    const AnnotationProjectedScene* projected_scene, std::size_t object_count);
+std::vector<AnnotationResolvedObject> resolve_annotation_objects(
+    const AnnotationFrame& frame, const AnnotationCategories& categories, const std::vector<AnnotationObject>& objects,
+    bool live_mode, const AnnotationProjectedScene* projected_scene = nullptr);
+AnnotationPreviewResult build_annotation_preview(const AnnotationFrame& frame, const AnnotationCategories& categories,
+                                                 const std::vector<AnnotationObject>& objects, bool live_mode,
                                                  const AnnotationProjectedScene* projected_scene = nullptr);
 AnnotationCategories load_annotation_categories(const std::filesystem::path& output_root);
 std::size_t ensure_annotation_category(AnnotationCategories& categories, const std::string& class_name);
-void write_annotation_categories(const std::filesystem::path& output_root,
-                                 const AnnotationCategories& categories);
+void write_annotation_categories(const std::filesystem::path& output_root, const AnnotationCategories& categories);
 std::vector<AnnotationObject> load_annotation_scene_objects(const std::filesystem::path& scene_jsonl_path,
-                                                           AnnotationCategories* categories);
+                                                            AnnotationCategories* categories);
 std::optional<std::vector<AnnotationObject>> load_saved_annotation_scene_for_frame(
-    const std::filesystem::path& output_root,
-    const AnnotationFrame& frame,
-    AnnotationCategories* categories);
-void write_annotation_png(const std::filesystem::path& path,
-                          int width,
-                          int height,
-                          int channels,
-                          const void* pixels,
+    const std::filesystem::path& output_root, const AnnotationFrame& frame, AnnotationCategories* categories);
+void write_annotation_png(const std::filesystem::path& path, int width, int height, int channels, const void* pixels,
                           int stride_bytes);
-AnnotationSaveResult save_annotation_scene(const AnnotationSaveConfig& config,
-                                           const AnnotationFrame& frame,
+AnnotationSaveResult save_annotation_scene(const AnnotationSaveConfig& config, const AnnotationFrame& frame,
                                            AnnotationCategories& categories,
-                                           const std::vector<AnnotationObject>& objects,
-                                           bool live_mode,
+                                           const std::vector<AnnotationObject>& objects, bool live_mode,
                                            const AnnotationProjectedScene* projected_scene = nullptr);
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

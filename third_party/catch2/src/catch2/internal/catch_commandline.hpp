@@ -12,10 +12,10 @@
 
 namespace Catch {
 
-    struct ConfigData;
+struct ConfigData;
 
-    Clara::Parser makeCommandLineParser( ConfigData& config );
+Clara::Parser makeCommandLineParser(ConfigData& config);
 
-} // end namespace Catch
+}  // namespace Catch
 
-#endif // CATCH_COMMANDLINE_HPP_INCLUDED
+#endif  // CATCH_COMMANDLINE_HPP_INCLUDED

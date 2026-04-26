@@ -1,4 +1,5 @@
 #include "gui_settings.h"
+#include "view_state.h"
 #include "mmltk_logging.h"
 
 #include <nlohmann/json.hpp>
@@ -26,6 +27,12 @@ T get_value_or(const nlohmann::json& j, const char* key, T fallback) {
         it->get_to(fallback);
     }
     return fallback;
+}
+
+void get_optional_compile_mode(const nlohmann::json& j, const char* key, mmltk::rfdetr::CompilationMode& out) {
+    int compile_mode = mmltk::rfdetr::compilation_mode_index(out);
+    get_optional(j, key, compile_mode);
+    out = mmltk::rfdetr::compilation_mode_from_index(compile_mode);
 }
 
 using mmltk::gui::DatasetPathState;
@@ -111,15 +118,9 @@ ExecutionShape export_execution_shape() {
     return shape;
 }
 
-/// Build the canonical kExecutionKey JSON from a legacy flat object.
-/// Fields not present in the legacy object get the supplied defaults.
-nlohmann::json make_legacy_execution_json(const nlohmann::json& legacy,
-                                          std::string cpu_affinity_default = {},
-                                          int device_id_default = 0,
-                                          int workers_default = 0,
-                                          int lanes_default = 0,
-                                          bool allow_fp16_default = true,
-                                          bool progress_bar_default = false,
+nlohmann::json make_legacy_execution_json(const nlohmann::json& legacy, std::string cpu_affinity_default = {},
+                                          int device_id_default = 0, int workers_default = 0, int lanes_default = 0,
+                                          bool allow_fp16_default = true, bool progress_bar_default = false,
                                           int compile_mode_default = 1) {
     return nlohmann::json{
         {"cpu_affinity", get_value_or<std::string>(legacy, "cpu_affinity", std::move(cpu_affinity_default))},
@@ -132,7 +133,6 @@ nlohmann::json make_legacy_execution_json(const nlohmann::json& legacy,
     };
 }
 
-/// Deserialize SourceSelectionState fields from a JSON object.
 void apply_source_json(const nlohmann::json& source, SourceSelectionState& s) {
     int kind = static_cast<int>(s.kind);
     get_optional(source, "kind", kind);
@@ -152,8 +152,101 @@ void apply_source_json(const nlohmann::json& source, SourceSelectionState& s) {
     get_optional(source, "crop_height", s.crop_height);
 }
 
-nlohmann::json snapshot_model_artifacts(const ModelArtifactSelectionState& state,
-                                        const ModelArtifactsShape& shape) {
+nlohmann::json snapshot_dataset_paths(const DatasetPathState& state) {
+    return nlohmann::json{
+        {"compiled_path", state.compiled_path},
+        {"source_dir", state.source_dir},
+        {"train_compiled_path", state.train_compiled_path},
+        {"val_compiled_path", state.val_compiled_path},
+        {"test_compiled_path", state.test_compiled_path},
+    };
+}
+
+void apply_dataset_paths_json(const nlohmann::json& json, DatasetPathState& state) {
+    get_optional(json, "compiled_path", state.compiled_path);
+    get_optional(json, "source_dir", state.source_dir);
+    get_optional(json, "train_compiled_path", state.train_compiled_path);
+    get_optional(json, "val_compiled_path", state.val_compiled_path);
+    get_optional(json, "test_compiled_path", state.test_compiled_path);
+}
+
+nlohmann::json snapshot_train_execution_target(const TrainExecutionPaneState& state) {
+    return nlohmann::json{
+        {"execution_target", static_cast<int>(state.execution_target)},
+        {"local_device_ids", state.local_device_ids},
+        {"remote_family_enabled", state.remote_family_enabled},
+        {"remote_container_image", state.remote_container_image},
+        {"remote_launch_template", state.remote_launch_template},
+    };
+}
+
+void apply_train_execution_target_json(const nlohmann::json& json, TrainExecutionPaneState& state) {
+    int execution_target = static_cast<int>(state.execution_target);
+    get_optional(json, "execution_target", execution_target);
+    state.execution_target = static_cast<TrainExecutionTarget>(execution_target);
+    get_optional(json, "local_device_ids", state.local_device_ids);
+    get_optional(json, "remote_family_enabled", state.remote_family_enabled);
+    get_optional(json, "remote_container_image", state.remote_container_image);
+    get_optional(json, "remote_launch_template", state.remote_launch_template);
+}
+
+nlohmann::json recipe_overrides_json(const mmltk::rfdetr::TrainRecipeFieldOverrides& overrides) {
+    return nlohmann::json{
+        {"lr", overrides.lr},
+        {"lr_encoder", overrides.lr_encoder},
+        {"lr_component_decay", overrides.lr_component_decay},
+        {"encoder_layer_decay", overrides.encoder_layer_decay},
+        {"momentum", overrides.momentum},
+        {"weight_decay", overrides.weight_decay},
+        {"warmup_epochs", overrides.warmup_epochs},
+        {"warmup_momentum", overrides.warmup_momentum},
+        {"lr_min_factor", overrides.lr_min_factor},
+        {"lr_drop", overrides.lr_drop},
+        {"lr_scheduler", overrides.lr_scheduler},
+    };
+}
+
+nlohmann::json snapshot_train_workflow_state(const TrainViewState& state, const TrainPaneState& train_pane) {
+    return nlohmann::json{
+        {"input_mode", static_cast<int>(train_pane.input_mode)},
+        {"output_dir", train_pane.output_dir},
+        {"resume_path", train_pane.resume_path},
+        {"batch_size", state.batch_size},
+        {"val_batch_size", state.val_batch_size},
+        {"epochs", state.epochs},
+        {"grad_accum_steps", state.grad_accum_steps},
+        {"eval_max_dets", state.eval_max_dets},
+        {"lr_drop", state.lr_drop},
+        {"ema_tau", state.ema_tau},
+        {"print_freq", state.print_freq},
+        {"prefetch_factor", state.prefetch_factor},
+        {"seed", state.seed},
+        {"lr", state.lr},
+        {"lr_encoder", state.lr_encoder},
+        {"lr_component_decay", state.lr_component_decay},
+        {"encoder_layer_decay", state.encoder_layer_decay},
+        {"momentum", state.momentum},
+        {"weight_decay", state.weight_decay},
+        {"warmup_epochs", state.warmup_epochs},
+        {"warmup_momentum", state.warmup_momentum},
+        {"lr_min_factor", state.lr_min_factor},
+        {"clip_max_norm", state.clip_max_norm},
+        {"ema_decay", state.ema_decay},
+        {"lr_scheduler", state.lr_scheduler},
+        {"use_ema", state.use_ema},
+        {"amp", state.amp},
+        {"freeze_encoder", state.freeze_encoder},
+        {"fused_optimizer", state.fused_optimizer},
+        {"optimizer", static_cast<int>(state.optimizer)},
+        {"distributed_store_path", state.distributed_store_path},
+        {"distributed_rank", state.distributed_rank},
+        {"distributed_world_size", state.distributed_world_size},
+        {"distributed_worker", state.distributed_worker},
+        {"recipe_overrides", recipe_overrides_json(state.recipe_overrides)},
+    };
+}
+
+nlohmann::json snapshot_model_artifacts(const ModelArtifactSelectionState& state, const ModelArtifactsShape& shape) {
     nlohmann::json json = nlohmann::json::object();
     if (shape.weights) {
         json["weights_path"] = state.weights_path;
@@ -167,8 +260,7 @@ nlohmann::json snapshot_model_artifacts(const ModelArtifactSelectionState& state
     return json;
 }
 
-void apply_model_artifacts_json(const nlohmann::json& json,
-                                ModelArtifactSelectionState& state,
+void apply_model_artifacts_json(const nlohmann::json& json, ModelArtifactSelectionState& state,
                                 const ModelArtifactsShape& shape) {
     if (shape.weights) {
         get_optional(json, "weights_path", state.weights_path);
@@ -181,8 +273,7 @@ void apply_model_artifacts_json(const nlohmann::json& json,
     }
 }
 
-nlohmann::json snapshot_execution(const ExecutionTuningState& state,
-                                  const ExecutionShape& shape) {
+nlohmann::json snapshot_execution(const ExecutionTuningState& state, const ExecutionShape& shape) {
     nlohmann::json json = nlohmann::json::object();
     if (shape.cpu_affinity) {
         json["cpu_affinity"] = state.cpu_affinity;
@@ -203,14 +294,12 @@ nlohmann::json snapshot_execution(const ExecutionTuningState& state,
         json["progress_bar"] = state.progress_bar;
     }
     if (shape.compile_mode) {
-        json["compile_mode"] = state.compile_mode;
+        json["compile_mode"] = mmltk::rfdetr::compilation_mode_index(state.compile_mode);
     }
     return json;
 }
 
-void apply_execution_json(const nlohmann::json& json,
-                          ExecutionTuningState& state,
-                          const ExecutionShape& shape) {
+void apply_execution_json(const nlohmann::json& json, ExecutionTuningState& state, const ExecutionShape& shape) {
     if (shape.cpu_affinity) {
         get_optional(json, "cpu_affinity", state.cpu_affinity);
     }
@@ -230,28 +319,37 @@ void apply_execution_json(const nlohmann::json& json,
         get_optional(json, "progress_bar", state.progress_bar);
     }
     if (shape.compile_mode) {
-        get_optional(json, "compile_mode", state.compile_mode);
+        get_optional_compile_mode(json, "compile_mode", state.compile_mode);
     }
 }
 
 nlohmann::json normalize_train_workflow_v2_to_v3(const nlohmann::json& legacy) {
     nlohmann::json normalized = nlohmann::json::object();
-    normalized[kDatasetPathsKey] = nlohmann::json{
-        {"compiled_path", get_value_or<std::string>(legacy, "train_compiled_path", {})},
-        {"source_dir", std::string{}},
-        {"train_compiled_path", get_value_or<std::string>(legacy, "train_compiled_path", {})},
-        {"val_compiled_path", get_value_or<std::string>(legacy, "val_compiled_path", {})},
-        {"test_compiled_path", get_value_or<std::string>(legacy, "test_compiled_path", {})},
-    };
+    normalized[kDatasetPathsKey] = snapshot_dataset_paths(DatasetPathState{
+        get_value_or<std::string>(legacy, "train_compiled_path", {}),
+        std::string{},
+        get_value_or<std::string>(legacy, "train_compiled_path", {}),
+        get_value_or<std::string>(legacy, "val_compiled_path", {}),
+        get_value_or<std::string>(legacy, "test_compiled_path", {}),
+    });
     normalized[kModelArtifactsKey] = nlohmann::json{
         {"weights_path", get_value_or<std::string>(legacy, "weights_path", {})},
         {"onnx_path", get_value_or<std::string>(legacy, "onnx_path", {})},
         {"tensorrt_path", get_value_or<std::string>(legacy, "tensorrt_path", {})},
     };
     normalized[kExecutionKey] = make_legacy_execution_json(legacy);
-    normalized[kTrainingKey] = nlohmann::json{
+    constexpr std::array<bool, 5> default_remote_family_enabled{true, true, true, true, true};
+    const TrainExecutionPaneState execution_target_state{
+        static_cast<TrainExecutionTarget>(get_value_or<int>(legacy, "execution_target", 0)),
+        get_value_or<std::vector<int>>(legacy, "local_device_ids", std::vector<int>{0}),
+        get_value_or<std::array<bool, 5>>(legacy, "remote_family_enabled", default_remote_family_enabled),
+        get_value_or<std::string>(legacy, "remote_container_image", {}),
+        get_value_or<std::string>(legacy, "remote_launch_template", {}),
+    };
+    nlohmann::json training_json = nlohmann::json{
         {"input_mode", get_value_or<int>(legacy, "input_mode", 0)},
         {"output_dir", get_value_or<std::string>(legacy, "output_dir", "./gui-train-output")},
+        {"distributed_store_path", get_value_or<std::string>(legacy, "distributed_store_path", {})},
         {"resume_path", get_value_or<std::string>(legacy, "resume_path", {})},
         {"batch_size", get_value_or<int>(legacy, "batch_size", 2)},
         {"val_batch_size", get_value_or<int>(legacy, "val_batch_size", 0)},
@@ -259,18 +357,17 @@ nlohmann::json normalize_train_workflow_v2_to_v3(const nlohmann::json& legacy) {
         {"grad_accum_steps", get_value_or<int>(legacy, "grad_accum_steps", 1)},
         {"eval_max_dets", get_value_or<int>(legacy, "eval_max_dets", 500)},
         {"lr_drop", get_value_or<int>(legacy, "lr_drop", 100)},
+        {"ema_tau", get_value_or<int>(legacy, "ema_tau", 100)},
         {"print_freq", get_value_or<int>(legacy, "print_freq", 100)},
         {"prefetch_factor", get_value_or<int>(legacy, "prefetch_factor", 2)},
         {"seed", get_value_or<int>(legacy, "seed", 42)},
         {"amp", get_value_or<bool>(legacy, "amp", true)},
         {"freeze_encoder", get_value_or<bool>(legacy, "freeze_encoder", false)},
+        {"fused_optimizer", get_value_or<bool>(legacy, "fused_optimizer", true)},
         {"optimizer", get_value_or<int>(legacy, "optimizer", 0)},
-        {"execution_target", get_value_or<int>(legacy, "execution_target", 0)},
-        {"local_device_ids", get_value_or<std::vector<int>>(legacy, "local_device_ids", std::vector<int>{0})},
-        {"remote_family_enabled",
-         get_value_or<std::array<bool, 5>>(legacy,
-                                           "remote_family_enabled",
-                                           std::array<bool, 5>{true, true, true, true, true})},
+        {"distributed_rank", get_value_or<int>(legacy, "distributed_rank", 0)},
+        {"distributed_world_size", get_value_or<int>(legacy, "distributed_world_size", 1)},
+        {"distributed_worker", get_value_or<bool>(legacy, "distributed_worker", false)},
         {"recipe_overrides", nlohmann::json::object()},
         {"lr", get_value_or<double>(legacy, "lr", 1.0e-4)},
         {"lr_encoder", get_value_or<double>(legacy, "lr_encoder", 1.5e-4)},
@@ -282,8 +379,11 @@ nlohmann::json normalize_train_workflow_v2_to_v3(const nlohmann::json& legacy) {
         {"warmup_momentum", get_value_or<double>(legacy, "warmup_momentum", 0.0)},
         {"lr_min_factor", get_value_or<double>(legacy, "lr_min_factor", 0.0)},
         {"clip_max_norm", get_value_or<double>(legacy, "clip_max_norm", 0.1)},
+        {"ema_decay", get_value_or<double>(legacy, "ema_decay", 0.993)},
         {"lr_scheduler", get_value_or<std::string>(legacy, "lr_scheduler", "step")},
     };
+    training_json.update(snapshot_train_execution_target(execution_target_state));
+    normalized[kTrainingKey] = std::move(training_json);
     normalized[kTrainingKey]["recipe_overrides"] =
         legacy.contains("recipe_overrides") ? legacy.at("recipe_overrides") : nlohmann::json::object();
     return normalized;
@@ -324,57 +424,56 @@ nlohmann::json normalize_validate_workflow_v2_to_v3(const nlohmann::json& legacy
              {"compile_workers", get_value_or<int>(legacy, "compile_workers", -1)},
              {"compile_cuda_mask_batch_size", get_value_or<int>(legacy, "compile_cuda_mask_batch_size", 0)},
              {"compile_cuda_device_id", get_value_or<int>(legacy, "compile_cuda_device_id", 0)},
+             {"log_mode", get_value_or<int>(legacy, "log_mode", 0)},
          }},
+    };
+}
+
+nlohmann::json make_legacy_model_artifacts_json(const nlohmann::json& legacy) {
+    return {
+        {"weights_path", get_value_or<std::string>(legacy, "weights_path", {})},
+        {"onnx_path", get_value_or<std::string>(legacy, "onnx_path", {})},
+        {"tensorrt_path", get_value_or<std::string>(legacy, "tensorrt_path", {})},
+    };
+}
+
+nlohmann::json make_legacy_detection_workflow_base_json(const nlohmann::json& legacy) {
+    return {
+        {"source", legacy.contains("source") ? legacy.at("source") : nlohmann::json::object()},
+        {kModelArtifactsKey, make_legacy_model_artifacts_json(legacy)},
+        {kExecutionKey, make_legacy_execution_json(legacy)},
     };
 }
 
 nlohmann::json normalize_predict_workflow_v2_to_v3(const nlohmann::json& legacy) {
-    return nlohmann::json{
-        {"source", legacy.contains("source") ? legacy.at("source") : nlohmann::json::object()},
-        {kModelArtifactsKey,
-         {
-             {"weights_path", get_value_or<std::string>(legacy, "weights_path", {})},
-             {"onnx_path", get_value_or<std::string>(legacy, "onnx_path", {})},
-             {"tensorrt_path", get_value_or<std::string>(legacy, "tensorrt_path", {})},
-         }},
-        {kExecutionKey, make_legacy_execution_json(legacy)},
-        {kPredictKey,
-         {
-             {"output_path", get_value_or<std::string>(legacy, "output_path", "./predictions.json")},
-             {"backend", get_value_or<std::string>(legacy, "backend", "auto")},
-             {"model_input", get_value_or<int>(legacy, "model_input", static_cast<int>(ModelInputMode::Weights))},
-             {"batch_size", get_value_or<int>(legacy, "batch_size", 4)},
-             {"max_dets_per_image", get_value_or<int>(legacy, "max_dets_per_image", 500)},
-             {"live_split_count", get_value_or<int>(legacy, "live_split_count", 1)},
-             {"threshold", get_value_or<float>(legacy, "threshold", 0.25f)},
-         }},
+    nlohmann::json normalized = make_legacy_detection_workflow_base_json(legacy);
+    normalized[kPredictKey] = {
+        {"output_path", get_value_or<std::string>(legacy, "output_path", "./predictions.json")},
+        {"backend", get_value_or<std::string>(legacy, "backend", "auto")},
+        {"model_input", get_value_or<int>(legacy, "model_input", static_cast<int>(ModelInputMode::Weights))},
+        {"batch_size", get_value_or<int>(legacy, "batch_size", 4)},
+        {"max_dets_per_image", get_value_or<int>(legacy, "max_dets_per_image", 500)},
+        {"live_split_count", get_value_or<int>(legacy, "live_split_count", 1)},
+        {"threshold", get_value_or<float>(legacy, "threshold", 0.25f)},
     };
+    return normalized;
 }
 
 nlohmann::json normalize_annotate_workflow_v2_to_v3(const nlohmann::json& legacy) {
-    return nlohmann::json{
-        {"source", legacy.contains("source") ? legacy.at("source") : nlohmann::json::object()},
-        {kModelArtifactsKey,
-         {
-             {"weights_path", get_value_or<std::string>(legacy, "weights_path", {})},
-             {"onnx_path", get_value_or<std::string>(legacy, "onnx_path", {})},
-             {"tensorrt_path", get_value_or<std::string>(legacy, "tensorrt_path", {})},
-         }},
-        {kExecutionKey, make_legacy_execution_json(legacy)},
-        {kAnnotateKey,
-         {
-             {"output_dir", get_value_or<std::string>(legacy, "output_dir", "./annotated-scenes")},
-             {"split", get_value_or<std::string>(legacy, "split", "train")},
-             {"backend", get_value_or<std::string>(legacy, "backend", "auto")},
-             {"model_input", get_value_or<int>(legacy, "model_input", static_cast<int>(ModelInputMode::None))},
-             {"device_id", get_value_or<int>(legacy, "device_id", 0)},
-             {"max_dets_per_image", get_value_or<int>(legacy, "max_dets_per_image", 300)},
-             {"threshold", get_value_or<float>(legacy, "threshold", 0.25f)},
-             {"allow_fp16", get_value_or<bool>(legacy, "allow_fp16", true)},
-             {"full_frame", get_value_or<bool>(legacy, "full_frame", false)},
-             {"compile_mode", get_value_or<int>(legacy, "compile_mode", 1)},
-         }},
+    nlohmann::json normalized = make_legacy_detection_workflow_base_json(legacy);
+    normalized[kAnnotateKey] = {
+        {"output_dir", get_value_or<std::string>(legacy, "output_dir", "./annotated-scenes")},
+        {"split", get_value_or<std::string>(legacy, "split", "train")},
+        {"backend", get_value_or<std::string>(legacy, "backend", "auto")},
+        {"model_input", get_value_or<int>(legacy, "model_input", static_cast<int>(ModelInputMode::None))},
+        {"device_id", get_value_or<int>(legacy, "device_id", 0)},
+        {"max_dets_per_image", get_value_or<int>(legacy, "max_dets_per_image", 300)},
+        {"threshold", get_value_or<float>(legacy, "threshold", 0.25f)},
+        {"allow_fp16", get_value_or<bool>(legacy, "allow_fp16", true)},
+        {"full_frame", get_value_or<bool>(legacy, "full_frame", false)},
+        {"compile_mode", get_value_or<int>(legacy, "compile_mode", 1)},
     };
+    return normalized;
 }
 
 nlohmann::json normalize_export_workflow_v2_to_v3(const nlohmann::json& legacy) {
@@ -402,23 +501,24 @@ nlohmann::json normalize_gui_settings_v2_to_v3(const nlohmann::json& legacy) {
 
     if (const auto workflows_it = legacy.find("workflows"); workflows_it != legacy.end() && workflows_it->is_object()) {
         nlohmann::json workflows = nlohmann::json::object();
-        if (const auto train_it = workflows_it->find("train"); train_it != workflows_it->end() && train_it->is_object()) {
+        if (const auto train_it = workflows_it->find("train");
+            train_it != workflows_it->end() && train_it->is_object()) {
             workflows["train"] = normalize_train_workflow_v2_to_v3(*train_it);
         }
-        if (const auto validate_it = workflows_it->find("validate"); validate_it != workflows_it->end() &&
-            validate_it->is_object()) {
+        if (const auto validate_it = workflows_it->find("validate");
+            validate_it != workflows_it->end() && validate_it->is_object()) {
             workflows["validate"] = normalize_validate_workflow_v2_to_v3(*validate_it);
         }
-        if (const auto predict_it = workflows_it->find("predict"); predict_it != workflows_it->end() &&
-            predict_it->is_object()) {
+        if (const auto predict_it = workflows_it->find("predict");
+            predict_it != workflows_it->end() && predict_it->is_object()) {
             workflows["predict"] = normalize_predict_workflow_v2_to_v3(*predict_it);
         }
-        if (const auto annotate_it = workflows_it->find("annotate"); annotate_it != workflows_it->end() &&
-            annotate_it->is_object()) {
+        if (const auto annotate_it = workflows_it->find("annotate");
+            annotate_it != workflows_it->end() && annotate_it->is_object()) {
             workflows["annotate"] = normalize_annotate_workflow_v2_to_v3(*annotate_it);
         }
-        if (const auto export_it = workflows_it->find("export"); export_it != workflows_it->end() &&
-            export_it->is_object()) {
+        if (const auto export_it = workflows_it->find("export");
+            export_it != workflows_it->end() && export_it->is_object()) {
             workflows["export"] = normalize_export_workflow_v2_to_v3(*export_it);
         }
         normalized["workflows"] = std::move(workflows);
@@ -450,9 +550,7 @@ nlohmann::json normalize_gui_settings_document_impl(const nlohmann::json& j) {
     throw std::runtime_error("unsupported GUI settings schema_version");
 }
 
-} // namespace
-
-// ---- SourceSelectionState ----
+}  // namespace
 
 void to_json(nlohmann::json& j, const SourceSelectionState& s) {
     j = nlohmann::json{
@@ -476,8 +574,6 @@ void to_json(nlohmann::json& j, const SourceSelectionState& s) {
 void from_json(const nlohmann::json& j, SourceSelectionState& s) {
     apply_source_json(j, s);
 }
-
-// ---- Shared Sub-Objects ----
 
 void to_json(nlohmann::json& j, const ModelArtifactSelectionState& s) {
     j = nlohmann::json{
@@ -519,7 +615,7 @@ void to_json(nlohmann::json& j, const ExecutionTuningState& s) {
         {"lanes", s.lanes},
         {"allow_fp16", s.allow_fp16},
         {"progress_bar", s.progress_bar},
-        {"compile_mode", s.compile_mode},
+        {"compile_mode", mmltk::rfdetr::compilation_mode_index(s.compile_mode)},
     };
 }
 
@@ -530,23 +626,7 @@ void from_json(const nlohmann::json& j, ExecutionTuningState& s) {
     get_optional(j, "lanes", s.lanes);
     get_optional(j, "allow_fp16", s.allow_fp16);
     get_optional(j, "progress_bar", s.progress_bar);
-    get_optional(j, "compile_mode", s.compile_mode);
-}
-
-nlohmann::json recipe_overrides_json(const mmltk::rfdetr::TrainRecipeFieldOverrides& overrides) {
-    return nlohmann::json{
-        {"lr", overrides.lr},
-        {"lr_encoder", overrides.lr_encoder},
-        {"lr_component_decay", overrides.lr_component_decay},
-        {"encoder_layer_decay", overrides.encoder_layer_decay},
-        {"momentum", overrides.momentum},
-        {"weight_decay", overrides.weight_decay},
-        {"warmup_epochs", overrides.warmup_epochs},
-        {"warmup_momentum", overrides.warmup_momentum},
-        {"lr_min_factor", overrides.lr_min_factor},
-        {"lr_drop", overrides.lr_drop},
-        {"lr_scheduler", overrides.lr_scheduler},
-    };
+    get_optional_compile_mode(j, "compile_mode", s.compile_mode);
 }
 
 void load_recipe_overrides(const nlohmann::json& j, mmltk::rfdetr::TrainRecipeFieldOverrides& overrides) {
@@ -563,55 +643,24 @@ void load_recipe_overrides(const nlohmann::json& j, mmltk::rfdetr::TrainRecipeFi
     get_optional(j, "lr_scheduler", overrides.lr_scheduler);
 }
 
-// ---- TrainViewState ----
-
 void to_json(nlohmann::json& j, const TrainViewState& s) {
     const DatasetPathState dataset_state = dataset_paths(s);
     const ModelArtifactSelectionState artifact_state = model_artifacts(s);
     const ExecutionTuningState execution_state = execution_tuning(s);
     const TrainPaneState train_pane = train_pane_state(s);
-    j = nlohmann::json{
+    j = snapshot_train_workflow_state(s, train_pane);
+    j.update(nlohmann::json{
         {"train_compiled_path", dataset_state.train_compiled_path},
         {"val_compiled_path", dataset_state.val_compiled_path},
         {"test_compiled_path", dataset_state.test_compiled_path},
-        {"output_dir", train_pane.output_dir},
         {"weights_path", artifact_state.weights_path},
-        {"resume_path", train_pane.resume_path},
         {"cpu_affinity", execution_state.cpu_affinity},
-        {"input_mode", static_cast<int>(train_pane.input_mode)},
-        {"batch_size", s.batch_size},
-        {"val_batch_size", s.val_batch_size},
-        {"epochs", s.epochs},
-        {"grad_accum_steps", s.grad_accum_steps},
-        {"eval_max_dets", s.eval_max_dets},
-        {"lr_drop", s.lr_drop},
-        {"print_freq", s.print_freq},
-        {"prefetch_factor", s.prefetch_factor},
-        {"seed", s.seed},
         {"workers", execution_state.workers},
         {"lanes", execution_state.lanes},
-        {"lr", s.lr},
-        {"lr_encoder", s.lr_encoder},
-        {"lr_component_decay", s.lr_component_decay},
-        {"encoder_layer_decay", s.encoder_layer_decay},
-        {"momentum", s.momentum},
-        {"weight_decay", s.weight_decay},
-        {"warmup_epochs", s.warmup_epochs},
-        {"warmup_momentum", s.warmup_momentum},
-        {"lr_min_factor", s.lr_min_factor},
-        {"clip_max_norm", s.clip_max_norm},
-        {"lr_scheduler", s.lr_scheduler},
-        {"use_ema", s.use_ema},
-        {"amp", s.amp},
         {"progress_bar", execution_state.progress_bar},
-        {"freeze_encoder", s.freeze_encoder},
-        {"optimizer", static_cast<int>(s.optimizer)},
-        {"compile_mode", execution_state.compile_mode},
-        {"execution_target", static_cast<int>(train_pane.execution_target)},
-        {"local_device_ids", train_pane.local_device_ids},
-        {"remote_family_enabled", train_pane.remote_family_enabled},
-        {"recipe_overrides", recipe_overrides_json(s.recipe_overrides)},
-    };
+        {"compile_mode", mmltk::rfdetr::compilation_mode_index(execution_state.compile_mode)},
+    });
+    j.update(snapshot_train_execution_target(train_pane));
 }
 
 void from_json(const nlohmann::json& j, TrainViewState& s) {
@@ -623,6 +672,7 @@ void from_json(const nlohmann::json& j, TrainViewState& s) {
     get_optional(j, "val_compiled_path", dataset_state.val_compiled_path);
     get_optional(j, "test_compiled_path", dataset_state.test_compiled_path);
     get_optional(j, "output_dir", train_pane.output_dir);
+    get_optional(j, "distributed_store_path", s.distributed_store_path);
     get_optional(j, "weights_path", artifact_state.weights_path);
     get_optional(j, "resume_path", train_pane.resume_path);
     get_optional(j, "cpu_affinity", execution_state.cpu_affinity);
@@ -635,6 +685,7 @@ void from_json(const nlohmann::json& j, TrainViewState& s) {
     get_optional(j, "grad_accum_steps", s.grad_accum_steps);
     get_optional(j, "eval_max_dets", s.eval_max_dets);
     get_optional(j, "lr_drop", s.lr_drop);
+    get_optional(j, "ema_tau", s.ema_tau);
     get_optional(j, "print_freq", s.print_freq);
     get_optional(j, "prefetch_factor", s.prefetch_factor);
     get_optional(j, "seed", s.seed);
@@ -650,20 +701,21 @@ void from_json(const nlohmann::json& j, TrainViewState& s) {
     get_optional(j, "warmup_momentum", s.warmup_momentum);
     get_optional(j, "lr_min_factor", s.lr_min_factor);
     get_optional(j, "clip_max_norm", s.clip_max_norm);
+    get_optional(j, "ema_decay", s.ema_decay);
     get_optional(j, "lr_scheduler", s.lr_scheduler);
     get_optional(j, "use_ema", s.use_ema);
     get_optional(j, "amp", s.amp);
     get_optional(j, "progress_bar", execution_state.progress_bar);
     get_optional(j, "freeze_encoder", s.freeze_encoder);
+    get_optional(j, "fused_optimizer", s.fused_optimizer);
     int optimizer = static_cast<int>(s.optimizer);
     get_optional(j, "optimizer", optimizer);
     s.optimizer = static_cast<TrainOptimizerMode>(optimizer);
-    get_optional(j, "compile_mode", execution_state.compile_mode);
-    int execution_target = static_cast<int>(train_pane.execution_target);
-    get_optional(j, "execution_target", execution_target);
-    train_pane.execution_target = static_cast<TrainExecutionTarget>(execution_target);
-    get_optional(j, "local_device_ids", train_pane.local_device_ids);
-    get_optional(j, "remote_family_enabled", train_pane.remote_family_enabled);
+    get_optional_compile_mode(j, "compile_mode", execution_state.compile_mode);
+    get_optional(j, "distributed_rank", s.distributed_rank);
+    get_optional(j, "distributed_world_size", s.distributed_world_size);
+    get_optional(j, "distributed_worker", s.distributed_worker);
+    apply_train_execution_target_json(j, train_pane);
     if (const auto overrides = j.find("recipe_overrides"); overrides != j.end() && overrides->is_object()) {
         load_recipe_overrides(*overrides, s.recipe_overrides);
     }
@@ -672,8 +724,6 @@ void from_json(const nlohmann::json& j, TrainViewState& s) {
     apply_execution_tuning(s, execution_state);
     apply_train_pane_state(s, train_pane);
 }
-
-// ---- ValidateViewState ----
 
 void to_json(nlohmann::json& j, const ValidateViewState& s) {
     j = nlohmann::json{
@@ -698,6 +748,10 @@ void to_json(nlohmann::json& j, const ValidateViewState& s) {
         {"profile", s.profile},
         {"allow_fp16", s.allow_fp16},
         {"write_report_json", s.write_report_json},
+        {"compile_workers", s.compile_workers},
+        {"compile_cuda_mask_batch_size", s.compile_cuda_mask_batch_size},
+        {"compile_cuda_device_id", s.compile_cuda_device_id},
+        {"log_mode", static_cast<int>(s.log_mode)},
     };
 }
 
@@ -723,9 +777,13 @@ void from_json(const nlohmann::json& j, ValidateViewState& s) {
     get_optional(j, "profile", s.profile);
     get_optional(j, "allow_fp16", s.allow_fp16);
     get_optional(j, "write_report_json", s.write_report_json);
+    get_optional(j, "compile_workers", s.compile_workers);
+    get_optional(j, "compile_cuda_mask_batch_size", s.compile_cuda_mask_batch_size);
+    get_optional(j, "compile_cuda_device_id", s.compile_cuda_device_id);
+    int log_mode = static_cast<int>(s.log_mode);
+    get_optional(j, "log_mode", log_mode);
+    s.log_mode = static_cast<mmltk::rfdetr::ValidationLogMode>(log_mode);
 }
-
-// ---- PredictViewState ----
 
 void to_json(nlohmann::json& j, const PredictViewState& s) {
     j = nlohmann::json{
@@ -746,7 +804,7 @@ void to_json(nlohmann::json& j, const PredictViewState& s) {
         {"threshold", s.threshold},
         {"allow_fp16", s.allow_fp16},
         {"progress_bar", s.progress_bar},
-        {"compile_mode", s.compile_mode},
+        {"compile_mode", mmltk::rfdetr::compilation_mode_index(s.compile_mode)},
     };
 }
 
@@ -770,13 +828,12 @@ void from_json(const nlohmann::json& j, PredictViewState& s) {
     get_optional(j, "threshold", s.threshold);
     get_optional(j, "allow_fp16", s.allow_fp16);
     get_optional(j, "progress_bar", s.progress_bar);
-    get_optional(j, "compile_mode", s.compile_mode);
+    get_optional_compile_mode(j, "compile_mode", s.compile_mode);
 }
-
-// ---- UiSettingsState ----
 
 void to_json(nlohmann::json& j, const UiSettingsState& s) {
     j = nlohmann::json{
+        {"dark_mode", s.dark_mode},
         {"ui_scale", s.ui_scale},
         {"font_size", s.font_size},
         {"secondary_font_size", s.secondary_font_size},
@@ -790,6 +847,7 @@ void to_json(nlohmann::json& j, const UiSettingsState& s) {
 }
 
 void from_json(const nlohmann::json& j, UiSettingsState& s) {
+    get_optional(j, "dark_mode", s.dark_mode);
     get_optional(j, "ui_scale", s.ui_scale);
     get_optional(j, "font_size", s.font_size);
     get_optional(j, "secondary_font_size", s.secondary_font_size);
@@ -803,24 +861,15 @@ void from_json(const nlohmann::json& j, UiSettingsState& s) {
     s.density = static_cast<UiDensity>(density);
 }
 
-// ---- AnnotateViewState ----
-
 void to_json(nlohmann::json& j, const AnnotateViewState& s) {
     j = nlohmann::json{
-        {"source", s.source},
-        {"weights_path", s.weights_path},
-        {"onnx_path", s.onnx_path},
-        {"tensorrt_path", s.tensorrt_path},
-        {"output_dir", s.output_dir},
-        {"split", s.split},
-        {"backend", s.backend},
-        {"model_input", static_cast<int>(s.model_input)},
-        {"device_id", s.device_id},
-        {"max_dets_per_image", s.max_dets_per_image},
-        {"threshold", s.threshold},
-        {"allow_fp16", s.allow_fp16},
-        {"full_frame", s.full_frame},
-        {"compile_mode", s.compile_mode},
+        {"source", s.source},         {"weights_path", s.weights_path},
+        {"onnx_path", s.onnx_path},   {"tensorrt_path", s.tensorrt_path},
+        {"output_dir", s.output_dir}, {"split", s.split},
+        {"backend", s.backend},       {"model_input", static_cast<int>(s.model_input)},
+        {"device_id", s.device_id},   {"max_dets_per_image", s.max_dets_per_image},
+        {"threshold", s.threshold},   {"allow_fp16", s.allow_fp16},
+        {"full_frame", s.full_frame}, {"compile_mode", mmltk::rfdetr::compilation_mode_index(s.compile_mode)},
     };
 }
 
@@ -840,21 +889,14 @@ void from_json(const nlohmann::json& j, AnnotateViewState& s) {
     get_optional(j, "threshold", s.threshold);
     get_optional(j, "allow_fp16", s.allow_fp16);
     get_optional(j, "full_frame", s.full_frame);
-    get_optional(j, "compile_mode", s.compile_mode);
+    get_optional_compile_mode(j, "compile_mode", s.compile_mode);
 }
-
-// ---- ExportViewState ----
 
 void to_json(nlohmann::json& j, const ExportViewState& s) {
     j = nlohmann::json{
-        {"weights_path", s.weights_path},
-        {"onnx_path", s.onnx_path},
-        {"output_path", s.output_path},
-        {"device_id", s.device_id},
-        {"opset_version", s.opset_version},
-        {"allow_fp16", s.allow_fp16},
-        {"build_tensorrt", s.build_tensorrt},
-        {"simplify", s.simplify},
+        {"weights_path", s.weights_path},     {"onnx_path", s.onnx_path},         {"output_path", s.output_path},
+        {"device_id", s.device_id},           {"opset_version", s.opset_version}, {"allow_fp16", s.allow_fp16},
+        {"build_tensorrt", s.build_tensorrt}, {"simplify", s.simplify},
     };
 }
 
@@ -869,8 +911,6 @@ void from_json(const nlohmann::json& j, ExportViewState& s) {
     get_optional(j, "simplify", s.simplify);
 }
 
-// ---- Snapshot / Apply ----
-
 nlohmann::json snapshot_workflows(const WorkflowSettingsSnapshot& workflows) {
     nlohmann::json j = nlohmann::json::object();
 
@@ -880,52 +920,15 @@ nlohmann::json snapshot_workflows(const WorkflowSettingsSnapshot& workflows) {
         const ModelArtifactSelectionState artifact_state = model_artifacts(s);
         const ExecutionTuningState execution_state = execution_tuning(s);
         const TrainPaneState train_pane = train_pane_state(s);
-        j["train"] = nlohmann::json{
-            {kDatasetPathsKey,
-             {
-                 {"compiled_path", dataset_state.compiled_path},
-                 {"source_dir", dataset_state.source_dir},
-                 {"train_compiled_path", dataset_state.train_compiled_path},
-                 {"val_compiled_path", dataset_state.val_compiled_path},
-                 {"test_compiled_path", dataset_state.test_compiled_path},
-             }},
+        nlohmann::json train_json = nlohmann::json{
+            {kDatasetPathsKey, snapshot_dataset_paths(dataset_state)},
             {kModelArtifactsKey, snapshot_model_artifacts(artifact_state, train_model_artifacts_shape())},
             {kExecutionKey, snapshot_execution(execution_state, train_execution_shape())},
-            {kTrainingKey,
-             {
-                 {"input_mode", static_cast<int>(train_pane.input_mode)},
-                 {"output_dir", train_pane.output_dir},
-                 {"resume_path", train_pane.resume_path},
-                 {"batch_size", s.batch_size},
-                 {"val_batch_size", s.val_batch_size},
-                 {"epochs", s.epochs},
-                 {"grad_accum_steps", s.grad_accum_steps},
-                 {"eval_max_dets", s.eval_max_dets},
-                 {"lr_drop", s.lr_drop},
-                 {"print_freq", s.print_freq},
-                 {"prefetch_factor", s.prefetch_factor},
-                 {"seed", s.seed},
-                 {"lr", s.lr},
-                 {"lr_encoder", s.lr_encoder},
-                 {"lr_component_decay", s.lr_component_decay},
-                 {"encoder_layer_decay", s.encoder_layer_decay},
-                 {"momentum", s.momentum},
-                 {"weight_decay", s.weight_decay},
-                 {"warmup_epochs", s.warmup_epochs},
-                 {"warmup_momentum", s.warmup_momentum},
-                 {"lr_min_factor", s.lr_min_factor},
-                 {"clip_max_norm", s.clip_max_norm},
-                 {"lr_scheduler", s.lr_scheduler},
-                 {"use_ema", s.use_ema},
-                 {"amp", s.amp},
-                 {"freeze_encoder", s.freeze_encoder},
-                 {"optimizer", static_cast<int>(s.optimizer)},
-                 {"execution_target", static_cast<int>(train_pane.execution_target)},
-                 {"local_device_ids", train_pane.local_device_ids},
-                 {"remote_family_enabled", train_pane.remote_family_enabled},
-                 {"recipe_overrides", recipe_overrides_json(s.recipe_overrides)},
-             }},
         };
+        nlohmann::json training_json = snapshot_train_workflow_state(s, train_pane);
+        training_json.update(snapshot_train_execution_target(train_pane));
+        train_json[kTrainingKey] = std::move(training_json);
+        j["train"] = std::move(train_json);
     }
 
     if (workflows.validate != nullptr) {
@@ -934,14 +937,7 @@ nlohmann::json snapshot_workflows(const WorkflowSettingsSnapshot& workflows) {
         const ModelArtifactSelectionState artifact_state = model_artifacts(s);
         const ExecutionTuningState execution_state = execution_tuning(s);
         j["validate"] = nlohmann::json{
-            {kDatasetPathsKey,
-             {
-                 {"compiled_path", dataset_state.compiled_path},
-                 {"source_dir", dataset_state.source_dir},
-                 {"train_compiled_path", dataset_state.train_compiled_path},
-                 {"val_compiled_path", dataset_state.val_compiled_path},
-                 {"test_compiled_path", dataset_state.test_compiled_path},
-             }},
+            {kDatasetPathsKey, snapshot_dataset_paths(dataset_state)},
             {kModelArtifactsKey, snapshot_model_artifacts(artifact_state, validate_model_artifacts_shape())},
             {kExecutionKey, snapshot_execution(execution_state, validate_execution_shape())},
             {kValidationKey,
@@ -959,9 +955,10 @@ nlohmann::json snapshot_workflows(const WorkflowSettingsSnapshot& workflows) {
                  {"recompile", s.recompile},
                  {"profile", s.profile},
                  {"write_report_json", s.write_report_json},
-                 {"compile_workers", 0},
-                 {"compile_cuda_mask_batch_size", 0},
-                 {"compile_cuda_device_id", 0},
+                 {"compile_workers", s.compile_workers},
+                 {"compile_cuda_mask_batch_size", s.compile_cuda_mask_batch_size},
+                 {"compile_cuda_device_id", s.compile_cuda_device_id},
+                 {"log_mode", static_cast<int>(s.log_mode)},
              }},
         };
     }
@@ -1042,28 +1039,25 @@ void apply_workflows(const nlohmann::json& j, WorkflowSettingsSnapshot& workflow
             ModelArtifactSelectionState artifact_state = model_artifacts(s);
             ExecutionTuningState execution_state = execution_tuning(s);
             TrainPaneState train_pane = train_pane_state(s);
-            if (const auto datasets = train_it->find(kDatasetPathsKey); datasets != train_it->end() &&
-                datasets->is_object()) {
-                get_optional(*datasets, "compiled_path", dataset_state.compiled_path);
-                get_optional(*datasets, "source_dir", dataset_state.source_dir);
-                get_optional(*datasets, "train_compiled_path", dataset_state.train_compiled_path);
-                get_optional(*datasets, "val_compiled_path", dataset_state.val_compiled_path);
-                get_optional(*datasets, "test_compiled_path", dataset_state.test_compiled_path);
+            if (const auto datasets = train_it->find(kDatasetPathsKey);
+                datasets != train_it->end() && datasets->is_object()) {
+                apply_dataset_paths_json(*datasets, dataset_state);
             }
-            if (const auto artifacts = train_it->find(kModelArtifactsKey); artifacts != train_it->end() &&
-                artifacts->is_object()) {
+            if (const auto artifacts = train_it->find(kModelArtifactsKey);
+                artifacts != train_it->end() && artifacts->is_object()) {
                 apply_model_artifacts_json(*artifacts, artifact_state, train_model_artifacts_shape());
             }
-            if (const auto execution = train_it->find(kExecutionKey); execution != train_it->end() &&
-                execution->is_object()) {
+            if (const auto execution = train_it->find(kExecutionKey);
+                execution != train_it->end() && execution->is_object()) {
                 apply_execution_json(*execution, execution_state, train_execution_shape());
             }
             apply_dataset_paths(s, dataset_state);
             apply_model_artifacts(s, artifact_state);
             apply_execution_tuning(s, execution_state);
-            if (const auto training = train_it->find(kTrainingKey); training != train_it->end() &&
-                training->is_object()) {
+            if (const auto training = train_it->find(kTrainingKey);
+                training != train_it->end() && training->is_object()) {
                 get_optional(*training, "output_dir", train_pane.output_dir);
+                get_optional(*training, "distributed_store_path", s.distributed_store_path);
                 get_optional(*training, "resume_path", train_pane.resume_path);
                 int input_mode = static_cast<int>(train_pane.input_mode);
                 get_optional(*training, "input_mode", input_mode);
@@ -1074,6 +1068,7 @@ void apply_workflows(const nlohmann::json& j, WorkflowSettingsSnapshot& workflow
                 get_optional(*training, "grad_accum_steps", s.grad_accum_steps);
                 get_optional(*training, "eval_max_dets", s.eval_max_dets);
                 get_optional(*training, "lr_drop", s.lr_drop);
+                get_optional(*training, "ema_tau", s.ema_tau);
                 get_optional(*training, "print_freq", s.print_freq);
                 get_optional(*training, "prefetch_factor", s.prefetch_factor);
                 get_optional(*training, "seed", s.seed);
@@ -1087,18 +1082,19 @@ void apply_workflows(const nlohmann::json& j, WorkflowSettingsSnapshot& workflow
                 get_optional(*training, "warmup_momentum", s.warmup_momentum);
                 get_optional(*training, "lr_min_factor", s.lr_min_factor);
                 get_optional(*training, "clip_max_norm", s.clip_max_norm);
+                get_optional(*training, "ema_decay", s.ema_decay);
                 get_optional(*training, "lr_scheduler", s.lr_scheduler);
                 get_optional(*training, "use_ema", s.use_ema);
                 get_optional(*training, "amp", s.amp);
                 get_optional(*training, "freeze_encoder", s.freeze_encoder);
+                get_optional(*training, "fused_optimizer", s.fused_optimizer);
                 int optimizer = static_cast<int>(s.optimizer);
                 get_optional(*training, "optimizer", optimizer);
                 s.optimizer = static_cast<TrainOptimizerMode>(optimizer);
-                int execution_target = static_cast<int>(train_pane.execution_target);
-                get_optional(*training, "execution_target", execution_target);
-                train_pane.execution_target = static_cast<TrainExecutionTarget>(execution_target);
-                get_optional(*training, "local_device_ids", train_pane.local_device_ids);
-                get_optional(*training, "remote_family_enabled", train_pane.remote_family_enabled);
+                get_optional(*training, "distributed_rank", s.distributed_rank);
+                get_optional(*training, "distributed_world_size", s.distributed_world_size);
+                get_optional(*training, "distributed_worker", s.distributed_worker);
+                apply_train_execution_target_json(*training, train_pane);
                 if (const auto overrides = training->find("recipe_overrides");
                     overrides != training->end() && overrides->is_object()) {
                     load_recipe_overrides(*overrides, s.recipe_overrides);
@@ -1115,24 +1111,23 @@ void apply_workflows(const nlohmann::json& j, WorkflowSettingsSnapshot& workflow
             DatasetPathState dataset_state = dataset_paths(s);
             ModelArtifactSelectionState artifact_state = model_artifacts(s);
             ExecutionTuningState execution_state = execution_tuning(s);
-            if (const auto datasets = validate_it->find(kDatasetPathsKey); datasets != validate_it->end() &&
-                datasets->is_object()) {
-                get_optional(*datasets, "compiled_path", dataset_state.compiled_path);
-                get_optional(*datasets, "source_dir", dataset_state.source_dir);
+            if (const auto datasets = validate_it->find(kDatasetPathsKey);
+                datasets != validate_it->end() && datasets->is_object()) {
+                apply_dataset_paths_json(*datasets, dataset_state);
             }
-            if (const auto artifacts = validate_it->find(kModelArtifactsKey); artifacts != validate_it->end() &&
-                artifacts->is_object()) {
+            if (const auto artifacts = validate_it->find(kModelArtifactsKey);
+                artifacts != validate_it->end() && artifacts->is_object()) {
                 apply_model_artifacts_json(*artifacts, artifact_state, validate_model_artifacts_shape());
             }
-            if (const auto execution = validate_it->find(kExecutionKey); execution != validate_it->end() &&
-                execution->is_object()) {
+            if (const auto execution = validate_it->find(kExecutionKey);
+                execution != validate_it->end() && execution->is_object()) {
                 apply_execution_json(*execution, execution_state, validate_execution_shape());
             }
             apply_dataset_paths(s, dataset_state);
             apply_model_artifacts(s, artifact_state);
             apply_execution_tuning(s, execution_state);
-            if (const auto validation = validate_it->find(kValidationKey); validation != validate_it->end() &&
-                validation->is_object()) {
+            if (const auto validation = validate_it->find(kValidationKey);
+                validation != validate_it->end() && validation->is_object()) {
                 get_optional(*validation, "save_engine_path", s.save_engine_path);
                 get_optional(*validation, "report_json_path", s.report_json_path);
                 get_optional(*validation, "split", s.split);
@@ -1146,6 +1141,12 @@ void apply_workflows(const nlohmann::json& j, WorkflowSettingsSnapshot& workflow
                 get_optional(*validation, "recompile", s.recompile);
                 get_optional(*validation, "profile", s.profile);
                 get_optional(*validation, "write_report_json", s.write_report_json);
+                get_optional(*validation, "compile_workers", s.compile_workers);
+                get_optional(*validation, "compile_cuda_mask_batch_size", s.compile_cuda_mask_batch_size);
+                get_optional(*validation, "compile_cuda_device_id", s.compile_cuda_device_id);
+                int log_mode = static_cast<int>(s.log_mode);
+                get_optional(*validation, "log_mode", log_mode);
+                s.log_mode = static_cast<mmltk::rfdetr::ValidationLogMode>(log_mode);
             }
         }
     }
@@ -1159,18 +1160,18 @@ void apply_workflows(const nlohmann::json& j, WorkflowSettingsSnapshot& workflow
             if (const auto source = predict_it->find("source"); source != predict_it->end() && source->is_object()) {
                 apply_source_json(*source, s.source);
             }
-            if (const auto artifacts = predict_it->find(kModelArtifactsKey); artifacts != predict_it->end() &&
-                artifacts->is_object()) {
+            if (const auto artifacts = predict_it->find(kModelArtifactsKey);
+                artifacts != predict_it->end() && artifacts->is_object()) {
                 apply_model_artifacts_json(*artifacts, artifact_state, ModelArtifactsShape{});
             }
-            if (const auto execution = predict_it->find(kExecutionKey); execution != predict_it->end() &&
-                execution->is_object()) {
+            if (const auto execution = predict_it->find(kExecutionKey);
+                execution != predict_it->end() && execution->is_object()) {
                 apply_execution_json(*execution, execution_state, ExecutionShape{});
             }
             apply_model_artifacts(s, artifact_state);
             apply_execution_tuning(s, execution_state);
-            if (const auto predict = predict_it->find(kPredictKey); predict != predict_it->end() &&
-                predict->is_object()) {
+            if (const auto predict = predict_it->find(kPredictKey);
+                predict != predict_it->end() && predict->is_object()) {
                 get_optional(*predict, "output_path", s.output_path);
                 get_optional(*predict, "backend", s.backend);
                 int model_input = static_cast<int>(s.model_input);
@@ -1193,18 +1194,18 @@ void apply_workflows(const nlohmann::json& j, WorkflowSettingsSnapshot& workflow
             if (const auto source = annotate_it->find("source"); source != annotate_it->end() && source->is_object()) {
                 apply_source_json(*source, s.source);
             }
-            if (const auto artifacts = annotate_it->find(kModelArtifactsKey); artifacts != annotate_it->end() &&
-                artifacts->is_object()) {
+            if (const auto artifacts = annotate_it->find(kModelArtifactsKey);
+                artifacts != annotate_it->end() && artifacts->is_object()) {
                 apply_model_artifacts_json(*artifacts, artifact_state, ModelArtifactsShape{});
             }
-            if (const auto execution = annotate_it->find(kExecutionKey); execution != annotate_it->end() &&
-                execution->is_object()) {
+            if (const auto execution = annotate_it->find(kExecutionKey);
+                execution != annotate_it->end() && execution->is_object()) {
                 apply_execution_json(*execution, execution_state, annotate_execution_shape());
             }
             apply_model_artifacts(s, artifact_state);
             apply_execution_tuning(s, execution_state);
-            if (const auto annotate = annotate_it->find(kAnnotateKey); annotate != annotate_it->end() &&
-                annotate->is_object()) {
+            if (const auto annotate = annotate_it->find(kAnnotateKey);
+                annotate != annotate_it->end() && annotate->is_object()) {
                 get_optional(*annotate, "output_dir", s.output_dir);
                 get_optional(*annotate, "split", s.split);
                 get_optional(*annotate, "backend", s.backend);
@@ -1224,12 +1225,12 @@ void apply_workflows(const nlohmann::json& j, WorkflowSettingsSnapshot& workflow
             ExportViewState& s = *workflows.export_state;
             ModelArtifactSelectionState artifact_state = model_artifacts(s);
             ExecutionTuningState execution_state = execution_tuning(s);
-            if (const auto artifacts = export_it->find(kModelArtifactsKey); artifacts != export_it->end() &&
-                artifacts->is_object()) {
+            if (const auto artifacts = export_it->find(kModelArtifactsKey);
+                artifacts != export_it->end() && artifacts->is_object()) {
                 apply_model_artifacts_json(*artifacts, artifact_state, export_model_artifacts_shape());
             }
-            if (const auto execution = export_it->find(kExecutionKey); execution != export_it->end() &&
-                execution->is_object()) {
+            if (const auto execution = export_it->find(kExecutionKey);
+                execution != export_it->end() && execution->is_object()) {
                 apply_execution_json(*execution, execution_state, export_execution_shape());
             }
             apply_model_artifacts(s, artifact_state);
@@ -1254,9 +1255,11 @@ nlohmann::json snapshot_gui_settings(const GuiSettingsSnapshot& snap) {
     j["schema_version"] = kGuiSettingsSchemaVersion;
     j["current_view"] = static_cast<int>(snap.current_view);
     j["selected_preset"] = snap.selected_preset;
-    if (snap.ui_settings) j["ui"] = *snap.ui_settings;
+    if (snap.ui_settings)
+        j["ui"] = *snap.ui_settings;
     const nlohmann::json workflows = snapshot_workflows(snap.workflows);
-    if (!workflows.empty()) j["workflows"] = workflows;
+    if (!workflows.empty())
+        j["workflows"] = workflows;
     return j;
 }
 
@@ -1267,15 +1270,13 @@ void apply_gui_settings(const nlohmann::json& j, GuiSettingsSnapshot& snap) {
         snap.current_view = static_cast<View>(v);
     }
     get_optional(normalized, "selected_preset", snap.selected_preset);
-    if (normalized.contains("ui") && snap.ui_settings) normalized.at("ui").get_to(*snap.ui_settings);
+    if (normalized.contains("ui") && snap.ui_settings)
+        normalized.at("ui").get_to(*snap.ui_settings);
     apply_workflows(normalized, snap.workflows);
 }
 
-// ---- GuiSettingsPersistence ----
-
 GuiSettingsPersistence::GuiSettingsPersistence(std::string path)
-    : path_(std::move(path)),
-      writer_thread_(&GuiSettingsPersistence::writer_main, this) {}
+    : path_(std::move(path)), writer_thread_(&GuiSettingsPersistence::writer_main, this) {}
 
 GuiSettingsPersistence::~GuiSettingsPersistence() {
     flush();
@@ -1304,9 +1305,7 @@ bool GuiSettingsPersistence::load(GuiSettingsSnapshot& snap) {
         last_saved_ = normalized;
         return true;
     } catch (const std::exception& e) {
-        mmltk::logging::logger("gui")->warn("[gui] ignoring malformed settings from {}: {}",
-                                             path_,
-                                             e.what());
+        mmltk::logging::logger("gui")->warn("[gui] ignoring malformed settings from {}: {}", path_, e.what());
         return false;
     }
 }
@@ -1342,9 +1341,7 @@ void GuiSettingsPersistence::flush() {
         dirty_ = false;
     }
     std::unique_lock<std::mutex> lock(writer_mutex_);
-    writer_cv_.wait(lock, [this]() {
-        return !pending_save_.has_value() && !save_in_flight_;
-    });
+    writer_cv_.wait(lock, [this]() { return !pending_save_.has_value() && !save_in_flight_; });
 }
 
 void GuiSettingsPersistence::enqueue_save(nlohmann::json j) {
@@ -1367,9 +1364,7 @@ void GuiSettingsPersistence::writer_main() {
         std::optional<nlohmann::json> save_request;
         {
             std::unique_lock<std::mutex> lock(writer_mutex_);
-            writer_cv_.wait(lock, [this]() {
-                return writer_should_stop_ || pending_save_.has_value();
-            });
+            writer_cv_.wait(lock, [this]() { return writer_should_stop_ || pending_save_.has_value(); });
             if (writer_should_stop_ && !pending_save_.has_value()) {
                 return;
             }
@@ -1394,17 +1389,14 @@ void GuiSettingsPersistence::save_to_disk(const nlohmann::json& j) {
     {
         std::ofstream file(tmp_path);
         if (!file.is_open()) {
-            mmltk::logging::logger("gui")->error("[gui] failed to write settings to {}",
-                                                  tmp_path);
+            mmltk::logging::logger("gui")->error("[gui] failed to write settings to {}", tmp_path);
             return;
         }
         file << j.dump(2) << '\n';
     }
     if (std::rename(tmp_path.c_str(), path_.c_str()) != 0) {
-        mmltk::logging::logger("gui")->error("[gui] failed to rename {} -> {}",
-                                              tmp_path,
-                                              path_);
+        mmltk::logging::logger("gui")->error("[gui] failed to rename {} -> {}", tmp_path, path_);
     }
 }
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

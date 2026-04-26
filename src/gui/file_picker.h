@@ -1,14 +1,27 @@
 #pragma once
 
+#include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
+#include <vector>
 
 namespace mmltk::gui {
 
-std::optional<std::string> pick_file_with_zenity(const char* title, const std::string& initial_path);
-bool draw_file_picker_input(const char* label,
-                            std::string& value,
-                            bool browse_busy = false,
-                            const char* browse_label = "Browse");
+enum class FilePickerMode : std::uint8_t {
+    OpenFile = 0,
+    OpenFolder = 1,
+    SaveFile = 2,
+};
 
-} // namespace mmltk::gui
+struct FilePickerFilter {
+    std::string name;
+    std::vector<std::string> patterns;
+};
+
+std::optional<std::string> pick_path_with_dialog(const char* title, const std::string& initial_path,
+                                                 FilePickerMode mode = FilePickerMode::OpenFile,
+                                                 std::span<const FilePickerFilter> filters = {});
+std::optional<std::string> pick_file_with_dialog(const char* title, const std::string& initial_path);
+
+}  // namespace mmltk::gui

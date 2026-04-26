@@ -12,16 +12,7 @@
 
 namespace mmltk::rfdetr {
 
-struct TrainRecipeConfig {
-    double lr = 1.0e-4;
-    double lr_encoder = 1.5e-4;
-    double lr_component_decay = 0.7;
-    double encoder_layer_decay = 0.8;
-    double momentum = 0.95;
-    double weight_decay = 1.0e-4;
-    double warmup_epochs = 0.0;
-    double warmup_momentum = 0.0;
-    double lr_min_factor = 0.0;
+struct TrainRecipeConfig : TrainHyperparameterConfig {
     int lr_drop = 100;
     std::string_view lr_scheduler = "step";
 };
@@ -47,31 +38,11 @@ struct TrainRecipePresetConfig {
 };
 
 constexpr TrainRecipeConfig kAdamWTrainRecipe{
-    1.0e-4,
-    1.5e-4,
-    0.7,
-    0.8,
-    0.95,
-    1.0e-4,
-    0.0,
-    0.0,
-    0.0,
-    100,
-    "step",
+    1.0e-4, 1.5e-4, 0.7, 0.8, 0.95, 1.0e-4, 0.0, 0.0, 0.0, 100, "step",
 };
 
 constexpr TrainRecipeConfig kMuonTrainRecipe{
-    2.0e-4,
-    3.0e-4,
-    0.7,
-    0.8,
-    0.9,
-    5.0e-4,
-    3.0,
-    0.8,
-    0.01,
-    100,
-    "cosine",
+    2.0e-4, 3.0e-4, 0.7, 0.8, 0.9, 5.0e-4, 3.0, 0.8, 0.01, 100, "cosine",
 };
 
 inline const auto& train_recipe_presets() {
@@ -111,8 +82,7 @@ inline TrainRecipeConfig resolve_train_recipe(std::string_view preset_name, Trai
 }
 
 template <typename Target>
-inline void apply_train_recipe(Target& target,
-                               const TrainRecipeConfig& recipe,
+inline void apply_train_recipe(Target& target, const TrainRecipeConfig& recipe,
                                const TrainRecipeFieldOverrides& overrides = {}) {
     if (!overrides.lr) {
         target.lr = recipe.lr;
@@ -163,4 +133,4 @@ inline bool train_recipe_value_matches(double lhs, double rhs, double eps = 1.0e
     return std::abs(lhs - rhs) <= eps;
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

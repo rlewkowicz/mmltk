@@ -13,10 +13,10 @@
 
 namespace Catch {
 
-    std::ostream& cout();
-    std::ostream& cerr();
-    std::ostream& clog();
+std::ostream& cout();
+std::ostream& cerr();
+std::ostream& clog();
 
-} // namespace Catch
+}  // namespace Catch
 
 #endif

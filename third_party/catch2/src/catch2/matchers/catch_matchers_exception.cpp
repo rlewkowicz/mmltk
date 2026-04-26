@@ -22,5 +22,5 @@ ExceptionMessageMatcher Message(std::string const& message) {
     return ExceptionMessageMatcher(message);
 }
 
-} // namespace Matchers
-} // namespace Catch
+}  // namespace Matchers
+}  // namespace Catch

@@ -25,12 +25,12 @@ namespace spdmon {
 
 [[nodiscard]] inline const char* compile_phase_label(mmltk::CompileProgressPhase phase) {
     switch (phase) {
-    case mmltk::CompileProgressPhase::kLabels:
-        return "labels";
-    case mmltk::CompileProgressPhase::kPixels:
-        return "pixels";
-    case mmltk::CompileProgressPhase::kSyncing:
-        return "syncing";
+        case mmltk::CompileProgressPhase::kLabels:
+            return "labels";
+        case mmltk::CompileProgressPhase::kPixels:
+            return "pixels";
+        case mmltk::CompileProgressPhase::kSyncing:
+            return "syncing";
     }
     return "";
 }
@@ -55,7 +55,7 @@ namespace spdmon {
 }
 
 class ProgressBar {
-public:
+   public:
     using clock_t = std::chrono::steady_clock;
     using timepoint_t = clock_t::time_point;
     using duration_t = clock_t::duration;
@@ -121,7 +121,7 @@ public:
         std::fflush(stderr);
     }
 
-private:
+   private:
     struct RenderMetrics {
         double progress = 0.0;
         double elapsed_seconds = 0.0;
@@ -150,9 +150,8 @@ private:
 
         const double elapsed_seconds = std::chrono::duration<double>(now - started_).count();
         const double rate = elapsed_seconds > 0.0 ? static_cast<double>(current_) / elapsed_seconds : 0.0;
-        const double progress = total_ > 0
-            ? std::clamp(static_cast<double>(current_) / static_cast<double>(total_), 0.0, 1.0)
-            : 0.0;
+        const double progress =
+            total_ > 0 ? std::clamp(static_cast<double>(current_) / static_cast<double>(total_), 0.0, 1.0) : 0.0;
         const RenderMetrics metrics{progress, elapsed_seconds, rate};
         const size_t terminal_width = detect_terminal_width();
 
@@ -165,13 +164,12 @@ private:
         std::string line = build_line(label, include_postfix, bar_width, metrics);
         if (line.size() > terminal_width) {
             const std::string min_bar_line = build_line(label, include_postfix, kMinimumBarWidth, metrics);
-            const size_t fixed_width =
-                min_bar_line.size() > static_cast<size_t>(kMinimumBarWidth)
-                    ? min_bar_line.size() - static_cast<size_t>(kMinimumBarWidth)
-                    : 0;
+            const size_t fixed_width = min_bar_line.size() > static_cast<size_t>(kMinimumBarWidth)
+                                           ? min_bar_line.size() - static_cast<size_t>(kMinimumBarWidth)
+                                           : 0;
             const size_t available_bar = terminal_width > fixed_width ? terminal_width - fixed_width : 0;
-            bar_width = static_cast<int>(std::clamp<size_t>(
-                available_bar, static_cast<size_t>(kMinimumBarWidth), static_cast<size_t>(kDefaultBarWidth)));
+            bar_width = static_cast<int>(std::clamp<size_t>(available_bar, static_cast<size_t>(kMinimumBarWidth),
+                                                            static_cast<size_t>(kDefaultBarWidth)));
             line = build_line(label, include_postfix, bar_width, metrics);
         }
         if (line.size() > terminal_width) {
@@ -242,8 +240,7 @@ private:
 
     static size_t detect_terminal_width() {
         struct winsize window_size {};
-        if (::isatty(STDERR_FILENO) != 0 &&
-            ::ioctl(STDERR_FILENO, TIOCGWINSZ, &window_size) == 0 &&
+        if (::isatty(STDERR_FILENO) != 0 && ::ioctl(STDERR_FILENO, TIOCGWINSZ, &window_size) == 0 &&
             window_size.ws_col >= 40) {
             return static_cast<size_t>(window_size.ws_col);
         }
@@ -259,12 +256,9 @@ private:
         return 80;
     }
 
-    [[nodiscard]] std::string build_line(const std::string& label,
-                                         bool include_postfix,
-                                         int bar_width,
+    [[nodiscard]] std::string build_line(const std::string& label, bool include_postfix, int bar_width,
                                          const RenderMetrics& metrics) const {
-        const int filled =
-            total_ > 0 ? static_cast<int>(metrics.progress * static_cast<double>(bar_width)) : 0;
+        const int filled = total_ > 0 ? static_cast<int>(metrics.progress * static_cast<double>(bar_width)) : 0;
 
         std::ostringstream line;
         line << label << ": ";
@@ -309,4 +303,4 @@ private:
     }
 };
 
-} // namespace spdmon
+}  // namespace spdmon

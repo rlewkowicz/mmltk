@@ -87,9 +87,8 @@ inline void run_checked(const std::vector<std::string>& args, std::string_view s
     if (result.exit_code == 0) {
         return;
     }
-    throw std::runtime_error(
-        std::string(step_name) + " failed with exit code " + std::to_string(result.exit_code) + "\n" +
-        result.output_text);
+    throw std::runtime_error(std::string(step_name) + " failed with exit code " + std::to_string(result.exit_code) +
+                             "\n" + result.output_text);
 }
 
 inline std::string md5_of_file(const fs::path& path) {
@@ -98,6 +97,20 @@ inline std::string md5_of_file(const fs::path& path) {
         throw std::runtime_error("md5sum failed for " + path.string() + "\n" + result.output_text);
     }
     return first_whitespace_delimited_token(result.output_text);
+}
+
+inline bool validate_tensorrt_engine(const fs::path& tensorrt_path) {
+    if (!is_nonempty_regular_file(tensorrt_path)) {
+        return false;
+    }
+    const auto result = mmltk::testsupport::run_subprocess_capture_output({
+        mmltk::testsupport::mmltk_cli_path(),
+        "rfdetr",
+        "info",
+        "--tensorrt",
+        tensorrt_path.string(),
+    });
+    return result.exit_code == 0;
 }
 
 inline void ensure_downloaded_weight(const fs::path& output_path, const WeightAsset& asset) {
@@ -127,9 +140,8 @@ inline void ensure_downloaded_weight(const fs::path& output_path, const WeightAs
     const std::string actual_md5 = md5_of_file(temp_path);
     if (actual_md5 != asset.md5_hash) {
         remove_if_exists(temp_path);
-        throw std::runtime_error(
-            "downloaded RF-DETR weight hash mismatch for " + output_path.string() +
-            ": expected=" + std::string(asset.md5_hash) + " actual=" + actual_md5);
+        throw std::runtime_error("downloaded RF-DETR weight hash mismatch for " + output_path.string() +
+                                 ": expected=" + std::string(asset.md5_hash) + " actual=" + actual_md5);
     }
 
     remove_if_exists(output_path);
@@ -190,13 +202,14 @@ inline void ensure_exported_onnx(const fs::path& native_checkpoint_path, const f
 }
 
 inline void ensure_built_tensorrt_engine(const fs::path& onnx_path, const fs::path& tensorrt_path) {
-    if (is_nonempty_regular_file_newer_than(tensorrt_path, onnx_path)) {
+    if (is_nonempty_regular_file_newer_than(tensorrt_path, onnx_path) && validate_tensorrt_engine(tensorrt_path)) {
         return;
     }
 
     fs::create_directories(tensorrt_path.parent_path());
     const fs::path temp_path = tensorrt_path.string() + ".part";
     remove_if_exists(temp_path);
+    remove_if_exists(tensorrt_path);
 
     run_checked(
         {
@@ -235,4 +248,4 @@ inline CachedModelAssets ensure_cached_model_assets(std::string_view preset_name
     return assets;
 }
 
-} // namespace mmltk::rfdetr::testsupport
+}  // namespace mmltk::rfdetr::testsupport

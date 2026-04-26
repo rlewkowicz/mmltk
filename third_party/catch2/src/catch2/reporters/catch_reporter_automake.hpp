@@ -15,26 +15,23 @@
 
 namespace Catch {
 
-    class AutomakeReporter final : public StreamingReporterBase {
-    public:
-        // GCC5 compat: we cannot use inherited constructor, because it
-        //              doesn't implement backport of P0136
-        AutomakeReporter( ReporterConfig&& _config ):
-            StreamingReporterBase( CATCH_MOVE( _config ) ) {
-            m_preferences.shouldReportAllAssertionStarts = false;
-        }
+class AutomakeReporter final : public StreamingReporterBase {
+   public:
+    AutomakeReporter(ReporterConfig&& _config) : StreamingReporterBase(CATCH_MOVE(_config)) {
+        m_preferences.shouldReportAllAssertionStarts = false;
+    }
 
-        ~AutomakeReporter() override;
+    ~AutomakeReporter() override;
 
-        static std::string getDescription() {
-            using namespace std::string_literals;
-            return "Reports test results in the format of Automake .trs files"s;
-        }
+    static std::string getDescription() {
+        using namespace std::string_literals;
+        return "Reports test results in the format of Automake .trs files"s;
+    }
 
-        void testCaseEnded(TestCaseStats const& _testCaseStats) override;
-        void skipTest(TestCaseInfo const& testInfo) override;
-    };
+    void testCaseEnded(TestCaseStats const& _testCaseStats) override;
+    void skipTest(TestCaseInfo const& testInfo) override;
+};
 
-} // end namespace Catch
+}  // namespace Catch
 
-#endif // CATCH_REPORTER_AUTOMAKE_HPP_INCLUDED
+#endif  // CATCH_REPORTER_AUTOMAKE_HPP_INCLUDED

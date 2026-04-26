@@ -3,11 +3,9 @@
 
 #pragma once
 
-// Helper RAII over winsock udp client socket.
-// Will throw on construction if socket creation failed.
-
 #include <spdlog/common.h>
 #include <spdlog/details/os.h>
+#include <spdlog/details/winsock_error.h>
 #include <spdlog/details/windows_include.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,13 +34,8 @@ class udp_client {
         }
     }
 
-    static void throw_winsock_error_(const std::string &msg, int last_error) {
-        char buf[512];
-        ::FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL,
-                         last_error, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), buf,
-                         (sizeof(buf) / sizeof(char)), NULL);
-
-        throw_spdlog_ex(fmt_lib::format("udp_sink - {}: {}", msg, buf));
+    static void throw_winsock_error_(const std::string& msg, int last_error) {
+        throw_winsock_error("udp_sink", msg, last_error);
     }
 
     void cleanup_() {
@@ -53,8 +46,8 @@ class udp_client {
         ::WSACleanup();
     }
 
-public:
-    udp_client(const std::string &host, uint16_t port) {
+   public:
+    udp_client(const std::string& host, uint16_t port) {
         init_winsock_();
 
         addr_.sin_family = PF_INET;
@@ -74,22 +67,25 @@ public:
         }
 
         int option_value = TX_BUFFER_SIZE;
-        if (::setsockopt(socket_, SOL_SOCKET, SO_SNDBUF,
-                         reinterpret_cast<const char *>(&option_value), sizeof(option_value)) < 0) {
+        if (::setsockopt(socket_, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&option_value),
+                         sizeof(option_value)) < 0) {
             int last_error = ::WSAGetLastError();
             cleanup_();
             throw_winsock_error_("error: setsockopt(SO_SNDBUF) Failed!", last_error);
         }
     }
 
-    ~udp_client() { cleanup_(); }
+    ~udp_client() {
+        cleanup_();
+    }
 
-    SOCKET fd() const { return socket_; }
+    SOCKET fd() const {
+        return socket_;
+    }
 
-    void send(const char *data, size_t n_bytes) {
+    void send(const char* data, size_t n_bytes) {
         socklen_t tolen = sizeof(struct sockaddr);
-        if (::sendto(socket_, data, static_cast<int>(n_bytes), 0, (struct sockaddr *)&addr_,
-                     tolen) == -1) {
+        if (::sendto(socket_, data, static_cast<int>(n_bytes), 0, (struct sockaddr*)&addr_, tolen) == -1) {
             throw_spdlog_ex("sendto(2) failed", errno);
         }
     }

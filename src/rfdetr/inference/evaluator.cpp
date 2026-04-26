@@ -149,12 +149,8 @@ struct CategoryMetricWork {
     std::vector<const Prediction*> predictions;
 };
 
-SelectedPredictions select_predictions(int image_id,
-                                       const torch::Tensor& scores,
-                                       const torch::Tensor& labels,
-                                       const torch::Tensor& boxes,
-                                       size_t category_count,
-                                       size_t max_dets_per_image) {
+SelectedPredictions select_predictions(int image_id, const torch::Tensor& scores, const torch::Tensor& labels,
+                                       const torch::Tensor& boxes, size_t category_count, size_t max_dets_per_image) {
     MMLTK_PROFILE_SCOPE("rfdetr.native.eval.select_predictions");
     const auto* score_ptr = scores.data_ptr<float>();
     const auto* label_ptr = labels.data_ptr<int64_t>();
@@ -186,8 +182,7 @@ SelectedPredictions select_predictions(int image_id,
 template <typename IoUFn>
 double compute_average_precision(const std::vector<const Prediction*>& predictions,
                                  const std::unordered_map<int, std::vector<const GroundTruthAnnotation*>>& gt_by_image,
-                                 double threshold,
-                                 IoUFn&& iou_fn) {
+                                 double threshold, IoUFn&& iou_fn) {
     MMLTK_NVTX_RANGE("compute_average_precision", NVTX_COLOR_MAGENTA);
     size_t gt_count = 0;
     for (const auto& item : gt_by_image) {
@@ -276,10 +271,8 @@ double compute_average_precision(const std::vector<const Prediction*>& predictio
 
 template <typename IoUFn>
 MetricSummary compute_metric_summary(const std::vector<GroundTruthAnnotation>& ground_truths,
-                                     const std::vector<Prediction>& predictions,
-                                     size_t category_count,
-                                     size_t max_dets_per_image,
-                                     IoUFn&& iou_fn) {
+                                     const std::vector<Prediction>& predictions, size_t category_count,
+                                     size_t max_dets_per_image, IoUFn&& iou_fn) {
     MMLTK_PROFILE_SCOPE("rfdetr.native.eval.metric");
     std::vector<CategoryMetricWork> work_by_category(category_count);
     for (const GroundTruthAnnotation& gt : ground_truths) {
@@ -326,11 +319,11 @@ MetricSummary compute_metric_summary(const std::vector<GroundTruthAnnotation>& g
                 preds.push_back(prediction);
             }
             std::ranges::sort(preds,
-                      [](const Prediction* lhs, const Prediction* rhs) { return lhs->score > rhs->score; });
+                              [](const Prediction* lhs, const Prediction* rhs) { return lhs->score > rhs->score; });
 
             for (size_t threshold_index = 0; threshold_index < std::size(kIouThresholds); ++threshold_index) {
-                const double ap = compute_average_precision(
-                    preds, work.gt_by_image, kIouThresholds[threshold_index], iou_fn);
+                const double ap =
+                    compute_average_precision(preds, work.gt_by_image, kIouThresholds[threshold_index], iou_fn);
                 if (!std::isnan(ap)) {
                     category_ap_sums[category_index][threshold_index] = ap;
                     category_ap_counts[category_index][threshold_index] = 1;
@@ -369,9 +362,7 @@ MetricSummary compute_metric_summary(const std::vector<GroundTruthAnnotation>& g
     return summary;
 }
 
-std::vector<Prediction> valid_predictions(const TensorMap& result,
-                                          int image_id,
-                                          size_t category_count,
+std::vector<Prediction> valid_predictions(const TensorMap& result, int image_id, size_t category_count,
                                           size_t max_dets_per_image) {
     MMLTK_PROFILE_SCOPE("rfdetr.native.eval.result_to_predictions");
     torch::Tensor scores;
@@ -401,9 +392,8 @@ std::vector<Prediction> valid_predictions(const TensorMap& result,
     torch::Tensor mask_index;
     {
         MMLTK_PROFILE_SCOPE("rfdetr.native.eval.d2h_masks");
-        mask_index = torch::tensor(
-            selected.mask_source_indices,
-            torch::TensorOptions().dtype(torch::kInt64).device(source_masks.device()));
+        mask_index = torch::tensor(selected.mask_source_indices,
+                                   torch::TensorOptions().dtype(torch::kInt64).device(source_masks.device()));
         source_masks = source_masks.index_select(0, mask_index).to(torch::kCPU);
     }
 
@@ -422,10 +412,8 @@ std::vector<Prediction> valid_predictions(const TensorMap& result,
         MMLTK_NVTX_RANGE("encode_masks_loop", NVTX_COLOR_ORANGE);
         MMLTK_PROFILE_SCOPE("rfdetr.native.eval.encode_masks");
         for (size_t index = 0; index < selected.predictions.size(); ++index) {
-            encoded_masks[index] = encode_mask_from_linear_data(
-                staged_ptr + index * static_cast<size_t>(pixels_per_mask),
-                height,
-                width);
+            encoded_masks[index] =
+                encode_mask_from_linear_data(staged_ptr + index * static_cast<size_t>(pixels_per_mask), height, width);
         }
     }
 
@@ -446,7 +434,7 @@ Prediction* first_valid_prediction(std::vector<Prediction>& predictions) {
     return &predictions.front();
 }
 
-} // namespace
+}  // namespace
 
 PredictionBufferSlotPool::PredictionBufferSlotPool(size_t slot_count) {
     if (slot_count == 0) {
@@ -466,9 +454,8 @@ PredictionBufferLease PredictionBufferSlotPool::acquire() {
     free_slots_.pop_front();
     PredictionBufferLease lease;
     lease.buffers = slots_.at(slot_index);
-    lease.release_guard = std::shared_ptr<void>(
-        nullptr,
-        [pool = shared_from_this(), slot_index](void*) { pool->release(slot_index); });
+    lease.release_guard =
+        std::shared_ptr<void>(nullptr, [pool = shared_from_this(), slot_index](void*) { pool->release(slot_index); });
     return lease;
 }
 
@@ -481,49 +468,32 @@ void PredictionBufferSlotPool::release(size_t slot_index) {
 }
 
 void PinnedPredictionBuffers::ensure_prediction_capacity(int64_t count) {
-    if (prediction_capacity >= count &&
-        scores_cpu.defined() &&
-        labels_cpu.defined() &&
-        boxes_cpu.defined()) {
+    if (prediction_capacity >= count && scores_cpu.defined() && labels_cpu.defined() && boxes_cpu.defined()) {
         return;
     }
     prediction_capacity = std::max<int64_t>(prediction_capacity, count);
-    const auto float_options = torch::TensorOptions()
-                                   .dtype(torch::kFloat32)
-                                   .device(torch::kCPU)
-                                   .pinned_memory(true);
-    const auto int_options = torch::TensorOptions()
-                                 .dtype(torch::kInt64)
-                                 .device(torch::kCPU)
-                                 .pinned_memory(true);
+    const auto float_options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(true);
+    const auto int_options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU).pinned_memory(true);
     scores_cpu = torch::empty({prediction_capacity}, float_options);
     labels_cpu = torch::empty({prediction_capacity}, int_options);
     boxes_cpu = torch::empty({prediction_capacity, 4}, float_options);
 }
 
 void PinnedPredictionBuffers::ensure_mask_capacity(int64_t count, uint32_t height, uint32_t width) {
-    if (masks_cpu.defined() &&
-        masks_cpu.dim() == 3 &&
-        masks_cpu.size(0) >= count &&
-        mask_height == height &&
+    if (masks_cpu.defined() && masks_cpu.dim() == 3 && masks_cpu.size(0) >= count && mask_height == height &&
         mask_width == width) {
         return;
     }
     ensure_prediction_capacity(count);
     mask_height = height;
     mask_width = width;
-    masks_cpu = torch::empty(
-        {prediction_capacity, static_cast<int64_t>(height), static_cast<int64_t>(width)},
-        torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU).pinned_memory(true));
+    masks_cpu = torch::empty({prediction_capacity, static_cast<int64_t>(height), static_cast<int64_t>(width)},
+                             torch::TensorOptions().dtype(torch::kBool).device(torch::kCPU).pinned_memory(true));
 }
 
 // NOLINTBEGIN(clang-analyzer-cplusplus.NewDeleteLeaks)
-StagedPredictionBatch stage_result_to_predictions(int image_id,
-                                                  const TensorMap& result,
-                                                  size_t category_count,
-                                                  size_t max_dets_per_image,
-                                                  PredictionBufferLease lease,
-                                                  int device_id,
+StagedPredictionBatch stage_result_to_predictions(int image_id, const TensorMap& result, size_t category_count,
+                                                  size_t max_dets_per_image, PredictionBufferLease lease, int device_id,
                                                   void* stream_handle) {
     MMLTK_PROFILE_SCOPE("rfdetr.native.eval.result_to_predictions");
     if (!lease.buffers) {
@@ -564,13 +534,7 @@ StagedPredictionBatch stage_result_to_predictions(int image_id,
         select_predictions(image_id, score_view, label_view, box_view, category_count, max_dets_per_image);
     if (selected.predictions.empty() || !result.contains("masks")) {
         return StagedPredictionBatch{
-            std::move(selected.predictions),
-            torch::Tensor(),
-            torch::Tensor(),
-            0,
-            0,
-            nullptr,
-            std::move(lease),
+            std::move(selected.predictions), torch::Tensor(), torch::Tensor(), 0, 0, nullptr, std::move(lease),
         };
     }
 
@@ -585,14 +549,11 @@ StagedPredictionBatch stage_result_to_predictions(int image_id,
     const auto mask_height = static_cast<uint32_t>(source_masks.size(1));
     const auto mask_width = static_cast<uint32_t>(source_masks.size(2));
     buffers.ensure_mask_capacity(
-        checked_cast<int64_t>(selected.predictions.size(), "selected prediction count overflow"),
-        mask_height,
+        checked_cast<int64_t>(selected.predictions.size(), "selected prediction count overflow"), mask_height,
         mask_width);
 
     const auto mask_view = buffers.masks_cpu.narrow(
-        0,
-        0,
-        checked_cast<int64_t>(selected.predictions.size(), "selected prediction count overflow"));
+        0, 0, checked_cast<int64_t>(selected.predictions.size(), "selected prediction count overflow"));
     torch::Tensor staged_masks;
     {
         MMLTK_PROFILE_SCOPE("rfdetr.native.eval.d2h_masks");
@@ -600,8 +561,7 @@ StagedPredictionBatch stage_result_to_predictions(int image_id,
         c10::cuda::CUDAGuard device_guard(checked_index);
         c10::cuda::CUDAStreamGuard stream_guard(c10::cuda::getStreamFromExternal(stream, checked_index));
         const auto mask_index = torch::tensor(
-            selected.mask_source_indices,
-            torch::TensorOptions().dtype(torch::kInt64).device(source_masks.device()));
+            selected.mask_source_indices, torch::TensorOptions().dtype(torch::kInt64).device(source_masks.device()));
         {
             MMLTK_PROFILE_SCOPE("rfdetr.native.eval.relayout_masks");
             staged_masks = source_masks.index_select(0, mask_index).contiguous();
@@ -627,7 +587,7 @@ StagedPredictionBatch stage_result_to_predictions(int image_id,
         std::move(staged_masks),
         mask_height,
         mask_width,
-        std::make_unique<CudaEventHandle>(ready_event),
+        std::make_unique<SharedCudaEvent>(ready_event),
         std::move(lease),
     };
 }
@@ -654,9 +614,7 @@ std::vector<Prediction> encode_staged_predictions(StagedPredictionBatch&& staged
     const auto* staged_ptr = staged.linear_masks_cpu.data_ptr<bool>();
     for (size_t index = 0; index < staged.predictions.size(); ++index) {
         staged.predictions[index].mask = encode_mask_from_linear_data(
-            staged_ptr + index * static_cast<size_t>(pixels_per_mask),
-            staged.mask_height,
-            staged.mask_width);
+            staged_ptr + index * static_cast<size_t>(pixels_per_mask), staged.mask_height, staged.mask_width);
         staged.predictions[index].has_mask = true;
     }
     return std::move(staged.predictions);
@@ -695,12 +653,8 @@ CocoDataset CocoDataset::load_from_binary(const std::filesystem::path& path) {
             GroundTruthAnnotation gt;
             gt.image_id = image_id;
             gt.category_id = static_cast<int>(packed.class_id) + 1;
-            gt.bbox_xyxy = {
-                static_cast<float>(packed.bbox_x1),
-                static_cast<float>(packed.bbox_y1),
-                static_cast<float>(packed.bbox_x2),
-                static_cast<float>(packed.bbox_y2)
-            };
+            gt.bbox_xyxy = {static_cast<float>(packed.bbox_x1), static_cast<float>(packed.bbox_y1),
+                            static_cast<float>(packed.bbox_x2), static_cast<float>(packed.bbox_y2)};
             if (packed.mask_rle_pairs > 0) {
                 gt.has_mask = true;
                 gt.mask.height = loader.image_height();
@@ -723,17 +677,14 @@ void CocoDataset::limit_images(size_t limit) {
     if (limit >= image_ids_.size()) {
         return;
     }
-    const std::unordered_set<int> keep(
-        image_ids_.begin(), image_ids_.begin() + static_cast<std::ptrdiff_t>(limit));
+    const std::unordered_set<int> keep(image_ids_.begin(), image_ids_.begin() + static_cast<std::ptrdiff_t>(limit));
     image_ids_.resize(limit);
     image_id_to_index_.clear();
     for (size_t index = 0; index < image_ids_.size(); ++index) {
         image_id_to_index_[image_ids_[index]] = index;
     }
-    std::erase_if(ground_truths_,
-            [&keep](const GroundTruthAnnotation& gt) { return !keep.contains(gt.image_id); });
-    std::erase_if(predictions_,
-            [&keep](const Prediction& prediction) { return !keep.contains(prediction.image_id); });
+    std::erase_if(ground_truths_, [&keep](const GroundTruthAnnotation& gt) { return !keep.contains(gt.image_id); });
+    std::erase_if(predictions_, [&keep](const Prediction& prediction) { return !keep.contains(prediction.image_id); });
 }
 
 bool CocoDataset::has_image(int image_id) const {
@@ -746,22 +697,17 @@ void CocoDataset::add_predictions(const std::vector<Prediction>& predictions) {
 
 void CocoDataset::add_predictions(std::vector<Prediction>&& predictions) {
     predictions_.reserve(predictions_.size() + predictions.size());
-    predictions_.insert(predictions_.end(),
-                        std::make_move_iterator(predictions.begin()),
+    predictions_.insert(predictions_.end(), std::make_move_iterator(predictions.begin()),
                         std::make_move_iterator(predictions.end()));
 }
 
 EvalSummary CocoDataset::evaluate(size_t max_dets_per_image) const {
     MMLTK_PROFILE_SCOPE("rfdetr.native.eval.total");
     EvalSummary summary;
-    summary.bbox = compute_metric_summary(
-        ground_truths_,
-        predictions_,
-        category_names_.size(),
-        max_dets_per_image,
-        [](const Prediction& prediction, const GroundTruthAnnotation& gt) {
-            return bbox_iou(prediction.bbox_xyxy, gt.bbox_xyxy);
-        });
+    summary.bbox = compute_metric_summary(ground_truths_, predictions_, category_names_.size(), max_dets_per_image,
+                                          [](const Prediction& prediction, const GroundTruthAnnotation& gt) {
+                                              return bbox_iou(prediction.bbox_xyxy, gt.bbox_xyxy);
+                                          });
 
     std::vector<GroundTruthAnnotation> mask_ground_truths;
     std::vector<Prediction> mask_predictions;
@@ -777,20 +723,15 @@ EvalSummary CocoDataset::evaluate(size_t max_dets_per_image) const {
             mask_predictions.push_back(prediction);
         }
     }
-    summary.mask = compute_metric_summary(
-        mask_ground_truths,
-        mask_predictions,
-        category_names_.size(),
-        max_dets_per_image,
-        [](const Prediction& prediction, const GroundTruthAnnotation& gt) {
-            return mask_iou(prediction.mask, gt.mask);
-        });
+    summary.mask =
+        compute_metric_summary(mask_ground_truths, mask_predictions, category_names_.size(), max_dets_per_image,
+                               [](const Prediction& prediction, const GroundTruthAnnotation& gt) {
+                                   return mask_iou(prediction.mask, gt.mask);
+                               });
     return summary;
 }
 
-std::vector<Prediction> result_to_predictions(int image_id,
-                                              const TensorMap& result,
-                                              size_t category_count,
+std::vector<Prediction> result_to_predictions(int image_id, const TensorMap& result, size_t category_count,
                                               size_t max_dets_per_image) {
     return valid_predictions(result, image_id, category_count, max_dets_per_image);
 }
@@ -813,22 +754,19 @@ AlignmentStats compare_top1(const TensorMap& lhs, const TensorMap& rhs, size_t c
 
     double box_diff = 0.0;
     for (size_t index = 0; index < lhs_top1->bbox_xyxy.size(); ++index) {
-        box_diff = std::max(
-            box_diff,
-            std::abs(static_cast<double>(lhs_top1->bbox_xyxy[index]) -
-                     static_cast<double>(rhs_top1->bbox_xyxy[index])));
+        box_diff = std::max(box_diff, std::abs(static_cast<double>(lhs_top1->bbox_xyxy[index]) -
+                                               static_cast<double>(rhs_top1->bbox_xyxy[index])));
     }
     stats.top1_box_abs_diff_px_mean = box_diff;
     stats.top1_box_abs_diff_px_max = box_diff;
 
     if (lhs_top1->has_mask && rhs_top1->has_mask) {
         const uint32_t intersect = intersection_area(lhs_top1->mask, rhs_top1->mask);
-        const auto xor_pixels =
-            static_cast<double>(lhs_top1->mask.area + rhs_top1->mask.area - 2 * intersect);
+        const auto xor_pixels = static_cast<double>(lhs_top1->mask.area + rhs_top1->mask.area - 2 * intersect);
         stats.top1_mask_xor_pixels_mean = xor_pixels;
         stats.top1_mask_xor_pixels_max = xor_pixels;
     }
     return stats;
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

@@ -15,8 +15,6 @@
 #include <utility>
 #include <vector>
 
-struct ImFont;
-
 namespace mmltk::gui {
 
 struct AnnotationProjectedScene;
@@ -44,16 +42,6 @@ struct AnnotationSaveTabPlan {
     AnnotationLiveSavePlan live_save;
 };
 
-struct AnnotationSaveTabUiState {
-    std::string* output_root = nullptr;
-    std::string* split = nullptr;
-    std::size_t loaded_class_count = 0;
-    bool live_video = false;
-    bool hold_save_active = false;
-    bool hold_save_blocked = false;
-    ImFont* compact_font = nullptr;
-};
-
 struct AnnotationSaveTabUiActions {
     bool request_save_now = false;
     bool hold_save_active = false;
@@ -61,6 +49,11 @@ struct AnnotationSaveTabUiActions {
 };
 
 struct AnnotationQueuedSave {
+    AnnotationQueuedSave() = default;
+    AnnotationQueuedSave(AnnotationFrame frame_in, std::vector<AnnotationObject> objects_in,
+                         std::shared_ptr<const AnnotationProjectedScene> projected_scene_in = {})
+        : frame(std::move(frame_in)), objects(std::move(objects_in)), projected_scene(std::move(projected_scene_in)) {}
+
     AnnotationFrame frame;
     std::vector<AnnotationObject> objects;
     std::shared_ptr<const AnnotationProjectedScene> projected_scene;
@@ -92,20 +85,16 @@ struct AnnotationSaveTabState {
     std::size_t input_count = 0;
 };
 
-[[nodiscard]] inline AnnotationSaveTabPlan plan_annotation_save_tab(
-    const AnnotationSaveTabState& state) noexcept {
+[[nodiscard]] inline AnnotationSaveTabPlan plan_annotation_save_tab(const AnnotationSaveTabState& state) noexcept {
     const bool live_video = state.source_kind == SourceKind::VideoStream;
     const bool live_save_active = live_video && state.annotation_live_running;
 
     AnnotationSaveTabPlan plan;
-    plan.save_now.enabled =
-        state.has_annotation_frame && state.has_resolved_instances && !state.save_running;
+    plan.save_now.enabled = state.has_annotation_frame && state.has_resolved_instances && !state.save_running;
     plan.save_now.requires_live_frame_refresh = live_save_active;
-    plan.save_now.should_advance_image_folder =
-        plan.save_now.enabled &&
-        state.source_kind == SourceKind::ImageFolder &&
-        state.input_count > 0U &&
-        state.current_input_index + 1U < state.input_count;
+    plan.save_now.should_advance_image_folder = plan.save_now.enabled && state.source_kind == SourceKind::ImageFolder &&
+                                                state.input_count > 0U &&
+                                                state.current_input_index + 1U < state.input_count;
 
     plan.hold_save.enabled = live_save_active;
     plan.hold_save.blocked = state.hold_save_blocked;
@@ -116,8 +105,7 @@ struct AnnotationSaveTabState {
     return plan;
 }
 
-[[nodiscard]] inline bool has_queued_annotation_save(
-    const AnnotationSaveControllerState& state) noexcept {
+[[nodiscard]] inline bool has_queued_annotation_save(const AnnotationSaveControllerState& state) noexcept {
     return state.queued_save.has_value();
 }
 
@@ -147,8 +135,7 @@ inline void stop_annotation_hold_save(AnnotationSaveControllerState* state) noex
     clear_annotation_save_queue(state);
 }
 
-inline void note_annotation_save_started(AnnotationSaveControllerState* state,
-                                         const AnnotationFrame& frame) noexcept {
+inline void note_annotation_save_started(AnnotationSaveControllerState* state, const AnnotationFrame& frame) noexcept {
     if (state == nullptr) {
         return;
     }
@@ -156,8 +143,7 @@ inline void note_annotation_save_started(AnnotationSaveControllerState* state,
     state->last_saved_live_frame_id = frame.live_frame_id;
 }
 
-inline void queue_annotation_save(AnnotationSaveControllerState* state,
-                                  AnnotationFrame frame,
+inline void queue_annotation_save(AnnotationSaveControllerState* state, AnnotationFrame frame,
                                   std::vector<AnnotationObject> objects,
                                   std::shared_ptr<const AnnotationProjectedScene> projected_scene = {}) {
     if (state == nullptr) {
@@ -185,8 +171,7 @@ struct AnnotationSaveTabUiCommitResult {
 };
 
 [[nodiscard]] inline AnnotationSaveTabUiCommitResult apply_annotation_save_tab_ui_actions(
-    AnnotationSaveControllerState* controller_state,
-    const bool live_video,
+    AnnotationSaveControllerState* controller_state, const bool live_video,
     const AnnotationSaveTabUiActions& actions) noexcept {
     AnnotationSaveTabUiCommitResult result;
     if (controller_state == nullptr) {
@@ -218,32 +203,23 @@ struct AnnotationSavePipelineState {
 };
 
 [[nodiscard]] inline AnnotationSavePipelineState make_annotation_save_pipeline_state(
-    const AnnotationSaveTabPlan& tab_plan,
-    const AnnotationSaveControllerState& controller_state,
-    const AnnotationFrame* current_frame,
-    const bool save_running) noexcept {
+    const AnnotationSaveTabPlan& tab_plan, const AnnotationSaveControllerState& controller_state,
+    const AnnotationFrame* current_frame, const bool save_running) noexcept {
     const bool has_current_frame = current_frame != nullptr;
     const bool current_frame_matches_last_saved =
         has_current_frame &&
-        annotation_frame_matches_saved_identity(*current_frame,
-                                                controller_state.last_saved_frame_id,
+        annotation_frame_matches_saved_identity(*current_frame, controller_state.last_saved_frame_id,
                                                 controller_state.last_saved_live_frame_id);
     const bool current_frame_matches_queued =
-        has_current_frame &&
-        controller_state.queued_save.has_value() &&
+        has_current_frame && controller_state.queued_save.has_value() &&
         annotation_frames_match_for_save(controller_state.queued_save->frame, *current_frame);
     return AnnotationSavePipelineState{
-        tab_plan,
-        save_running,
-        has_current_frame,
-        current_frame_matches_last_saved,
-        current_frame_matches_queued,
+        tab_plan, save_running, has_current_frame, current_frame_matches_last_saved, current_frame_matches_queued,
     };
 }
 
 [[nodiscard]] inline AnnotationQueuedSaveDispatchPlan plan_annotation_queued_save_dispatch(
-    const AnnotationSaveControllerState& controller_state,
-    const bool save_running) noexcept {
+    const AnnotationSaveControllerState& controller_state, const bool save_running) noexcept {
     AnnotationQueuedSaveDispatchPlan plan;
     if (save_running || !controller_state.queued_save.has_value()) {
         return plan;
@@ -292,9 +268,18 @@ struct AnnotationSaveSnapshotRequest {
     const char* resolve_error_context = "annotate save resolve error";
 };
 
+[[nodiscard]] inline AnnotationSaveSnapshotRequest make_annotation_save_snapshot_request(
+    const bool refresh_live_frame, const AnnotationFrame* frame, const std::uint64_t document_generation,
+    const std::vector<AnnotationObject>& document_objects, const bool has_resolved_instances,
+    std::string* error_message, const char* resolve_error_context = "annotate save resolve error") noexcept {
+    return AnnotationSaveSnapshotRequest{
+        refresh_live_frame,     frame,         document_generation,   &document_objects,
+        has_resolved_instances, error_message, resolve_error_context,
+    };
+}
+
 [[nodiscard]] inline AnnotationHoldSaveDispatchPlan plan_annotation_hold_save_dispatch(
-    const AnnotationSaveControllerState& controller_state,
-    const AnnotationHoldSaveDispatchState& state) noexcept {
+    const AnnotationSaveControllerState& controller_state, const AnnotationHoldSaveDispatchState& state) noexcept {
     AnnotationHoldSaveDispatchPlan plan;
 
     if (state.tab_plan.hold_save.should_clear_queue || !state.tab_plan.hold_save.enabled) {
@@ -302,9 +287,7 @@ struct AnnotationSaveSnapshotRequest {
         return plan;
     }
 
-    if (!controller_state.hold_save ||
-        !state.tab_plan.live_save.enabled ||
-        !state.has_current_frame ||
+    if (!controller_state.hold_save || !state.tab_plan.live_save.enabled || !state.has_current_frame ||
         state.current_frame_matches_last_saved) {
         return plan;
     }
@@ -326,19 +309,17 @@ struct AnnotationSaveSnapshotRequest {
 }
 
 [[nodiscard]] inline AnnotationSavePipelinePlan plan_annotation_save_pipeline(
-    const AnnotationSaveControllerState& controller_state,
-    const AnnotationSavePipelineState& state) noexcept {
+    const AnnotationSaveControllerState& controller_state, const AnnotationSavePipelineState& state) noexcept {
     return AnnotationSavePipelinePlan{
         plan_annotation_queued_save_dispatch(controller_state, state.save_running),
-        plan_annotation_hold_save_dispatch(
-            controller_state,
-            AnnotationHoldSaveDispatchState{
-                state.tab_plan,
-                state.save_running,
-                state.has_current_frame,
-                state.current_frame_matches_last_saved,
-                state.current_frame_matches_queued,
-        }),
+        plan_annotation_hold_save_dispatch(controller_state,
+                                           AnnotationHoldSaveDispatchState{
+                                               state.tab_plan,
+                                               state.save_running,
+                                               state.has_current_frame,
+                                               state.current_frame_matches_last_saved,
+                                               state.current_frame_matches_queued,
+                                           }),
     };
 }
 
@@ -346,16 +327,10 @@ struct AnnotationSaveSnapshotRequest {
     const AnnotationSavePipelineRequest& request) noexcept {
     if (request.controller_state == nullptr) {
         return AnnotationSavePipelineState{
-            request.tab_plan,
-            request.save_running,
-            request.current_frame != nullptr,
-            false,
-            false,
+            request.tab_plan, request.save_running, request.current_frame != nullptr, false, false,
         };
     }
-    return make_annotation_save_pipeline_state(request.tab_plan,
-                                               *request.controller_state,
-                                               request.current_frame,
+    return make_annotation_save_pipeline_state(request.tab_plan, *request.controller_state, request.current_frame,
                                                request.save_running);
 }
 
@@ -364,19 +339,15 @@ struct AnnotationSaveSnapshotRequest {
     if (request.controller_state == nullptr) {
         return {};
     }
-    return plan_annotation_save_pipeline(*request.controller_state,
-                                         make_annotation_save_pipeline_state(request));
+    return plan_annotation_save_pipeline(*request.controller_state, make_annotation_save_pipeline_state(request));
 }
 
-template <typename EnsureLiveFramePixelsFn,
-          typename ResolveCurrentObjectsFn,
-          typename CurrentProjectedSceneFn>
-[[nodiscard]] inline bool prepare_annotation_save_snapshot(
-    const AnnotationSaveSnapshotRequest& request,
-    EnsureLiveFramePixelsFn&& ensure_live_frame_pixels,
-    ResolveCurrentObjectsFn&& resolve_current_annotation_objects,
-    CurrentProjectedSceneFn&& current_projected_scene,
-    AnnotationSaveSnapshot* snapshot) {
+template <typename EnsureLiveFramePixelsFn, typename ResolveCurrentObjectsFn, typename CurrentProjectedSceneFn>
+[[nodiscard]] inline bool prepare_annotation_save_snapshot(const AnnotationSaveSnapshotRequest& request,
+                                                           EnsureLiveFramePixelsFn&& ensure_live_frame_pixels,
+                                                           ResolveCurrentObjectsFn&& resolve_current_annotation_objects,
+                                                           CurrentProjectedSceneFn&& current_projected_scene,
+                                                           AnnotationSaveSnapshot* snapshot) {
     if (snapshot == nullptr || request.frame == nullptr || !request.has_resolved_instances) {
         return false;
     }
@@ -387,10 +358,7 @@ template <typename EnsureLiveFramePixelsFn,
             return false;
         }
         if (!std::forward<ResolveCurrentObjectsFn>(resolve_current_annotation_objects)(
-                true,
-                request.resolve_error_context,
-                false,
-                &projected_scene)) {
+                true, request.resolve_error_context, false, &projected_scene)) {
             return false;
         }
     } else {
@@ -401,14 +369,13 @@ template <typename EnsureLiveFramePixelsFn,
         }
     }
 
-    if (projected_scene != nullptr &&
-        projected_scene->document_generation != request.document_generation) {
+    if (projected_scene != nullptr && projected_scene->document_generation != request.document_generation) {
         projected_scene.reset();
     }
 
     snapshot->frame = *request.frame;
-    snapshot->objects = request.document_objects != nullptr ? *request.document_objects
-                                                           : std::vector<AnnotationObject>{};
+    snapshot->objects =
+        request.document_objects != nullptr ? *request.document_objects : std::vector<AnnotationObject>{};
     snapshot->projected_scene = std::move(projected_scene);
     if (request.error_message != nullptr) {
         request.error_message->clear();
@@ -416,108 +383,32 @@ template <typename EnsureLiveFramePixelsFn,
     return true;
 }
 
-template <typename EnsureLiveFramePixelsFn,
-          typename ResolveCurrentObjectsFn,
-          typename CurrentProjectedSceneFn>
-[[nodiscard]] inline bool prepare_annotation_save_snapshot(
-    const bool refresh_live_frame,
-    EnsureLiveFramePixelsFn&& ensure_live_frame_pixels,
-    ResolveCurrentObjectsFn&& resolve_current_annotation_objects,
-    CurrentProjectedSceneFn&& current_projected_scene,
-    const AnnotationFrame* frame,
-    const std::uint64_t document_generation,
-    const std::vector<AnnotationObject>& document_objects,
-    const bool has_resolved_instances,
-    AnnotationSaveSnapshot* snapshot,
-    std::string* error_message,
-    const char* resolve_error_context = "annotate save resolve error") {
-    return prepare_annotation_save_snapshot(
-        AnnotationSaveSnapshotRequest{
-            refresh_live_frame,
-            frame,
-            document_generation,
-            &document_objects,
-            has_resolved_instances,
-            error_message,
-            resolve_error_context,
-        },
-        std::forward<EnsureLiveFramePixelsFn>(ensure_live_frame_pixels),
-        std::forward<ResolveCurrentObjectsFn>(resolve_current_annotation_objects),
-        std::forward<CurrentProjectedSceneFn>(current_projected_scene),
-        snapshot);
-}
-
-template <typename EnsureLiveFramePixelsFn,
-          typename ResolveCurrentObjectsFn,
-          typename CurrentProjectedSceneFn>
+template <typename EnsureLiveFramePixelsFn, typename ResolveCurrentObjectsFn, typename CurrentProjectedSceneFn>
 [[nodiscard]] inline std::optional<AnnotationSaveSnapshot> make_annotation_save_snapshot(
-    const AnnotationSaveSnapshotRequest& request,
-    EnsureLiveFramePixelsFn&& ensure_live_frame_pixels,
-    ResolveCurrentObjectsFn&& resolve_current_annotation_objects,
-    CurrentProjectedSceneFn&& current_projected_scene) {
+    const AnnotationSaveSnapshotRequest& request, EnsureLiveFramePixelsFn&& ensure_live_frame_pixels,
+    ResolveCurrentObjectsFn&& resolve_current_annotation_objects, CurrentProjectedSceneFn&& current_projected_scene) {
     AnnotationSaveSnapshot snapshot;
-    if (!prepare_annotation_save_snapshot(request,
-                                          std::forward<EnsureLiveFramePixelsFn>(ensure_live_frame_pixels),
+    if (!prepare_annotation_save_snapshot(request, std::forward<EnsureLiveFramePixelsFn>(ensure_live_frame_pixels),
                                           std::forward<ResolveCurrentObjectsFn>(resolve_current_annotation_objects),
-                                          std::forward<CurrentProjectedSceneFn>(current_projected_scene),
-                                          &snapshot)) {
+                                          std::forward<CurrentProjectedSceneFn>(current_projected_scene), &snapshot)) {
         return std::nullopt;
     }
     return std::make_optional<AnnotationSaveSnapshot>(std::move(snapshot));
 }
 
-template <typename EnsureLiveFramePixelsFn,
-          typename ResolveCurrentObjectsFn,
-          typename CurrentProjectedSceneFn>
-[[nodiscard]] inline std::optional<AnnotationSaveSnapshot> make_annotation_save_snapshot(
-    const bool refresh_live_frame,
-    EnsureLiveFramePixelsFn&& ensure_live_frame_pixels,
-    ResolveCurrentObjectsFn&& resolve_current_annotation_objects,
-    CurrentProjectedSceneFn&& current_projected_scene,
-    const AnnotationFrame* frame,
-    const std::uint64_t document_generation,
-    const std::vector<AnnotationObject>& document_objects,
-    const bool has_resolved_instances,
-    std::string* error_message,
-    const char* resolve_error_context = "annotate save resolve error") {
-    return make_annotation_save_snapshot(
-        AnnotationSaveSnapshotRequest{
-            refresh_live_frame,
-            frame,
-            document_generation,
-            &document_objects,
-            has_resolved_instances,
-            error_message,
-            resolve_error_context,
-        },
-        std::forward<EnsureLiveFramePixelsFn>(ensure_live_frame_pixels),
-        std::forward<ResolveCurrentObjectsFn>(resolve_current_annotation_objects),
-        std::forward<CurrentProjectedSceneFn>(current_projected_scene));
-}
-
-template <typename PrepareSnapshotFn,
-          typename QueueSnapshotFn,
-          typename LaunchSnapshotFn,
-          typename ClearQueueFn,
-          typename TakeQueuedSaveFn,
-          typename LaunchQueuedSaveFn,
-          typename BlockHoldSaveFn>
-inline void drive_annotation_save_pipeline(
-    const AnnotationSavePipelinePlan& pipeline_plan,
-    PrepareSnapshotFn&& prepare_snapshot,
-    QueueSnapshotFn&& queue_snapshot,
-    LaunchSnapshotFn&& launch_snapshot,
-    ClearQueueFn&& clear_queue,
-    TakeQueuedSaveFn&& take_queued_save,
-    LaunchQueuedSaveFn&& launch_queued_save,
-    BlockHoldSaveFn&& block_hold_save) {
+template <typename PrepareSnapshotFn, typename QueueSnapshotFn, typename LaunchSnapshotFn, typename ClearQueueFn,
+          typename TakeQueuedSaveFn, typename LaunchQueuedSaveFn, typename BlockHoldSaveFn>
+inline void drive_annotation_save_pipeline(const AnnotationSavePipelinePlan& pipeline_plan,
+                                           PrepareSnapshotFn&& prepare_snapshot, QueueSnapshotFn&& queue_snapshot,
+                                           LaunchSnapshotFn&& launch_snapshot, ClearQueueFn&& clear_queue,
+                                           TakeQueuedSaveFn&& take_queued_save, LaunchQueuedSaveFn&& launch_queued_save,
+                                           BlockHoldSaveFn&& block_hold_save) {
     if (pipeline_plan.queued_save.clear_queue) {
         std::forward<ClearQueueFn>(clear_queue)();
     }
 
     if (pipeline_plan.queued_save.dispatch_queued_save) {
-        std::optional<AnnotationQueuedSave> queued_save =
-            std::forward<TakeQueuedSaveFn>(take_queued_save)();
+        std::optional<AnnotationQueuedSave> queued_save = std::forward<TakeQueuedSaveFn>(take_queued_save)();
         if (queued_save.has_value() && !queued_save->objects.empty()) {
             std::forward<LaunchQueuedSaveFn>(launch_queued_save)(std::move(*queued_save));
         }
@@ -532,8 +423,7 @@ inline void drive_annotation_save_pipeline(
         return;
     }
 
-    std::optional<AnnotationSaveSnapshot> save_snapshot =
-        std::forward<PrepareSnapshotFn>(prepare_snapshot)();
+    std::optional<AnnotationSaveSnapshot> save_snapshot = std::forward<PrepareSnapshotFn>(prepare_snapshot)();
     if (!save_snapshot.has_value()) {
         return;
     }
@@ -556,8 +446,4 @@ inline void drive_annotation_save_pipeline(
     return plan.hold_save.enabled;
 }
 
-[[nodiscard]] AnnotationSaveTabUiActions draw_annotation_save_tab_ui(
-    AnnotationSaveTabUiState state,
-    const AnnotationSaveTabPlan& plan);
-
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

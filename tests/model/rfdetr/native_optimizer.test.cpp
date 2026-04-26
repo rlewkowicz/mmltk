@@ -6,6 +6,7 @@
 #include "support/catch2_compat.hpp"
 #include <cmath>
 #include <filesystem>
+#include <utility>
 
 namespace fs = std::filesystem;
 
@@ -18,25 +19,16 @@ using mmltk::rfdetr::NativeMuonWithAuxAdam;
 using mmltk::rfdetr::NativeOptimizerBackend;
 using mmltk::rfdetr::native_optimizer_supports_fused;
 
-NativeAdamW make_optimizer(const torch::Tensor& param,
-                           const NativeOptimizerBackend backend,
-                           const double lr = 1.0e-3,
+NativeAdamW make_optimizer(const torch::Tensor& param, const NativeOptimizerBackend backend, const double lr = 1.0e-3,
                            const double weight_decay = 1.0e-2) {
-    return NativeAdamW(
-        {NativeAdamW::Group{NativeAdamWGroupConfig{lr, weight_decay, false}, {0}}},
-        {NativeAdamW::NamedParameter{"weight", param}},
-        backend);
+    return NativeAdamW({NativeAdamW::Group{NativeAdamWGroupConfig{lr, weight_decay, false}, {0}}},
+                       {NativeAdamW::NamedParameter{"weight", param}}, backend);
 }
 
-NativeMuonWithAuxAdam make_muon_optimizer(const torch::Tensor& param,
-                                          const bool use_muon,
-                                          const double lr = 1.0e-3,
-                                          const double weight_decay = 1.0e-2,
-                                          const double momentum = 0.95) {
+NativeMuonWithAuxAdam make_muon_optimizer(const torch::Tensor& param, const bool use_muon, const double lr = 1.0e-3,
+                                          const double weight_decay = 1.0e-2, const double momentum = 0.95) {
     return NativeMuonWithAuxAdam(
-        {NativeMuonWithAuxAdam::Group{
-            NativeMuonGroupConfig{lr, weight_decay, momentum, use_muon, true},
-            {0}}},
+        {NativeMuonWithAuxAdam::Group{NativeMuonGroupConfig{lr, weight_decay, momentum, use_muon, true}, {0}}},
         {NativeMuonWithAuxAdam::NamedParameter{"weight", param}});
 }
 
@@ -67,9 +59,7 @@ torch::Tensor reference_zeropower(const torch::Tensor& grad, const int steps = 5
     return update;
 }
 
-torch::Tensor reference_muon_update(const torch::Tensor& grad,
-                                    torch::Tensor& momentum_buffer,
-                                    const double beta = 0.95,
+torch::Tensor reference_muon_update(const torch::Tensor& grad, torch::Tensor& momentum_buffer, const double beta = 0.95,
                                     const bool nesterov = true) {
     momentum_buffer.lerp_(grad, 1.0 - beta);
     auto update = nesterov ? grad.lerp(momentum_buffer, beta) : momentum_buffer;
@@ -81,15 +71,62 @@ torch::Tensor reference_muon_update(const torch::Tensor& grad,
     return update;
 }
 
-torch::Tensor reference_adam_update(const torch::Tensor& grad,
-                                    torch::Tensor& exp_avg,
-                                    torch::Tensor& exp_avg_sq,
+torch::Tensor reference_adam_update(const torch::Tensor& grad, torch::Tensor& exp_avg, torch::Tensor& exp_avg_sq,
                                     const int64_t step) {
     exp_avg.lerp_(grad, 1.0 - 0.9);
     exp_avg_sq.lerp_(grad.square(), 1.0 - 0.95);
     const auto exp_avg_corrected = exp_avg / (1.0 - std::pow(0.9, static_cast<double>(step)));
     const auto exp_avg_sq_corrected = exp_avg_sq / (1.0 - std::pow(0.95, static_cast<double>(step)));
     return exp_avg_corrected / (exp_avg_sq_corrected.sqrt() + 1.0e-10);
+}
+
+template <typename SaveFn, typename LoadFn>
+void roundtrip_archive(const fs::path& archive_path, SaveFn&& save_archive, LoadFn&& load_archive) {
+    {
+        torch::serialize::OutputArchive archive;
+        save_archive(archive);
+        archive.save_to(archive_path.string());
+    }
+    {
+        torch::serialize::InputArchive archive;
+        archive.load_from(archive_path.string());
+        load_archive(archive);
+    }
+}
+
+template <typename SaveFn, typename LoadFn, typename StepFn>
+void assert_roundtrip_resume_matches(const fs::path& archive_path, torch::Tensor& reference_param,
+                                     torch::Tensor& resumed_param, SaveFn&& save_archive, LoadFn&& load_archive,
+                                     StepFn&& step_both_optimizers, const double atol, const double rtol) {
+    roundtrip_archive(archive_path, std::forward<SaveFn>(save_archive), std::forward<LoadFn>(load_archive));
+
+    auto next_grad = torch::randn_like(reference_param);
+    assign_grad(reference_param, next_grad);
+    assign_grad(resumed_param, next_grad);
+    step_both_optimizers();
+
+    assert_close(reference_param, resumed_param, atol, rtol);
+    fs::remove(archive_path);
+}
+
+template <typename ReferenceOptimizer, typename ResumedOptimizer>
+void step_and_zero_grad(ReferenceOptimizer& reference, ResumedOptimizer& resumed) {
+    reference.step();
+    resumed.step();
+    reference.zero_grad(true);
+    resumed.zero_grad(true);
+}
+
+template <typename ReferenceOptimizer, typename ResumedOptimizer>
+void assert_optimizer_roundtrip_resume_matches(const fs::path& archive_path, torch::Tensor& reference_param,
+                                               torch::Tensor& resumed_param, ReferenceOptimizer& reference,
+                                               ResumedOptimizer& resumed, const double atol = 1.0e-6,
+                                               const double rtol = 1.0e-6) {
+    assert_roundtrip_resume_matches(
+        archive_path, reference_param, resumed_param,
+        [&](torch::serialize::OutputArchive& archive) { reference.save(archive); },
+        [&](torch::serialize::InputArchive& archive) { resumed.load(archive); },
+        [&]() { step_and_zero_grad(reference, resumed); }, atol, rtol);
 }
 
 void test_eager_fused_parity() {
@@ -137,29 +174,8 @@ void run_roundtrip_for_backend(const NativeOptimizerBackend backend, const torch
         resumed_param.copy_(reference_param.detach());
     }
     const fs::path archive_path =
-        fs::temp_directory_path() /
-        ("mmltk_rfdetr_native_optimizer_" + std::string(reference.backend_name()) + ".pt");
-    {
-        torch::serialize::OutputArchive archive;
-        reference.save(archive);
-        archive.save_to(archive_path.string());
-    }
-    {
-        torch::serialize::InputArchive archive;
-        archive.load_from(archive_path.string());
-        resumed.load(archive);
-    }
-
-    auto next_grad = torch::randn_like(reference_param);
-    assign_grad(reference_param, next_grad);
-    assign_grad(resumed_param, next_grad);
-    reference.step();
-    resumed.step();
-    reference.zero_grad(true);
-    resumed.zero_grad(true);
-
-    assert_close(reference_param, resumed_param, 1.0e-6, 1.0e-6);
-    fs::remove(archive_path);
+        fs::temp_directory_path() / ("mmltk_rfdetr_native_optimizer_" + std::string(reference.backend_name()) + ".pt");
+    assert_optimizer_roundtrip_resume_matches(archive_path, reference_param, resumed_param, reference, resumed);
 }
 
 void test_optimizer_roundtrip() {
@@ -194,7 +210,7 @@ void run_muon_reference_parity(const torch::Device& device) {
     auto param =
         torch::randn({8, 6}, torch::TensorOptions().dtype(torch::kFloat32).device(device)).requires_grad_(true);
     auto reference_param = param.detach().clone();
-    auto optimizer = make_muon_optimizer(param, /*use_muon=*/true);
+    auto optimizer = make_muon_optimizer(param, true);
     auto momentum_buffer = torch::zeros_like(reference_param);
 
     for (int step = 0; step < 3; ++step) {
@@ -216,7 +232,7 @@ void run_auxadam_reference_parity(const torch::Device& device) {
     auto param =
         torch::randn({5, 5}, torch::TensorOptions().dtype(torch::kFloat32).device(device)).requires_grad_(true);
     auto reference_param = param.detach().clone();
-    auto optimizer = make_muon_optimizer(param, /*use_muon=*/false);
+    auto optimizer = make_muon_optimizer(param, false);
     auto exp_avg = torch::zeros_like(reference_param);
     auto exp_avg_sq = torch::zeros_like(reference_param);
 
@@ -246,12 +262,11 @@ void test_muon_reference_parity() {
 }
 
 void test_muon_roundtrip() {
-    auto reference_param =
-        torch::randn({8, 8}, torch::TensorOptions().dtype(torch::kFloat32)).requires_grad_(true);
+    auto reference_param = torch::randn({8, 8}, torch::TensorOptions().dtype(torch::kFloat32)).requires_grad_(true);
     auto resumed_param = reference_param.detach().clone().requires_grad_(true);
 
-    auto reference = make_muon_optimizer(reference_param, /*use_muon=*/true);
-    auto resumed = make_muon_optimizer(resumed_param, /*use_muon=*/true);
+    auto reference = make_muon_optimizer(reference_param, true);
+    auto resumed = make_muon_optimizer(resumed_param, true);
 
     assign_grad(reference_param, torch::randn_like(reference_param));
     reference.step();
@@ -262,34 +277,14 @@ void test_muon_roundtrip() {
     }
 
     const fs::path archive_path = fs::temp_directory_path() / "mmltk_rfdetr_native_muon.pt";
-    {
-        torch::serialize::OutputArchive archive;
-        reference.save(archive);
-        archive.save_to(archive_path.string());
-    }
-    {
-        torch::serialize::InputArchive archive;
-        archive.load_from(archive_path.string());
-        resumed.load(archive);
-    }
-
-    auto next_grad = torch::randn_like(reference_param);
-    assign_grad(reference_param, next_grad);
-    assign_grad(resumed_param, next_grad);
-    reference.step();
-    resumed.step();
-    reference.zero_grad(true);
-    resumed.zero_grad(true);
-
-    assert_close(reference_param, resumed_param, 1.0e-6, 1.0e-6);
-    fs::remove(archive_path);
+    assert_optimizer_roundtrip_resume_matches(archive_path, reference_param, resumed_param, reference, resumed);
 }
 
 void test_optimizer_kind_mismatch_fails_loud() {
     auto adam_param = torch::randn({4, 4}, torch::TensorOptions().dtype(torch::kFloat32)).requires_grad_(true);
     auto muon_param = adam_param.detach().clone().requires_grad_(true);
     auto adam = make_optimizer(adam_param, NativeOptimizerBackend::eager);
-    auto muon = make_muon_optimizer(muon_param, /*use_muon=*/true);
+    auto muon = make_muon_optimizer(muon_param, true);
     const fs::path archive_path = fs::temp_directory_path() / "mmltk_rfdetr_optimizer_mismatch.pt";
     {
         torch::serialize::OutputArchive archive;
@@ -309,7 +304,7 @@ void test_optimizer_kind_mismatch_fails_loud() {
     fs::remove(archive_path);
 }
 
-} // namespace
+}  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_optimizer]", test_eager_fused_parity);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_optimizer]", test_optimizer_roundtrip);

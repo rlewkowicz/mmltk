@@ -6,6 +6,7 @@
 #include "gui/annotation/projected_scene_cache.h"
 #include "gui/annotation/render/renderer.h"
 #include "gui/annotation/sidebar_edits.h"
+#include "gui/annotation/workflow_ui.h"
 #include "gui/annotation/workspace/model.h"
 
 #include "support/catch2_compat.hpp"
@@ -48,12 +49,133 @@ AnnotationObject make_test_annotation_object() {
     return object;
 }
 
-class TrackingAnnotationTool final : public AnnotationTool {
-public:
-    TrackingAnnotationTool(AnnotationToolKind kind, int* reset_count)
-        : kind_(kind), reset_count_(reset_count) {}
+AnnotationObject make_test_mask_annotation_object() {
+    AnnotationObject object;
+    object.object_id = "mask-1";
+    object.category_index = 0U;
+    object.sup.center.hue_degrees = 16.0f;
+    object.nosup.center.hue_degrees = 48.0f;
+    object.shape = AnnotationMaskShape{
+        AnnotationBox{4, 5, 7, 8},
+        AnnotationMaskRegion{4U, 5U, 3U, 3U},
+        {
+            1U,
+            1U,
+            1U,
+            1U,
+            0U,
+            1U,
+            1U,
+            1U,
+            1U,
+        },
+        0U,
+        std::nullopt,
+    };
+    return object;
+}
 
-    [[nodiscard]] AnnotationToolKind kind() const noexcept override { return kind_; }
+AnnotationObject make_test_spline_annotation_object() {
+    AnnotationObject object;
+    object.object_id = "spline-1";
+    object.category_index = 0U;
+    object.shape = AnnotationSplineShape{
+        false,
+        {
+            AnnotationSplineKnot{
+                AnnotationPoint{8.0f, 12.0f},
+                AnnotationSplineHandle{},
+                AnnotationSplineHandle{},
+                AnnotationSplineHandleMode::Corner,
+            },
+            AnnotationSplineKnot{
+                AnnotationPoint{28.0f, 12.0f},
+                AnnotationSplineHandle{},
+                AnnotationSplineHandle{},
+                AnnotationSplineHandleMode::Corner,
+            },
+        },
+    };
+    return object;
+}
+
+AnnotationObject make_test_skeleton_annotation_object() {
+    AnnotationObject object;
+    object.object_id = "skeleton-1";
+    object.category_index = 0U;
+    object.shape = AnnotationSkeletonShape{
+        {
+            AnnotationSkeletonNode{"hip", AnnotationPoint{12.0f, 14.0f}, true},
+            AnnotationSkeletonNode{"knee", AnnotationPoint{24.0f, 22.0f}, true},
+        },
+        {
+            AnnotationSkeletonEdge{0U, 1U},
+        },
+    };
+    return object;
+}
+
+AnnotationFrame make_annotation_frame(const std::uint32_t width, const std::uint32_t height) {
+    AnnotationFrame frame;
+    frame.width = width;
+    frame.height = height;
+    frame.capture_width = width;
+    frame.capture_height = height;
+    return frame;
+}
+
+AnnotationFrame make_render_frame() {
+    return make_annotation_frame(96U, 64U);
+}
+
+AnnotationObject make_smooth_two_knot_spline_annotation_object(const char* object_id, const std::size_t category_index,
+                                                               const bool closed) {
+    AnnotationObject object;
+    object.object_id = object_id;
+    object.category_index = category_index;
+    object.shape = AnnotationSplineShape{
+        closed,
+        {
+            AnnotationSplineKnot{
+                AnnotationPoint{10.0f, 12.0f},
+                AnnotationSplineHandle{},
+                AnnotationSplineHandle{AnnotationPoint{18.0f, 12.0f}, true},
+                AnnotationSplineHandleMode::Smooth,
+            },
+            AnnotationSplineKnot{
+                AnnotationPoint{28.0f, 18.0f},
+                AnnotationSplineHandle{AnnotationPoint{20.0f, 18.0f}, true},
+                AnnotationSplineHandle{},
+                AnnotationSplineHandleMode::Smooth,
+            },
+        },
+    };
+    return object;
+}
+
+AnnotationObjectsTabApplyContext make_objects_tab_apply_context(AnnotationController& controller,
+                                                                AnnotationDocument& document,
+                                                                AnnotationSession& session,
+                                                                AnnotationCategories& categories,
+                                                                const AnnotationFrame* frame) {
+    return AnnotationObjectsTabApplyContext{
+        controller, document, session, categories, frame, nullptr, false,
+    };
+}
+
+std::vector<AnnotationEditableHandle> build_selected_editable_handles(const AnnotationDocument& document,
+                                                                      const std::size_t selected_object_index = 0U) {
+    return AnnotationRenderer::build_editable_handles(make_render_frame(), document,
+                                                      std::optional<std::size_t>{selected_object_index});
+}
+
+class TrackingAnnotationTool final : public AnnotationTool {
+   public:
+    TrackingAnnotationTool(AnnotationToolKind kind, int* reset_count) : kind_(kind), reset_count_(reset_count) {}
+
+    [[nodiscard]] AnnotationToolKind kind() const noexcept override {
+        return kind_;
+    }
 
     void reset_active_drawing(AnnotationSession&) override {
         if (reset_count_ == nullptr) {
@@ -62,7 +184,7 @@ public:
         ++(*reset_count_);
     }
 
-private:
+   private:
     AnnotationToolKind kind_;
     int* reset_count_ = nullptr;
 };
@@ -227,9 +349,12 @@ void test_renderer_builds_interaction_overlay_snapshot() {
     request.drag_box = AnnotationBox{40, 50, 140, 150};
     request.create_box = AnnotationBox{200, 210, 260, 280};
     request.objects = {
-        AnnotationInteractionOverlayObject{0U, 0U, AnnotationShapeType::Box, AnnotationBox{12, 18, 60, 90}, false, false},
-        AnnotationInteractionOverlayObject{1U, 1U, AnnotationShapeType::Box, AnnotationBox{80, 40, 120, 100}, true, false},
-        AnnotationInteractionOverlayObject{2U, 2U, AnnotationShapeType::Box, AnnotationBox{130, 60, 180, 140}, false, true},
+        AnnotationInteractionOverlayObject{0U, 0U, AnnotationShapeType::Box, AnnotationBox{12, 18, 60, 90}, false,
+                                           false},
+        AnnotationInteractionOverlayObject{1U, 1U, AnnotationShapeType::Box, AnnotationBox{80, 40, 120, 100}, true,
+                                           false},
+        AnnotationInteractionOverlayObject{2U, 2U, AnnotationShapeType::Box, AnnotationBox{130, 60, 180, 140}, false,
+                                           true},
     };
     request.polylines = {
         PreviewInteractionOverlayPolyline{
@@ -274,8 +399,7 @@ void test_renderer_builds_interaction_overlay_snapshot() {
         },
     };
 
-    const PreviewInteractionOverlaySnapshot snapshot =
-        AnnotationRenderer::build_interaction_overlay_snapshot(request);
+    const PreviewInteractionOverlaySnapshot snapshot = AnnotationRenderer::build_interaction_overlay_snapshot(request);
     assert(snapshot.width == 640U);
     assert(snapshot.height == 480U);
     assert(snapshot.cuda_device_index == 2);
@@ -312,18 +436,12 @@ void test_annotation_workspace_model_projects_selection_and_crop() {
     source.crop_height = 24;
 
     const AnnotationWorkspaceViewModel model =
-        AnnotationWorkspaceModelBuilder::build(frame,
-                                              document,
-                                              session,
-                                              source,
-                                              true);
-    const auto selected_object_index =
-        require_optional_value(model.selection.selected_object_index,
-                               "expected selected object index in workspace view model");
+        AnnotationWorkspaceModelBuilder::build(frame, document, session, source, true);
+    const auto selected_object_index = require_optional_value(model.selection.selected_object_index,
+                                                              "expected selected object index in workspace view model");
     assert(selected_object_index == 0U);
-    const AnnotationBox& selected_capture_box =
-        require_optional_ref(model.selection.selected_capture_box,
-                             "expected selected capture box in workspace view model");
+    const AnnotationBox& selected_capture_box = require_optional_ref(
+        model.selection.selected_capture_box, "expected selected capture box in workspace view model");
     assert(selected_capture_box.x1 == 4);
     assert(selected_capture_box.y1 == 5);
     assert(model.selection.selected_frame_box.has_value());
@@ -331,8 +449,7 @@ void test_annotation_workspace_model_projects_selection_and_crop() {
     assert(model.projected_scene != nullptr);
     assert(model.projected_scene->visible_objects.size() == 1U);
     const AnnotationBox& crop_frame_box =
-        require_optional_ref(model.crop_frame_box,
-                             "expected crop frame box in workspace view model");
+        require_optional_ref(model.crop_frame_box, "expected crop frame box in workspace view model");
     assert(crop_frame_box.x1 == 8);
     assert(crop_frame_box.y1 == 10);
     assert(crop_frame_box.x2 == 40);
@@ -387,11 +504,7 @@ void test_renderer_manual_overlay_snapshot_tracks_document_and_session_revisions
     session.select_object(0U);
     session.set_active_tool(AnnotationToolKind::MaskPaint);
 
-    AnnotationFrame frame;
-    frame.width = 64U;
-    frame.height = 48U;
-    frame.capture_width = 64U;
-    frame.capture_height = 48U;
+    const AnnotationFrame frame = make_annotation_frame(64U, 48U);
 
     const mmltk::live::ManualOverlayDocumentSnapshot snapshot =
         AnnotationRenderer::build_manual_overlay_snapshot(frame, document, session);
@@ -400,8 +513,7 @@ void test_renderer_manual_overlay_snapshot_tracks_document_and_session_revisions
     assert(snapshot.capture_width == 64U);
     assert(snapshot.capture_height == 48U);
     const auto selected_instance =
-        require_optional_value(snapshot.selected_instance,
-                               "expected selected instance in manual overlay snapshot");
+        require_optional_value(snapshot.selected_instance, "expected selected instance in manual overlay snapshot");
     assert(selected_instance == 0U);
     assert(snapshot.instances.size() == 1U);
 }
@@ -409,26 +521,7 @@ void test_renderer_manual_overlay_snapshot_tracks_document_and_session_revisions
 void test_renderer_manual_overlay_snapshot_includes_vector_primitives() {
     AnnotationDocument document;
 
-    AnnotationObject spline_object;
-    spline_object.object_id = "spline-1";
-    spline_object.category_index = 0U;
-    spline_object.shape = AnnotationSplineShape{
-        true,
-        {
-            AnnotationSplineKnot{
-                AnnotationPoint{10.0f, 12.0f},
-                AnnotationSplineHandle{},
-                AnnotationSplineHandle{AnnotationPoint{18.0f, 12.0f}, true},
-                AnnotationSplineHandleMode::Smooth,
-            },
-            AnnotationSplineKnot{
-                AnnotationPoint{28.0f, 18.0f},
-                AnnotationSplineHandle{AnnotationPoint{20.0f, 18.0f}, true},
-                AnnotationSplineHandle{},
-                AnnotationSplineHandleMode::Smooth,
-            },
-        },
-    };
+    AnnotationObject spline_object = make_smooth_two_knot_spline_annotation_object("spline-1", 0U, true);
     assert(document.apply(AnnotationInsertObjectCommand{spline_object, std::nullopt}));
 
     AnnotationObject skeleton_object;
@@ -447,11 +540,7 @@ void test_renderer_manual_overlay_snapshot_includes_vector_primitives() {
     };
     assert(document.apply(AnnotationInsertObjectCommand{skeleton_object, std::nullopt}));
 
-    AnnotationFrame frame;
-    frame.width = 96U;
-    frame.height = 64U;
-    frame.capture_width = 96U;
-    frame.capture_height = 64U;
+    const AnnotationFrame frame = make_render_frame();
 
     const mmltk::live::ManualOverlayDocumentSnapshot snapshot =
         AnnotationRenderer::build_manual_overlay_snapshot(frame, document, AnnotationSession{});
@@ -472,38 +561,10 @@ void test_renderer_manual_overlay_snapshot_includes_vector_primitives() {
 void test_renderer_builds_editable_handles_for_selected_spline() {
     AnnotationDocument document;
 
-    AnnotationObject spline_object;
-    spline_object.object_id = "spline-1";
-    spline_object.category_index = 2U;
-    spline_object.shape = AnnotationSplineShape{
-        false,
-        {
-            AnnotationSplineKnot{
-                AnnotationPoint{10.0f, 12.0f},
-                AnnotationSplineHandle{},
-                AnnotationSplineHandle{AnnotationPoint{18.0f, 12.0f}, true},
-                AnnotationSplineHandleMode::Smooth,
-            },
-            AnnotationSplineKnot{
-                AnnotationPoint{28.0f, 18.0f},
-                AnnotationSplineHandle{AnnotationPoint{20.0f, 18.0f}, true},
-                AnnotationSplineHandle{},
-                AnnotationSplineHandleMode::Smooth,
-            },
-        },
-    };
+    AnnotationObject spline_object = make_smooth_two_knot_spline_annotation_object("spline-1", 2U, false);
     assert(document.apply(AnnotationInsertObjectCommand{spline_object, std::nullopt}));
 
-    AnnotationFrame frame;
-    frame.width = 96U;
-    frame.height = 64U;
-    frame.capture_width = 96U;
-    frame.capture_height = 64U;
-
-    const std::vector<AnnotationEditableHandle> handles =
-        AnnotationRenderer::build_editable_handles(frame,
-                                                   document,
-                                                   std::optional<std::size_t>{0U});
+    const std::vector<AnnotationEditableHandle> handles = build_selected_editable_handles(document);
     assert(handles.size() == 6U);
     assert(handles[0].id.role == AnnotationHandleRole::SplineKnot);
     assert(handles[0].id.element_index == 0U);
@@ -556,16 +617,7 @@ void test_renderer_exposes_latent_handles_for_selected_spline() {
     };
     assert(document.apply(AnnotationInsertObjectCommand{spline_object, std::nullopt}));
 
-    AnnotationFrame frame;
-    frame.width = 96U;
-    frame.height = 64U;
-    frame.capture_width = 96U;
-    frame.capture_height = 64U;
-
-    const std::vector<AnnotationEditableHandle> handles =
-        AnnotationRenderer::build_editable_handles(frame,
-                                                   document,
-                                                   std::optional<std::size_t>{0U});
+    const std::vector<AnnotationEditableHandle> handles = build_selected_editable_handles(document);
     assert(handles.size() == 7U);
 
     std::size_t latent_handle_count = 0U;
@@ -602,8 +654,7 @@ void test_remap_skeleton_annotation_object_to_category_preserves_named_nodes() {
     };
 
     assert(remap_skeleton_annotation_object_to_category(&object, &category));
-    const AnnotationSkeletonShape* skeleton =
-        std::get_if<AnnotationSkeletonShape>(&object.shape);
+    const AnnotationSkeletonShape* skeleton = std::get_if<AnnotationSkeletonShape>(&object.shape);
     assert(skeleton != nullptr);
     assert(skeleton->nodes.size() == 3U);
     assert(skeleton->edges.size() == 2U);
@@ -626,6 +677,41 @@ AnnotationFrame make_controller_frame() {
     return frame;
 }
 
+std::optional<std::size_t> create_skeleton_object(AnnotationController& controller, AnnotationDocument& document,
+                                                  AnnotationSession& session, const AnnotationFrame& frame,
+                                                  AnnotationCategories& categories, const std::size_t category_index) {
+    return controller.create_object(AnnotationToolKind::Skeleton, document, session, frame, categories, category_index);
+}
+
+AnnotationVisibleObjectHit hit_test_single_object(const AnnotationObject& object, const CanvasViewport& viewport,
+                                                  const CanvasPointerState pointer, const int capture_x,
+                                                  const int capture_y, const std::string_view message) {
+    AnnotationDocument document;
+    assert(document.apply(AnnotationInsertObjectCommand{object, std::nullopt}));
+    const AnnotationProjectedScene scene =
+        AnnotationRenderer::build_projected_scene(make_controller_frame(), document, std::nullopt);
+    const std::optional<AnnotationVisibleObjectHit> hit = AnnotationRenderer::hit_test_visible_objects(
+        scene.visible_objects, viewport, pointer, capture_x, capture_y, false);
+    return require_optional_ref(hit, message);
+}
+
+struct ObjectsTabApplyFixture {
+    AnnotationController controller;
+    AnnotationDocument document;
+    AnnotationSession session;
+    AnnotationCategories categories;
+    AnnotationFrame frame = make_controller_frame();
+
+    [[nodiscard]] AnnotationObjectsTabApplyContext make_context(const AnnotationFrame* frame_override) {
+        return make_objects_tab_apply_context(controller, document, session, categories, frame_override);
+    }
+
+    [[nodiscard]] AnnotationSidebarMutationResult apply_selected_edit(
+        const AnnotationSelectedObjectSidebarActionPayload& request, const AnnotationFrame* frame_override) {
+        return apply_annotation_selected_object_sidebar_payload(make_context(frame_override), request);
+    }
+};
+
 void test_annotation_controller_create_object_seeds_spline_grouped_edit_state() {
     AnnotationController controller;
     AnnotationDocument document;
@@ -634,31 +720,21 @@ void test_annotation_controller_create_object_seeds_spline_grouped_edit_state() 
     const AnnotationFrame frame = make_controller_frame();
 
     const std::optional<std::size_t> created_index =
-        controller.create_object(AnnotationToolKind::Spline,
-                                 document,
-                                 session,
-                                 frame,
-                                 categories,
-                                 0U);
-    const auto created_index_value =
-        require_optional_value(created_index, "expected created spline object index");
+        controller.create_object(AnnotationToolKind::Spline, document, session, frame, categories, 0U);
+    const auto created_index_value = require_optional_value(created_index, "expected created spline object index");
     assert(created_index_value == 0U);
     assert(document.transaction_active());
     const auto selected_object_index_value =
-        require_optional_value(session.selected_object_index(),
-                               "expected selected object index after spline creation");
+        require_optional_value(session.selected_object_index(), "expected selected object index after spline creation");
     assert(selected_object_index_value == 0U);
     const auto& grouped_edit_transaction = session.grouped_edit_transaction();
-    assert(grouped_edit_transaction.kind ==
-           AnnotationEditTransactionKind::SplineConstruction);
+    assert(grouped_edit_transaction.kind == AnnotationEditTransactionKind::SplineConstruction);
     const auto grouped_object_index =
-        require_optional_value(grouped_edit_transaction.object_index,
-                               "expected grouped spline edit object index");
+        require_optional_value(grouped_edit_transaction.object_index, "expected grouped spline edit object index");
     assert(grouped_object_index == 0U);
     const auto& spline_edit_state = session.spline_edit_state();
     const auto spline_object_index =
-        require_optional_value(spline_edit_state.object_index,
-                               "expected spline edit state object index");
+        require_optional_value(spline_edit_state.object_index, "expected spline edit state object index");
     assert(spline_object_index == 0U);
     assert(!spline_edit_state.active_knot_index.has_value());
     assert(!spline_edit_state.active_segment_index.has_value());
@@ -672,22 +748,14 @@ void test_annotation_controller_create_object_commits_empty_skeleton_grouped_edi
     const AnnotationFrame frame = make_controller_frame();
 
     const std::optional<std::size_t> created_index =
-        controller.create_object(AnnotationToolKind::Skeleton,
-                                 document,
-                                 session,
-                                 frame,
-                                 categories,
-                                 0U);
-    const auto created_index_value =
-        require_optional_value(created_index, "expected created skeleton object index");
+        create_skeleton_object(controller, document, session, frame, categories, 0U);
+    const auto created_index_value = require_optional_value(created_index, "expected created skeleton object index");
     assert(created_index_value == 0U);
     assert(!document.transaction_active());
-    assert(session.grouped_edit_transaction().kind ==
-           AnnotationEditTransactionKind::None);
+    assert(session.grouped_edit_transaction().kind == AnnotationEditTransactionKind::None);
     const auto& skeleton_edit_state = session.skeleton_edit_state();
     const auto skeleton_object_index =
-        require_optional_value(skeleton_edit_state.object_index,
-                               "expected skeleton edit state object index");
+        require_optional_value(skeleton_edit_state.object_index, "expected skeleton edit state object index");
     assert(skeleton_object_index == 0U);
     assert(!skeleton_edit_state.active_joint_index.has_value());
 }
@@ -705,31 +773,22 @@ void test_annotation_controller_create_object_keeps_skeleton_grouped_edit_open_f
     const AnnotationFrame frame = make_controller_frame();
 
     const std::optional<std::size_t> created_index =
-        controller.create_object(AnnotationToolKind::Skeleton,
-                                 document,
-                                 session,
-                                 frame,
-                                 categories,
-                                 category_index);
+        create_skeleton_object(controller, document, session, frame, categories, category_index);
     const auto created_index_value =
         require_optional_value(created_index, "expected created skeleton topology object index");
     assert(created_index_value == 0U);
     assert(document.transaction_active());
     const auto& grouped_edit_transaction = session.grouped_edit_transaction();
-    assert(grouped_edit_transaction.kind ==
-           AnnotationEditTransactionKind::SkeletonConstruction);
+    assert(grouped_edit_transaction.kind == AnnotationEditTransactionKind::SkeletonConstruction);
     const auto grouped_object_index =
-        require_optional_value(grouped_edit_transaction.object_index,
-                               "expected grouped skeleton edit object index");
+        require_optional_value(grouped_edit_transaction.object_index, "expected grouped skeleton edit object index");
     assert(grouped_object_index == 0U);
     const auto& skeleton_edit_state = session.skeleton_edit_state();
     const auto skeleton_object_index =
-        require_optional_value(skeleton_edit_state.object_index,
-                               "expected skeleton edit state object index");
+        require_optional_value(skeleton_edit_state.object_index, "expected skeleton edit state object index");
     assert(skeleton_object_index == 0U);
     const auto active_joint_index =
-        require_optional_value(skeleton_edit_state.active_joint_index,
-                               "expected active skeleton joint index");
+        require_optional_value(skeleton_edit_state.active_joint_index, "expected active skeleton joint index");
     assert(active_joint_index == 0U);
 }
 
@@ -755,8 +814,7 @@ void test_projected_scene_cache_refreshes_selection_without_invalidating_layout(
         });
     assert(first_scene != nullptr);
     const auto first_selected_object_index =
-        require_optional_value(first_scene->selected_object_index,
-                               "expected first projected scene selection");
+        require_optional_value(first_scene->selected_object_index, "expected first projected scene selection");
     assert(first_selected_object_index == 0U);
 
     session.select_object(1U);
@@ -769,8 +827,7 @@ void test_projected_scene_cache_refreshes_selection_without_invalidating_layout(
     assert(second_scene != nullptr);
     assert(second_scene != first_scene);
     const auto second_selected_object_index =
-        require_optional_value(second_scene->selected_object_index,
-                               "expected second projected scene selection");
+        require_optional_value(second_scene->selected_object_index, "expected second projected scene selection");
     assert(second_selected_object_index == 1U);
     assert(second_scene->visible_objects.size() == first_scene->visible_objects.size());
     assert(second_scene->editable_handles.size() == first_scene->editable_handles.size());
@@ -796,30 +853,24 @@ void test_annotation_editor_undo_redo_reselects_object_by_id_after_reorder() {
     inserted.shape = AnnotationBoxShape{AnnotationBox{1, 2, 6, 8}};
     assert(AnnotationEditor::insert_object(document, session, inserted, 0U));
     const auto selected_after_insert =
-        require_optional_value(session.selected_object_index(),
-                               "expected selected object index after insert");
+        require_optional_value(session.selected_object_index(), "expected selected object index after insert");
     assert(selected_after_insert == 2U);
-    assert(require_pointer(document.object(selected_after_insert),
-                           "expected selected object after insert")
-               .object_id == "box-2");
+    assert(require_pointer(document.object(selected_after_insert), "expected selected object after insert").object_id ==
+           "box-2");
 
     assert(AnnotationEditor::undo(document, session));
     const auto selected_after_undo =
-        require_optional_value(session.selected_object_index(),
-                               "expected selected object index after undo");
+        require_optional_value(session.selected_object_index(), "expected selected object index after undo");
     assert(selected_after_undo == 1U);
-    assert(require_pointer(document.object(selected_after_undo),
-                           "expected selected object after undo")
-               .object_id == "box-2");
+    assert(require_pointer(document.object(selected_after_undo), "expected selected object after undo").object_id ==
+           "box-2");
 
     assert(AnnotationEditor::redo(document, session));
     const auto selected_after_redo =
-        require_optional_value(session.selected_object_index(),
-                               "expected selected object index after redo");
+        require_optional_value(session.selected_object_index(), "expected selected object index after redo");
     assert(selected_after_redo == 2U);
-    assert(require_pointer(document.object(selected_after_redo),
-                           "expected selected object after redo")
-               .object_id == "box-2");
+    assert(require_pointer(document.object(selected_after_redo), "expected selected object after redo").object_id ==
+           "box-2");
 }
 
 void test_cancel_grouped_edit_for_selection_restores_prior_selection_and_cancels_changes() {
@@ -854,11 +905,7 @@ void test_cancel_grouped_edit_for_selection_restores_prior_selection_and_cancels
         false,
         false,
     });
-    assert(begin_grouped_edit(document,
-                              session,
-                              AnnotationEditTransactionKind::SplineConstruction,
-                              1U,
-                              0U));
+    assert(begin_grouped_edit(document, session, AnnotationEditTransactionKind::SplineConstruction, 1U, 0U));
     assert(document.transaction_active());
     assert(document.apply(AnnotationAppendSplineKnotCommand{
         1U,
@@ -867,19 +914,16 @@ void test_cancel_grouped_edit_for_selection_restores_prior_selection_and_cancels
 
     const AnnotationObject* active_object = document.object(1U);
     assert(active_object != nullptr);
-    const AnnotationSplineShape* active_spline =
-        std::get_if<AnnotationSplineShape>(&active_object->shape);
+    const AnnotationSplineShape* active_spline = std::get_if<AnnotationSplineShape>(&active_object->shape);
     assert(active_spline != nullptr);
     assert(active_spline->knots.size() == 2U);
 
     select_object(session, document, 0U);
     assert(!document.transaction_active());
     const auto selected_object_index =
-        require_optional_value(session.selected_object_index(),
-                               "expected selected object index after selection");
+        require_optional_value(session.selected_object_index(), "expected selected object index after selection");
     assert(selected_object_index == 0U);
-    assert(session.grouped_edit_transaction().kind ==
-           AnnotationEditTransactionKind::None);
+    assert(session.grouped_edit_transaction().kind == AnnotationEditTransactionKind::None);
     assert(!session.spline_edit_state().object_index.has_value());
 
     active_object = document.object(1U);
@@ -890,61 +934,42 @@ void test_cancel_grouped_edit_for_selection_restores_prior_selection_and_cancels
 }
 
 void test_sidebar_semantic_edits_commit_as_single_undo_step() {
-    AnnotationController controller;
-    AnnotationDocument document;
-    AnnotationSession session;
-    AnnotationCategories categories;
-    ensure_annotation_category(categories, "box");
-    ensure_annotation_category(categories, "alt");
-    const AnnotationFrame frame = make_controller_frame();
+    ObjectsTabApplyFixture fixture;
+    ensure_annotation_category(fixture.categories, "box");
+    ensure_annotation_category(fixture.categories, "alt");
 
     AnnotationObject object = make_test_annotation_object();
     object.object_id = "box-1";
-    assert(document.apply(AnnotationInsertObjectCommand{object, std::nullopt}));
-    session.select_object(0U);
+    assert(fixture.document.apply(AnnotationInsertObjectCommand{object, std::nullopt}));
+    fixture.session.select_object(0U);
 
-    AnnotationSelectedObjectSidebarEditRequest request;
+    AnnotationSelectedObjectSidebarActionPayload request;
     request.selected_object_index = 0U;
     request.update_selected_metadata = true;
     request.selected_enabled = false;
     request.selected_category_index = 1U;
     request.request_redraw_box = true;
 
-    const AnnotationSidebarMutationResult result =
-        apply_annotation_selected_object_sidebar_edit(
-            AnnotationObjectsTabApplyContext{
-                controller,
-                document,
-                session,
-                categories,
-                &frame,
-                nullptr,
-                false,
-            },
-            request);
+    const AnnotationSidebarMutationResult result = fixture.apply_selected_edit(request, &fixture.frame);
     assert(result.preview_invalidated);
     assert(result.reset_canvas_interactions);
-    const auto next_tool =
-        require_optional_value(result.next_tool,
-                               "expected next tool after sidebar mutation");
+    const auto next_tool = require_optional_value(result.next_tool, "expected next tool after sidebar mutation");
     assert(next_tool == AnnotationToolKind::Box);
 
-    const AnnotationObject* edited = document.object(0U);
+    const AnnotationObject* edited = fixture.document.object(0U);
     assert(edited != nullptr);
     assert(!edited->enabled);
     assert(edited->category_index == 1U);
-    const AnnotationBoxShape* edited_box =
-        std::get_if<AnnotationBoxShape>(&edited->shape);
+    const AnnotationBoxShape* edited_box = std::get_if<AnnotationBoxShape>(&edited->shape);
     assert(edited_box != nullptr);
     assert(!annotation_box_has_area(edited_box->box));
 
-    assert(AnnotationEditor::undo(document, session));
-    const AnnotationObject* restored = document.object(0U);
+    assert(AnnotationEditor::undo(fixture.document, fixture.session));
+    const AnnotationObject* restored = fixture.document.object(0U);
     assert(restored != nullptr);
     assert(restored->enabled);
     assert(restored->category_index == 0U);
-    const AnnotationBoxShape* restored_box =
-        std::get_if<AnnotationBoxShape>(&restored->shape);
+    const AnnotationBoxShape* restored_box = std::get_if<AnnotationBoxShape>(&restored->shape);
     assert(restored_box != nullptr);
     assert(restored_box->box.x1 == 4);
     assert(restored_box->box.y1 == 5);
@@ -952,35 +977,156 @@ void test_sidebar_semantic_edits_commit_as_single_undo_step() {
     assert(restored_box->box.y2 == 18);
 }
 
+void test_sidebar_mutation_effects_gate_assist_and_apply_follow_up_actions() {
+    AnnotationSidebarMutationResult result;
+    result.preview_invalidated = true;
+    result.reset_canvas_interactions = true;
+    result.next_tool = AnnotationToolKind::Skeleton;
+    result.request_assist = true;
+
+    int assist_count = 0;
+    int reset_count = 0;
+    int invalidate_count = 0;
+    std::optional<AnnotationToolKind> selected_tool;
+
+    apply_annotation_sidebar_mutation_effects(
+        result, false, [&assist_count]() { ++assist_count; }, [&reset_count]() { ++reset_count; },
+        [&selected_tool](const AnnotationToolKind tool) { selected_tool = tool; },
+        [&invalidate_count]() { ++invalidate_count; });
+    assert(assist_count == 0);
+    assert(reset_count == 1);
+    assert(selected_tool == AnnotationToolKind::Skeleton);
+    assert(invalidate_count == 1);
+
+    selected_tool.reset();
+    apply_annotation_sidebar_mutation_effects(
+        result, true, [&assist_count]() { ++assist_count; }, [&reset_count]() { ++reset_count; },
+        [&selected_tool](const AnnotationToolKind tool) { selected_tool = tool; },
+        [&invalidate_count]() { ++invalidate_count; });
+    assert(assist_count == 1);
+    assert(reset_count == 2);
+    assert(selected_tool == AnnotationToolKind::Skeleton);
+    assert(invalidate_count == 2);
+}
+
+void test_mask_sidebar_edits_commit_cleanup_and_color_ranges_in_one_undo_step() {
+    AnnotationDocument document;
+    AnnotationSession session;
+    const AnnotationFrame frame = make_controller_frame();
+    AnnotationObject object = make_test_mask_annotation_object();
+    assert(document.apply(AnnotationInsertObjectCommand{object, std::nullopt}));
+    session.select_object(0U);
+
+    int cleanup_radius = 1;
+    AnnotationMaskSidebarActionPayload request;
+    request.cleanup_radius = 5;
+    request.cleanup_op = AnnotationMaskCleanupOp::FillHoles;
+    request.update_color_ranges = true;
+    request.sup.center.hue_degrees = 120.0f;
+    request.sup.tolerance.hue_plus_pct = 7.0f;
+    request.nosup.center.hue_degrees = 240.0f;
+    request.nosup.tolerance.value_minus_pct = 12.0f;
+    request.nosup.sampling = true;
+
+    const AnnotationSidebarMutationResult result = apply_annotation_mask_sidebar_edit(
+        AnnotationMaskTabApplyContext{
+            document,
+            session,
+            &frame,
+            &cleanup_radius,
+        },
+        request);
+    assert(result.preview_invalidated);
+    assert(cleanup_radius == 5);
+
+    const AnnotationObject& edited = require_pointer(document.object(0U), "expected edited mask object");
+    const AnnotationMaskShape& edited_mask =
+        require_pointer(annotation_object_mask_shape(edited), "expected selected object mask after sidebar edits");
+    assert(edited_mask.mask.size() == 9U);
+    assert(edited_mask.mask[4] == 1U);
+    assert(edited.sup.center.hue_degrees == 120.0f);
+    assert(edited.sup.tolerance.hue_plus_pct == 7.0f);
+    assert(edited.nosup.center.hue_degrees == 240.0f);
+    assert(edited.nosup.tolerance.value_minus_pct == 12.0f);
+    assert(edited.nosup.sampling);
+
+    assert(AnnotationEditor::undo(document, session));
+    const AnnotationObject& restored = require_pointer(document.object(0U), "expected restored mask object");
+    const AnnotationMaskShape& restored_mask =
+        require_pointer(annotation_object_mask_shape(restored), "expected restored selected object mask");
+    assert(restored_mask.mask.size() == 9U);
+    assert(restored_mask.mask[4] == 0U);
+    assert(restored.sup.center.hue_degrees == 16.0f);
+    assert(restored.nosup.center.hue_degrees == 48.0f);
+    assert(!restored.nosup.sampling);
+}
+
+void test_spline_sidebar_edits_insert_knot_and_update_handle_mode() {
+    ObjectsTabApplyFixture fixture;
+    AnnotationObject object = make_test_spline_annotation_object();
+    assert(fixture.document.apply(AnnotationInsertObjectCommand{object, std::nullopt}));
+    fixture.session.select_object(0U);
+
+    AnnotationSelectedObjectSidebarActionPayload request;
+    request.update_spline_active_segment = true;
+    request.spline_active_segment_index = 0U;
+    request.request_insert_active_spline_knot = true;
+    request.spline_handle_mode = AnnotationSplineHandleMode::Mirrored;
+
+    const AnnotationSidebarMutationResult result = fixture.apply_selected_edit(request, nullptr);
+    assert(result.preview_invalidated);
+    assert(result.next_tool == AnnotationToolKind::Spline);
+
+    const AnnotationObject& edited = require_pointer(fixture.document.object(0U), "expected edited spline object");
+    const AnnotationSplineShape* spline = std::get_if<AnnotationSplineShape>(&edited.shape);
+    assert(spline != nullptr);
+    assert(spline->knots.size() == 3U);
+    assert(spline->knots[1].handle_mode == AnnotationSplineHandleMode::Mirrored);
+
+    const auto active_knot_index = require_optional_value(fixture.session.spline_edit_state().active_knot_index,
+                                                          "expected active spline knot after sidebar insert");
+    assert(active_knot_index == 1U);
+}
+
+void test_skeleton_sidebar_edits_update_active_joint_and_hide_selected_joint() {
+    ObjectsTabApplyFixture fixture;
+    AnnotationObject object = make_test_skeleton_annotation_object();
+    assert(fixture.document.apply(AnnotationInsertObjectCommand{object, std::nullopt}));
+    fixture.session.select_object(0U);
+
+    AnnotationSelectedObjectSidebarActionPayload request;
+    request.update_skeleton_active_joint = true;
+    request.skeleton_active_joint_index = 1U;
+    request.skeleton_action = AnnotationToolActionKind::HideJoint;
+
+    const AnnotationSidebarMutationResult result = fixture.apply_selected_edit(request, &fixture.frame);
+    assert(result.preview_invalidated);
+    assert(result.next_tool == AnnotationToolKind::Skeleton);
+
+    const AnnotationObject& edited = require_pointer(fixture.document.object(0U), "expected edited skeleton object");
+    const AnnotationSkeletonShape* skeleton = std::get_if<AnnotationSkeletonShape>(&edited.shape);
+    assert(skeleton != nullptr);
+    assert(skeleton->nodes.size() == 2U);
+    assert(!skeleton->nodes[1].visible);
+
+    const auto active_joint_index = require_optional_value(fixture.session.skeleton_edit_state().active_joint_index,
+                                                           "expected active skeleton joint after sidebar update");
+    assert(active_joint_index == 1U);
+}
+
 void test_renderer_hit_tests_non_box_geometry() {
-    const CanvasViewport viewport =
-        make_canvas_viewport(0.0f, 0.0f, 96.0f, 72.0f, 96U, 72U);
+    const CanvasViewport viewport = make_canvas_viewport(0.0f, 0.0f, 96.0f, 72.0f, 96U, 72U);
 
     {
-        AnnotationDocument document;
         AnnotationObject point;
         point.object_id = "point-1";
         point.shape = AnnotationPointShape{AnnotationPoint{24.0f, 28.0f}};
-        assert(document.apply(AnnotationInsertObjectCommand{point, std::nullopt}));
-        const AnnotationProjectedScene scene =
-            AnnotationRenderer::build_projected_scene(make_controller_frame(),
-                                                      document,
-                                                      std::nullopt);
-        const std::optional<AnnotationVisibleObjectHit> hit =
-            AnnotationRenderer::hit_test_visible_objects(
-                scene.visible_objects,
-                viewport,
-                CanvasPointerState{24.0f, 28.0f, true, false, false},
-                24,
-                28,
-                false);
-        const AnnotationVisibleObjectHit& hit_value =
-            require_optional_ref(hit, "expected point hit");
+        const AnnotationVisibleObjectHit& hit_value = hit_test_single_object(
+            point, viewport, CanvasPointerState{24.0f, 28.0f, true, false, false}, 24, 28, "expected point hit");
         assert(hit_value.object.shape_type == AnnotationShapeType::Point);
     }
 
     {
-        AnnotationDocument document;
         AnnotationObject spline;
         spline.object_id = "spline-1";
         spline.shape = AnnotationSplineShape{
@@ -1000,26 +1146,12 @@ void test_renderer_hit_tests_non_box_geometry() {
                 },
             },
         };
-        assert(document.apply(AnnotationInsertObjectCommand{spline, std::nullopt}));
-        const AnnotationProjectedScene scene =
-            AnnotationRenderer::build_projected_scene(make_controller_frame(),
-                                                      document,
-                                                      std::nullopt);
-        const std::optional<AnnotationVisibleObjectHit> hit =
-            AnnotationRenderer::hit_test_visible_objects(
-                scene.visible_objects,
-                viewport,
-                CanvasPointerState{24.0f, 24.0f, true, false, false},
-                24,
-                24,
-                false);
-        const AnnotationVisibleObjectHit& hit_value =
-            require_optional_ref(hit, "expected spline hit");
+        const AnnotationVisibleObjectHit& hit_value = hit_test_single_object(
+            spline, viewport, CanvasPointerState{24.0f, 24.0f, true, false, false}, 24, 24, "expected spline hit");
         assert(hit_value.object.shape_type == AnnotationShapeType::Spline);
     }
 
     {
-        AnnotationDocument document;
         AnnotationObject skeleton;
         skeleton.object_id = "skeleton-1";
         skeleton.shape = AnnotationSkeletonShape{
@@ -1031,21 +1163,8 @@ void test_renderer_hit_tests_non_box_geometry() {
                 AnnotationSkeletonEdge{0U, 1U},
             },
         };
-        assert(document.apply(AnnotationInsertObjectCommand{skeleton, std::nullopt}));
-        const AnnotationProjectedScene scene =
-            AnnotationRenderer::build_projected_scene(make_controller_frame(),
-                                                      document,
-                                                      std::nullopt);
-        const std::optional<AnnotationVisibleObjectHit> hit =
-            AnnotationRenderer::hit_test_visible_objects(
-                scene.visible_objects,
-                viewport,
-                CanvasPointerState{64.0f, 24.0f, true, false, false},
-                64,
-                24,
-                false);
-        const AnnotationVisibleObjectHit& hit_value =
-            require_optional_ref(hit, "expected skeleton hit");
+        const AnnotationVisibleObjectHit& hit_value = hit_test_single_object(
+            skeleton, viewport, CanvasPointerState{64.0f, 24.0f, true, false, false}, 64, 24, "expected skeleton hit");
         assert(hit_value.object.shape_type == AnnotationShapeType::Skeleton);
     }
 }
@@ -1058,13 +1177,7 @@ void test_annotation_controller_canvas_click_creates_and_updates_point_objects()
     ensure_annotation_category(categories, "point");
 
     assert(controller.set_active_tool(AnnotationToolKind::Point, document, session));
-    assert(controller.handle_canvas_click(document,
-                                         session,
-                                         make_controller_frame(),
-                                         categories,
-                                         24,
-                                         28,
-                                         false));
+    assert(controller.handle_canvas_click(document, session, make_controller_frame(), categories, 24, 28, false));
     assert(document.size() == 1U);
     assert(session.selected_object_index().has_value());
     const AnnotationObject* created = document.object(0U);
@@ -1074,13 +1187,7 @@ void test_annotation_controller_canvas_click_creates_and_updates_point_objects()
     assert(point_shape->point.x == 24.0f);
     assert(point_shape->point.y == 28.0f);
 
-    assert(controller.handle_canvas_click(document,
-                                         session,
-                                         make_controller_frame(),
-                                         categories,
-                                         48,
-                                         52,
-                                         false));
+    assert(controller.handle_canvas_click(document, session, make_controller_frame(), categories, 48, 52, false));
     created = document.object(0U);
     assert(created != nullptr);
     point_shape = std::get_if<AnnotationPointShape>(&created->shape);
@@ -1097,20 +1204,10 @@ void test_annotation_controller_box_commit_updates_box_and_mask_tools() {
     ensure_annotation_category(categories, "box");
     AnnotationFrame frame = make_controller_frame();
 
-    assert(controller.create_object(AnnotationToolKind::Box,
-                                    document,
-                                    session,
-                                    frame,
-                                    categories,
-                                    0U).has_value());
+    assert(controller.create_object(AnnotationToolKind::Box, document, session, frame, categories, 0U).has_value());
     assert(controller.set_active_tool(AnnotationToolKind::Box, document, session));
-    assert(controller.handle_box_commit(document,
-                                       session,
-                                       frame,
-                                       categories,
-                                       RectDragKind::Create,
-                                       AnnotationBox{8, 10, 24, 32},
-                                       0U));
+    assert(controller.handle_box_commit(document, session, frame, categories, RectDragKind::Create,
+                                        AnnotationBox{8, 10, 24, 32}, 0U));
     const AnnotationObject* boxed = document.object(0U);
     assert(boxed != nullptr);
     const auto* box_shape = std::get_if<AnnotationBoxShape>(&boxed->shape);
@@ -1121,13 +1218,7 @@ void test_annotation_controller_box_commit_updates_box_and_mask_tools() {
     assert(box_shape->box.y2 == 32);
 
     assert(controller.set_active_tool(AnnotationToolKind::MaskPaint, document, session));
-    assert(controller.handle_brush_sample(document,
-                                          session,
-                                          frame,
-                                          categories,
-                                          16,
-                                          20,
-                                          3));
+    assert(controller.handle_brush_sample(document, session, frame, categories, 16, 20, 3));
     boxed = document.object(0U);
     assert(boxed != nullptr);
     const AnnotationMaskShape* mask_shape = annotation_object_mask_shape(*boxed);
@@ -1148,13 +1239,8 @@ void test_annotation_controller_direct_tool_moves_selected_box() {
     session.select_object(0U);
     assert(controller.set_active_tool(AnnotationToolKind::Direct, document, session));
     session.set_direct_drag_index(0U);
-    assert(controller.handle_box_commit(document,
-                                       session,
-                                       frame,
-                                       categories,
-                                       RectDragKind::Move,
-                                       AnnotationBox{20, 24, 28, 37},
-                                       0U));
+    assert(controller.handle_box_commit(document, session, frame, categories, RectDragKind::Move,
+                                        AnnotationBox{20, 24, 28, 37}, 0U));
 
     const AnnotationObject* moved = document.object(0U);
     assert(moved != nullptr);
@@ -1239,13 +1325,8 @@ void test_annotation_controller_direct_tool_moves_selected_point_handle() {
 
     session.select_object(0U);
     assert(controller.set_active_tool(AnnotationToolKind::Direct, document, session));
-    assert(controller.handle_handle_drag(document,
-                                        session,
-                                        frame,
-                                        categories,
-                                        AnnotationHandleId{0U, 0U, AnnotationHandleRole::Point},
-                                        40,
-                                        44));
+    assert(controller.handle_handle_drag(document, session, frame, categories,
+                                         AnnotationHandleId{0U, 0U, AnnotationHandleRole::Point}, 40, 44));
 
     const AnnotationObject* moved = document.object(0U);
     assert(moved != nullptr);
@@ -1320,33 +1401,54 @@ void test_annotation_document_set_object_box_command_resets_dense_mask_state() {
     assert(box_shape->box.y2 == 34);
 }
 
-} // namespace
+}  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_annotation_document_generation_tracks_commands);
 MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_annotation_document_metadata_commands_update_generation);
 MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_annotation_document_transform_commands_update_generation);
 MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_annotation_document_mask_commands_update_generation);
-MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_annotation_document_set_object_box_command_resets_dense_mask_state);
-MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_annotation_controller_tool_switch_clears_transient_session_state);
+MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]",
+                         test_annotation_document_set_object_box_command_resets_dense_mask_state);
+MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]",
+                         test_annotation_controller_tool_switch_clears_transient_session_state);
 MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_annotation_session_overlay_revision_tracks_selection_only);
 MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_tool_manager_resets_outgoing_tool_on_switch);
 MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_renderer_builds_interaction_overlay_snapshot);
 MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_annotation_workspace_model_projects_selection_and_crop);
-MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_renderer_manual_overlay_snapshot_tracks_document_and_session_revisions);
-MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_renderer_manual_overlay_snapshot_includes_vector_primitives);
+MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]",
+                         test_renderer_manual_overlay_snapshot_tracks_document_and_session_revisions);
+MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]",
+                         test_renderer_manual_overlay_snapshot_includes_vector_primitives);
 MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_renderer_builds_editable_handles_for_selected_spline);
 MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_renderer_exposes_latent_handles_for_selected_spline);
-MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_remap_skeleton_annotation_object_to_category_preserves_named_nodes);
-MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_annotation_controller_create_object_seeds_spline_grouped_edit_state);
-MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_annotation_controller_create_object_commits_empty_skeleton_grouped_edit);
-MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_annotation_controller_create_object_keeps_skeleton_grouped_edit_open_for_topology);
-MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_projected_scene_cache_refreshes_selection_without_invalidating_layout);
-MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_annotation_editor_undo_redo_reselects_object_by_id_after_reorder);
-MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_cancel_grouped_edit_for_selection_restores_prior_selection_and_cancels_changes);
+MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]",
+                         test_remap_skeleton_annotation_object_to_category_preserves_named_nodes);
+MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]",
+                         test_annotation_controller_create_object_seeds_spline_grouped_edit_state);
+MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]",
+                         test_annotation_controller_create_object_commits_empty_skeleton_grouped_edit);
+MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]",
+                         test_annotation_controller_create_object_keeps_skeleton_grouped_edit_open_for_topology);
+MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]",
+                         test_projected_scene_cache_refreshes_selection_without_invalidating_layout);
+MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]",
+                         test_annotation_editor_undo_redo_reselects_object_by_id_after_reorder);
+MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]",
+                         test_cancel_grouped_edit_for_selection_restores_prior_selection_and_cancels_changes);
 MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_sidebar_semantic_edits_commit_as_single_undo_step);
+MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]",
+                         test_sidebar_mutation_effects_gate_assist_and_apply_follow_up_actions);
+MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]",
+                         test_mask_sidebar_edits_commit_cleanup_and_color_ranges_in_one_undo_step);
+MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_spline_sidebar_edits_insert_knot_and_update_handle_mode);
+MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]",
+                         test_skeleton_sidebar_edits_update_active_joint_and_hide_selected_joint);
 MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_renderer_hit_tests_non_box_geometry);
-MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_annotation_controller_canvas_click_creates_and_updates_point_objects);
-MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_annotation_controller_box_commit_updates_box_and_mask_tools);
+MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]",
+                         test_annotation_controller_canvas_click_creates_and_updates_point_objects);
+MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]",
+                         test_annotation_controller_box_commit_updates_box_and_mask_tools);
 MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_annotation_controller_direct_tool_moves_selected_box);
 MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_annotation_document_handle_commands_update_generation);
-MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_annotation_controller_direct_tool_moves_selected_point_handle);
+MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]",
+                         test_annotation_controller_direct_tool_moves_selected_point_handle);

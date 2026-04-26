@@ -79,8 +79,7 @@ void test_info_requires_exactly_one_model_input() {
         "info",
     });
     assert(result.exit_code == 1);
-    assert(result.output_text.find("rfdetr info requires exactly one of --onnx or --tensorrt") !=
-           std::string::npos);
+    assert(result.output_text.find("rfdetr info requires exactly one of --onnx or --tensorrt") != std::string::npos);
 }
 
 void test_normalize_weights_requires_paths() {
@@ -109,7 +108,7 @@ void test_train_help_lists_optimizer_controls() {
     assert(result.output_text.find("AdamW only") != std::string::npos);
 }
 
-} // namespace
+}  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][cli_aliases][cli]", test_evaluate_aliases_require_compiled);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][cli_aliases][cli]", test_validate_still_routes_to_validate);

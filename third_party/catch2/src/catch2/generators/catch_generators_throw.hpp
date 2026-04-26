@@ -9,15 +9,14 @@
 #define CATCH_GENERATORS_THROW_HPP_INCLUDED
 
 namespace Catch {
-    namespace Generators {
-        namespace Detail {
+namespace Generators {
+namespace Detail {
 
-            //! Throws GeneratorException with the provided message
-            [[noreturn]]
-            void throw_generator_exception( char const* msg );
+[[noreturn]]
+void throw_generator_exception(char const* msg);
 
-        } // namespace Detail
-    } // namespace Generators
-} // namespace Catch
+}
+}  // namespace Generators
+}  // namespace Catch
 
-#endif // CATCH_GENERATORS_THROW_HPP_INCLUDED
+#endif  // CATCH_GENERATORS_THROW_HPP_INCLUDED

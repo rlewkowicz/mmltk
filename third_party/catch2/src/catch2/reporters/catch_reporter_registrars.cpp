@@ -12,25 +12,20 @@
 #include <catch2/internal/catch_compiler_capabilities.hpp>
 
 namespace Catch {
-    namespace Detail {
+namespace Detail {
 
-        void registerReporterImpl( std::string const& name,
-                                   IReporterFactoryPtr reporterPtr ) {
-            CATCH_TRY {
-                getMutableRegistryHub().registerReporter(
-                    name, CATCH_MOVE( reporterPtr ) );
-            }
-            CATCH_CATCH_ALL {
-                // Do not throw when constructing global objects, instead
-                // register the exception to be processed later
-                getMutableRegistryHub().registerStartupException();
-            }
-        }
+void registerReporterImpl(std::string const& name, IReporterFactoryPtr reporterPtr) {
+    CATCH_TRY {
+        getMutableRegistryHub().registerReporter(name, CATCH_MOVE(reporterPtr));
+    }
+    CATCH_CATCH_ALL {
+        getMutableRegistryHub().registerStartupException();
+    }
+}
 
-        void registerListenerImpl( Detail::unique_ptr<EventListenerFactory> listenerFactory ) {
-            getMutableRegistryHub().registerListener( CATCH_MOVE(listenerFactory) );
-        }
+void registerListenerImpl(Detail::unique_ptr<EventListenerFactory> listenerFactory) {
+    getMutableRegistryHub().registerListener(CATCH_MOVE(listenerFactory));
+}
 
-
-    } // namespace Detail
-} // namespace Catch
+}  // namespace Detail
+}  // namespace Catch

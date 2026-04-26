@@ -3,6 +3,7 @@
 #include "mmltk/rfdetr/evaluation.h"
 
 #include "rfdetr/postprocess.h"
+#include "rfdetr/shared_cuda_event.h"
 
 #include <cuda_runtime.h>
 #include <torch/torch.h>
@@ -47,12 +48,12 @@ struct PredictionBufferLease {
 };
 
 class PredictionBufferSlotPool final : public std::enable_shared_from_this<PredictionBufferSlotPool> {
-public:
+   public:
     explicit PredictionBufferSlotPool(size_t slot_count);
 
     PredictionBufferLease acquire();
 
-private:
+   private:
     void release(size_t slot_index);
 
     std::mutex mutex_;
@@ -61,43 +62,32 @@ private:
     std::deque<size_t> free_slots_;
 };
 
-class CudaEventHandle {
-public:
-    explicit CudaEventHandle(cudaEvent_t event) : event_(event) {}
-
-    ~CudaEventHandle() {
-        if (event_ != nullptr) {
-            cudaEventDestroy(event_);
-        }
-    }
-
-    CudaEventHandle(const CudaEventHandle&) = delete;
-    CudaEventHandle& operator=(const CudaEventHandle&) = delete;
-
-    [[nodiscard]] cudaEvent_t get() const { return event_; }
-
-private:
-    cudaEvent_t event_ = nullptr;
-};
-
 struct StagedPredictionBatch {
     std::vector<Prediction> predictions;
     torch::Tensor linear_masks_cpu;
     torch::Tensor pending_masks_gpu;
     uint32_t mask_height = 0;
     uint32_t mask_width = 0;
-    std::unique_ptr<CudaEventHandle> ready_event;
+    std::unique_ptr<SharedCudaEvent> ready_event;
     PredictionBufferLease lease;
 };
 
 class CocoDataset {
-public:
+   public:
     static CocoDataset load_from_binary(const std::filesystem::path& path);
 
-    size_t num_images() const { return image_ids_.size(); }
-    size_t num_categories() const { return category_names_.size(); }
-    const std::vector<std::string>& category_names() const { return category_names_; }
-    const std::vector<int>& image_ids() const { return image_ids_; }
+    size_t num_images() const {
+        return image_ids_.size();
+    }
+    size_t num_categories() const {
+        return category_names_.size();
+    }
+    const std::vector<std::string>& category_names() const {
+        return category_names_;
+    }
+    const std::vector<int>& image_ids() const {
+        return image_ids_;
+    }
 
     void limit_images(size_t limit);
     bool has_image(int image_id) const;
@@ -106,7 +96,7 @@ public:
     void add_predictions(std::vector<Prediction>&& predictions);
     EvalSummary evaluate(size_t max_dets_per_image) const;
 
-private:
+   private:
     std::vector<int> image_ids_;
     std::vector<std::string> category_names_;
     std::vector<GroundTruthAnnotation> ground_truths_;
@@ -114,19 +104,13 @@ private:
     std::vector<Prediction> predictions_;
 };
 
-std::vector<Prediction> result_to_predictions(int image_id,
-                                              const TensorMap& result,
-                                              size_t category_count,
+std::vector<Prediction> result_to_predictions(int image_id, const TensorMap& result, size_t category_count,
                                               size_t max_dets_per_image);
-StagedPredictionBatch stage_result_to_predictions(int image_id,
-                                                  const TensorMap& result,
-                                                  size_t category_count,
-                                                  size_t max_dets_per_image,
-                                                  PredictionBufferLease lease,
-                                                  int device_id,
+StagedPredictionBatch stage_result_to_predictions(int image_id, const TensorMap& result, size_t category_count,
+                                                  size_t max_dets_per_image, PredictionBufferLease lease, int device_id,
                                                   void* stream_handle);
 std::vector<Prediction> encode_staged_predictions(StagedPredictionBatch&& staged);
 
 AlignmentStats compare_top1(const TensorMap& lhs, const TensorMap& rhs, size_t category_count);
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

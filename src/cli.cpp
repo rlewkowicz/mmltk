@@ -51,9 +51,8 @@ std::vector<const mmltk::model::CliModule*> discover_builtin_cli_modules() {
 }
 
 #if MMLTK_BUILD_RFDETR_NATIVE
-const mmltk::model::CliModule* find_builtin_cli_module(
-    const std::vector<const mmltk::model::CliModule*>& modules,
-    std::string_view command_name) {
+const mmltk::model::CliModule* find_builtin_cli_module(const std::vector<const mmltk::model::CliModule*>& modules,
+                                                       std::string_view command_name) {
     for (const auto* module : modules) {
         if (module != nullptr && module->command_name() == command_name) {
             return module;
@@ -63,10 +62,7 @@ const mmltk::model::CliModule* find_builtin_cli_module(
 }
 #endif
 
-CLI::Option* add_path_option(CLI::App* command,
-                             const std::string& name,
-                             std::string& value,
-                             const char* description,
+CLI::Option* add_path_option(CLI::App* command, const std::string& name, std::string& value, const char* description,
                              bool required = false) {
     auto* option = command->add_option(name, value, description)->type_name("PATH");
     if (required) {
@@ -101,8 +97,7 @@ void cmd_compile(const CompilerConfig& cfg) {
     });
     bar.close();
     auto t1 = std::chrono::steady_clock::now();
-    logging::logger("cli")->info("compile: done in {:.1f} seconds",
-                                 std::chrono::duration<double>(t1 - t0).count());
+    logging::logger("cli")->info("compile: done in {:.1f} seconds", std::chrono::duration<double>(t1 - t0).count());
 }
 
 void cmd_info(const std::string& compiled_path) {
@@ -111,8 +106,7 @@ void cmd_info(const std::string& compiled_path) {
     printf("File: %s\n", compiled_path.c_str());
     printf("Images: %u\n", header.num_images);
     printf("Size: %ux%u\n", header.image_width, header.image_height);
-    printf("Stride: %zu bytes/image (%.2f KB)\n",
-           static_cast<size_t>(header.image_stride),
+    printf("Stride: %zu bytes/image (%.2f KB)\n", static_cast<size_t>(header.image_stride),
            static_cast<double>(header.image_stride) / 1024.0);
     printf("Classes: %u\n", header.num_classes);
     for (uint32_t i = 0; i < header.num_classes; ++i) {
@@ -125,8 +119,8 @@ void cmd_bench(const DatasetLoader::Config& cfg, int num_epochs) {
     MMLTK_PROFILE_RUN_LABEL("mmltk bench");
 
     DatasetLoader loader(cfg);
-    printf("Benchmarking: %zu images, batch=%zu, stride=%zu, epochs=%d\n",
-           loader.num_images(), cfg.batch_size, loader.image_stride(), num_epochs);
+    printf("Benchmarking: %zu images, batch=%zu, stride=%zu, epochs=%d\n", loader.num_images(), cfg.batch_size,
+           loader.image_stride(), num_epochs);
 
     for (int e = 0; e < num_epochs; ++e) {
         auto t0 = std::chrono::steady_clock::now();
@@ -140,17 +134,15 @@ void cmd_bench(const DatasetLoader::Config& cfg, int num_epochs) {
         loader.cuda().sync();
         auto t1 = std::chrono::steady_clock::now();
         double secs = std::chrono::duration<double>(t1 - t0).count();
-        printf("Epoch %d: %zu images in %.2f sec (%.0f img/sec)\n",
-               e, total, secs, static_cast<double>(total) / secs);
+        printf("Epoch %d: %zu images in %.2f sec (%.0f img/sec)\n", e, total, secs, static_cast<double>(total) / secs);
     }
 }
 
-} // namespace
+}  // namespace
 
 int main(int argc, char** argv) {
     try {
-        logging::initialize(logging::merge(logging::config_from_env("mmltk"),
-                                           logging::scan_cli_overrides(argc, argv)));
+        logging::initialize(logging::merge(logging::config_from_env("mmltk"), logging::scan_cli_overrides(argc, argv)));
         const ExecutionPolicySnapshot execution_snapshot = apply_process_execution_policy();
         log_process_execution_policy("mmltk", execution_snapshot, false, true);
         const cli_support::ParsedTestRequest test_request = cli_support::parse_test_request(argc, argv);
@@ -180,35 +172,25 @@ int main(int argc, char** argv) {
             ->type_name("BUNDLE");
 
         CompilerConfig compile_config;
-        auto* compile_cmd = app.add_subcommand(
-            "compile",
-            "Compile a raw dataset split into mmltk's mmap-friendly binary format");
-        add_path_option(compile_cmd, "--source-dir,source_dir", compile_config.source_dir,
-                        "Source dataset directory", true);
+        auto* compile_cmd =
+            app.add_subcommand("compile", "Compile a raw dataset split into mmltk's mmap-friendly binary format");
+        add_path_option(compile_cmd, "--source-dir,source_dir", compile_config.source_dir, "Source dataset directory",
+                        true);
         add_path_option(compile_cmd, "--output-dir,output_dir", compile_config.output_dir,
                         "Output directory for compiled binaries", true);
-        compile_cmd->add_option("--split,split", compile_config.split, "Dataset split name")
-            ->required();
-        auto* compile_width = compile_cmd->add_option(
-            "--width,width",
-            compile_config.target_width,
-            "Target image width in pixels");
-        auto* compile_height = compile_cmd->add_option(
-            "--height,height",
-            compile_config.target_height,
-            "Target image height in pixels");
-        auto* compile_cuda_mask_batch = compile_cmd->add_option(
-            "--cuda-mask-batch-size",
-            compile_config.cuda_mask_batch_size,
-            "Batched CUDA mask-resize task count; 0 disables GPU mask resizing");
-        auto* compile_cuda_device = compile_cmd->add_option(
-            "--cuda-device-id",
-            compile_config.cuda_device_id,
-            "CUDA device id used for batched mask resizing");
-        auto* compile_workers = compile_cmd->add_option(
-            "--workers",
-            compile_config.num_workers,
-            "Total CPU worker budget for compile; 0 or negative selects all available CPUs");
+        compile_cmd->add_option("--split,split", compile_config.split, "Dataset split name")->required();
+        auto* compile_width =
+            compile_cmd->add_option("--width,width", compile_config.target_width, "Target image width in pixels");
+        auto* compile_height =
+            compile_cmd->add_option("--height,height", compile_config.target_height, "Target image height in pixels");
+        auto* compile_cuda_mask_batch =
+            compile_cmd->add_option("--cuda-mask-batch-size", compile_config.cuda_mask_batch_size,
+                                    "Batched CUDA mask-resize task count; 0 disables GPU mask resizing");
+        auto* compile_cuda_device = compile_cmd->add_option("--cuda-device-id", compile_config.cuda_device_id,
+                                                            "CUDA device id used for batched mask resizing");
+        auto* compile_workers =
+            compile_cmd->add_option("--workers", compile_config.num_workers,
+                                    "Total CPU worker budget for compile; 0 or negative selects all available CPUs");
         compile_width->type_name("INT");
         compile_height->type_name("INT");
         compile_cuda_mask_batch->type_name("INT");
@@ -219,24 +201,18 @@ int main(int argc, char** argv) {
         bench_config.shuffle = true;
         bench_config.batch_size = 32;
         int bench_epochs = 1;
-        auto* bench_cmd = app.add_subcommand(
-            "bench",
-            "Benchmark streaming throughput over a compiled dataset");
-        add_path_option(bench_cmd, "--compiled,compiled", bench_config.compiled_path,
-                        "Compiled dataset binary", true);
-        bench_cmd->add_option("--batch-size,batch_size", bench_config.batch_size,
-                              "Batch size to stream during the benchmark")
+        auto* bench_cmd = app.add_subcommand("bench", "Benchmark streaming throughput over a compiled dataset");
+        add_path_option(bench_cmd, "--compiled,compiled", bench_config.compiled_path, "Compiled dataset binary", true);
+        bench_cmd
+            ->add_option("--batch-size,batch_size", bench_config.batch_size,
+                         "Batch size to stream during the benchmark")
             ->type_name("INT");
-        bench_cmd->add_option("--epochs,num_epochs", bench_epochs,
-                              "Number of epochs to run during the benchmark")
+        bench_cmd->add_option("--epochs,num_epochs", bench_epochs, "Number of epochs to run during the benchmark")
             ->type_name("INT");
 
         std::string info_compiled_path;
-        auto* info_cmd = app.add_subcommand(
-            "info",
-            "Inspect metadata from a compiled dataset binary");
-        add_path_option(info_cmd, "--compiled,compiled", info_compiled_path,
-                        "Compiled dataset binary", true);
+        auto* info_cmd = app.add_subcommand("info", "Inspect metadata from a compiled dataset binary");
+        add_path_option(info_cmd, "--compiled,compiled", info_compiled_path, "Compiled dataset binary", true);
 
         for (const auto* cli_module : builtin_cli_modules) {
             if (cli_module == nullptr) {

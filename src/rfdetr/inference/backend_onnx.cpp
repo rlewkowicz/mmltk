@@ -21,30 +21,26 @@ namespace {
 
 std::string ort_type_name(ONNXTensorElementDataType dtype) {
     switch (dtype) {
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
-        return "float32";
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
-        return "float16";
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
-        return "int32";
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
-        return "int64";
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:
-        return "bool";
-    default:
-        return "unsupported";
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+            return "float32";
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+            return "float16";
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
+            return "int32";
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
+            return "int64";
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:
+            return "bool";
+        default:
+            return "unsupported";
     }
 }
 
 template <typename T>
-torch::Tensor wrap_ort_output_tensor(Ort::Value& value,
-                                     const std::vector<int64_t>& shape,
-                                     const torch::ScalarType dtype,
-                                     const int device_id) {
-    return torch::from_blob(
-        value.GetTensorMutableData<T>(),
-        shape,
-        torch::TensorOptions().dtype(dtype).device(torch::kCUDA, device_id));
+torch::Tensor wrap_ort_output_tensor(Ort::Value& value, const std::vector<int64_t>& shape,
+                                     const torch::ScalarType dtype, const int device_id) {
+    return torch::from_blob(value.GetTensorMutableData<T>(), shape,
+                            torch::TensorOptions().dtype(dtype).device(torch::kCUDA, device_id));
 }
 
 void infer_output_layout(ModelInfo& info) {
@@ -59,10 +55,8 @@ void infer_output_layout(ModelInfo& info) {
     }
 }
 
-void populate_model_info_from_session(const Ort::Session& session,
-                                      const std::filesystem::path& model_path,
-                                      ModelInfo& info,
-                                      std::string* input_name_out,
+void populate_model_info_from_session(const Ort::Session& session, const std::filesystem::path& model_path,
+                                      ModelInfo& info, std::string* input_name_out,
                                       std::vector<std::string>* output_names_out) {
     size_t input_count = 0;
     try {
@@ -123,8 +117,8 @@ void populate_model_info_from_session(const Ort::Session& session,
             auto output_name = session.GetOutputNameAllocated(output_index, allocator);
             output_name_value = output_name.get();
         } catch (const std::exception& error) {
-            throw std::runtime_error("failed to read ONNX output name at index " +
-                                     std::to_string(output_index) + ": " + error.what());
+            throw std::runtime_error("failed to read ONNX output name at index " + std::to_string(output_index) + ": " +
+                                     error.what());
         }
         if (output_names_out != nullptr) {
             output_names_out->push_back(output_name_value);
@@ -152,11 +146,9 @@ Ort::Env& ort_env() {
 }
 
 class OnnxBackend final : public InferenceBackend {
-public:
+   public:
     OnnxBackend(std::filesystem::path model_path, int device_id)
-        : model_path_(std::move(model_path)),
-          device_id_(device_id),
-          session_options_() {
+        : model_path_(std::move(model_path)), device_id_(device_id), session_options_() {
         MMLTK_PROFILE_SCOPE("rfdetr.native.onnx.construct");
         static_cast<void>(ort_env());
         ensure_cuda_ok(cudaSetDevice(device_id_), "cudaSetDevice for ONNX backend");
@@ -174,8 +166,7 @@ public:
         session_options_.AppendExecutionProvider_CUDA(cuda_options);
 
         try {
-            session_ = std::make_unique<Ort::Session>(
-                ort_env(), model_path_.string().c_str(), session_options_);
+            session_ = std::make_unique<Ort::Session>(ort_env(), model_path_.string().c_str(), session_options_);
         } catch (const std::exception& error) {
             throw std::runtime_error("failed to create ONNX Runtime session: " + std::string(error.what()));
         }
@@ -189,8 +180,12 @@ public:
         }
     }
 
-    [[nodiscard]] const ModelInfo& info() const override { return info_; }
-    [[nodiscard]] void* stream() const override { return stream_; }
+    [[nodiscard]] const ModelInfo& info() const override {
+        return info_;
+    }
+    [[nodiscard]] void* stream() const override {
+        return stream_;
+    }
 
     [[nodiscard]] std::vector<std::unique_ptr<InferenceBackend>> make_lanes(int count) const override {
         return make_onnx_backend_lanes(model_path_, device_id_, count);
@@ -205,12 +200,9 @@ public:
         c10::cuda::CUDAGuard device_guard(checked_device_index(device_id_));
         const auto shape = std::vector<int64_t>(normalized_input.sizes().begin(), normalized_input.sizes().end());
         Ort::MemoryInfo device_memory("Cuda", OrtArenaAllocator, device_id_, OrtMemTypeDefault);
-        Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
-            device_memory,
-            const_cast<float*>(normalized_input.data_ptr<float>()),
-            normalized_input.numel(),
-            shape.data(),
-            shape.size());
+        Ort::Value input_tensor =
+            Ort::Value::CreateTensor<float>(device_memory, const_cast<float*>(normalized_input.data_ptr<float>()),
+                                            normalized_input.numel(), shape.data(), shape.size());
 
         Ort::IoBinding binding(*session_);
         binding.BindInput(input_name_.c_str(), input_tensor);
@@ -231,7 +223,7 @@ public:
         };
     }
 
-private:
+   private:
     void infer_output_indices() {
         boxes_output_index_ = output_names_owned_.size();
         logits_output_index_ = output_names_owned_.size();
@@ -256,18 +248,18 @@ private:
         const auto type_info = value.GetTensorTypeAndShapeInfo();
         const auto shape = type_info.GetShape();
         switch (type_info.GetElementType()) {
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
-            return wrap_ort_output_tensor<float>(value, shape, torch::kFloat32, device_id_);
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
-            return wrap_ort_output_tensor<std::uint16_t>(value, shape, torch::kFloat16, device_id_);
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
-            return wrap_ort_output_tensor<int32_t>(value, shape, torch::kInt32, device_id_);
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
-            return wrap_ort_output_tensor<int64_t>(value, shape, torch::kInt64, device_id_);
-        case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:
-            return wrap_ort_output_tensor<bool>(value, shape, torch::kBool, device_id_);
-        default:
-            throw std::runtime_error("unsupported ONNX Runtime output tensor dtype");
+            case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+                return wrap_ort_output_tensor<float>(value, shape, torch::kFloat32, device_id_);
+            case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+                return wrap_ort_output_tensor<std::uint16_t>(value, shape, torch::kFloat16, device_id_);
+            case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
+                return wrap_ort_output_tensor<int32_t>(value, shape, torch::kInt32, device_id_);
+            case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
+                return wrap_ort_output_tensor<int64_t>(value, shape, torch::kInt64, device_id_);
+            case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:
+                return wrap_ort_output_tensor<bool>(value, shape, torch::kBool, device_id_);
+            default:
+                throw std::runtime_error("unsupported ONNX Runtime output tensor dtype");
         }
     }
 
@@ -285,17 +277,14 @@ private:
     ModelInfo info_;
 };
 
-} // namespace
+}  // namespace
 
-std::unique_ptr<InferenceBackend> make_onnx_backend(const std::filesystem::path& model_path,
-                                                    int device_id) {
+std::unique_ptr<InferenceBackend> make_onnx_backend(const std::filesystem::path& model_path, int device_id) {
     return std::make_unique<OnnxBackend>(model_path, device_id);
 }
 
-std::vector<std::unique_ptr<InferenceBackend>> make_onnx_backend_lanes(
-    const std::filesystem::path& model_path,
-    int device_id,
-    int lane_count) {
+std::vector<std::unique_ptr<InferenceBackend>> make_onnx_backend_lanes(const std::filesystem::path& model_path,
+                                                                       int device_id, int lane_count) {
     if (lane_count <= 0) {
         throw std::runtime_error("ONNX backend lanes must be greater than zero");
     }
@@ -307,4 +296,4 @@ std::vector<std::unique_ptr<InferenceBackend>> make_onnx_backend_lanes(
     return backends;
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

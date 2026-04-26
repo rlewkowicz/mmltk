@@ -15,6 +15,6 @@ inline void cuda_require(cudaError_t err, const char* expr) {
     std::abort();
 }
 
-} // namespace mmltk::testsupport
+}  // namespace mmltk::testsupport
 
 #define CUDA_ASSERT_OK(call) ::mmltk::testsupport::cuda_require((call), #call)

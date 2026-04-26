@@ -39,12 +39,10 @@ const BundledTestBundle* find_bundled_test_bundle(const std::vector<BundledTestB
     return nullptr;
 }
 
-int run_bundled_test_bundle(const BundledTestBundle& bundle,
-                            const std::vector<std::string>& forwarded_args,
+int run_bundled_test_bundle(const BundledTestBundle& bundle, const std::vector<std::string>& forwarded_args,
                             const bool announce_bundle) {
     if (announce_bundle) {
-        mmltk::logging::logger("cli")->info("mmltk --test: running bundle `{}` ({})",
-                                            bundle.spec->name,
+        mmltk::logging::logger("cli")->info("mmltk --test: running bundle `{}` ({})", bundle.spec->name,
                                             bundle.executable_path.string());
     }
 
@@ -62,21 +60,17 @@ int run_bundled_test_bundle(const BundledTestBundle& bundle,
 
     const pid_t child_pid = ::fork();
     if (child_pid < 0) {
-        throw std::runtime_error(std::string("failed to fork bundled test runner: ") +
-                                 std::strerror(errno));
+        throw std::runtime_error(std::string("failed to fork bundled test runner: ") + std::strerror(errno));
     }
     if (child_pid == 0) {
         ::execv(raw_argv.front(), raw_argv.data());
-        mmltk::logging::logger("cli")->error("execv({}) failed: {}",
-                                             raw_argv.front(),
-                                             std::strerror(errno));
+        mmltk::logging::logger("cli")->error("execv({}) failed: {}", raw_argv.front(), std::strerror(errno));
         std::_Exit(127);
     }
 
     const int status = mmltk::gui::subprocess::wait_child_process(child_pid);
     if (status < 0) {
-        throw std::runtime_error(std::string("failed waiting for bundled test runner: ") +
-                                 std::strerror(errno));
+        throw std::runtime_error(std::string("failed waiting for bundled test runner: ") + std::strerror(errno));
     }
     if (WIFEXITED(status)) {
         return WEXITSTATUS(status);
@@ -87,7 +81,7 @@ int run_bundled_test_bundle(const BundledTestBundle& bundle,
     return 1;
 }
 
-} // namespace
+}  // namespace
 
 ParsedTestRequest parse_test_request(int argc, char** argv) {
     ParsedTestRequest request;
@@ -175,15 +169,14 @@ void print_bundled_test_bundles(FILE* stream, const std::vector<BundledTestBundl
                  "Example: mmltk --test core -- --list-tests\n");
 }
 
-int handle_bundled_test_request(const ParsedTestRequest& request,
-                                const std::vector<BundledTestBundle>& bundles) {
+int handle_bundled_test_request(const ParsedTestRequest& request, const std::vector<BundledTestBundle>& bundles) {
     if (request.bundle_name.empty()) {
         mmltk::logging::logger("cli")->error("mmltk --test requires a bundle name or `list`");
         print_bundled_test_bundles(stderr, bundles);
         return 1;
     }
-    if (request.bundle_name == "list" || request.bundle_name == "help" ||
-        request.bundle_name == "--help" || request.bundle_name == "-h") {
+    if (request.bundle_name == "list" || request.bundle_name == "help" || request.bundle_name == "--help" ||
+        request.bundle_name == "-h") {
         print_bundled_test_bundles(stdout, bundles);
         return 0;
     }
@@ -213,4 +206,4 @@ int handle_bundled_test_request(const ParsedTestRequest& request,
     return run_bundled_test_bundle(*bundle, request.forwarded_args, false);
 }
 
-} // namespace mmltk::cli_support
+}  // namespace mmltk::cli_support

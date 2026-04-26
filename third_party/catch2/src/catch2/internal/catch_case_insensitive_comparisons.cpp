@@ -12,24 +12,17 @@
 #include <algorithm>
 
 namespace Catch {
-    namespace Detail {
+namespace Detail {
 
-        bool CaseInsensitiveLess::operator()( StringRef lhs,
-                                              StringRef rhs ) const {
-            return std::lexicographical_compare(
-                lhs.begin(), lhs.end(),
-                rhs.begin(), rhs.end(),
-                []( char l, char r ) { return toLower( l ) < toLower( r ); } );
-        }
+bool CaseInsensitiveLess::operator()(StringRef lhs, StringRef rhs) const {
+    return std::lexicographical_compare(lhs.begin(), lhs.end(), rhs.begin(), rhs.end(),
+                                        [](char l, char r) { return toLower(l) < toLower(r); });
+}
 
-        bool
-        CaseInsensitiveEqualTo::operator()( StringRef lhs,
-                                            StringRef rhs ) const {
-            return std::equal(
-                lhs.begin(), lhs.end(),
-                rhs.begin(), rhs.end(),
-                []( char l, char r ) { return toLower( l ) == toLower( r ); } );
-        }
+bool CaseInsensitiveEqualTo::operator()(StringRef lhs, StringRef rhs) const {
+    return std::equal(lhs.begin(), lhs.end(), rhs.begin(), rhs.end(),
+                      [](char l, char r) { return toLower(l) == toLower(r); });
+}
 
-    } // namespace Detail
-} // namespace Catch
+}  // namespace Detail
+}  // namespace Catch

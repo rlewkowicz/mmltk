@@ -7,7 +7,7 @@
 namespace mmltk::rfdetr {
 
 class SharedCudaEvent final {
-public:
+   public:
     explicit SharedCudaEvent(cudaEvent_t event) : event_(event) {}
 
     ~SharedCudaEvent() {
@@ -19,9 +19,11 @@ public:
     SharedCudaEvent(const SharedCudaEvent&) = delete;
     SharedCudaEvent& operator=(const SharedCudaEvent&) = delete;
 
-    [[nodiscard]] cudaEvent_t get() const { return event_; }
+    [[nodiscard]] cudaEvent_t get() const {
+        return event_;
+    }
 
-private:
+   private:
     cudaEvent_t event_ = nullptr;
 };
 
@@ -33,10 +35,8 @@ inline std::shared_ptr<SharedCudaEvent> record_shared_cuda_event(cudaStream_t st
     return handle;
 }
 
-inline void wait_for_shared_cuda_event(cudaStream_t stream,
-                                       const SharedCudaEvent& event,
-                                       const char* context) {
+inline void wait_for_shared_cuda_event(cudaStream_t stream, const SharedCudaEvent& event, const char* context) {
     ensure_cuda_ok(cudaStreamWaitEvent(stream, event.get(), 0), context);
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

@@ -18,45 +18,30 @@
 
 namespace Catch {
 
-    bool startsWith( std::string const& s, std::string const& prefix );
-    bool startsWith( StringRef s, char prefix );
-    bool endsWith( std::string const& s, std::string const& suffix );
-    bool endsWith( std::string const& s, char suffix );
-    bool contains( std::string const& s, std::string const& infix );
-    void toLowerInPlace( std::string& s );
-    std::string toLower( std::string const& s );
-    char toLower( char c );
-    //! Returns a new string without whitespace at the start/end
-    std::string trim( std::string const& str );
-    //! Returns a substring of the original ref without whitespace. Beware lifetimes!
-    StringRef trim( StringRef ref CATCH_ATTR_LIFETIMEBOUND );
+bool startsWith(std::string const& s, std::string const& prefix);
+bool startsWith(StringRef s, char prefix);
+bool endsWith(std::string const& s, std::string const& suffix);
+bool endsWith(std::string const& s, char suffix);
+bool contains(std::string const& s, std::string const& infix);
+void toLowerInPlace(std::string& s);
+std::string toLower(std::string const& s);
+char toLower(char c);
+std::string trim(std::string const& str);
+StringRef trim(StringRef ref CATCH_ATTR_LIFETIMEBOUND);
 
-    // !!! Be aware, returns refs into original string - make sure original string outlives them
-    std::vector<StringRef> splitStringRef( StringRef str CATCH_ATTR_LIFETIMEBOUND, char delimiter );
-    bool replaceInPlace( std::string& str, std::string const& replaceThis, std::string const& withThis );
+std::vector<StringRef> splitStringRef(StringRef str CATCH_ATTR_LIFETIMEBOUND, char delimiter);
+bool replaceInPlace(std::string& str, std::string const& replaceThis, std::string const& withThis);
 
-    /**
-     * Helper for streaming a "count [maybe-plural-of-label]" human-friendly string
-     *
-     * Usage example:
-     * ```cpp
-     * std::cout << "Found " << pluralise(count, "error") << '\n';
-     * ```
-     *
-     * **Important:** The provided string must outlive the instance
-     */
-    class pluralise {
-        std::uint64_t m_count;
-        StringRef m_label;
+class pluralise {
+    std::uint64_t m_count;
+    StringRef m_label;
 
-    public:
-        constexpr pluralise(std::uint64_t count, StringRef label CATCH_ATTR_LIFETIMEBOUND):
-            m_count(count),
-            m_label(label)
-        {}
+   public:
+    constexpr pluralise(std::uint64_t count, StringRef label CATCH_ATTR_LIFETIMEBOUND)
+        : m_count(count), m_label(label) {}
 
-        friend std::ostream& operator << ( std::ostream& os, pluralise const& pluraliser );
-    };
-}
+    friend std::ostream& operator<<(std::ostream& os, pluralise const& pluraliser);
+};
+}  // namespace Catch
 
-#endif // CATCH_STRING_MANIP_HPP_INCLUDED
+#endif  // CATCH_STRING_MANIP_HPP_INCLUDED

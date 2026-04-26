@@ -8,9 +8,9 @@
 namespace mmltk::rfdetr {
 
 enum class CompilationMode : std::uint8_t {
-    kNone,          // no JIT compilation, raw C++ forward
-    kSelective,     // compile safe submodules only (default)
-    kFullTrace,     // whole-model JIT trace (original behavior)
+    kNone,
+    kSelective,
+    kFullTrace,
 };
 
 struct ModelPresetConfig {
@@ -41,4 +41,4 @@ const ModelPresetConfig* find_model_preset(std::string_view preset_name);
 const ModelPresetConfig* find_model_preset_by_weight_filename(std::string_view filename);
 const ModelPresetConfig* infer_model_preset_from_path(const std::filesystem::path& path);
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

@@ -15,10 +15,8 @@
 namespace mmltk {
 
 class WorkerPool {
-public:
-    WorkerPool(size_t worker_count,
-               std::vector<int> cpu_affinity = {},
-               std::string thread_name_prefix = "fastworker");
+   public:
+    WorkerPool(size_t worker_count, std::vector<int> cpu_affinity = {}, std::string thread_name_prefix = "fastworker");
     ~WorkerPool();
 
     WorkerPool(const WorkerPool&) = delete;
@@ -33,7 +31,7 @@ public:
     template <typename Index, typename Func>
     void parallel_for(Index begin, Index end, int max_workers, Func&& func);
 
-private:
+   private:
     void enqueue_task(std::function<void()> task);
     [[nodiscard]] bool running_on_worker_thread() const noexcept;
 
@@ -68,9 +66,8 @@ void WorkerPool::parallel_for(Index begin, Index end, int max_workers, Func&& fu
         return;
     }
     const int requested_workers = max_workers > 0 ? max_workers : pool_workers;
-    const int worker_count = std::max(
-        1,
-        std::min<int>(std::min<int>(requested_workers, pool_workers), static_cast<int>(total)));
+    const int worker_count =
+        std::max(1, std::min<int>(std::min<int>(requested_workers, pool_workers), static_cast<int>(total)));
     if (worker_count == 1) {
         func(begin, end);
         return;
@@ -88,9 +85,7 @@ void WorkerPool::parallel_for(Index begin, Index end, int max_workers, Func&& fu
         if (worker == worker_count - 1) {
             func(chunk_begin, chunk_end);
         } else {
-            futures.push_back(enqueue([&, chunk_begin, chunk_end] {
-                func(chunk_begin, chunk_end);
-            }));
+            futures.push_back(enqueue([&, chunk_begin, chunk_end] { func(chunk_begin, chunk_end); }));
         }
     }
     for (auto& future : futures) {
@@ -98,4 +93,4 @@ void WorkerPool::parallel_for(Index begin, Index end, int max_workers, Func&& fu
     }
 }
 
-} // namespace mmltk
+}  // namespace mmltk

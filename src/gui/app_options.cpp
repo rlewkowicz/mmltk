@@ -12,7 +12,7 @@ namespace {
 
 constexpr int kCliParseSuccess = static_cast<int>(CLI::ExitCodes::Success);
 
-} // namespace
+}
 
 std::string resolve_vast_api_key(const std::string& explicit_value, const char* env_value) {
     if (!explicit_value.empty()) {
@@ -28,7 +28,7 @@ AppLaunchOptions parse_app_launch_options(int argc, char** argv) {
     AppLaunchOptions options;
     std::vector<std::string> launch_args;
     launch_args.reserve(static_cast<size_t>(argc));
-    launch_args.emplace_back(argc > 0 ? argv[0] : "mmltk-gui");
+    launch_args.emplace_back(argc > 0 ? argv[0] : "mmltk-browser-host");
 
     bool saw_separator = false;
     for (int index = 1; index < argc; ++index) {
@@ -50,19 +50,20 @@ AppLaunchOptions parse_app_launch_options(int argc, char** argv) {
         raw_launch_args.push_back(arg.c_str());
     }
 
-    CLI::App app{"mmltk GUI"};
+    CLI::App app{"mmltk Browser Runtime"};
     app.set_help_all_flag("--help-all", "Show all options");
     app.add_option("--vast-api-key", options.vast_api_key, "Optional Vast.ai API key for remote offer queries");
-    app.add_option("--settings-path", options.settings_path, "Path to the GUI settings JSON file")
-        ->type_name("PATH");
+    app.add_option("--settings-path", options.settings_path, "Path to the GUI settings JSON file")->type_name("PATH");
+    app.add_option("--browser-app-dir", options.browser_app_dir,
+                   "Internal: override the packaged browser app bundle directory")
+        ->type_name("PATH")
+        ->group("");
     std::string log_level_option;
     std::string log_file_option;
     std::string log_dir_option;
-    app.add_option("--log-level", log_level_option,
-                   "Logging level (trace, debug, info, warn, error, critical, off)");
+    app.add_option("--log-level", log_level_option, "Logging level (trace, debug, info, warn, error, critical, off)");
     app.add_option("--log-file", log_file_option, "Explicit log file path")->type_name("PATH");
-    app.add_option("--log-dir", log_dir_option,
-                   "Log directory for the default rotating file sink")->type_name("PATH");
+    app.add_option("--log-dir", log_dir_option, "Log directory for the default rotating file sink")->type_name("PATH");
     app.add_flag("--seed-from-cli", options.seed_from_cli,
                  "Internal: seed GUI state from forwarded mmltk CLI arguments")
         ->group("");
@@ -85,4 +86,4 @@ AppLaunchOptions parse_app_launch_options(int argc, char** argv) {
     return options;
 }
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

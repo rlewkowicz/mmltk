@@ -25,21 +25,29 @@
 namespace mmltk {
 
 class UniqueFd {
-public:
+   public:
     explicit UniqueFd(int fd = -1) : fd_(fd) {}
-    ~UniqueFd() { if (fd_ >= 0) ::close(fd_); }
+    ~UniqueFd() {
+        if (fd_ >= 0)
+            ::close(fd_);
+    }
     UniqueFd(const UniqueFd&) = delete;
     UniqueFd& operator=(const UniqueFd&) = delete;
-    UniqueFd(UniqueFd&& other) noexcept : fd_(other.fd_) { other.fd_ = -1; }
+    UniqueFd(UniqueFd&& other) noexcept : fd_(other.fd_) {
+        other.fd_ = -1;
+    }
     UniqueFd& operator=(UniqueFd&& other) noexcept {
-        if (fd_ >= 0) ::close(fd_);
+        if (fd_ >= 0)
+            ::close(fd_);
         fd_ = other.fd_;
         other.fd_ = -1;
         return *this;
     }
-    [[nodiscard]] int get() const { return fd_; }
+    [[nodiscard]] int get() const {
+        return fd_;
+    }
 
-private:
+   private:
     int fd_;
 };
 
@@ -55,9 +63,8 @@ inline T checked_cast(U value, const char* ctx) {
                 signed_value > static_cast<std::intmax_t>(std::numeric_limits<T>::max())) {
                 throw std::overflow_error(ctx);
             }
-        } else if (signed_value < 0 ||
-                   static_cast<std::uintmax_t>(signed_value) >
-                       static_cast<std::uintmax_t>(std::numeric_limits<T>::max())) {
+        } else if (signed_value < 0 || static_cast<std::uintmax_t>(signed_value) >
+                                           static_cast<std::uintmax_t>(std::numeric_limits<T>::max())) {
             throw std::overflow_error(ctx);
         }
     } else {
@@ -83,7 +90,7 @@ inline std::runtime_error errno_error(const char* action, const std::string& pat
 }
 
 class FileHandle {
-public:
+   public:
     FileHandle() = default;
     explicit FileHandle(int fd) : fd_(fd) {}
     FileHandle(const FileHandle&) = delete;
@@ -109,7 +116,9 @@ public:
         return file;
     }
 
-    [[nodiscard]] int get() const { return fd_.get(); }
+    [[nodiscard]] int get() const {
+        return fd_.get();
+    }
 
     [[nodiscard]] size_t size() const {
         struct stat st;
@@ -131,7 +140,6 @@ public:
         }
     }
 
-    // POSIX read/write syscalls conventionally take byte-count plus file offset.
     // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     void pwrite_all(const void* src, size_t bytes, size_t offset) const {
         MMLTK_PROFILE_SCOPE("io.pwrite_all");
@@ -139,8 +147,7 @@ public:
         const auto* ptr = static_cast<const uint8_t*>(src);
         size_t written = 0;
         while (written < bytes) {
-            const auto write_offset =
-                checked_cast<off_t>(offset + written, "pwrite offset overflow");
+            const auto write_offset = checked_cast<off_t>(offset + written, "pwrite offset overflow");
             ssize_t ret = pwrite(fd_.get(), ptr + written, bytes - written, write_offset);
             if (ret < 0) {
                 throw errno_error("pwrite failed");
@@ -149,7 +156,6 @@ public:
         }
     }
 
-    // POSIX read/write syscalls conventionally take byte-count plus file offset.
     // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     void pread_all(void* dst, size_t bytes, size_t offset) const {
         MMLTK_PROFILE_SCOPE("io.pread_all");
@@ -157,8 +163,7 @@ public:
         auto* ptr = static_cast<uint8_t*>(dst);
         size_t read_bytes = 0;
         while (read_bytes < bytes) {
-            const auto read_offset =
-                checked_cast<off_t>(offset + read_bytes, "pread offset overflow");
+            const auto read_offset = checked_cast<off_t>(offset + read_bytes, "pread offset overflow");
             ssize_t ret = pread(fd_.get(), ptr + read_bytes, bytes - read_bytes, read_offset);
             if (ret < 0) {
                 throw errno_error("pread failed");
@@ -170,7 +175,6 @@ public:
         }
     }
 
-    // posix_fadvise uses byte offset and length as its native API contract.
     // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     void advise(size_t offset, size_t bytes, int advice) const {
         const auto adv_offset = checked_cast<off_t>(offset, "posix_fadvise offset overflow");
@@ -189,18 +193,17 @@ public:
         }
     }
 
-private:
+   private:
     UniqueFd fd_;
 };
 
 class MappedFile {
-public:
+   public:
     MappedFile() = default;
     MappedFile(const MappedFile&) = delete;
     MappedFile& operator=(const MappedFile&) = delete;
 
-    MappedFile(MappedFile&& other) noexcept
-        : file_(std::move(other.file_)), data_(other.data_), size_(other.size_) {
+    MappedFile(MappedFile&& other) noexcept : file_(std::move(other.file_)), data_(other.data_), size_(other.size_) {
         other.data_ = nullptr;
         other.size_ = 0;
     }
@@ -218,7 +221,9 @@ public:
         return *this;
     }
 
-    ~MappedFile() { unmap(); }
+    ~MappedFile() {
+        unmap();
+    }
 
     static MappedFile open_readonly(const std::string& path) {
         MMLTK_PROFILE_SCOPE("mapped_file.open_readonly");
@@ -226,8 +231,7 @@ public:
         mapped.file_ = FileHandle::open_readonly(path);
         mapped.size_ = mapped.file_.size();
         MMLTK_PROFILE_ADD("mapped_file.bytes", mapped.size_);
-        void* ptr = mmap(nullptr, mapped.size_, PROT_READ, MAP_SHARED,
-                         mapped.file_.get(), 0);
+        void* ptr = mmap(nullptr, mapped.size_, PROT_READ, MAP_SHARED, mapped.file_.get(), 0);
         if (ptr == MAP_FAILED) {
             throw errno_error("mmap failed", path);
         }
@@ -245,8 +249,8 @@ public:
         }
         mapped.size_ = bytes;
         MMLTK_PROFILE_ADD("mapped_file.bytes", bytes);
-        void* ptr = mmap(nullptr, mapped.size_, PROT_READ, MAP_SHARED,
-                         mapped.file_.get(), checked_cast<off_t>(offset, "mmap offset overflow"));
+        void* ptr = mmap(nullptr, mapped.size_, PROT_READ, MAP_SHARED, mapped.file_.get(),
+                         checked_cast<off_t>(offset, "mmap offset overflow"));
         if (ptr == MAP_FAILED) {
             throw errno_error("mmap failed", path);
         }
@@ -254,8 +258,12 @@ public:
         return mapped;
     }
 
-    [[nodiscard]] const uint8_t* data() const { return data_; }
-    [[nodiscard]] size_t size() const { return size_; }
+    [[nodiscard]] const uint8_t* data() const {
+        return data_;
+    }
+    [[nodiscard]] size_t size() const {
+        return size_;
+    }
 
     void advise(int advice) const {
         advise_range(0, size_, advice);
@@ -273,7 +281,7 @@ public:
         }
     }
 
-private:
+   private:
     void unmap() noexcept {
         if (data_) {
             munmap(const_cast<uint8_t*>(data_), size_);
@@ -289,7 +297,7 @@ private:
 
 template <typename T>
 class OwnedBuffer {
-public:
+   public:
     OwnedBuffer() = default;
     OwnedBuffer(const OwnedBuffer&) = delete;
     OwnedBuffer& operator=(const OwnedBuffer&) = delete;
@@ -311,7 +319,9 @@ public:
         return *this;
     }
 
-    ~OwnedBuffer() { reset(); }
+    ~OwnedBuffer() {
+        reset();
+    }
 
     static OwnedBuffer allocate(size_t count) {
         OwnedBuffer buffer;
@@ -322,8 +332,7 @@ public:
             throw std::overflow_error("owned buffer allocation overflow");
         }
         const size_t bytes = count * sizeof(T);
-        void* ptr = mmap(nullptr, bytes, PROT_READ | PROT_WRITE,
-                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        void* ptr = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (ptr == MAP_FAILED) {
             throw errno_error("anonymous mmap failed");
         }
@@ -332,11 +341,21 @@ public:
         return buffer;
     }
 
-    [[nodiscard]] T* data() { return data_; }
-    [[nodiscard]] const T* data() const { return data_; }
-    [[nodiscard]] size_t size() const { return count_; }
-    [[nodiscard]] size_t bytes() const { return count_ * sizeof(T); }
-    [[nodiscard]] bool empty() const { return count_ == 0; }
+    [[nodiscard]] T* data() {
+        return data_;
+    }
+    [[nodiscard]] const T* data() const {
+        return data_;
+    }
+    [[nodiscard]] size_t size() const {
+        return count_;
+    }
+    [[nodiscard]] size_t bytes() const {
+        return count_ * sizeof(T);
+    }
+    [[nodiscard]] bool empty() const {
+        return count_ == 0;
+    }
 
     void advise(int advice) const {
         if (empty()) {
@@ -347,7 +366,7 @@ public:
         }
     }
 
-private:
+   private:
     void reset() noexcept {
         if (data_) {
             munmap(data_, bytes());
@@ -370,7 +389,6 @@ inline OwnedBuffer<T> allocate_hugepage_buffer(size_t count) {
 }
 
 template <typename T>
-// Count and byte offset are distinct dataset layout coordinates here.
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
 inline OwnedBuffer<T> load_hugepage_block(const FileHandle& file, size_t count, size_t offset) {
     OwnedBuffer<T> block = allocate_hugepage_buffer<T>(count);
@@ -390,25 +408,21 @@ void parallel_for_range_indexed(Index begin, Index end, int num_workers, Func&& 
     }
 
     const Index total = end - begin;
-    const int requested_workers = std::max(
-        1,
-        std::min(num_workers, checked_cast<int>(total, "parallel range too large for worker count")));
+    const int requested_workers =
+        std::max(1, std::min(num_workers, checked_cast<int>(total, "parallel range too large for worker count")));
     const std::vector<int> worker_cpus = allowed_cpu_set();
-    const int worker_count =
-        clamp_worker_count_to_cpus(requested_workers, worker_cpus.size(), 0, 1);
+    const int worker_count = clamp_worker_count_to_cpus(requested_workers, worker_cpus.size(), 0, 1);
     log_worker_budget_clamp("parallel_for_range", requested_workers, worker_count, worker_cpus);
     MMLTK_PROFILE_ADD("parallel_for_range.calls", 1);
     MMLTK_PROFILE_ADD("parallel_for_range.total_items",
-                           checked_cast<std::uint64_t>(total, "parallel range size overflow"));
-    MMLTK_PROFILE_ADD("parallel_for_range.worker_count_sum",
-                           static_cast<std::uint64_t>(worker_count));
+                      checked_cast<std::uint64_t>(total, "parallel range size overflow"));
+    MMLTK_PROFILE_ADD("parallel_for_range.worker_count_sum", static_cast<std::uint64_t>(worker_count));
     if (worker_count == 1) {
         func(0, begin, end);
         return;
     }
 
-    const Index chunk = (total + static_cast<Index>(worker_count) - 1) /
-                        static_cast<Index>(worker_count);
+    const Index chunk = (total + static_cast<Index>(worker_count) - 1) / static_cast<Index>(worker_count);
 
     std::exception_ptr error;
     std::mutex error_mtx;
@@ -422,7 +436,7 @@ void parallel_for_range_indexed(Index begin, Index end, int num_workers, Func&& 
         const Index chunk_end = std::min(end, chunk_begin + chunk);
         threads.emplace_back([&, worker, chunk_begin, chunk_end] {
             try {
-                apply_worker_execution_policy(ExecutionPolicyRequest{
+                (void)apply_worker_execution_policy(ExecutionPolicyRequest{
                     worker_cpus,
                     "fl_par" + std::to_string(worker),
                     static_cast<size_t>(worker),
@@ -449,12 +463,8 @@ void parallel_for_range_indexed(Index begin, Index end, int num_workers, Func&& 
 
 template <typename Index, typename Func>
 void parallel_for_range(Index begin, Index end, int num_workers, Func&& func) {
-    parallel_for_range_indexed<Index>(begin,
-                                      end,
-                                      num_workers,
-                                      [&](int, Index chunk_begin, Index chunk_end) {
-                                          func(chunk_begin, chunk_end);
-                                      });
+    parallel_for_range_indexed<Index>(begin, end, num_workers,
+                                      [&](int, Index chunk_begin, Index chunk_end) { func(chunk_begin, chunk_end); });
 }
 
-} // namespace mmltk
+}  // namespace mmltk

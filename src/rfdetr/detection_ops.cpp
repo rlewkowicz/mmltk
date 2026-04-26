@@ -24,6 +24,7 @@
 #include <limits>
 #include <numeric>
 #include <stdexcept>
+#include <vector>
 
 #include <cuda_runtime.h>
 
@@ -44,15 +45,10 @@ struct MatcherCostScratch {
     int64_t cost_target_capacity = 0;
     bool cpu_cost_is_pinned = false;
 
-    void ensure_cost_capacity(int64_t batch_size,
-                              int64_t num_queries,
-                              int64_t max_targets_per_image,
+    void ensure_cost_capacity(int64_t batch_size, int64_t num_queries, int64_t max_targets_per_image,
                               bool pinned_memory) {
-        if (cpu_cost.defined() &&
-            cpu_cost_is_pinned == pinned_memory &&
-            cost_batch_capacity >= batch_size &&
-            cost_query_capacity >= num_queries &&
-            cost_target_capacity >= max_targets_per_image) {
+        if (cpu_cost.defined() && cpu_cost_is_pinned == pinned_memory && cost_batch_capacity >= batch_size &&
+            cost_query_capacity >= num_queries && cost_target_capacity >= max_targets_per_image) {
             return;
         }
 
@@ -61,24 +57,18 @@ struct MatcherCostScratch {
         cost_target_capacity = std::max(cost_target_capacity, max_targets_per_image);
         cpu_cost = torch::empty(
             {cost_batch_capacity, cost_query_capacity, cost_target_capacity},
-            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(pinned_memory)
-        );
+            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(pinned_memory));
         cpu_cost_is_pinned = pinned_memory;
         live_copy_sources.clear();
     }
 
-    [[nodiscard]] torch::Tensor cost_view(const int64_t batch_size,
-                                          const int64_t num_queries,
+    [[nodiscard]] torch::Tensor cost_view(const int64_t batch_size, const int64_t num_queries,
                                           const int64_t max_targets_per_image) const {
-        return cpu_cost.narrow(0, 0, batch_size)
-            .narrow(1, 0, num_queries)
-            .narrow(2, 0, max_targets_per_image);
+        return cpu_cost.narrow(0, 0, batch_size).narrow(1, 0, num_queries).narrow(2, 0, max_targets_per_image);
     }
 
-    [[nodiscard]] torch::Tensor cost_batch_view(const int64_t batch_index,
-                                                const int64_t batch_size,
-                                                const int64_t num_queries,
-                                                const int64_t max_targets_per_image) const {
+    [[nodiscard]] torch::Tensor cost_batch_view(const int64_t batch_index, const int64_t batch_size,
+                                                const int64_t num_queries, const int64_t max_targets_per_image) const {
         return cost_view(batch_size, num_queries, max_targets_per_image).select(0, batch_index);
     }
 };
@@ -95,10 +85,8 @@ struct LsapScratch {
             return;
         }
         element_capacity = std::max(element_capacity, required_elements);
-        cost_double_flat = torch::empty(
-            {element_capacity},
-            torch::TensorOptions().dtype(torch::kDouble).device(torch::kCPU)
-        );
+        cost_double_flat =
+            torch::empty({element_capacity}, torch::TensorOptions().dtype(torch::kDouble).device(torch::kCPU));
     }
 
     [[nodiscard]] torch::Tensor cost_view(int64_t rows, int64_t cols) const {
@@ -150,8 +138,6 @@ struct TracedLossOpCache {
 using MatchIndices = std::vector<std::pair<torch::Tensor, torch::Tensor>>;
 
 MatcherCostScratch& matcher_cost_scratch() {
-    // Keep matcher scratch alive until process exit so CUDA tensor teardown never
-    // races TLS destructor order inside libtorch/libc10.
     thread_local auto* scratch = new MatcherCostScratch();
     return *scratch;
 }
@@ -166,50 +152,40 @@ TracedLossOpCache& traced_loss_op_cache() {
     return *cache;
 }
 
-bool matches_binary_signature(const TracedBinaryLossOp& cache,
-                              const torch::Tensor& input,
+torch::Tensor make_cpu_int64_tensor(const std::vector<int64_t>& values) {
+    auto tensor = torch::empty({static_cast<int64_t>(values.size())},
+                               torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+    if (!values.empty()) {
+        std::copy(values.begin(), values.end(), tensor.data_ptr<int64_t>());
+    }
+    return tensor;
+}
+
+bool matches_binary_signature(const TracedBinaryLossOp& cache, const torch::Tensor& input,
                               const torch::Tensor& target) {
-    return cache.initialized &&
-           cache.input_device_type == input.device().type() &&
-           cache.target_device_type == target.device().type() &&
-           cache.input_dtype == input.scalar_type() &&
-           cache.target_dtype == target.scalar_type() &&
-           cache.input_dim == input.dim() &&
+    return cache.initialized && cache.input_device_type == input.device().type() &&
+           cache.target_device_type == target.device().type() && cache.input_dtype == input.scalar_type() &&
+           cache.target_dtype == target.scalar_type() && cache.input_dim == input.dim() &&
            cache.target_dim == target.dim();
 }
 
-bool matches_parametric_binary_signature(const TracedParametricBinaryLossOp& cache,
-                                         const torch::Tensor& input,
-                                         const torch::Tensor& target,
-                                         double alpha,
-                                         double gamma) {
-    return matches_binary_signature(cache, input, target) &&
-           cache.alpha == alpha &&
-           cache.gamma == gamma;
+bool matches_parametric_binary_signature(const TracedParametricBinaryLossOp& cache, const torch::Tensor& input,
+                                         const torch::Tensor& target, double alpha, double gamma) {
+    return matches_binary_signature(cache, input, target) && cache.alpha == alpha && cache.gamma == gamma;
 }
 
-bool matches_ternary_signature(const TracedTernaryLossOp& cache,
-                               const torch::Tensor& first,
-                               const torch::Tensor& second,
-                               const torch::Tensor& third) {
-    return cache.initialized &&
-           cache.first_device_type == first.device().type() &&
-           cache.second_device_type == second.device().type() &&
-           cache.third_device_type == third.device().type() &&
-           cache.first_dtype == first.scalar_type() &&
-           cache.second_dtype == second.scalar_type() &&
-           cache.third_dtype == third.scalar_type() &&
-           cache.first_dim == first.dim() &&
-           cache.second_dim == second.dim() &&
-           cache.third_dim == third.dim();
+bool matches_ternary_signature(const TracedTernaryLossOp& cache, const torch::Tensor& first,
+                               const torch::Tensor& second, const torch::Tensor& third) {
+    return cache.initialized && cache.first_device_type == first.device().type() &&
+           cache.second_device_type == second.device().type() && cache.third_device_type == third.device().type() &&
+           cache.first_dtype == first.scalar_type() && cache.second_dtype == second.scalar_type() &&
+           cache.third_dtype == third.scalar_type() && cache.first_dim == first.dim() &&
+           cache.second_dim == second.dim() && cache.third_dim == third.dim();
 }
 
 template <typename TraceFn>
-void ensure_binary_loss_trace(TracedBinaryLossOp& cache,
-                              const char* class_name,
-                              const torch::Tensor& input,
-                              const torch::Tensor& target,
-                              TraceFn&& fn) {
+void ensure_binary_loss_trace(TracedBinaryLossOp& cache, const char* class_name, const torch::Tensor& input,
+                              const torch::Tensor& target, TraceFn&& fn) {
     if (matches_binary_signature(cache, input, target)) {
         return;
     }
@@ -222,12 +198,8 @@ void ensure_binary_loss_trace(TracedBinaryLossOp& cache,
     const auto example_target = target.detach().contiguous();
     auto trace_res = torch::jit::tracer::trace(
         {example_input, example_target},
-        [&](torch::jit::Stack args) -> torch::jit::Stack {
-            return {fn(args[0].toTensor(), args[1].toTensor())};
-        },
-        [](const torch::autograd::Variable&) { return ""; },
-        false, false, &cache.module
-    );
+        [&](torch::jit::Stack args) -> torch::jit::Stack { return {fn(args[0].toTensor(), args[1].toTensor())}; },
+        [](const torch::autograd::Variable&) { return ""; }, false, false, &cache.module);
     cache.module.type()->addMethod(cu->create_function("forward", trace_res.first->graph, true));
     cache.input_device_type = input.device().type();
     cache.target_device_type = target.device().type();
@@ -239,13 +211,9 @@ void ensure_binary_loss_trace(TracedBinaryLossOp& cache,
 }
 
 template <typename TraceFn>
-void ensure_parametric_binary_loss_trace(TracedParametricBinaryLossOp& cache,
-                                         const char* class_name,
-                                         const torch::Tensor& input,
-                                         const torch::Tensor& target,
-                                         double alpha,
-                                         double gamma,
-                                         TraceFn&& fn) {
+void ensure_parametric_binary_loss_trace(TracedParametricBinaryLossOp& cache, const char* class_name,
+                                         const torch::Tensor& input, const torch::Tensor& target, double alpha,
+                                         double gamma, TraceFn&& fn) {
     if (matches_parametric_binary_signature(cache, input, target, alpha, gamma)) {
         return;
     }
@@ -255,12 +223,8 @@ void ensure_parametric_binary_loss_trace(TracedParametricBinaryLossOp& cache,
 }
 
 template <typename TraceFn>
-void ensure_ternary_loss_trace(TracedTernaryLossOp& cache,
-                               const char* class_name,
-                               const torch::Tensor& first,
-                               const torch::Tensor& second,
-                               const torch::Tensor& third,
-                               TraceFn&& fn) {
+void ensure_ternary_loss_trace(TracedTernaryLossOp& cache, const char* class_name, const torch::Tensor& first,
+                               const torch::Tensor& second, const torch::Tensor& third, TraceFn&& fn) {
     if (matches_ternary_signature(cache, first, second, third)) {
         return;
     }
@@ -277,9 +241,7 @@ void ensure_ternary_loss_trace(TracedTernaryLossOp& cache,
         [&](torch::jit::Stack args) -> torch::jit::Stack {
             return {fn(args[0].toTensor(), args[1].toTensor(), args[2].toTensor())};
         },
-        [](const torch::autograd::Variable&) { return ""; },
-        false, false, &cache.module
-    );
+        [](const torch::autograd::Variable&) { return ""; }, false, false, &cache.module);
     cache.module.type()->addMethod(cu->create_function("forward", trace_res.first->graph, true));
     cache.first_device_type = first.device().type();
     cache.second_device_type = second.device().type();
@@ -293,16 +255,13 @@ void ensure_ternary_loss_trace(TracedTernaryLossOp& cache,
     cache.initialized = true;
 }
 
-torch::Tensor point_sample(const torch::Tensor& input,
-                           const torch::Tensor& point_coords,
+torch::Tensor point_sample(const torch::Tensor& input, const torch::Tensor& point_coords,
                            F::GridSampleFuncOptions::mode_t mode);
 
-torch::Tensor matcher_point_sample(const torch::Tensor& input,
-                                   const torch::Tensor& point_coords,
+torch::Tensor matcher_point_sample(const torch::Tensor& input, const torch::Tensor& point_coords,
                                    F::GridSampleFuncOptions::mode_t mode);
 
-const PackedTargetMasks& require_target_masks(const PreparedTargets& targets,
-                                              const char* context) {
+const PackedTargetMasks& require_target_masks(const PreparedTargets& targets, const char* context) {
     if (!targets.packed_masks.has_value() || !targets.packed_masks->bits.defined()) {
         throw std::runtime_error(std::string(context) + " requires target masks");
     }
@@ -315,10 +274,8 @@ int64_t nearest_grid_sample_index(float coord, int64_t size) {
     return std::clamp<int64_t>(index, 0, size - 1);
 }
 
-torch::Tensor sample_packed_target_masks_cpu(const PackedTargetMasks& masks,
-                                             const torch::Tensor& mask_indices,
-                                             const torch::Tensor& point_coords,
-                                             const char* context) {
+torch::Tensor sample_packed_target_masks_cpu(const PackedTargetMasks& masks, const torch::Tensor& mask_indices,
+                                             const torch::Tensor& point_coords, const char* context) {
     if (point_coords.dim() != 3 || point_coords.size(2) != 2) {
         throw std::runtime_error(std::string(context) + " expects point coordinates shaped [batch, points, 2]");
     }
@@ -329,9 +286,8 @@ torch::Tensor sample_packed_target_masks_cpu(const PackedTargetMasks& masks,
         throw std::runtime_error(std::string(context) + " requires positive packed mask dimensions");
     }
     if (masks.bits.size(0) == 0) {
-        return torch::empty(
-            {0, point_coords.size(1)},
-            torch::TensorOptions().dtype(torch::kFloat32).device(point_coords.device()));
+        return torch::empty({0, point_coords.size(1)},
+                            torch::TensorOptions().dtype(torch::kFloat32).device(point_coords.device()));
     }
     if (!point_coords.device().is_cpu()) {
         throw std::runtime_error(std::string(context) + " CPU packed mask sampling requires CPU point coordinates");
@@ -342,15 +298,14 @@ torch::Tensor sample_packed_target_masks_cpu(const PackedTargetMasks& masks,
 
     const auto masks_contiguous = masks.bits.contiguous();
     const auto indices = mask_indices.contiguous();
-    const auto coords = point_coords.scalar_type() == torch::kFloat32
-        ? point_coords.contiguous()
-        : point_coords.to(torch::kFloat32).contiguous();
+    const auto coords = point_coords.scalar_type() == torch::kFloat32 ? point_coords.contiguous()
+                                                                      : point_coords.to(torch::kFloat32).contiguous();
     if (coords.size(0) != 1 && coords.size(0) != indices.size(0)) {
-        throw std::runtime_error(std::string(context) + " point coordinate batch must match sampled masks or be shared");
+        throw std::runtime_error(std::string(context) +
+                                 " point coordinate batch must match sampled masks or be shared");
     }
-    auto output = torch::empty(
-        {indices.size(0), coords.size(1)},
-        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
+    auto output = torch::empty({indices.size(0), coords.size(1)},
+                               torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU));
     const auto* words = reinterpret_cast<const uint64_t*>(masks_contiguous.data_ptr<int64_t>());
     const auto* index_data = indices.data_ptr<int64_t>();
     const auto* coords_data = coords.data_ptr<float>();
@@ -375,18 +330,15 @@ torch::Tensor sample_packed_target_masks_cpu(const PackedTargetMasks& masks,
     return output;
 }
 
-torch::Tensor sample_target_masks(const PackedTargetMasks& masks,
-                                  const torch::Tensor& mask_indices,
-                                  const torch::Tensor& point_coords,
-                                  const char* context) {
-    const auto indices = mask_indices.scalar_type() == torch::kInt64
-        ? mask_indices.contiguous()
-        : mask_indices.to(torch::kInt64).contiguous();
-    const auto coords = point_coords.scalar_type() == torch::kFloat32
-        ? point_coords.contiguous()
-        : point_coords.to(torch::kFloat32).contiguous();
+torch::Tensor sample_target_masks(const PackedTargetMasks& masks, const torch::Tensor& mask_indices,
+                                  const torch::Tensor& point_coords, const char* context) {
+    const auto indices = mask_indices.scalar_type() == torch::kInt64 ? mask_indices.contiguous()
+                                                                     : mask_indices.to(torch::kInt64).contiguous();
+    const auto coords = point_coords.scalar_type() == torch::kFloat32 ? point_coords.contiguous()
+                                                                      : point_coords.to(torch::kFloat32).contiguous();
     if (masks.bits.device() != coords.device()) {
-        throw std::runtime_error(std::string(context) + " requires packed masks and point coordinates on the same device");
+        throw std::runtime_error(std::string(context) +
+                                 " requires packed masks and point coordinates on the same device");
     }
     if (masks.bits.device() != indices.device()) {
         throw std::runtime_error(std::string(context) + " requires packed masks and mask indices on the same device");
@@ -397,12 +349,8 @@ torch::Tensor sample_target_masks(const PackedTargetMasks& masks,
     return sample_packed_target_masks_cpu(masks, indices, coords, context);
 }
 
-void enqueue_cost_copy_to_pinned_cpu(const torch::Tensor& cost,
-                                     int64_t batch_index,
-                                     int64_t batch_size,
-                                     int64_t num_queries,
-                                     int64_t max_targets_per_image,
-                                     MatcherCostScratch& scratch) {
+void enqueue_cost_copy_to_pinned_cpu(const torch::Tensor& cost, int64_t batch_index, int64_t batch_size,
+                                     int64_t num_queries, int64_t max_targets_per_image, MatcherCostScratch& scratch) {
     const auto cost_contiguous = cost.contiguous();
     scratch.ensure_cost_capacity(batch_size, num_queries, max_targets_per_image, cost_contiguous.device().is_cuda());
     auto cost_cpu = scratch.cost_batch_view(batch_index, batch_size, num_queries, max_targets_per_image)
@@ -412,11 +360,8 @@ void enqueue_cost_copy_to_pinned_cpu(const torch::Tensor& cost,
     cost_cpu.copy_(cost_contiguous, true);
 }
 
-torch::Tensor wait_for_cost_copies(const torch::Device& device,
-                                   int64_t batch_size,
-                                   int64_t num_queries,
-                                   int64_t max_targets_per_image,
-                                   MatcherCostScratch& scratch) {
+torch::Tensor wait_for_cost_copies(const torch::Device& device, int64_t batch_size, int64_t num_queries,
+                                   int64_t max_targets_per_image, MatcherCostScratch& scratch) {
     auto cost_cpu = scratch.cost_view(batch_size, num_queries, max_targets_per_image);
     if (!device.is_cuda()) {
         scratch.live_copy_sources.clear();
@@ -424,9 +369,8 @@ torch::Tensor wait_for_cost_copies(const torch::Device& device,
     }
     const auto device_index = static_cast<c10::DeviceIndex>(device.index());
     c10::cuda::CUDAGuard device_guard(device_index);
-    mmltk::rfdetr::ensure_cuda_ok(
-        cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream(device_index).stream()),
-        "cudaStreamSynchronize for matcher cost copy");
+    mmltk::rfdetr::ensure_cuda_ok(cudaStreamSynchronize(c10::cuda::getCurrentCUDAStream(device_index).stream()),
+                                  "cudaStreamSynchronize for matcher cost copy");
     MMLTK_PROFILE_ADD("rfdetr.matcher.cost_copy_syncs", 1);
     scratch.live_copy_sources.clear();
     return cost_cpu;
@@ -491,14 +435,10 @@ void sanitize_cost_matrix_cpu_(const torch::Tensor& cost_cpu) {
     }
 }
 
-/// Run a binary (2-tensor) loss through JIT trace or compute directly.
 template <typename DirectFn>
-torch::Tensor run_binary_traced_or_direct(TracedBinaryLossOp TracedLossOpCache::* cache_member,
-                                          const char* class_name,
-                                          const torch::Tensor& inputs,
-                                          const torch::Tensor& targets,
-                                          bool use_jit_traced,
-                                          DirectFn&& direct_fn) {
+torch::Tensor run_binary_traced_or_direct(TracedBinaryLossOp TracedLossOpCache::*cache_member, const char* class_name,
+                                          const torch::Tensor& inputs, const torch::Tensor& targets,
+                                          bool use_jit_traced, DirectFn&& direct_fn) {
     if (use_jit_traced) {
         auto& slot = traced_loss_op_cache().*cache_member;
         ensure_binary_loss_trace(slot, class_name, inputs, targets, direct_fn);
@@ -507,16 +447,11 @@ torch::Tensor run_binary_traced_or_direct(TracedBinaryLossOp TracedLossOpCache::
     return direct_fn(inputs, targets);
 }
 
-/// Run a parametric binary (2-tensor + alpha/gamma) loss through JIT trace or compute directly.
 template <typename DirectFn>
-torch::Tensor run_parametric_traced_or_direct(TracedParametricBinaryLossOp TracedLossOpCache::* cache_member,
-                                              const char* class_name,
-                                              const torch::Tensor& inputs,
-                                              const torch::Tensor& targets,
-                                              double alpha,
-                                              double gamma,
-                                              bool use_jit_traced,
-                                              DirectFn&& direct_fn) {
+torch::Tensor run_parametric_traced_or_direct(TracedParametricBinaryLossOp TracedLossOpCache::*cache_member,
+                                              const char* class_name, const torch::Tensor& inputs,
+                                              const torch::Tensor& targets, double alpha, double gamma,
+                                              bool use_jit_traced, DirectFn&& direct_fn) {
     if (use_jit_traced) {
         auto& slot = traced_loss_op_cache().*cache_member;
         ensure_parametric_binary_loss_trace(slot, class_name, inputs, targets, alpha, gamma, direct_fn);
@@ -525,15 +460,10 @@ torch::Tensor run_parametric_traced_or_direct(TracedParametricBinaryLossOp Trace
     return direct_fn(inputs, targets);
 }
 
-/// Run a ternary (3-tensor) loss through JIT trace or compute directly.
 template <typename DirectFn>
-torch::Tensor run_ternary_traced_or_direct(TracedTernaryLossOp TracedLossOpCache::* cache_member,
-                                           const char* class_name,
-                                           const torch::Tensor& first,
-                                           const torch::Tensor& second,
-                                           const torch::Tensor& third,
-                                           bool use_jit_traced,
-                                           DirectFn&& direct_fn) {
+torch::Tensor run_ternary_traced_or_direct(TracedTernaryLossOp TracedLossOpCache::*cache_member, const char* class_name,
+                                           const torch::Tensor& first, const torch::Tensor& second,
+                                           const torch::Tensor& third, bool use_jit_traced, DirectFn&& direct_fn) {
     if (use_jit_traced) {
         auto& slot = traced_loss_op_cache().*cache_member;
         ensure_ternary_loss_trace(slot, class_name, first, second, third, direct_fn);
@@ -542,52 +472,38 @@ torch::Tensor run_ternary_traced_or_direct(TracedTernaryLossOp TracedLossOpCache
     return direct_fn(first, second, third);
 }
 
-torch::Tensor binary_cross_entropy_with_logits_none(const torch::Tensor& inputs,
-                                                    const torch::Tensor& targets) {
-    return F::binary_cross_entropy_with_logits(
-        inputs,
-        targets,
-        F::BinaryCrossEntropyWithLogitsFuncOptions().reduction(torch::kNone)
-    );
+torch::Tensor binary_cross_entropy_with_logits_none(const torch::Tensor& inputs, const torch::Tensor& targets) {
+    return F::binary_cross_entropy_with_logits(inputs, targets,
+                                               F::BinaryCrossEntropyWithLogitsFuncOptions().reduction(torch::kNone));
 }
 
-torch::Tensor sigmoid_ce_loss(const torch::Tensor& inputs,
-                              const torch::Tensor& targets,
-                              double num_masks,
+torch::Tensor sigmoid_ce_loss(const torch::Tensor& inputs, const torch::Tensor& targets, double num_masks,
                               bool use_jit_traced_loss_ops) {
-    return run_binary_traced_or_direct(
-        &TracedLossOpCache::sigmoid_ce,
-        "__torch__.NativeRfDetrSigmoidCeLoss",
-        inputs, targets, use_jit_traced_loss_ops,
-        [](const torch::Tensor& a, const torch::Tensor& b) {
-            return binary_cross_entropy_with_logits_none(a, b).mean(1).sum();
-        }) / num_masks;
+    return run_binary_traced_or_direct(&TracedLossOpCache::sigmoid_ce, "__torch__.NativeRfDetrSigmoidCeLoss", inputs,
+                                       targets, use_jit_traced_loss_ops,
+                                       [](const torch::Tensor& a, const torch::Tensor& b) {
+                                           return binary_cross_entropy_with_logits_none(a, b).mean(1).sum();
+                                       }) /
+           num_masks;
 }
 
-torch::Tensor dice_loss(const torch::Tensor& inputs,
-                        const torch::Tensor& targets,
-                        double num_masks,
+torch::Tensor dice_loss(const torch::Tensor& inputs, const torch::Tensor& targets, double num_masks,
                         bool use_jit_traced_loss_ops) {
-    return run_binary_traced_or_direct(
-        &TracedLossOpCache::dice,
-        "__torch__.NativeRfDetrDiceLoss",
-        inputs, targets, use_jit_traced_loss_ops,
-        [](const torch::Tensor& a, const torch::Tensor& b) {
-            const auto probs = a.sigmoid().flatten(1);
-            const auto flat_targets = b.flatten(1);
-            const auto numerator = 2 * (probs * flat_targets).sum(-1);
-            const auto denominator = probs.sum(-1) + flat_targets.sum(-1);
-            return (1 - (numerator + 1) / (denominator + 1)).sum();
-        }) / num_masks;
+    return run_binary_traced_or_direct(&TracedLossOpCache::dice, "__torch__.NativeRfDetrDiceLoss", inputs, targets,
+                                       use_jit_traced_loss_ops,
+                                       [](const torch::Tensor& a, const torch::Tensor& b) {
+                                           const auto probs = a.sigmoid().flatten(1);
+                                           const auto flat_targets = b.flatten(1);
+                                           const auto numerator = 2 * (probs * flat_targets).sum(-1);
+                                           const auto denominator = probs.sum(-1) + flat_targets.sum(-1);
+                                           return (1 - (numerator + 1) / (denominator + 1)).sum();
+                                       }) /
+           num_masks;
 }
 
-torch::Tensor batch_dice_loss(const torch::Tensor& inputs,
-                              const torch::Tensor& targets,
-                              bool use_jit_traced_loss_ops) {
+torch::Tensor batch_dice_loss(const torch::Tensor& inputs, const torch::Tensor& targets, bool use_jit_traced_loss_ops) {
     return run_binary_traced_or_direct(
-        &TracedLossOpCache::batch_dice,
-        "__torch__.NativeRfDetrBatchDiceLoss",
-        inputs, targets, use_jit_traced_loss_ops,
+        &TracedLossOpCache::batch_dice, "__torch__.NativeRfDetrBatchDiceLoss", inputs, targets, use_jit_traced_loss_ops,
         [](const torch::Tensor& a, const torch::Tensor& b) {
             const auto probs = a.sigmoid().flatten(1);
             const auto flat_targets = b.flatten(1);
@@ -597,27 +513,21 @@ torch::Tensor batch_dice_loss(const torch::Tensor& inputs,
         });
 }
 
-torch::Tensor batch_sigmoid_ce_loss(const torch::Tensor& inputs,
-                                    const torch::Tensor& targets,
+torch::Tensor batch_sigmoid_ce_loss(const torch::Tensor& inputs, const torch::Tensor& targets,
                                     bool use_jit_traced_loss_ops) {
     return run_binary_traced_or_direct(
-        &TracedLossOpCache::batch_sigmoid_ce,
-        "__torch__.NativeRfDetrBatchSigmoidCeLoss",
-        inputs, targets, use_jit_traced_loss_ops,
-        [](const torch::Tensor& a, const torch::Tensor& b) {
+        &TracedLossOpCache::batch_sigmoid_ce, "__torch__.NativeRfDetrBatchSigmoidCeLoss", inputs, targets,
+        use_jit_traced_loss_ops, [](const torch::Tensor& a, const torch::Tensor& b) {
             const auto flat_targets = b.flatten(1);
-            const auto positives =
-                binary_cross_entropy_with_logits_none(a, torch::ones_like(a));
-            const auto negatives =
-                binary_cross_entropy_with_logits_none(a, torch::zeros_like(a));
+            const auto positives = binary_cross_entropy_with_logits_none(a, torch::ones_like(a));
+            const auto negatives = binary_cross_entropy_with_logits_none(a, torch::zeros_like(a));
             return (torch::einsum("nc,mc->nm", {positives, flat_targets}) +
                     torch::einsum("nc,mc->nm", {negatives, 1 - flat_targets})) /
                    static_cast<double>(flat_targets.size(1));
         });
 }
 
-torch::Tensor point_sample(const torch::Tensor& input,
-                           const torch::Tensor& point_coords,
+torch::Tensor point_sample(const torch::Tensor& input, const torch::Tensor& point_coords,
                            F::GridSampleFuncOptions::mode_t mode = torch::kBilinear) {
     torch::Tensor grid = point_coords;
     bool add_dim = false;
@@ -625,25 +535,20 @@ torch::Tensor point_sample(const torch::Tensor& input,
         add_dim = true;
         grid = grid.unsqueeze(2);
     }
-    auto output = F::grid_sample(
-        input,
-        2.0 * grid - 1.0,
-        F::GridSampleFuncOptions().mode(mode).padding_mode(torch::kBorder).align_corners(false)
-    );
+    auto output =
+        F::grid_sample(input, 2.0 * grid - 1.0,
+                       F::GridSampleFuncOptions().mode(mode).padding_mode(torch::kBorder).align_corners(false));
     if (add_dim) {
         output = output.squeeze(3);
     }
     return output;
 }
 
-torch::Tensor matcher_point_sample(const torch::Tensor& input,
-                                   const torch::Tensor& point_coords,
+torch::Tensor matcher_point_sample(const torch::Tensor& input, const torch::Tensor& point_coords,
                                    F::GridSampleFuncOptions::mode_t mode) {
     if (input.is_cuda() && input.scalar_type() == torch::kFloat32 && point_coords.scalar_type() == torch::kFloat32) {
-        return matcher_point_sample_cuda_forward(
-            input.contiguous(),
-            point_coords.contiguous(),
-            std::holds_alternative<torch::enumtype::kNearest>(mode));
+        return matcher_point_sample_cuda_forward(input.contiguous(), point_coords.contiguous(),
+                                                 std::holds_alternative<torch::enumtype::kNearest>(mode));
     }
     return point_sample(input, point_coords, mode);
 }
@@ -652,8 +557,7 @@ torch::Tensor calculate_uncertainty(const torch::Tensor& logits) {
     return -torch::abs(logits);
 }
 
-torch::Tensor get_uncertain_point_coords_with_randomness(const torch::Tensor& coarse_logits,
-                                                         int64_t num_points,
+torch::Tensor get_uncertain_point_coords_with_randomness(const torch::Tensor& coarse_logits, int64_t num_points,
                                                          int64_t oversample_ratio = 3,
                                                          double importance_sample_ratio = 0.75) {
     if (oversample_ratio < 1) {
@@ -665,45 +569,35 @@ torch::Tensor get_uncertain_point_coords_with_randomness(const torch::Tensor& co
 
     const int64_t num_boxes = coarse_logits.size(0);
     const int64_t num_sampled = num_points * oversample_ratio;
-    auto point_coords = torch::rand(
-        {num_boxes, num_sampled, 2},
-        torch::TensorOptions().dtype(torch::kFloat32).device(coarse_logits.device())
-    );
+    auto point_coords = torch::rand({num_boxes, num_sampled, 2},
+                                    torch::TensorOptions().dtype(torch::kFloat32).device(coarse_logits.device()));
     const auto point_logits = point_sample(coarse_logits, point_coords, torch::kBilinear);
     const auto point_uncertainties = calculate_uncertainty(point_logits);
-    const auto num_uncertain_points =
-        static_cast<int64_t>(importance_sample_ratio * static_cast<double>(num_points));
+    const auto num_uncertain_points = static_cast<int64_t>(importance_sample_ratio * static_cast<double>(num_points));
     const int64_t num_random_points = num_points - num_uncertain_points;
 
     torch::Tensor sampled_coords;
     if (num_uncertain_points > 0) {
         auto idx = std::get<1>(point_uncertainties.index({Slice(), 0, Slice()}).topk(num_uncertain_points, 1));
-        const auto shift = num_sampled * torch::arange(
-            num_boxes,
-            torch::TensorOptions().dtype(torch::kInt64).device(coarse_logits.device())
-        );
+        const auto shift =
+            num_sampled *
+            torch::arange(num_boxes, torch::TensorOptions().dtype(torch::kInt64).device(coarse_logits.device()));
         idx = idx + shift.unsqueeze(1);
-        sampled_coords = point_coords.view({-1, 2})
-                             .index({idx.reshape({-1})})
-                             .view({num_boxes, num_uncertain_points, 2});
+        sampled_coords =
+            point_coords.view({-1, 2}).index({idx.reshape({-1})}).view({num_boxes, num_uncertain_points, 2});
     } else {
-        sampled_coords = torch::empty(
-            {num_boxes, 0, 2},
-            torch::TensorOptions().dtype(torch::kFloat32).device(coarse_logits.device())
-        );
+        sampled_coords = torch::empty({num_boxes, 0, 2},
+                                      torch::TensorOptions().dtype(torch::kFloat32).device(coarse_logits.device()));
     }
 
     if (num_random_points > 0) {
         sampled_coords = torch::cat(
             {
                 sampled_coords,
-                torch::rand(
-                    {num_boxes, num_random_points, 2},
-                    torch::TensorOptions().dtype(torch::kFloat32).device(coarse_logits.device())
-                ),
+                torch::rand({num_boxes, num_random_points, 2},
+                            torch::TensorOptions().dtype(torch::kFloat32).device(coarse_logits.device())),
             },
-            1
-        );
+            1);
     }
     return sampled_coords;
 }
@@ -715,43 +609,30 @@ torch::Tensor box_area(const torch::Tensor& boxes) {
     return wh.select(-1, 0) * wh.select(-1, 1);
 }
 
+torch::Tensor box_intersection(const torch::Tensor& boxes1, const torch::Tensor& boxes2) {
+    const auto lt =
+        torch::max(boxes1.index({Slice(), None, Slice(None, 2)}), boxes2.index({None, Slice(), Slice(None, 2)}));
+    const auto rb = torch::min(boxes1.index({Slice(), None, Slice(2, 4)}), boxes2.index({None, Slice(), Slice(2, 4)}));
+    const auto wh = (rb - lt).clamp_min(0.0);
+    return wh.select(-1, 0) * wh.select(-1, 1);
+}
+
 std::pair<torch::Tensor, torch::Tensor> box_iou(const torch::Tensor& boxes1, const torch::Tensor& boxes2) {
-    if (boxes1.device().is_cuda() && boxes2.device().is_cuda() &&
-        boxes1.scalar_type() == torch::kFloat32 && boxes2.scalar_type() == torch::kFloat32) {
+    if (boxes1.device().is_cuda() && boxes2.device().is_cuda() && boxes1.scalar_type() == torch::kFloat32 &&
+        boxes2.scalar_type() == torch::kFloat32) {
         const auto iou = box_iou_cuda(boxes1, boxes2);
         const auto area1 = box_area(boxes1);
         const auto area2 = box_area(boxes2);
-        const auto uni = area1.index({Slice(), None}) + area2.index({None, Slice()}) - (iou * (area1.index({Slice(), None}) + area2.index({None, Slice()})) / (1 + iou));
-        // Actually union is easier to compute normally if we want it, but wait:
-        // iou = inter / uni => uni = inter / iou. 
-        // Let's just compute uni the standard way for now to be safe, it's just a few O(N*M) ops.
-        const auto lt = torch::max(
-            boxes1.index({Slice(), None, Slice(None, 2)}),
-            boxes2.index({None, Slice(), Slice(None, 2)})
-        );
-        const auto rb = torch::min(
-            boxes1.index({Slice(), None, Slice(2, 4)}),
-            boxes2.index({None, Slice(), Slice(2, 4)})
-        );
-        const auto wh = (rb - lt).clamp_min(0.0);
-        const auto inter = wh.select(-1, 0) * wh.select(-1, 1);
+        const auto uni = area1.index({Slice(), None}) + area2.index({None, Slice()}) -
+                         (iou * (area1.index({Slice(), None}) + area2.index({None, Slice()})) / (1 + iou));
+        const auto inter = box_intersection(boxes1, boxes2);
         const auto union_res = area1.index({Slice(), None}) + area2.index({None, Slice()}) - inter;
         return {iou, union_res};
     }
     const auto area1 = box_area(boxes1);
     const auto area2 = box_area(boxes2);
 
-    const auto lt = torch::max(
-        boxes1.index({Slice(), None, Slice(None, 2)}),
-        boxes2.index({None, Slice(), Slice(None, 2)})
-    );
-    const auto rb = torch::min(
-        boxes1.index({Slice(), None, Slice(2, 4)}),
-        boxes2.index({None, Slice(), Slice(2, 4)})
-    );
-
-    const auto wh = (rb - lt).clamp_min(0.0);
-    const auto inter = wh.select(-1, 0) * wh.select(-1, 1);
+    const auto inter = box_intersection(boxes1, boxes2);
     const auto uni = area1.index({Slice(), None}) + area2.index({None, Slice()}) - inter;
     return {inter / uni, uni};
 }
@@ -767,14 +648,8 @@ std::pair<torch::Tensor, torch::Tensor> aligned_box_inter_union(const torch::Ten
 
     const auto area1 = box_area(boxes1);
     const auto area2 = box_area(boxes2);
-    const auto lt = torch::max(
-        boxes1.index({Slice(), Slice(None, 2)}),
-        boxes2.index({Slice(), Slice(None, 2)})
-    );
-    const auto rb = torch::min(
-        boxes1.index({Slice(), Slice(2, 4)}),
-        boxes2.index({Slice(), Slice(2, 4)})
-    );
+    const auto lt = torch::max(boxes1.index({Slice(), Slice(None, 2)}), boxes2.index({Slice(), Slice(None, 2)}));
+    const auto rb = torch::min(boxes1.index({Slice(), Slice(2, 4)}), boxes2.index({Slice(), Slice(2, 4)}));
     const auto wh = (rb - lt).clamp_min(0.0);
     const auto inter = wh.select(-1, 0) * wh.select(-1, 1);
     const auto uni = area1 + area2 - inter;
@@ -787,19 +662,14 @@ torch::Tensor aligned_box_iou(const torch::Tensor& boxes1, const torch::Tensor& 
 }
 
 torch::Tensor generalized_box_iou(const torch::Tensor& boxes1, const torch::Tensor& boxes2) {
-    if (boxes1.device().is_cuda() && boxes2.device().is_cuda() &&
-        boxes1.scalar_type() == torch::kFloat32 && boxes2.scalar_type() == torch::kFloat32) {
+    if (boxes1.device().is_cuda() && boxes2.device().is_cuda() && boxes1.scalar_type() == torch::kFloat32 &&
+        boxes2.scalar_type() == torch::kFloat32) {
         return generalized_box_iou_cuda(boxes1, boxes2);
     }
     const auto [iou, uni] = box_iou(boxes1, boxes2);
-    const auto lt = torch::min(
-        boxes1.index({Slice(), None, Slice(None, 2)}),
-        boxes2.index({None, Slice(), Slice(None, 2)})
-    );
-    const auto rb = torch::max(
-        boxes1.index({Slice(), None, Slice(2, 4)}),
-        boxes2.index({None, Slice(), Slice(2, 4)})
-    );
+    const auto lt =
+        torch::min(boxes1.index({Slice(), None, Slice(None, 2)}), boxes2.index({None, Slice(), Slice(None, 2)}));
+    const auto rb = torch::max(boxes1.index({Slice(), None, Slice(2, 4)}), boxes2.index({None, Slice(), Slice(2, 4)}));
     const auto wh = (rb - lt).clamp_min(0.0);
     const auto area = wh.select(-1, 0) * wh.select(-1, 1);
     return iou - (area - uni) / area;
@@ -815,97 +685,72 @@ torch::Tensor aligned_generalized_box_iou(const torch::Tensor& boxes1, const tor
 
     const auto [inter, uni] = aligned_box_inter_union(boxes1, boxes2);
     const auto iou = inter / uni;
-    const auto lt = torch::min(
-        boxes1.index({Slice(), Slice(None, 2)}),
-        boxes2.index({Slice(), Slice(None, 2)})
-    );
-    const auto rb = torch::max(
-        boxes1.index({Slice(), Slice(2, 4)}),
-        boxes2.index({Slice(), Slice(2, 4)})
-    );
+    const auto lt = torch::min(boxes1.index({Slice(), Slice(None, 2)}), boxes2.index({Slice(), Slice(None, 2)}));
+    const auto rb = torch::max(boxes1.index({Slice(), Slice(2, 4)}), boxes2.index({Slice(), Slice(2, 4)}));
     const auto wh = (rb - lt).clamp_min(0.0);
     const auto area = wh.select(-1, 0) * wh.select(-1, 1);
     return iou - (area - uni) / area;
 }
 
-torch::Tensor sigmoid_focal_loss(const torch::Tensor& inputs,
-                                 const torch::Tensor& targets,
-                                 double num_boxes,
-                                 double alpha,
-                                 double gamma,
-                                 bool use_jit_traced_loss_ops) {
-    return run_parametric_traced_or_direct(
-        &TracedLossOpCache::sigmoid_focal,
-        "__torch__.NativeRfDetrSigmoidFocalLoss",
-        inputs, targets, alpha, gamma, use_jit_traced_loss_ops,
-        [alpha, gamma](const torch::Tensor& a, const torch::Tensor& b) {
-            const auto prob = a.sigmoid();
-            const auto ce_loss = binary_cross_entropy_with_logits_none(a, b);
-            const auto p_t = prob * b + (1 - prob) * (1 - b);
-            auto loss = ce_loss * torch::pow(1 - p_t, gamma);
-            if (alpha >= 0.0) {
-                const auto alpha_t = alpha * b + (1 - alpha) * (1 - b);
-                loss = alpha_t * loss;
-            }
-            return loss.mean(1).sum();
-        }) / num_boxes;
+torch::Tensor sigmoid_focal_loss(const torch::Tensor& inputs, const torch::Tensor& targets, double num_boxes,
+                                 double alpha, double gamma, bool use_jit_traced_loss_ops) {
+    return run_parametric_traced_or_direct(&TracedLossOpCache::sigmoid_focal, "__torch__.NativeRfDetrSigmoidFocalLoss",
+                                           inputs, targets, alpha, gamma, use_jit_traced_loss_ops,
+                                           [alpha, gamma](const torch::Tensor& a, const torch::Tensor& b) {
+                                               const auto prob = a.sigmoid();
+                                               const auto ce_loss = binary_cross_entropy_with_logits_none(a, b);
+                                               const auto p_t = prob * b + (1 - prob) * (1 - b);
+                                               auto loss = ce_loss * torch::pow(1 - p_t, gamma);
+                                               if (alpha >= 0.0) {
+                                                   const auto alpha_t = alpha * b + (1 - alpha) * (1 - b);
+                                                   loss = alpha_t * loss;
+                                               }
+                                               return loss.mean(1).sum();
+                                           }) /
+           num_boxes;
 }
 
-torch::Tensor sigmoid_varifocal_loss(const torch::Tensor& inputs,
-                                     const torch::Tensor& targets,
-                                     double num_boxes,
-                                     double alpha,
-                                     double gamma,
-                                     bool use_jit_traced_loss_ops) {
+torch::Tensor sigmoid_varifocal_loss(const torch::Tensor& inputs, const torch::Tensor& targets, double num_boxes,
+                                     double alpha, double gamma, bool use_jit_traced_loss_ops) {
     return run_parametric_traced_or_direct(
-        &TracedLossOpCache::sigmoid_varifocal,
-        "__torch__.NativeRfDetrSigmoidVarifocalLoss",
-        inputs, targets, alpha, gamma, use_jit_traced_loss_ops,
-        [alpha, gamma](const torch::Tensor& a, const torch::Tensor& b) {
-            const auto prob = a.sigmoid();
-            const auto focal_weight =
-                b * b.gt(0.0).to(a.dtype()) +
-                (1 - alpha) * torch::pow((prob - b).abs(), gamma) * b.le(0.0).to(a.dtype());
-            const auto ce_loss = binary_cross_entropy_with_logits_none(a, b);
-            return (ce_loss * focal_weight).mean(1).sum();
-        }) / num_boxes;
+               &TracedLossOpCache::sigmoid_varifocal, "__torch__.NativeRfDetrSigmoidVarifocalLoss", inputs, targets,
+               alpha, gamma, use_jit_traced_loss_ops,
+               [alpha, gamma](const torch::Tensor& a, const torch::Tensor& b) {
+                   const auto prob = a.sigmoid();
+                   const auto focal_weight = b * b.gt(0.0).to(a.dtype()) + (1 - alpha) *
+                                                                               torch::pow((prob - b).abs(), gamma) *
+                                                                               b.le(0.0).to(a.dtype());
+                   const auto ce_loss = binary_cross_entropy_with_logits_none(a, b);
+                   return (ce_loss * focal_weight).mean(1).sum();
+               }) /
+           num_boxes;
 }
 
-torch::Tensor position_supervised_loss(const torch::Tensor& inputs,
-                                       const torch::Tensor& targets,
-                                       double num_boxes,
-                                       double alpha,
-                                       double gamma,
-                                       bool use_jit_traced_loss_ops) {
+torch::Tensor position_supervised_loss(const torch::Tensor& inputs, const torch::Tensor& targets, double num_boxes,
+                                       double alpha, double gamma, bool use_jit_traced_loss_ops) {
     return run_parametric_traced_or_direct(
-        &TracedLossOpCache::position_supervised,
-        "__torch__.NativeRfDetrPositionSupervisedLoss",
-        inputs, targets, alpha, gamma, use_jit_traced_loss_ops,
-        [alpha, gamma](const torch::Tensor& a, const torch::Tensor& b) {
-            const auto prob = a.sigmoid();
-            auto loss = binary_cross_entropy_with_logits_none(a, b) *
-                        torch::pow((b - prob).abs(), gamma);
-            if (alpha >= 0.0) {
-                const auto alpha_t = alpha * b.gt(0.0).to(a.dtype()) +
-                                     (1 - alpha) * b.le(0.0).to(a.dtype());
-                loss = alpha_t * loss;
-            }
-            return loss.mean(1).sum();
-        }) / num_boxes;
+               &TracedLossOpCache::position_supervised, "__torch__.NativeRfDetrPositionSupervisedLoss", inputs, targets,
+               alpha, gamma, use_jit_traced_loss_ops,
+               [alpha, gamma](const torch::Tensor& a, const torch::Tensor& b) {
+                   const auto prob = a.sigmoid();
+                   auto loss = binary_cross_entropy_with_logits_none(a, b) * torch::pow((b - prob).abs(), gamma);
+                   if (alpha >= 0.0) {
+                       const auto alpha_t = alpha * b.gt(0.0).to(a.dtype()) + (1 - alpha) * b.le(0.0).to(a.dtype());
+                       loss = alpha_t * loss;
+                   }
+                   return loss.mean(1).sum();
+               }) /
+           num_boxes;
 }
 
-torch::Tensor ia_bce_loss(const torch::Tensor& inputs,
-                          const torch::Tensor& pos_weights,
-                          const torch::Tensor& neg_weights,
-                          double num_boxes,
-                          bool use_jit_traced_loss_ops) {
-    return run_ternary_traced_or_direct(
-        &TracedLossOpCache::ia_bce,
-        "__torch__.NativeRfDetrIaBceLoss",
-        inputs, pos_weights, neg_weights, use_jit_traced_loss_ops,
-        [](const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& c) {
-            return (c * a - F::logsigmoid(a) * (b + c)).sum();
-        }) / num_boxes;
+torch::Tensor ia_bce_loss(const torch::Tensor& inputs, const torch::Tensor& pos_weights,
+                          const torch::Tensor& neg_weights, double num_boxes, bool use_jit_traced_loss_ops) {
+    return run_ternary_traced_or_direct(&TracedLossOpCache::ia_bce, "__torch__.NativeRfDetrIaBceLoss", inputs,
+                                        pos_weights, neg_weights, use_jit_traced_loss_ops,
+                                        [](const torch::Tensor& a, const torch::Tensor& b, const torch::Tensor& c) {
+                                            return (c * a - F::logsigmoid(a) * (b + c)).sum();
+                                        }) /
+           num_boxes;
 }
 
 torch::Tensor accuracy_top1(const torch::Tensor& output, const torch::Tensor& target) {
@@ -919,8 +764,7 @@ torch::Tensor accuracy_top1(const torch::Tensor& output, const torch::Tensor& ta
 }
 
 std::pair<torch::Tensor, torch::Tensor> src_permutation_idx(
-    const std::vector<std::pair<torch::Tensor, torch::Tensor>>& indices,
-    const torch::Device& device) {
+    const std::vector<std::pair<torch::Tensor, torch::Tensor>>& indices, const torch::Device& device) {
     std::vector<torch::Tensor> batch_idx;
     std::vector<torch::Tensor> src_idx;
     batch_idx.reserve(indices.size());
@@ -933,11 +777,8 @@ std::pair<torch::Tensor, torch::Tensor> src_permutation_idx(
         if (device.is_cuda()) {
             MMLTK_PROFILE_ADD("rfdetr.matcher.indices_to_device", src.numel());
         }
-        batch_idx.push_back(torch::full(
-            src.sizes(),
-            static_cast<int64_t>(batch),
-            torch::TensorOptions().dtype(torch::kInt64).device(device)
-        ));
+        batch_idx.push_back(torch::full(src.sizes(), static_cast<int64_t>(batch),
+                                        torch::TensorOptions().dtype(torch::kInt64).device(device)));
         src_idx.push_back(src.to(device, torch::kInt64, false, false));
     }
     if (batch_idx.empty()) {
@@ -947,8 +788,6 @@ std::pair<torch::Tensor, torch::Tensor> src_permutation_idx(
     return {torch::cat(batch_idx), torch::cat(src_idx)};
 }
 
-/// Gather offset-adjusted target indices from per-batch match results into a single CPU tensor.
-/// Returns an empty {0} Int64 tensor when no matches exist.
 torch::Tensor gather_global_target_indices(const PreparedTargets& targets,
                                            const std::vector<std::pair<torch::Tensor, torch::Tensor>>& indices) {
     std::vector<torch::Tensor> global_pieces;
@@ -997,8 +836,7 @@ bool has_target_masks(const PreparedTargets& targets) {
     return targets.packed_masks.has_value() && targets.packed_masks->bits.defined();
 }
 
-torch::Tensor matched_sparse_pred_masks_for_batch(const OutputLayer::SparsePredMasks& sparse,
-                                                  int64_t batch_index,
+torch::Tensor matched_sparse_pred_masks_for_batch(const OutputLayer::SparsePredMasks& sparse, int64_t batch_index,
                                                   const torch::Tensor& query_indices) {
     if (query_indices.dim() != 1) {
         throw std::runtime_error("native RF-DETR sparse mask projection expects 1D query indices");
@@ -1016,15 +854,13 @@ torch::Tensor matched_sparse_pred_masks_for_batch(const OutputLayer::SparsePredM
         batch_query_features = batch_query_features.to(batch_spatial_features.scalar_type());
     }
     const auto bias = sparse.bias.to(batch_spatial_features.dtype());
-    const auto flattened_spatial =
-        batch_spatial_features.flatten(1).contiguous();
+    const auto flattened_spatial = batch_spatial_features.flatten(1).contiguous();
     return torch::matmul(batch_query_features, flattened_spatial)
-        .view({batch_query_features.size(0), batch_spatial_features.size(-2), batch_spatial_features.size(-1)}) +
-        bias;
+               .view({batch_query_features.size(0), batch_spatial_features.size(-2), batch_spatial_features.size(-1)}) +
+           bias;
 }
 
-torch::Tensor matched_pred_masks(const OutputLayer& layer,
-                                 const std::pair<torch::Tensor, torch::Tensor>& idx) {
+torch::Tensor matched_pred_masks(const OutputLayer& layer, const std::pair<torch::Tensor, torch::Tensor>& idx) {
     if (layer.pred_masks.has_value()) {
         const auto device = layer.pred_masks->device();
         return layer.pred_masks->index({
@@ -1056,10 +892,7 @@ torch::Tensor matched_pred_masks(const OutputLayer& layer,
             ++end;
         }
         selected_masks.push_back(
-            matched_sparse_pred_masks_for_batch(
-                sparse,
-                batch_index,
-                query_indices_cpu.narrow(0, begin, end - begin)));
+            matched_sparse_pred_masks_for_batch(sparse, batch_index, query_indices_cpu.narrow(0, begin, end - begin)));
         begin = end;
     }
     if (selected_masks.size() == 1) {
@@ -1091,13 +924,7 @@ std::pair<std::vector<int64_t>, std::vector<int64_t>> solve_linear_assignment(co
     std::vector<int64_t> row_indices(static_cast<size_t>(assignment_size));
     std::vector<int64_t> col_indices(static_cast<size_t>(assignment_size));
     const auto status = mmltk::rfdetr::solve_rectangular_linear_sum_assignment(
-        rows,
-        cols,
-        matrix.data_ptr<double>(),
-        false,
-        row_indices.data(),
-        col_indices.data()
-    );
+        rows, cols, matrix.data_ptr<double>(), false, row_indices.data(), col_indices.data());
     if (status == mmltk::rfdetr::RectangularLsApStatus::kInvalid) {
         throw std::runtime_error("native RF-DETR matcher received invalid numeric entries in the cost matrix");
     }
@@ -1117,8 +944,7 @@ MatchIndices empty_matcher_indices(const PreparedTargets& targets) {
     return empty;
 }
 
-torch::Tensor build_matcher_cost(const OutputLayer& layer,
-                                 const PreparedTargets& targets,
+torch::Tensor build_matcher_cost(const OutputLayer& layer, const PreparedTargets& targets,
                                  const DetectionConfig& config) {
     const auto bs = layer.pred_logits.size(0);
     const auto num_queries = layer.pred_logits.size(1);
@@ -1129,9 +955,7 @@ torch::Tensor build_matcher_cost(const OutputLayer& layer,
         total_targets += count;
     }
     if (total_targets == 0) {
-        return torch::empty(
-            {bs, num_queries, 0},
-            torch::TensorOptions().dtype(torch::kFloat32).device(device));
+        return torch::empty({bs, num_queries, 0}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
     }
 
     const double alpha = 0.25;
@@ -1145,18 +969,14 @@ torch::Tensor build_matcher_cost(const OutputLayer& layer,
     torch::Tensor cost_giou;
     {
         MMLTK_PROFILE_SCOPE("rfdetr.matcher.cost_giou");
-        cost_giou = -generalized_box_iou(
-            box_cxcywh_to_xyxy(out_bbox),
-            box_cxcywh_to_xyxy(tgt_bbox));
+        cost_giou = -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox));
     }
 
     torch::Tensor cost_class;
     {
         MMLTK_PROFILE_SCOPE("rfdetr.matcher.cost_class");
-        const auto neg_cost_class =
-            (1 - alpha) * torch::pow(out_prob, gamma) * (-F::logsigmoid(-flat_pred_logits));
-        const auto pos_cost_class =
-            alpha * torch::pow(1 - out_prob, gamma) * (-F::logsigmoid(flat_pred_logits));
+        const auto neg_cost_class = (1 - alpha) * torch::pow(out_prob, gamma) * (-F::logsigmoid(-flat_pred_logits));
+        const auto pos_cost_class = alpha * torch::pow(1 - out_prob, gamma) * (-F::logsigmoid(flat_pred_logits));
         cost_class = pos_cost_class.index({Slice(), tgt_ids}) - neg_cost_class.index({Slice(), tgt_ids});
     }
 
@@ -1167,9 +987,7 @@ torch::Tensor build_matcher_cost(const OutputLayer& layer,
     }
 
     auto cost =
-        config.set_cost_bbox * cost_bbox +
-        config.set_cost_class * cost_class +
-        config.set_cost_giou * cost_giou;
+        config.set_cost_bbox * cost_bbox + config.set_cost_class * cost_class + config.set_cost_giou * cost_giou;
 
     const bool masks_present = config.include_masks && has_target_masks(targets);
     if (masks_present) {
@@ -1178,28 +996,23 @@ torch::Tensor build_matcher_cost(const OutputLayer& layer,
         torch::Tensor pred_masks_logits;
         if (layer.pred_masks.has_value()) {
             const auto out_masks = layer.pred_masks->flatten(0, 1);
-            const int64_t num_points =
-                out_masks.size(-2) * out_masks.size(-1) / config.mask_point_sample_ratio;
-            point_coords = torch::rand(
-                {1, num_points, 2},
-                torch::TensorOptions().dtype(torch::kFloat32).device(out_masks.device()));
-            pred_masks_logits = matcher_point_sample(
-                                   out_masks.unsqueeze(1),
-                                   point_coords.expand({out_masks.size(0), num_points, 2}),
-                                   torch::kBilinear)
-                                   .squeeze(1);
+            const int64_t num_points = out_masks.size(-2) * out_masks.size(-1) / config.mask_point_sample_ratio;
+            point_coords = torch::rand({1, num_points, 2},
+                                       torch::TensorOptions().dtype(torch::kFloat32).device(out_masks.device()));
+            pred_masks_logits =
+                matcher_point_sample(out_masks.unsqueeze(1), point_coords.expand({out_masks.size(0), num_points, 2}),
+                                     torch::kBilinear)
+                    .squeeze(1);
             MMLTK_PROFILE_SET("rfdetr.matcher.mask_points", static_cast<size_t>(num_points));
         } else if (layer.sparse_pred_masks.has_value()) {
             const auto& sparse = *layer.sparse_pred_masks;
             const int64_t num_points =
-                sparse.spatial_features.size(-2) * sparse.spatial_features.size(-1) /
-                config.mask_point_sample_ratio;
-            point_coords = torch::rand(
-                {1, num_points, 2},
-                torch::TensorOptions().dtype(torch::kFloat32).device(sparse.spatial_features.device()));
+                sparse.spatial_features.size(-2) * sparse.spatial_features.size(-1) / config.mask_point_sample_ratio;
+            point_coords =
+                torch::rand({1, num_points, 2},
+                            torch::TensorOptions().dtype(torch::kFloat32).device(sparse.spatial_features.device()));
             auto sampled_features = matcher_point_sample(
-                sparse.spatial_features,
-                point_coords.expand({sparse.spatial_features.size(0), num_points, 2}),
+                sparse.spatial_features, point_coords.expand({sparse.spatial_features.size(0), num_points, 2}),
                 torch::kBilinear);
             auto query_features = sparse.query_features;
             if (query_features.scalar_type() != sampled_features.scalar_type()) {
@@ -1214,14 +1027,10 @@ torch::Tensor build_matcher_cost(const OutputLayer& layer,
 
         const auto& all_masks = require_target_masks(targets, "native RF-DETR mask matcher");
         const auto mask_indices = torch::arange(
-            all_masks.bits.size(0),
-            torch::TensorOptions().dtype(torch::kInt64).device(all_masks.bits.device()));
-        const auto tgt_masks_flat = sample_target_masks(
-            all_masks,
-            mask_indices,
-            point_coords,
-            "native RF-DETR mask matcher")
-            .to(pred_masks_logits.dtype());
+            all_masks.bits.size(0), torch::TensorOptions().dtype(torch::kInt64).device(all_masks.bits.device()));
+        const auto tgt_masks_flat =
+            sample_target_masks(all_masks, mask_indices, point_coords, "native RF-DETR mask matcher")
+                .to(pred_masks_logits.dtype());
         cost = cost +
                config.mask_ce_loss_coef *
                    batch_sigmoid_ce_loss(pred_masks_logits, tgt_masks_flat, config.use_jit_traced_loss_ops) +
@@ -1233,7 +1042,7 @@ torch::Tensor build_matcher_cost(const OutputLayer& layer,
 }
 
 std::pair<torch::Tensor, torch::Tensor> solve_matcher_indices_for_batch_cpu(const torch::Tensor& batch_cost_cpu,
-                                                                             int64_t group_detr) {
+                                                                            int64_t group_detr) {
     const int64_t num_queries = batch_cost_cpu.size(0);
     const int64_t group_queries = num_queries / group_detr;
     const auto options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
@@ -1257,13 +1066,12 @@ std::pair<torch::Tensor, torch::Tensor> solve_matcher_indices_for_batch_cpu(cons
             batch_cols.insert(batch_cols.end(), cols.begin(), cols.end());
         }
     }
-    return {torch::tensor(batch_rows, options), torch::tensor(batch_cols, options)};
+    return {make_cpu_int64_tensor(batch_rows).to(options), make_cpu_int64_tensor(batch_cols).to(options)};
 }
 
 std::vector<MatchIndices> compute_matcher_indices_for_layers(const std::vector<const OutputLayer*>& layers,
                                                              const PreparedTargets& targets,
-                                                             const DetectionConfig& config,
-                                                             int64_t group_detr) {
+                                                             const DetectionConfig& config, int64_t group_detr) {
     MMLTK_PROFILE_SCOPE("rfdetr.matcher.total");
     torch::NoGradGuard no_grad;
     if (layers.empty()) {
@@ -1313,8 +1121,8 @@ std::vector<MatchIndices> compute_matcher_indices_for_layers(const std::vector<c
     std::vector<MatchIndices> all_indices;
     all_indices.reserve(layers.size());
     for (size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
-        auto layer_cost = build_matcher_cost(*layers[layer_index], targets, config)
-                              .narrow(1, 0, layer_query_counts[layer_index]);
+        auto layer_cost =
+            build_matcher_cost(*layers[layer_index], targets, config).narrow(1, 0, layer_query_counts[layer_index]);
         torch::Tensor layer_cost_cpu;
         {
             MMLTK_PROFILE_SCOPE("rfdetr.matcher.cost_to_cpu");
@@ -1324,21 +1132,14 @@ std::vector<MatchIndices> compute_matcher_indices_for_layers(const std::vector<c
                     continue;
                 }
                 const int64_t target_offset = targets.offsets[batch_index];
-                auto batch_cost = layer_cost.index({static_cast<int64_t>(batch_index)}).narrow(1, target_offset, target_count);
-                enqueue_cost_copy_to_pinned_cpu(
-                    batch_cost,
-                    static_cast<int64_t>(batch_index),
-                    bs,
-                    layer_query_counts[layer_index],
-                    max_targets_per_image,
-                    matcher_cost_scratch());
+                auto batch_cost =
+                    layer_cost.index({static_cast<int64_t>(batch_index)}).narrow(1, target_offset, target_count);
+                enqueue_cost_copy_to_pinned_cpu(batch_cost, static_cast<int64_t>(batch_index), bs,
+                                                layer_query_counts[layer_index], max_targets_per_image,
+                                                matcher_cost_scratch());
             }
-            layer_cost_cpu = wait_for_cost_copies(
-                device,
-                bs,
-                layer_query_counts[layer_index],
-                max_targets_per_image,
-                matcher_cost_scratch());
+            layer_cost_cpu = wait_for_cost_copies(device, bs, layer_query_counts[layer_index], max_targets_per_image,
+                                                  matcher_cost_scratch());
         }
         MatchIndices layer_indices;
         layer_indices.reserve(targets.targets.size());
@@ -1349,7 +1150,8 @@ std::vector<MatchIndices> compute_matcher_indices_for_layers(const std::vector<c
                 layer_indices.emplace_back(torch::empty({0}, options), torch::empty({0}, options));
                 continue;
             }
-            auto batch_cost_cpu = layer_cost_cpu.select(0, static_cast<int64_t>(batch_index)).narrow(1, 0, target_count);
+            auto batch_cost_cpu =
+                layer_cost_cpu.select(0, static_cast<int64_t>(batch_index)).narrow(1, 0, target_count);
             {
                 MMLTK_PROFILE_SCOPE("rfdetr.matcher.sanitize_cost");
                 sanitize_cost_matrix_cpu_(batch_cost_cpu);
@@ -1361,50 +1163,31 @@ std::vector<MatchIndices> compute_matcher_indices_for_layers(const std::vector<c
     return all_indices;
 }
 
-MatchIndices compute_matcher_indices(const OutputLayer& layer,
-                                     const PreparedTargets& targets,
-                                     const DetectionConfig& config,
-                                     int64_t group_detr) {
+MatchIndices compute_matcher_indices(const OutputLayer& layer, const PreparedTargets& targets,
+                                     const DetectionConfig& config, int64_t group_detr) {
     std::vector<const OutputLayer*> layers = {&layer};
     return compute_matcher_indices_for_layers(layers, targets, config, group_detr).front();
 }
 
-/// Compute per-position IoU between matched src/target boxes. Shared by ia_bce,
-/// position_supervised, and varifocal loss branches in loss_labels.
-torch::Tensor matched_pos_ious(const OutputLayer& layer,
-                               const PreparedTargets& targets,
+torch::Tensor matched_pos_ious(const OutputLayer& layer, const PreparedTargets& targets,
                                const std::vector<std::pair<torch::Tensor, torch::Tensor>>& indices,
-                               const std::pair<torch::Tensor, torch::Tensor>& idx,
-                               const torch::Device& device) {
+                               const std::pair<torch::Tensor, torch::Tensor>& idx, const torch::Device& device) {
     const auto src_boxes = layer.pred_boxes.index({idx.first, idx.second});
     const auto target_boxes = concat_target_boxes(targets, indices, device);
-    return aligned_box_iou(
-               box_cxcywh_to_xyxy(src_boxes.detach()),
-               box_cxcywh_to_xyxy(target_boxes))
-               .detach();
+    return aligned_box_iou(box_cxcywh_to_xyxy(src_boxes.detach()), box_cxcywh_to_xyxy(target_boxes)).detach();
 }
 
-/// Build iou-weighted soft class targets. Shared by position_supervised and
-/// varifocal loss branches in loss_labels.
-torch::Tensor iou_weighted_class_targets(const torch::Tensor& src_logits,
-                                         const torch::Tensor& pos_ious,
+torch::Tensor iou_weighted_class_targets(const torch::Tensor& src_logits, const torch::Tensor& pos_ious,
                                          const std::pair<torch::Tensor, torch::Tensor>& idx,
-                                         const torch::Tensor& target_classes_o,
-                                         int64_t num_classes) {
-    auto cls_targets = torch::zeros(
-        {src_logits.size(0), src_logits.size(1), num_classes},
-        src_logits.options()
-    );
+                                         const torch::Tensor& target_classes_o, int64_t num_classes) {
+    auto cls_targets = torch::zeros({src_logits.size(0), src_logits.size(1), num_classes}, src_logits.options());
     cls_targets.index_put_({idx.first, idx.second, target_classes_o}, pos_ious.to(cls_targets.dtype()));
     return cls_targets;
 }
 
-TensorMap loss_labels(const OutputLayer& layer,
-                      const PreparedTargets& targets,
+TensorMap loss_labels(const OutputLayer& layer, const PreparedTargets& targets,
                       const std::vector<std::pair<torch::Tensor, torch::Tensor>>& indices,
-                      const DetectionConfig& config,
-                      double num_boxes,
-                      bool log) {
+                      const DetectionConfig& config, double num_boxes, bool log) {
     MMLTK_PROFILE_SCOPE("rfdetr.criterion.loss_labels");
     TensorMap losses;
     const auto src_logits = layer.pred_logits;
@@ -1420,71 +1203,40 @@ TensorMap loss_labels(const OutputLayer& layer,
         const auto prob = src_logits.sigmoid();
         auto pos_weights = torch::zeros_like(src_logits);
         auto neg_weights = torch::pow(prob, gamma);
-        auto t = torch::pow(prob.index({idx.first, idx.second, target_classes_o}), alpha) *
-                 torch::pow(pos_ious, 1 - alpha);
+        auto t =
+            torch::pow(prob.index({idx.first, idx.second, target_classes_o}), alpha) * torch::pow(pos_ious, 1 - alpha);
         t = torch::clamp(t, 0.01).detach();
         const auto t_cast = t.to(pos_weights.dtype());
         pos_weights.index_put_({idx.first, idx.second, target_classes_o}, t_cast);
         const auto neg_update = (torch::ones_like(t_cast) - t_cast).to(neg_weights.dtype());
-        neg_weights.index_put_(
-            {idx.first, idx.second, target_classes_o},
-            neg_update
-        );
-        loss_ce = ia_bce_loss(
-            src_logits,
-            pos_weights,
-            neg_weights,
-            num_boxes,
-            config.use_jit_traced_loss_ops);
+        neg_weights.index_put_({idx.first, idx.second, target_classes_o}, neg_update);
+        loss_ce = ia_bce_loss(src_logits, pos_weights, neg_weights, num_boxes, config.use_jit_traced_loss_ops);
     } else if (config.use_position_supervised_loss) {
         const auto pos_ious = matched_pos_ious(layer, targets, indices, idx, device);
-        auto cls_targets = iou_weighted_class_targets(
-            src_logits, pos_ious, idx, target_classes_o, config.num_classes);
+        auto cls_targets = iou_weighted_class_targets(src_logits, pos_ious, idx, target_classes_o, config.num_classes);
         cls_targets = cls_targets / (cls_targets.view({cls_targets.size(0), -1, 1}).amax(1, true) + 1e-8f);
-        loss_ce = position_supervised_loss(
-                      src_logits,
-                      cls_targets,
-                      num_boxes,
-                      config.focal_alpha,
-                      2.0,
-                      config.use_jit_traced_loss_ops) *
+        loss_ce = position_supervised_loss(src_logits, cls_targets, num_boxes, config.focal_alpha, 2.0,
+                                           config.use_jit_traced_loss_ops) *
                   src_logits.size(1);
     } else if (config.use_varifocal_loss) {
         const auto pos_ious = matched_pos_ious(layer, targets, indices, idx, device);
-        const auto cls_targets = iou_weighted_class_targets(
-            src_logits, pos_ious, idx, target_classes_o, config.num_classes);
-        loss_ce = sigmoid_varifocal_loss(
-                      src_logits,
-                      cls_targets,
-                      num_boxes,
-                      config.focal_alpha,
-                      2.0,
-                      config.use_jit_traced_loss_ops) *
+        const auto cls_targets =
+            iou_weighted_class_targets(src_logits, pos_ious, idx, target_classes_o, config.num_classes);
+        loss_ce = sigmoid_varifocal_loss(src_logits, cls_targets, num_boxes, config.focal_alpha, 2.0,
+                                         config.use_jit_traced_loss_ops) *
                   src_logits.size(1);
     } else {
-        auto target_classes = torch::full(
-            {src_logits.size(0), src_logits.size(1)},
-            config.num_classes,
-            torch::TensorOptions().dtype(torch::kInt64).device(device)
-        );
+        auto target_classes = torch::full({src_logits.size(0), src_logits.size(1)}, config.num_classes,
+                                          torch::TensorOptions().dtype(torch::kInt64).device(device));
         target_classes.index_put_({idx.first, idx.second}, target_classes_o);
-        auto target_classes_onehot = torch::zeros(
-            {src_logits.size(0), src_logits.size(1), src_logits.size(2) + 1},
-            src_logits.options()
-        );
+        auto target_classes_onehot =
+            torch::zeros({src_logits.size(0), src_logits.size(1), src_logits.size(2) + 1}, src_logits.options());
         target_classes_onehot.scatter_(
-            2,
-            target_classes.unsqueeze(-1),
-            torch::ones(target_classes.unsqueeze(-1).sizes(), target_classes_onehot.options())
-        );
+            2, target_classes.unsqueeze(-1),
+            torch::ones(target_classes.unsqueeze(-1).sizes(), target_classes_onehot.options()));
         target_classes_onehot = target_classes_onehot.index({Slice(), Slice(), Slice(None, -1)});
-        loss_ce = sigmoid_focal_loss(
-                      src_logits,
-                      target_classes_onehot,
-                      num_boxes,
-                      config.focal_alpha,
-                      2.0,
-                      config.use_jit_traced_loss_ops) *
+        loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, config.focal_alpha, 2.0,
+                                     config.use_jit_traced_loss_ops) *
                   src_logits.size(1);
     }
 
@@ -1496,38 +1248,27 @@ TensorMap loss_labels(const OutputLayer& layer,
     return losses;
 }
 
-TensorMap loss_cardinality(const OutputLayer& layer,
-                           const PreparedTargets& targets) {
+TensorMap loss_cardinality(const OutputLayer& layer, const PreparedTargets& targets) {
     MMLTK_PROFILE_SCOPE("rfdetr.criterion.loss_cardinality");
     TensorMap losses;
     const auto pred_logits = layer.pred_logits;
-    const auto target_lengths = torch::tensor(
-        targets.counts,
-        torch::TensorOptions().dtype(torch::kInt64).device(pred_logits.device())
-    );
+    const auto target_lengths =
+        make_cpu_int64_tensor(targets.counts).to(pred_logits.device(), torch::kInt64, false, false);
     const auto card_pred = pred_logits.argmax(-1).ne(pred_logits.size(-1) - 1).sum(1);
-    losses["cardinality_error"] = F::l1_loss(
-        card_pred.to(torch::kFloat32),
-        target_lengths.to(torch::kFloat32)
-    );
+    losses["cardinality_error"] = F::l1_loss(card_pred.to(torch::kFloat32), target_lengths.to(torch::kFloat32));
     return losses;
 }
 
-TensorMap loss_boxes(const OutputLayer& layer,
-                     const PreparedTargets& targets,
-                     const std::vector<std::pair<torch::Tensor, torch::Tensor>>& indices,
-                     double num_boxes) {
+TensorMap loss_boxes(const OutputLayer& layer, const PreparedTargets& targets,
+                     const std::vector<std::pair<torch::Tensor, torch::Tensor>>& indices, double num_boxes) {
     MMLTK_PROFILE_SCOPE("rfdetr.criterion.loss_boxes");
     TensorMap losses;
     const auto device = layer.pred_boxes.device();
     const auto idx = src_permutation_idx(indices, device);
     const auto src_boxes = layer.pred_boxes.index({idx.first, idx.second});
     const auto target_boxes = concat_target_boxes(targets, indices, device);
-    const auto loss_bbox = F::l1_loss(
-        src_boxes,
-        target_boxes,
-        torch::nn::functional::L1LossFuncOptions().reduction(torch::kNone)
-    );
+    const auto loss_bbox =
+        F::l1_loss(src_boxes, target_boxes, torch::nn::functional::L1LossFuncOptions().reduction(torch::kNone));
     losses["loss_bbox"] = loss_bbox.sum() / num_boxes;
     const auto loss_giou =
         1 - aligned_generalized_box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes));
@@ -1535,10 +1276,8 @@ TensorMap loss_boxes(const OutputLayer& layer,
     return losses;
 }
 
-TensorMap loss_masks(const OutputLayer& layer,
-                     const PreparedTargets& targets,
-                     const std::vector<std::pair<torch::Tensor, torch::Tensor>>& indices,
-                     const DetectionConfig& config,
+TensorMap loss_masks(const OutputLayer& layer, const PreparedTargets& targets,
+                     const std::vector<std::pair<torch::Tensor, torch::Tensor>>& indices, const DetectionConfig& config,
                      double num_boxes) {
     MMLTK_PROFILE_SCOPE("rfdetr.criterion.loss_masks");
     TensorMap losses;
@@ -1560,9 +1299,8 @@ TensorMap loss_masks(const OutputLayer& layer,
 
     src_masks = src_masks.unsqueeze(1);
 
-    const int64_t num_points = std::max<int64_t>(
-        src_masks.size(-2),
-        src_masks.size(-2) * src_masks.size(-1) / config.mask_point_sample_ratio);
+    const int64_t num_points =
+        std::max<int64_t>(src_masks.size(-2), src_masks.size(-2) * src_masks.size(-1) / config.mask_point_sample_ratio);
     MMLTK_PROFILE_ADD("rfdetr.criterion.matched_pairs", idx.first.size(0));
     MMLTK_PROFILE_SET("rfdetr.criterion.mask_points", static_cast<size_t>(num_points));
 
@@ -1576,26 +1314,14 @@ TensorMap loss_masks(const OutputLayer& layer,
     {
         torch::NoGradGuard no_grad;
         const auto& all_masks = require_target_masks(targets, "native RF-DETR mask loss");
-        const auto global_indices = concat_global_target_indices(targets, indices)
-                                        .to(all_masks.bits.device(), torch::kInt64, false, false);
-        point_labels = sample_target_masks(
-                           all_masks,
-                           global_indices,
-                           point_coords,
-                           "native RF-DETR mask loss")
+        const auto global_indices =
+            concat_global_target_indices(targets, indices).to(all_masks.bits.device(), torch::kInt64, false, false);
+        point_labels = sample_target_masks(all_masks, global_indices, point_coords, "native RF-DETR mask loss")
                            .to(point_logits.dtype());
     }
 
-    losses["loss_mask_ce"] = sigmoid_ce_loss(
-        point_logits,
-        point_labels,
-        num_boxes,
-        config.use_jit_traced_loss_ops);
-    losses["loss_mask_dice"] = dice_loss(
-        point_logits,
-        point_labels,
-        num_boxes,
-        config.use_jit_traced_loss_ops);
+    losses["loss_mask_ce"] = sigmoid_ce_loss(point_logits, point_labels, num_boxes, config.use_jit_traced_loss_ops);
+    losses["loss_mask_dice"] = dice_loss(point_logits, point_labels, num_boxes, config.use_jit_traced_loss_ops);
     return losses;
 }
 
@@ -1605,7 +1331,7 @@ void update_losses(TensorMap& destination, TensorMap source, const std::string& 
     }
 }
 
-} // namespace
+}  // namespace
 
 void populate_default_detection_weight_dict(DetectionConfig& config) {
     config.weight_dict.clear();
@@ -1641,11 +1367,8 @@ std::vector<std::pair<torch::Tensor, torch::Tensor>> matcher_indices(const Model
     return compute_matcher_indices(outputs.main, targets, config, training_mode ? config.group_detr : 1);
 }
 
-TensorMap detection_loss_dict(const ModelOutputs& outputs,
-                              const PreparedTargets& targets,
-                              const DetectionConfig& config,
-                              bool training_mode,
-                              bool distributed_enabled,
+TensorMap detection_loss_dict(const ModelOutputs& outputs, const PreparedTargets& targets,
+                              const DetectionConfig& config, bool training_mode, bool distributed_enabled,
                               const AllReduceTensorFn& distributed_all_reduce) {
     MMLTK_PROFILE_SCOPE("rfdetr.criterion.total");
     const int64_t group_detr = training_mode ? config.group_detr : 1;
@@ -1659,30 +1382,23 @@ TensorMap detection_loss_dict(const ModelOutputs& outputs,
 
     MMLTK_PROFILE_ADD("rfdetr.criterion.num_boxes", num_boxes_int);
     double num_boxes_value = std::max(
-        static_cast<double>(num_boxes_int) / static_cast<double>(std::max<int64_t>(1, config.world_size)),
-        1.0
-    );
+        static_cast<double>(num_boxes_int) / static_cast<double>(std::max<int64_t>(1, config.world_size)), 1.0);
     if (distributed_enabled) {
         MMLTK_PROFILE_SCOPE("rfdetr.criterion.distributed_num_boxes");
-        auto num_boxes = torch::tensor(
-            {static_cast<float>(num_boxes_int)},
-            torch::TensorOptions().dtype(torch::kFloat32).device(outputs.main.pred_logits.device())
-        );
+        auto num_boxes =
+            torch::empty({1}, torch::TensorOptions().dtype(torch::kFloat32).device(outputs.main.pred_logits.device()));
+        num_boxes.fill_(static_cast<float>(num_boxes_int));
         if (distributed_all_reduce) {
             distributed_all_reduce(num_boxes);
         }
-        num_boxes_value =
-            torch::clamp_min(num_boxes / std::max<int64_t>(1, config.world_size), 1.0).item<double>();
+        num_boxes_value = torch::clamp_min(num_boxes / std::max<int64_t>(1, config.world_size), 1.0).item<double>();
     }
 
     return detection_loss_dict(outputs, targets, config, training_mode, num_boxes_value);
 }
 
-TensorMap detection_loss_dict(const ModelOutputs& outputs,
-                              const PreparedTargets& targets,
-                              const DetectionConfig& config,
-                              bool training_mode,
-                              double num_boxes_value) {
+TensorMap detection_loss_dict(const ModelOutputs& outputs, const PreparedTargets& targets,
+                              const DetectionConfig& config, bool training_mode, double num_boxes_value) {
     MMLTK_PROFILE_SCOPE("rfdetr.criterion.total_resolved_num_boxes");
     const int64_t group_detr = training_mode ? config.group_detr : 1;
     std::vector<const OutputLayer*> matcher_layers;
@@ -1713,24 +1429,15 @@ TensorMap detection_loss_dict(const ModelOutputs& outputs,
             update_losses(
                 losses,
                 loss_labels(outputs.aux_outputs[aux_index], targets, aux_indices, config, num_boxes_value, false),
-                "_" + std::to_string(aux_index)
-            );
-            update_losses(
-                losses,
-                loss_cardinality(outputs.aux_outputs[aux_index], targets),
-                "_" + std::to_string(aux_index)
-            );
-            update_losses(
-                losses,
-                loss_boxes(outputs.aux_outputs[aux_index], targets, aux_indices, num_boxes_value),
-                "_" + std::to_string(aux_index)
-            );
+                "_" + std::to_string(aux_index));
+            update_losses(losses, loss_cardinality(outputs.aux_outputs[aux_index], targets),
+                          "_" + std::to_string(aux_index));
+            update_losses(losses, loss_boxes(outputs.aux_outputs[aux_index], targets, aux_indices, num_boxes_value),
+                          "_" + std::to_string(aux_index));
             if (config.include_masks) {
-                update_losses(
-                    losses,
-                    loss_masks(outputs.aux_outputs[aux_index], targets, aux_indices, config, num_boxes_value),
-                    "_" + std::to_string(aux_index)
-                );
+                update_losses(losses,
+                              loss_masks(outputs.aux_outputs[aux_index], targets, aux_indices, config, num_boxes_value),
+                              "_" + std::to_string(aux_index));
             }
         }
     }
@@ -1738,19 +1445,20 @@ TensorMap detection_loss_dict(const ModelOutputs& outputs,
     if (outputs.enc_outputs.has_value()) {
         MMLTK_PROFILE_SCOPE("rfdetr.criterion.encoder");
         const auto& enc_indices = matcher_indices_all[matcher_layer_index++];
-        update_losses(losses, loss_labels(*outputs.enc_outputs, targets, enc_indices, config, num_boxes_value, false), "_enc");
+        update_losses(losses, loss_labels(*outputs.enc_outputs, targets, enc_indices, config, num_boxes_value, false),
+                      "_enc");
         update_losses(losses, loss_cardinality(*outputs.enc_outputs, targets), "_enc");
         update_losses(losses, loss_boxes(*outputs.enc_outputs, targets, enc_indices, num_boxes_value), "_enc");
         if (config.include_masks) {
-            update_losses(losses, loss_masks(*outputs.enc_outputs, targets, enc_indices, config, num_boxes_value), "_enc");
+            update_losses(losses, loss_masks(*outputs.enc_outputs, targets, enc_indices, config, num_boxes_value),
+                          "_enc");
         }
     }
 
     return losses;
 }
 
-torch::Tensor weighted_detection_loss(const TensorMap& loss_dict,
-                                      const DetectionConfig& config,
+torch::Tensor weighted_detection_loss(const TensorMap& loss_dict, const DetectionConfig& config,
                                       const torch::Device& device) {
     MMLTK_PROFILE_SCOPE("rfdetr.criterion.weighted_total");
     auto total = torch::zeros({}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
@@ -1773,8 +1481,7 @@ torch::Tensor weighted_detection_loss(const TensorMap& loss_dict,
     return total;
 }
 
-std::vector<TensorMap> postprocess_outputs(const ModelOutputs& outputs,
-                                           const torch::Tensor& target_sizes,
+std::vector<TensorMap> postprocess_outputs(const ModelOutputs& outputs, const torch::Tensor& target_sizes,
                                            int64_t num_select) {
     OutputTensors tensors{
         outputs.main.pred_logits,
@@ -1784,8 +1491,7 @@ std::vector<TensorMap> postprocess_outputs(const ModelOutputs& outputs,
     return mmltk::rfdetr::postprocess_outputs(tensors, target_sizes, num_select);
 }
 
-ScopedWorkerPool::ScopedWorkerPool(mmltk::WorkerPool* pool)
-    : previous_(g_worker_pool) {
+ScopedWorkerPool::ScopedWorkerPool(mmltk::WorkerPool* pool) : previous_(g_worker_pool) {
     g_worker_pool = pool;
 }
 
@@ -1793,4 +1499,4 @@ ScopedWorkerPool::~ScopedWorkerPool() {
     g_worker_pool = previous_;
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

@@ -123,25 +123,20 @@ ValidationOptions to_validate_options(const ValidateRequest& request) {
 }
 
 void validate_train_request(const TrainRequest& request) {
-    if (request.train_compiled_path.empty() ||
-        request.val_compiled_path.empty() ||
-        request.output_dir.empty()) {
+    if (request.train_compiled_path.empty() || request.val_compiled_path.empty() || request.output_dir.empty()) {
         throw std::runtime_error("rfdetr train requires --train-compiled, --val-compiled, and --output-dir");
     }
-    const std::size_t selected_input_count =
-        static_cast<std::size_t>(!request.weights_path.empty()) +
-        static_cast<std::size_t>(!request.resume_path.empty());
+    const std::size_t selected_input_count = static_cast<std::size_t>(!request.weights_path.empty()) +
+                                             static_cast<std::size_t>(!request.resume_path.empty());
     if (selected_input_count != 1U) {
         throw std::runtime_error("rfdetr train requires exactly one of --weights or --resume");
     }
     if (request.distributed_worker) {
-        if (request.distributed_rank < 0 ||
-            request.distributed_world_size <= 1 ||
+        if (request.distributed_rank < 0 || request.distributed_world_size <= 1 ||
             request.distributed_store_path.empty()) {
             throw std::runtime_error("invalid internal RF-DETR distributed worker arguments");
         }
-    } else if (request.distributed_world_size != 1 ||
-               request.distributed_rank != 0 ||
+    } else if (request.distributed_world_size != 1 || request.distributed_rank != 0 ||
                !request.distributed_store_path.empty()) {
         throw std::runtime_error("internal RF-DETR distributed worker options require --dist-worker");
     }
@@ -197,7 +192,7 @@ TrainOptions to_train_options(const TrainRequest& request) {
 }
 
 TrainRequest train_request_from_options(const TrainOptions& options,
-                                       const TrainRecipeFieldOverrides& recipe_overrides) {
+                                        const TrainRecipeFieldOverrides& recipe_overrides) {
     TrainRequest request;
     request.train_compiled_path = options.train_compiled_path;
     request.val_compiled_path = options.val_compiled_path;
@@ -263,15 +258,11 @@ void finalize_train_request(TrainRequest& request, std::string_view fallback_pre
         recipe_preset_name = std::string(fallback_preset_name);
     }
     if (recipe_preset_name.empty()) {
-        throw std::runtime_error(
-            "unable to infer an RF-DETR train recipe preset from the checkpoint path");
+        throw std::runtime_error("unable to infer an RF-DETR train recipe preset from the checkpoint path");
     }
 
     TrainOptions options = to_train_options(request);
-    apply_train_recipe(
-        options,
-        resolve_train_recipe(recipe_preset_name, options.optimizer),
-        request.recipe_overrides);
+    apply_train_recipe(options, resolve_train_recipe(recipe_preset_name, options.optimizer), request.recipe_overrides);
     if (options.lr_scheduler != "step" && options.lr_scheduler != "cosine") {
         throw std::runtime_error("rfdetr train --lr-scheduler must be 'step' or 'cosine'");
     }
@@ -279,4 +270,4 @@ void finalize_train_request(TrainRequest& request, std::string_view fallback_pre
     validate_train_request(request);
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

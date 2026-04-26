@@ -12,30 +12,29 @@
 
 namespace Catch {
 
-    struct Counts {
-        Counts operator - ( Counts const& other ) const;
-        Counts& operator += ( Counts const& other );
+struct Counts {
+    Counts operator-(Counts const& other) const;
+    Counts& operator+=(Counts const& other);
 
-        std::uint64_t total() const;
-        bool allPassed() const;
-        bool allOk() const;
+    std::uint64_t total() const;
+    bool allPassed() const;
+    bool allOk() const;
 
-        std::uint64_t passed = 0;
-        std::uint64_t failed = 0;
-        std::uint64_t failedButOk = 0;
-        std::uint64_t skipped = 0;
-    };
+    std::uint64_t passed = 0;
+    std::uint64_t failed = 0;
+    std::uint64_t failedButOk = 0;
+    std::uint64_t skipped = 0;
+};
 
-    struct Totals {
+struct Totals {
+    Totals operator-(Totals const& other) const;
+    Totals& operator+=(Totals const& other);
 
-        Totals operator - ( Totals const& other ) const;
-        Totals& operator += ( Totals const& other );
+    Totals delta(Totals const& prevTotals) const;
 
-        Totals delta( Totals const& prevTotals ) const;
+    Counts assertions;
+    Counts testCases;
+};
+}  // namespace Catch
 
-        Counts assertions;
-        Counts testCases;
-    };
-}
-
-#endif // CATCH_TOTALS_HPP_INCLUDED
+#endif  // CATCH_TOTALS_HPP_INCLUDED

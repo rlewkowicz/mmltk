@@ -34,24 +34,17 @@ inline int checked_prefetch_factor(size_t value) {
     return static_cast<int>(value);
 }
 
-inline torch::Tensor normalize_batch(const Batch& batch,
-                                     int device_id,
-                                     int64_t image_height,
-                                     int64_t image_width,
-                                     const torch::Tensor& mean,
-                                     const torch::Tensor& std) {
-    return (torch::from_blob(
-                const_cast<float*>(batch.device_images),
-                {static_cast<int64_t>(batch.num_images), 3, image_height, image_width},
-                torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, device_id)) -
+inline torch::Tensor normalize_batch(const Batch& batch, int device_id, int64_t image_height, int64_t image_width,
+                                     const torch::Tensor& mean, const torch::Tensor& std) {
+    return (torch::from_blob(const_cast<float*>(batch.device_images),
+                             {static_cast<int64_t>(batch.num_images), 3, image_height, image_width},
+                             torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA, device_id)) -
             mean) /
            std;
 }
 
-inline DatasetLoader::Config make_inference_loader_config(const std::string& compiled_path,
-                                                          size_t batch_size,
-                                                          const std::string& cpu_affinity,
-                                                          int device_id,
+inline DatasetLoader::Config make_inference_loader_config(const std::string& compiled_path, size_t batch_size,
+                                                          const std::string& cpu_affinity, int device_id,
                                                           int prefetch_factor) {
     DatasetLoader::Config config;
     config.compiled_path = std::filesystem::absolute(std::filesystem::path(compiled_path)).string();
@@ -66,20 +59,14 @@ inline DatasetLoader::Config make_inference_loader_config(const std::string& com
     return config;
 }
 
-inline DatasetLoader::Config make_loader_config(const ValidationOptions& options,
-                                                const RuntimeContext& runtime) {
-    return make_inference_loader_config(
-        options.compiled_path.string(),
-        1,
-        runtime.loader_affinity_string(),
-        options.device_id,
-        checked_prefetch_factor(options.prefetch_factor));
+inline DatasetLoader::Config make_loader_config(const ValidationOptions& options, const RuntimeContext& runtime) {
+    return make_inference_loader_config(options.compiled_path.string(), 1, runtime.loader_affinity_string(),
+                                        options.device_id, checked_prefetch_factor(options.prefetch_factor));
 }
 
 inline c10::cuda::CUDAStream backend_cuda_stream(const InferenceBackend& backend, int device_id) {
-    return c10::cuda::getStreamFromExternal(
-        reinterpret_cast<cudaStream_t>(backend.stream()),
-        checked_device_index(device_id));
+    return c10::cuda::getStreamFromExternal(reinterpret_cast<cudaStream_t>(backend.stream()),
+                                            checked_device_index(device_id));
 }
 
 inline PhaseTiming elapsed_timing(const std::chrono::steady_clock::time_point& start, size_t images) {
@@ -93,12 +80,8 @@ inline PhaseTiming elapsed_timing(const std::chrono::steady_clock::time_point& s
 
 inline nlohmann::json summary_to_json(const EvalSummary& summary) {
     return nlohmann::json{
-        {"bbox_ap", summary.bbox.ap},
-        {"bbox_ap50", summary.bbox.ap50},
-        {"bbox_ap75", summary.bbox.ap75},
-        {"mask_ap", summary.mask.ap},
-        {"mask_ap50", summary.mask.ap50},
-        {"mask_ap75", summary.mask.ap75},
+        {"bbox_ap", summary.bbox.ap}, {"bbox_ap50", summary.bbox.ap50}, {"bbox_ap75", summary.bbox.ap75},
+        {"mask_ap", summary.mask.ap}, {"mask_ap50", summary.mask.ap50}, {"mask_ap75", summary.mask.ap75},
     };
 }
 
@@ -110,8 +93,7 @@ inline nlohmann::json timing_to_json(const PhaseTiming& timing) {
     };
 }
 
-inline std::string format_validation_summary_line(const std::string& backend_name,
-                                                  const EvalSummary& summary) {
+inline std::string format_validation_summary_line(const std::string& backend_name, const EvalSummary& summary) {
     std::ostringstream line;
     line.setf(std::ios::fixed);
     line.precision(4);
@@ -124,25 +106,18 @@ inline std::string format_validation_delta_summary_line(const ValidationDeltaSum
     std::ostringstream line;
     line.setf(std::ios::fixed);
     line.precision(4);
-    line << "delta(tensorrt-onnx): bbox_ap=" << delta.bbox_ap
-         << " bbox_ap50=" << delta.bbox_ap50
-         << " mask_ap=" << delta.mask_ap
-         << " mask_ap50=" << delta.mask_ap50;
+    line << "delta(tensorrt-onnx): bbox_ap=" << delta.bbox_ap << " bbox_ap50=" << delta.bbox_ap50
+         << " mask_ap=" << delta.mask_ap << " mask_ap50=" << delta.mask_ap50;
     return line.str();
 }
 
-} // namespace validate_detail
+}  // namespace validate_detail
 
-// Parallel validation implementation (defined in validate_workers.cpp).
-ValidationBackendResult run_backend_eval_parallel_impl(
-    const ValidationOptions& options,
-    const CocoDataset& dataset,
-    const InferenceBackend& backend,
-    const torch::Tensor& mean,
-    const torch::Tensor& std);
+ValidationBackendResult run_backend_eval_parallel_impl(const ValidationOptions& options, const CocoDataset& dataset,
+                                                       const InferenceBackend& backend, const torch::Tensor& mean,
+                                                       const torch::Tensor& std);
 
-ValidationBackendResult run_validation_backend(const ValidationOptions& options,
-                                               const CocoDataset& source_dataset,
+ValidationBackendResult run_validation_backend(const ValidationOptions& options, const CocoDataset& source_dataset,
                                                InferenceBackend& backend);
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

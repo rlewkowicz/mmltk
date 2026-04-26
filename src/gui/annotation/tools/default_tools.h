@@ -9,4 +9,4 @@ namespace mmltk::gui {
 std::unique_ptr<AnnotationTool> make_annotation_tool(AnnotationToolKind kind);
 void register_default_annotation_tools(AnnotationToolManager& manager);
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

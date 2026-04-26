@@ -78,8 +78,8 @@ struct AnnotationSkeletonShape {
     std::vector<AnnotationSkeletonEdge> edges;
 };
 
-using AnnotationShapeVariant =
-    std::variant<AnnotationBoxShape, AnnotationMaskShape, AnnotationSplineShape, AnnotationPointShape, AnnotationSkeletonShape>;
+using AnnotationShapeVariant = std::variant<AnnotationBoxShape, AnnotationMaskShape, AnnotationSplineShape,
+                                            AnnotationPointShape, AnnotationSkeletonShape>;
 
 struct AnnotationObject {
     std::string object_id;
@@ -112,22 +112,18 @@ const char* annotation_object_shape_label(const AnnotationObject& object);
 std::optional<AnnotationBox> annotation_object_bbox(const AnnotationObject& object);
 std::optional<AnnotationBox> annotation_object_display_box(const AnnotationObject& object);
 std::vector<AnnotationPoint> annotation_object_points(const AnnotationObject& object);
+AnnotationMaskRegion mask_region_from_box(const AnnotationBox& box);
+AnnotationBox box_from_mask_region(const AnnotationMaskRegion& region);
 const AnnotationMaskShape* annotation_object_mask_shape(const AnnotationObject& object);
 AnnotationMaskShape* annotation_object_mask_shape(AnnotationObject* object);
 bool annotation_object_supports_mask_editing(const AnnotationObject& object);
-bool translate_annotation_object(AnnotationObject* object,
-                                 int dx,
-                                 int dy,
-                                 std::uint32_t capture_width,
+bool translate_annotation_object(AnnotationObject* object, int dx, int dy, std::uint32_t capture_width,
                                  std::uint32_t capture_height);
-bool resize_annotation_object_to_box(AnnotationObject* object,
-                                     const AnnotationBox& box,
-                                     std::uint32_t capture_width,
+bool resize_annotation_object_to_box(AnnotationObject* object, const AnnotationBox& box, std::uint32_t capture_width,
                                      std::uint32_t capture_height);
 std::optional<AnnotationPoint> annotation_spline_segment_point(const AnnotationSplineShape& spline,
-                                                               std::size_t segment_index,
-                                                               float t);
+                                                               std::size_t segment_index, float t);
 std::vector<AnnotationPoint> sample_annotation_spline_points(const AnnotationSplineShape& spline,
                                                              int samples_per_segment = 32);
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

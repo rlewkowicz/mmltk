@@ -12,29 +12,28 @@
 
 namespace Catch {
 
-    class ITransientExpression;
+class ITransientExpression;
 
-    class LazyExpression {
-        friend class AssertionHandler;
-        friend struct AssertionStats;
-        friend class RunContext;
+class LazyExpression {
+    friend class AssertionHandler;
+    friend struct AssertionStats;
+    friend class RunContext;
 
-        ITransientExpression const* m_transientExpression = nullptr;
-        bool m_isNegated;
-    public:
-        constexpr LazyExpression( bool isNegated ):
-            m_isNegated(isNegated)
-        {}
-        constexpr LazyExpression(LazyExpression const& other) = default;
-        LazyExpression& operator = ( LazyExpression const& ) = delete;
+    ITransientExpression const* m_transientExpression = nullptr;
+    bool m_isNegated;
 
-        constexpr explicit operator bool() const {
-            return m_transientExpression != nullptr;
-        }
+   public:
+    constexpr LazyExpression(bool isNegated) : m_isNegated(isNegated) {}
+    constexpr LazyExpression(LazyExpression const& other) = default;
+    LazyExpression& operator=(LazyExpression const&) = delete;
 
-        friend auto operator << ( std::ostream& os, LazyExpression const& lazyExpr ) -> std::ostream&;
-    };
+    constexpr explicit operator bool() const {
+        return m_transientExpression != nullptr;
+    }
 
-} // namespace Catch
+    friend auto operator<<(std::ostream& os, LazyExpression const& lazyExpr) -> std::ostream&;
+};
 
-#endif // CATCH_LAZY_EXPR_HPP_INCLUDED
+}  // namespace Catch
+
+#endif  // CATCH_LAZY_EXPR_HPP_INCLUDED

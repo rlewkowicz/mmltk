@@ -18,32 +18,44 @@ enum class ValidationLogMode : std::uint8_t {
     Interactive,
 };
 
-struct ValidationOptions {
-    std::filesystem::path compiled_path;
-    std::filesystem::path source_dir;
-    std::filesystem::path onnx_path;
-    std::filesystem::path tensorrt_path;
-    std::filesystem::path save_engine_path;
-    std::filesystem::path report_json_path;
-    std::string split;
-    std::string eval_order = "onnx,tensorrt";
-    uint32_t resolution = 432;
-    size_t limit_images = 0;
-    size_t alignment_images = 16;
-    size_t eval_max_dets = 500;
-    size_t batch_size = 1;
-    size_t prefetch_factor = 2;
+struct ValidationSharedConfig {
+    std::string cpu_affinity;
     int device_id = 0;
     int workers = 0;
-    int compile_workers = -1;
-    int compile_cuda_mask_batch_size = 0;
-    int compile_cuda_device_id = 0;
-    std::string cpu_affinity;
     bool recompile = false;
     bool profile = false;
     bool allow_fp16 = true;
     bool write_report_json = true;
+};
+
+template <typename PathType, typename ResolutionType, typename CountType>
+struct ValidationDatasetConfig {
+    PathType compiled_path;
+    PathType source_dir;
+    PathType onnx_path;
+    PathType tensorrt_path;
+    PathType save_engine_path;
+    std::string eval_order = "onnx,tensorrt";
+    ResolutionType resolution = static_cast<ResolutionType>(432);
+    CountType limit_images = static_cast<CountType>(0);
+    CountType alignment_images = static_cast<CountType>(16);
+    CountType eval_max_dets = static_cast<CountType>(500);
+    CountType batch_size = static_cast<CountType>(1);
+    CountType prefetch_factor = static_cast<CountType>(2);
+};
+
+struct ValidationCompileConfig {
+    int compile_workers = -1;
+    int compile_cuda_mask_batch_size = 0;
+    int compile_cuda_device_id = 0;
     ValidationLogMode log_mode = ValidationLogMode::Interactive;
+};
+
+using ValidationOptionsDatasetConfig = ValidationDatasetConfig<std::filesystem::path, std::uint32_t, std::size_t>;
+
+struct ValidationOptions : ValidationSharedConfig, ValidationOptionsDatasetConfig, ValidationCompileConfig {
+    std::filesystem::path report_json_path;
+    std::string split;
 };
 
 struct PhaseTiming {
@@ -80,4 +92,4 @@ void write_validation_report(const ValidationOptions& options, const ValidationR
 void print_model_metadata(const ModelInfo& info, size_t images, size_t categories, ValidationLogMode log_mode);
 void print_validation_run_summary(const ValidationOptions& options, const ValidationRunResult& result);
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

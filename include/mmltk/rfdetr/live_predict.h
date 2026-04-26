@@ -42,4 +42,4 @@ struct LivePredictOptions : ModelArtifactRequest {
 bool live_capture_supported();
 std::unique_ptr<mmltk::live::FrameAnalyzer> make_live_rfdetr_frame_analyzer(const LivePredictOptions& options);
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

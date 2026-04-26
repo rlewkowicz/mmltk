@@ -1,5 +1,7 @@
 #include "gui/train_process_runtime.h"
 
+#include "mmltk/rfdetr/workflow_requests.h"
+
 #include "support/catch2_compat.hpp"
 #include "support/filesystem_test_utils.hpp"
 
@@ -19,8 +21,7 @@ namespace {
 namespace fs = std::filesystem;
 
 fs::path make_temp_root(const char* pattern_name) {
-    std::string temp_pattern =
-        (fs::temp_directory_path() / (std::string(pattern_name) + ".XXXXXX")).string();
+    std::string temp_pattern = (fs::temp_directory_path() / (std::string(pattern_name) + ".XXXXXX")).string();
     std::vector<char> temp_buffer(temp_pattern.begin(), temp_pattern.end());
     temp_buffer.push_back('\0');
     const char* temp_root_raw = ::mkdtemp(temp_buffer.data());
@@ -43,8 +44,7 @@ void write_text_file(const fs::path& path, std::string_view contents) {
 
 void write_executable_script(const fs::path& path, std::string_view contents) {
     write_text_file(path, contents);
-    fs::permissions(path,
-                    fs::perms::owner_read | fs::perms::owner_write | fs::perms::owner_exec,
+    fs::permissions(path, fs::perms::owner_read | fs::perms::owner_write | fs::perms::owner_exec,
                     fs::perm_options::replace);
 }
 
@@ -102,11 +102,10 @@ void test_local_train_session_cleans_stale_artifacts_before_exec_failure() {
 void test_local_train_session_appends_captured_output_to_exit_errors() {
     const fs::path temp_root = make_temp_root("mmltk-local-train-error");
     const fs::path script_path = temp_root / "fake-train.sh";
-    write_executable_script(
-        script_path,
-        "#!/usr/bin/env bash\n"
-        "printf 'fatal output line\\n'\n"
-        "exit 3\n");
+    write_executable_script(script_path,
+                            "#!/usr/bin/env bash\n"
+                            "printf 'fatal output line\\n'\n"
+                            "exit 3\n");
 
     mmltk::gui::LocalTrainSession session;
     const mmltk::rfdetr::TrainRequest request = make_train_request(temp_root);
@@ -124,9 +123,8 @@ void test_local_train_session_appends_captured_output_to_exit_errors() {
     mmltk::testsupport::remove_path_recursively_best_effort(temp_root);
 }
 
-} // namespace
+}  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[gui][local_train_runtime]",
                          test_local_train_session_cleans_stale_artifacts_before_exec_failure);
-MMLTK_REGISTER_TEST_CASE("[gui][local_train_runtime]",
-                         test_local_train_session_appends_captured_output_to_exit_errors);
+MMLTK_REGISTER_TEST_CASE("[gui][local_train_runtime]", test_local_train_session_appends_captured_output_to_exit_errors);

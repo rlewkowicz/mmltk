@@ -10,8 +10,8 @@
 
 namespace Catch {
 
-    // ResultWas::OfType enum
-    struct ResultWas { enum OfType {
+struct ResultWas {
+    enum OfType {
         Unknown = -1,
         Ok = 0,
         Info = 1,
@@ -30,37 +30,37 @@ namespace Catch {
         DidntThrowException = Exception | 2,
 
         FatalErrorCondition = 0x200 | FailureBit
+    };
+};
 
-    }; };
+constexpr bool isOk(ResultWas::OfType resultType) {
+    return (resultType & ResultWas::FailureBit) == 0;
+}
+constexpr bool isJustInfo(int flags) {
+    return flags == ResultWas::Info;
+}
 
-    constexpr bool isOk( ResultWas::OfType resultType ) {
-        return ( resultType & ResultWas::FailureBit ) == 0;
-    }
-    constexpr bool isJustInfo( int flags ) { return flags == ResultWas::Info; }
-
-
-    // ResultDisposition::Flags enum
-    struct ResultDisposition { enum Flags {
+struct ResultDisposition {
+    enum Flags {
         Normal = 0x01,
 
-        ContinueOnFailure = 0x02,   // Failures fail test, but execution continues
-        FalseTest = 0x04,           // Prefix expression with !
-        SuppressFail = 0x08         // Failures are reported but do not fail the test
-    }; };
+        ContinueOnFailure = 0x02,
+        FalseTest = 0x04,
+        SuppressFail = 0x08
+    };
+};
 
-    constexpr ResultDisposition::Flags operator|( ResultDisposition::Flags lhs,
-                                        ResultDisposition::Flags rhs ) {
-        return static_cast<ResultDisposition::Flags>( static_cast<int>( lhs ) |
-                                                      static_cast<int>( rhs ) );
-    }
+constexpr ResultDisposition::Flags operator|(ResultDisposition::Flags lhs, ResultDisposition::Flags rhs) {
+    return static_cast<ResultDisposition::Flags>(static_cast<int>(lhs) | static_cast<int>(rhs));
+}
 
-    constexpr bool isFalseTest( int flags ) {
-        return ( flags & ResultDisposition::FalseTest ) != 0;
-    }
-    constexpr bool shouldSuppressFailure( int flags ) {
-        return ( flags & ResultDisposition::SuppressFail ) != 0;
-    }
+constexpr bool isFalseTest(int flags) {
+    return (flags & ResultDisposition::FalseTest) != 0;
+}
+constexpr bool shouldSuppressFailure(int flags) {
+    return (flags & ResultDisposition::SuppressFail) != 0;
+}
 
-} // end namespace Catch
+}  // namespace Catch
 
-#endif // CATCH_RESULT_TYPE_HPP_INCLUDED
+#endif  // CATCH_RESULT_TYPE_HPP_INCLUDED

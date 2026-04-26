@@ -18,22 +18,17 @@ void run_onnx_simplify(ONNX_NAMESPACE::ModelProto& model) {
         mmltk::logging::logger("rfdetr.onnx_simplify")->info("onnx: checking exported model...");
         ONNX_NAMESPACE::checker::check_model(model);
         mmltk::logging::logger("rfdetr.onnx_simplify")->info("onnx: running shape inference...");
-        ONNX_NAMESPACE::shape_inference::InferShapes(
-            model,
-            ONNX_NAMESPACE::OpSchemaRegistry::Instance());
+        ONNX_NAMESPACE::shape_inference::InferShapes(model, ONNX_NAMESPACE::OpSchemaRegistry::Instance());
         mmltk::logging::logger("rfdetr.onnx_simplify")->info("onnx: shape inference complete");
     } catch (const ONNX_NAMESPACE::checker::ValidationError& error) {
-        throw std::runtime_error(
-            std::string("RF-DETR ONNX simplify failed: ONNX checker rejected the model: ") +
-            error.what());
+        throw std::runtime_error(std::string("RF-DETR ONNX simplify failed: ONNX checker rejected the model: ") +
+                                 error.what());
     } catch (const ONNX_NAMESPACE::InferenceError& error) {
         throw std::runtime_error(
-            std::string("RF-DETR ONNX simplify failed: ONNX shape inference rejected the model: ") +
-            error.what());
+            std::string("RF-DETR ONNX simplify failed: ONNX shape inference rejected the model: ") + error.what());
     } catch (const std::exception& error) {
-        throw std::runtime_error(
-            std::string("RF-DETR ONNX simplify failed: ") + error.what());
+        throw std::runtime_error(std::string("RF-DETR ONNX simplify failed: ") + error.what());
     }
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

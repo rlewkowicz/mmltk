@@ -18,9 +18,7 @@ inline void trim_output_tail(std::string& output_tail, std::size_t max_size = 65
     }
 }
 
-inline void append_console_output(std::string& tail,
-                                  const std::string_view chunk,
-                                  std::size_t max_size = 65536) {
+inline void append_console_output(std::string& tail, const std::string_view chunk, std::size_t max_size = 65536) {
     std::size_t index = 0;
     while (index < chunk.size()) {
         const char ch = chunk[index];
@@ -60,9 +58,7 @@ inline void append_console_output(std::string& tail,
     trim_output_tail(tail, max_size);
 }
 
-inline std::string read_fd(const int fd,
-                           const std::string_view error_prefix,
-                           const bool nonblocking = false) {
+inline std::string read_fd(const int fd, const std::string_view error_prefix, const bool nonblocking = false) {
     std::string output;
     if (fd < 0) {
         return output;
@@ -89,4 +85,4 @@ inline std::string read_fd(const int fd,
     return output;
 }
 
-} // namespace mmltk::gui::console_output
+}  // namespace mmltk::gui::console_output

@@ -16,44 +16,39 @@
 
 namespace Catch {
 
-    class IConfig;
-    class ITestInvoker;
-    class TestCaseHandle;
-    class TestSpec;
+class IConfig;
+class ITestInvoker;
+class TestCaseHandle;
+class TestSpec;
 
-    std::vector<TestCaseHandle> sortTests( IConfig const& config, std::vector<TestCaseHandle> const& unsortedTestCases );
+std::vector<TestCaseHandle> sortTests(IConfig const& config, std::vector<TestCaseHandle> const& unsortedTestCases);
 
-    bool isThrowSafe( TestCaseHandle const& testCase, IConfig const& config );
+bool isThrowSafe(TestCaseHandle const& testCase, IConfig const& config);
 
-    std::vector<TestCaseHandle> filterTests( std::vector<TestCaseHandle> const& testCases, TestSpec const& testSpec, IConfig const& config );
-    std::vector<TestCaseHandle> const& getAllTestCasesSorted( IConfig const& config );
+std::vector<TestCaseHandle> filterTests(std::vector<TestCaseHandle> const& testCases, TestSpec const& testSpec,
+                                        IConfig const& config);
+std::vector<TestCaseHandle> const& getAllTestCasesSorted(IConfig const& config);
 
-    class TestRegistry : public ITestCaseRegistry {
-    public:
-        void registerTest( Detail::unique_ptr<TestCaseInfo> testInfo, Detail::unique_ptr<ITestInvoker> testInvoker );
+class TestRegistry : public ITestCaseRegistry {
+   public:
+    void registerTest(Detail::unique_ptr<TestCaseInfo> testInfo, Detail::unique_ptr<ITestInvoker> testInvoker);
 
-        std::vector<TestCaseInfo*> const& getAllInfos() const override;
-        std::vector<TestCaseHandle> const& getAllTests() const override;
-        std::vector<TestCaseHandle> const& getAllTestsSorted( IConfig const& config ) const override;
+    std::vector<TestCaseInfo*> const& getAllInfos() const override;
+    std::vector<TestCaseHandle> const& getAllTests() const override;
+    std::vector<TestCaseHandle> const& getAllTestsSorted(IConfig const& config) const override;
 
-        ~TestRegistry() override; // = default
+    ~TestRegistry() override;
 
-    private:
-        std::vector<Detail::unique_ptr<TestCaseInfo>> m_owned_test_infos;
-        // Keeps a materialized vector for `getAllInfos`.
-        // We should get rid of that eventually (see interface note)
-        std::vector<TestCaseInfo*> m_viewed_test_infos;
+   private:
+    std::vector<Detail::unique_ptr<TestCaseInfo>> m_owned_test_infos;
+    std::vector<TestCaseInfo*> m_viewed_test_infos;
 
-        std::vector<Detail::unique_ptr<ITestInvoker>> m_invokers;
-        std::vector<TestCaseHandle> m_handles;
-        mutable TestRunOrder m_currentSortOrder = TestRunOrder::Declared;
-        mutable std::vector<TestCaseHandle> m_sortedFunctions;
-    };
+    std::vector<Detail::unique_ptr<ITestInvoker>> m_invokers;
+    std::vector<TestCaseHandle> m_handles;
+    mutable TestRunOrder m_currentSortOrder = TestRunOrder::Declared;
+    mutable std::vector<TestCaseHandle> m_sortedFunctions;
+};
 
-    ///////////////////////////////////////////////////////////////////////////
+}  // namespace Catch
 
-
-} // end namespace Catch
-
-
-#endif // CATCH_TEST_CASE_REGISTRY_IMPL_HPP_INCLUDED
+#endif  // CATCH_TEST_CASE_REGISTRY_IMPL_HPP_INCLUDED

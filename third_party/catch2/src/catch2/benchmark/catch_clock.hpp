@@ -5,7 +5,6 @@
 //        https://www.boost.org/LICENSE_1_0.txt)
 
 // SPDX-License-Identifier: BSL-1.0
-// Adapted from donated nonius code.
 
 #ifndef CATCH_CLOCK_HPP_INCLUDED
 #define CATCH_CLOCK_HPP_INCLUDED
@@ -13,15 +12,15 @@
 #include <chrono>
 
 namespace Catch {
-    namespace Benchmark {
-        using IDuration = std::chrono::nanoseconds;
-        using FDuration = std::chrono::duration<double, std::nano>;
+namespace Benchmark {
+using IDuration = std::chrono::nanoseconds;
+using FDuration = std::chrono::duration<double, std::nano>;
 
-        template <typename Clock>
-        using TimePoint = typename Clock::time_point;
+template <typename Clock>
+using TimePoint = typename Clock::time_point;
 
-        using default_clock = std::chrono::steady_clock;
-    } // namespace Benchmark
-} // namespace Catch
+using default_clock = std::chrono::steady_clock;
+}  // namespace Benchmark
+}  // namespace Catch
 
-#endif // CATCH_CLOCK_HPP_INCLUDED
+#endif  // CATCH_CLOCK_HPP_INCLUDED

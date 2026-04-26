@@ -22,4 +22,4 @@ void create_synthetic_dataset(const FixtureSpec& spec);
 std::vector<float> expected_nchw_stub(const std::string& path, int width, int height);
 void assert_image_matches(const float* actual, const std::vector<float>& expected);
 
-} // namespace mmltk::testsupport
+}  // namespace mmltk::testsupport

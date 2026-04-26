@@ -6,13 +6,6 @@
 
 # SPDX-License-Identifier: BSL-1.0
 
-##
-# This file contains options that are materialized into the Catch2
-# compiled library. All of them default to OFF, as even the positive
-# forms correspond to the user _forcing_ them to ON, while being OFF
-# means that Catch2 can use its own autodetection.
-#
-# For detailed docs look into docs/configuration.md
 
 macro(AddOverridableConfigOption OptionBaseName)
   option(CATCH_CONFIG_${OptionBaseName} "Read docs/configuration.md for details" OFF)
@@ -85,7 +78,3 @@ set(CATCH_CONFIG_CONSOLE_WIDTH "80" CACHE STRING "Read docs/configuration.md for
 
 mark_as_advanced(CATCH_CONFIG_SHARED_LIBRARY CATCH_CONFIG_DEFAULT_REPORTER CATCH_CONFIG_CONSOLE_WIDTH)
 
-# There is no good way to both turn this into a CMake cache variable,
-# and keep reasonable default semantics inside the project. Thus we do
-# not define it and users have to provide it as an outside variable.
-#set(CATCH_CONFIG_FALLBACK_STRINGIFIER "" CACHE STRING "Read docs/configuration.md for details.")

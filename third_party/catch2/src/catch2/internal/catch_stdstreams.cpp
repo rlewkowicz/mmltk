@@ -14,11 +14,16 @@
 
 namespace Catch {
 
-// If you #define this you must implement these functions
-#if !defined( CATCH_CONFIG_NOSTDOUT )
-    std::ostream& cout() { return std::cout; }
-    std::ostream& cerr() { return std::cerr; }
-    std::ostream& clog() { return std::clog; }
+#if !defined(CATCH_CONFIG_NOSTDOUT)
+std::ostream& cout() {
+    return std::cout;
+}
+std::ostream& cerr() {
+    return std::cerr;
+}
+std::ostream& clog() {
+    return std::clog;
+}
 #endif
 
-} // namespace Catch
+}  // namespace Catch

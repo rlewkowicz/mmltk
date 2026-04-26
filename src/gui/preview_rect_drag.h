@@ -21,19 +21,10 @@ struct PreviewRectDragResult {
 };
 
 bool preview_rect_box_meets_min_extent(const AnnotationBox& box, int min_extent);
-void start_preview_rect_drag(PreviewRectDragSession& session,
-                             RectDragKind kind,
-                             float mouse_x,
-                             float mouse_y,
-                             const AnnotationBox& start_box,
-                             int commit_min_extent);
-PreviewRectDragResult update_preview_rect_drag(PreviewRectDragSession& session,
-                                               bool left_down,
-                                               float mouse_x,
-                                               float mouse_y,
-                                               const CanvasViewport& viewport,
-                                               int max_width,
-                                               int max_height,
-                                               int min_size);
+void start_preview_rect_drag(PreviewRectDragSession& session, RectDragKind kind, float mouse_x, float mouse_y,
+                             const AnnotationBox& start_box, int commit_min_extent);
+PreviewRectDragResult update_preview_rect_drag(PreviewRectDragSession& session, bool left_down, float mouse_x,
+                                               float mouse_y, const CanvasViewport& viewport, int max_width,
+                                               int max_height, int min_size);
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

@@ -43,16 +43,15 @@ void set_packed_mask_range(int64_t* words_data, size_t start, size_t length) {
         const size_t bit_index = bit_offset % static_cast<size_t>(kMaskWordBits);
         const size_t fill_bits = std::min(remaining, static_cast<size_t>(kMaskWordBits) - bit_index);
         const uint64_t full_mask = std::numeric_limits<uint64_t>::max();
-        const uint64_t mask = fill_bits == static_cast<size_t>(kMaskWordBits)
-            ? full_mask
-            : ((uint64_t{1} << fill_bits) - 1);
+        const uint64_t mask =
+            fill_bits == static_cast<size_t>(kMaskWordBits) ? full_mask : ((uint64_t{1} << fill_bits) - 1);
         words[word_index] |= (mask << bit_index);
         bit_offset += fill_bits;
         remaining -= fill_bits;
     }
 }
 
-} // namespace
+}  // namespace
 
 c10::DeviceIndex cuda_device_index(int device_id) {
     return checked_device_index(device_id);
@@ -64,8 +63,7 @@ torch::Device cuda_device(int device_id) {
 
 void BatchStaticTensors::ensure(int64_t batch_size, int height, int width, int target_device_id) {
     MMLTK_PROFILE_SCOPE("rfdetr.targets.static_tensors");
-    const bool stale_shape =
-        device_id != target_device_id || image_height != height || image_width != width;
+    const bool stale_shape = device_id != target_device_id || image_height != height || image_width != width;
     if (!stale_shape && batch_capacity >= batch_size && sizes.defined() && nested_mask.defined()) {
         return;
     }
@@ -75,14 +73,10 @@ void BatchStaticTensors::ensure(int64_t batch_size, int height, int width, int t
     image_width = width;
     batch_capacity = std::max(batch_capacity, batch_size);
     const auto device = cuda_device(device_id);
-    sizes = make_size_tensor(batch_capacity,
-                             static_cast<int64_t>(image_height),
-                             static_cast<int64_t>(image_width),
-                             device);
-    nested_mask = torch::zeros(
-        {batch_capacity, image_height, image_width},
-        torch::TensorOptions().dtype(torch::kBool).device(device)
-    );
+    sizes =
+        make_size_tensor(batch_capacity, static_cast<int64_t>(image_height), static_cast<int64_t>(image_width), device);
+    nested_mask = torch::zeros({batch_capacity, image_height, image_width},
+                               torch::TensorOptions().dtype(torch::kBool).device(device));
 }
 
 torch::Tensor BatchStaticTensors::sizes_view(int64_t batch_size) const {
@@ -97,13 +91,12 @@ TargetScratch::~TargetScratch() {
     try {
         wait_for_pending_copy();
     } catch (const std::exception& ex) {
-        mmltk::logging::logger("rfdetr.target_builder")->error(
-            "fatal: failed to finish target copy before destruction: {}",
-            ex.what());
+        mmltk::logging::logger("rfdetr.target_builder")
+            ->error("fatal: failed to finish target copy before destruction: {}", ex.what());
         std::terminate();
     } catch (...) {
-        mmltk::logging::logger("rfdetr.target_builder")->error(
-            "fatal: failed to finish target copy before destruction with unknown exception");
+        mmltk::logging::logger("rfdetr.target_builder")
+            ->error("fatal: failed to finish target copy before destruction with unknown exception");
         std::terminate();
     }
     if (copy_complete_event != nullptr) {
@@ -122,30 +115,23 @@ void TargetScratch::ensure_batch(size_t batch_size, int height, int width, int t
     offsets.resize(batch_size);
     counts.resize(batch_size);
     if (!image_ids_cpu.defined() || image_ids_cpu.size(0) < static_cast<int64_t>(batch_size)) {
-        image_ids_cpu = torch::empty(
-            {std::max<int64_t>(batch.batch_capacity, static_cast<int64_t>(batch_size))},
-            torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU).pinned_memory(true)
-        );
+        image_ids_cpu =
+            torch::empty({std::max<int64_t>(batch.batch_capacity, static_cast<int64_t>(batch_size))},
+                         torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU).pinned_memory(true));
     }
 }
 
 void TargetScratch::ensure_instance_capacity(int64_t instances) {
     MMLTK_PROFILE_SCOPE("rfdetr.targets.ensure_instances");
-    const bool tensors_ready =
-        boxes_cpu.defined() &&
-        labels_cpu.defined() &&
-        area_cpu.defined() &&
-        iscrowd_cpu.defined() &&
-        boxes_cpu.size(1) == 4;
+    const bool tensors_ready = boxes_cpu.defined() && labels_cpu.defined() && area_cpu.defined() &&
+                               iscrowd_cpu.defined() && boxes_cpu.size(1) == 4;
     if (instance_capacity >= instances && tensors_ready) {
         return;
     }
 
     instance_capacity = std::max(instance_capacity, instances);
-    const auto cpu_float =
-        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(true);
-    const auto cpu_int64 =
-        torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU).pinned_memory(true);
+    const auto cpu_float = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(true);
+    const auto cpu_int64 = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU).pinned_memory(true);
 
     boxes_cpu = torch::empty({instance_capacity, 4}, cpu_float);
     labels_cpu = torch::empty({instance_capacity}, cpu_int64);
@@ -155,9 +141,7 @@ void TargetScratch::ensure_instance_capacity(int64_t instances) {
 
 void TargetScratch::ensure_packed_mask_capacity(int64_t instances, int height, int width) {
     const bool shape_matches = mask_height == height && mask_width == width;
-    if (packed_masks_cpu.defined() &&
-        shape_matches &&
-        packed_masks_cpu.size(0) >= instances) {
+    if (packed_masks_cpu.defined() && shape_matches && packed_masks_cpu.size(0) >= instances) {
         return;
     }
 
@@ -165,10 +149,9 @@ void TargetScratch::ensure_packed_mask_capacity(int64_t instances, int height, i
     mask_width = width;
     mask_words_per_instance = packed_mask_words_for_shape(mask_height, mask_width);
     const int64_t mask_capacity = std::max<int64_t>(instances, 1);
-    packed_masks_cpu = torch::zeros(
-        {mask_capacity, mask_words_per_instance},
-        torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU).pinned_memory(true)
-    );
+    packed_masks_cpu =
+        torch::zeros({mask_capacity, mask_words_per_instance},
+                     torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU).pinned_memory(true));
 }
 
 void TargetScratch::ensure_copy_resources(int target_device_id) {
@@ -212,9 +195,7 @@ void TargetScratch::handoff_pending_copy_to_current_stream(int target_device_id)
         "cudaStreamWaitEvent for target copy");
 }
 
-LoaderBatchGuard::LoaderBatchGuard(mmltk::DatasetLoader& loader,
-                                   const mmltk::Batch& batch,
-                                   int device_id)
+LoaderBatchGuard::LoaderBatchGuard(mmltk::DatasetLoader& loader, const mmltk::Batch& batch, int device_id)
     : loader_(&loader), batch_(batch), device_id_(device_id) {
     const auto device_index = cuda_device_index(device_id_);
     c10::cuda::CUDAGuard device_guard(device_index);
@@ -227,56 +208,39 @@ LoaderBatchGuard::~LoaderBatchGuard() {
         c10::cuda::CUDAGuard device_guard(cuda_device_index(device_id_));
         loader_->release_batch(batch_, consumer_stream_);
     } catch (const std::exception& ex) {
-        mmltk::logging::logger("rfdetr.target_builder")->error(
-            "fatal: failed to release dataset batch: {}",
-            ex.what());
+        mmltk::logging::logger("rfdetr.target_builder")->error("fatal: failed to release dataset batch: {}", ex.what());
         std::terminate();
     } catch (...) {
-        mmltk::logging::logger("rfdetr.target_builder")->error(
-            "fatal: failed to release dataset batch with unknown exception");
+        mmltk::logging::logger("rfdetr.target_builder")
+            ->error("fatal: failed to release dataset batch with unknown exception");
         std::terminate();
     }
 }
 
-torch::Tensor make_size_tensor(int64_t batch_size,
-                               int64_t image_height,
-                               int64_t image_width,
+torch::Tensor make_size_tensor(int64_t batch_size, int64_t image_height, int64_t image_width,
                                const torch::Device& device) {
-    auto sizes = torch::empty(
-        {batch_size, 2},
-        torch::TensorOptions().dtype(torch::kInt64).device(device)
-    );
+    auto sizes = torch::empty({batch_size, 2}, torch::TensorOptions().dtype(torch::kInt64).device(device));
     sizes.select(1, 0).fill_(image_height);
     sizes.select(1, 1).fill_(image_width);
     return sizes;
 }
 
-torch::Tensor make_device_batch_tensor(const mmltk::Batch& batch,
-                                       int device_id,
-                                       int64_t image_height,
+torch::Tensor make_device_batch_tensor(const mmltk::Batch& batch, int device_id, int64_t image_height,
                                        int64_t image_width) {
     MMLTK_PROFILE_SCOPE("rfdetr.pybind.device_batch_tensor");
-    return torch::from_blob(
-        const_cast<float*>(batch.device_images),
-        {static_cast<int64_t>(batch.num_images), 3, image_height, image_width},
-        torch::TensorOptions().dtype(torch::kFloat32).device(cuda_device(device_id))
-    );
+    return torch::from_blob(const_cast<float*>(batch.device_images),
+                            {static_cast<int64_t>(batch.num_images), 3, image_height, image_width},
+                            torch::TensorOptions().dtype(torch::kFloat32).device(cuda_device(device_id)));
 }
 
 std::string resolve_path(const std::string& path) {
     return std::filesystem::absolute(std::filesystem::path(path)).string();
 }
 
-mmltk::DatasetLoader::Config make_loader_config(const std::string& compiled_path,
-                                                     size_t batch_size,
-                                                     bool shuffle,
-                                                     int prefetch_factor,
-                                                     int gather_workers,
-                                                     const std::string& cpu_affinity,
-                                                     int device_id,
-                                                     uint64_t seed,
-                                                     uint32_t batch_shard_rank,
-                                                     uint32_t batch_shard_count) {
+mmltk::DatasetLoader::Config make_loader_config(const std::string& compiled_path, size_t batch_size, bool shuffle,
+                                                int prefetch_factor, int gather_workers,
+                                                const std::string& cpu_affinity, int device_id, uint64_t seed,
+                                                uint32_t batch_shard_rank, uint32_t batch_shard_count) {
     mmltk::DatasetLoader::Config config;
     config.compiled_path = resolve_path(compiled_path);
     config.batch_size = batch_size;
@@ -292,13 +256,8 @@ mmltk::DatasetLoader::Config make_loader_config(const std::string& compiled_path
     return config;
 }
 
-PreparedTargets build_targets(const mmltk::Batch& batch,
-                              int image_height,
-                              int image_width,
-                              bool include_masks,
-                              bool require_masks,
-                              int device_id,
-                              TargetScratch& scratch) {
+PreparedTargets build_targets(const mmltk::Batch& batch, int image_height, int image_width, bool include_masks,
+                              bool require_masks, int device_id, TargetScratch& scratch) {
     MMLTK_PROFILE_SCOPE("rfdetr.targets.total");
     PreparedTargets prepared;
     prepared.targets.reserve(batch.num_images);
@@ -354,15 +313,12 @@ PreparedTargets build_targets(const mmltk::Batch& batch,
         int64_t* packed_masks_data = nullptr;
         if (include_masks) {
             packed_masks_cpu = scratch.packed_masks_cpu.narrow(0, 0, total_instances);
-            std::memset(
-                packed_masks_cpu.data_ptr<int64_t>(),
-                0,
-                static_cast<size_t>(total_instances) * static_cast<size_t>(scratch.mask_words_per_instance) * sizeof(int64_t));
+            std::memset(packed_masks_cpu.data_ptr<int64_t>(), 0,
+                        static_cast<size_t>(total_instances) * static_cast<size_t>(scratch.mask_words_per_instance) *
+                            sizeof(int64_t));
             packed_masks_data = packed_masks_cpu.data_ptr<int64_t>();
         }
-        std::memset(iscrowd_cpu.data_ptr<int64_t>(),
-                    0,
-                    static_cast<size_t>(total_instances) * sizeof(int64_t));
+        std::memset(iscrowd_cpu.data_ptr<int64_t>(), 0, static_cast<size_t>(total_instances) * sizeof(int64_t));
         auto boxes = boxes_cpu.accessor<float, 2>();
         auto labels = labels_cpu.accessor<int64_t, 1>();
         auto areas = area_cpu.accessor<float, 1>();
@@ -390,8 +346,6 @@ PreparedTargets build_targets(const mmltk::Batch& batch,
                     boxes[target_index][1] = (y1 + y2) * 0.5f * inv_h;
                     boxes[target_index][2] = width * inv_w;
                     boxes[target_index][3] = height * inv_h;
-                    // Compiled labels are already normalized into RF-DETR's
-                    // 0-based contiguous training space.
                     labels[target_index] = static_cast<int64_t>(instance.class_id);
 
                     if (!include_masks) {
@@ -401,8 +355,7 @@ PreparedTargets build_targets(const mmltk::Batch& batch,
 
                     ++mask_instances;
                     const uint16_t pair_count = instance.mask_rle_pairs;
-                    const size_t pair_offset =
-                        static_cast<size_t>(instance.mask_rle_offset) / sizeof(mmltk::RLEPair);
+                    const size_t pair_offset = static_cast<size_t>(instance.mask_rle_offset) / sizeof(mmltk::RLEPair);
                     if (pair_count == 0) {
                         if (require_masks) {
                             throw std::runtime_error(
@@ -422,8 +375,8 @@ PreparedTargets build_targets(const mmltk::Batch& batch,
                         }
                         if (packed_masks_data != nullptr) {
                             int64_t* mask_words =
-                                packed_masks_data +
-                                static_cast<size_t>(target_index) * static_cast<size_t>(scratch.mask_words_per_instance);
+                                packed_masks_data + static_cast<size_t>(target_index) *
+                                                        static_cast<size_t>(scratch.mask_words_per_instance);
                             set_packed_mask_range(mask_words, static_cast<size_t>(pair.start), length);
                         }
                         area += static_cast<float>(length);
@@ -493,4 +446,4 @@ PreparedTargets build_targets(const mmltk::Batch& batch,
     return prepared;
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

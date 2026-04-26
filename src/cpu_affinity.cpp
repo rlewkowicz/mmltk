@@ -23,11 +23,9 @@ namespace mmltk {
 namespace {
 
 class CpuSetBuffer {
-public:
+   public:
     explicit CpuSetBuffer(size_t cpu_count)
-        : cpu_count_(std::max<size_t>(cpu_count, 1)),
-          bytes_(CPU_ALLOC_SIZE(cpu_count_)),
-          set_(CPU_ALLOC(cpu_count_)) {
+        : cpu_count_(std::max<size_t>(cpu_count, 1)), bytes_(CPU_ALLOC_SIZE(cpu_count_)), set_(CPU_ALLOC(cpu_count_)) {
         if (set_ == nullptr) {
             throw std::bad_alloc();
         }
@@ -43,12 +41,20 @@ public:
     CpuSetBuffer(const CpuSetBuffer&) = delete;
     CpuSetBuffer& operator=(const CpuSetBuffer&) = delete;
 
-    [[nodiscard]] cpu_set_t* get() noexcept { return set_; }
-    [[nodiscard]] const cpu_set_t* get() const noexcept { return set_; }
-    [[nodiscard]] size_t bytes() const noexcept { return bytes_; }
-    [[nodiscard]] size_t cpu_count() const noexcept { return cpu_count_; }
+    [[nodiscard]] cpu_set_t* get() noexcept {
+        return set_;
+    }
+    [[nodiscard]] const cpu_set_t* get() const noexcept {
+        return set_;
+    }
+    [[nodiscard]] size_t bytes() const noexcept {
+        return bytes_;
+    }
+    [[nodiscard]] size_t cpu_count() const noexcept {
+        return cpu_count_;
+    }
 
-private:
+   private:
     size_t cpu_count_ = 0;
     size_t bytes_ = 0;
     cpu_set_t* set_ = nullptr;
@@ -56,13 +62,11 @@ private:
 
 std::string_view trim_ascii(std::string_view value) {
     size_t begin = 0;
-    while (begin < value.size() &&
-           std::isspace(static_cast<unsigned char>(value[begin])) != 0) {
+    while (begin < value.size() && std::isspace(static_cast<unsigned char>(value[begin])) != 0) {
         ++begin;
     }
     size_t end = value.size();
-    while (end > begin &&
-           std::isspace(static_cast<unsigned char>(value[end - 1])) != 0) {
+    while (end > begin && std::isspace(static_cast<unsigned char>(value[end - 1])) != 0) {
         --end;
     }
     return value.substr(begin, end - begin);
@@ -92,14 +96,12 @@ size_t configured_cpu_count() {
     return CPU_SETSIZE;
 }
 
-} // namespace
+}  // namespace
 
 std::vector<int> allowed_cpu_set() {
     CpuSetBuffer mask(configured_cpu_count());
     if (::sched_getaffinity(0, mask.bytes(), mask.get()) != 0) {
-        throw std::system_error(errno,
-                                std::generic_category(),
-                                "sched_getaffinity failed");
+        throw std::system_error(errno, std::generic_category(), "sched_getaffinity failed");
     }
 
     std::vector<int> cpus;
@@ -134,8 +136,7 @@ std::vector<int> parse_cpu_list(const std::string& spec) {
                 const int begin = parse_cpu_id(token.substr(0, dash));
                 const int end = parse_cpu_id(token.substr(dash + 1));
                 if (begin > end) {
-                    throw std::runtime_error("cpu affinity range start exceeds end: " +
-                                             std::string(token));
+                    throw std::runtime_error("cpu affinity range start exceeds end: " + std::string(token));
                 }
                 for (int cpu = begin; cpu <= end; ++cpu) {
                     cpus.push_back(cpu);
@@ -165,8 +166,7 @@ std::vector<int> resolve_cpu_affinity(const std::string& spec) {
     std::vector<int> requested = parse_cpu_list(spec);
     for (const int cpu : requested) {
         if (!std::binary_search(allowed.begin(), allowed.end(), cpu)) {
-            throw std::runtime_error("cpu " + std::to_string(cpu) +
-                                     " is outside the current allowed cpuset " +
+            throw std::runtime_error("cpu " + std::to_string(cpu) + " is outside the current allowed cpuset " +
                                      format_cpu_list(allowed));
         }
     }
@@ -212,10 +212,8 @@ void pin_thread_to_cpu(const std::vector<int>& cpus, size_t worker_index) {
     CPU_SET_S(static_cast<size_t>(cpu), mask.bytes(), mask.get());
     const int rc = ::pthread_setaffinity_np(::pthread_self(), mask.bytes(), mask.get());
     if (rc != 0) {
-        throw std::system_error(rc,
-                                std::generic_category(),
-                                "pthread_setaffinity_np failed for cpu " +
-                                    std::to_string(cpu));
+        throw std::system_error(rc, std::generic_category(),
+                                "pthread_setaffinity_np failed for cpu " + std::to_string(cpu));
     }
 }
 
@@ -229,10 +227,8 @@ void set_thread_name(const std::string& name) {
     std::copy_n(name.data(), count, buffer.data());
     const int rc = ::pthread_setname_np(::pthread_self(), buffer.data());
     if (rc != 0) {
-        throw std::system_error(rc,
-                                std::generic_category(),
-                                "pthread_setname_np failed");
+        throw std::system_error(rc, std::generic_category(), "pthread_setname_np failed");
     }
 }
 
-} // namespace mmltk
+}  // namespace mmltk

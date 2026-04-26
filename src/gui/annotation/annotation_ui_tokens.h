@@ -23,10 +23,9 @@ struct ButtonToken {
     ButtonTone tone = ButtonTone::Default;
 };
 
-constexpr ButtonToken button_token(const char* label,
-                                   bool enabled = true,
+constexpr ButtonToken button_token(const char* label, bool enabled = true,
                                    ButtonTone tone = ButtonTone::Default) noexcept {
     return ButtonToken{label, enabled, tone};
 }
 
-} // namespace mmltk::gui::annotation_ui
+}  // namespace mmltk::gui::annotation_ui

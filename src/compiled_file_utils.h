@@ -42,32 +42,25 @@ inline FileHeader read_compiled_header(const std::string& path) {
     return read_compiled_header(file);
 }
 
-inline CompiledFileSections validate_compiled_file_sections(const FileHeader& header,
-                                                            size_t file_size) {
+inline CompiledFileSections validate_compiled_file_sections(const FileHeader& header, size_t file_size) {
     const auto index_offset = checked_cast<size_t>(header.index_offset, "index offset overflow");
     const auto label_offset = checked_cast<size_t>(header.label_offset, "label offset overflow");
     const auto rle_offset = checked_cast<size_t>(header.mask_rle_offset, "RLE offset overflow");
     const auto pixel_offset = checked_cast<size_t>(header.pixel_offset, "pixel offset overflow");
-    const auto total_file_size =
-        checked_cast<size_t>(header.total_file_size, "file size overflow");
+    const auto total_file_size = checked_cast<size_t>(header.total_file_size, "file size overflow");
     if (total_file_size != file_size) {
         throw std::runtime_error("compiled file size does not match header");
     }
     if (pixel_offset % PAGE_SIZE != 0) {
         throw std::runtime_error("pixel blob offset must be page aligned");
     }
-    // v4 layout: index < pixel < label < rle < total
-    if (index_offset < sizeof(FileHeader) ||
-        pixel_offset < index_offset ||
-        label_offset < pixel_offset ||
-        rle_offset < label_offset ||
-        total_file_size < rle_offset) {
+    if (index_offset < sizeof(FileHeader) || pixel_offset < index_offset || label_offset < pixel_offset ||
+        rle_offset < label_offset || total_file_size < rle_offset) {
         throw std::runtime_error("compiled file layout is invalid");
     }
 
     const auto expected_index_bytes =
-        checked_cast<size_t>(static_cast<uint64_t>(header.num_images) * sizeof(ImageEntry),
-                             "index size overflow");
+        checked_cast<size_t>(static_cast<uint64_t>(header.num_images) * sizeof(ImageEntry), "index size overflow");
     if (pixel_offset < index_offset + expected_index_bytes) {
         throw std::runtime_error("compiled file index block size mismatch");
     }
@@ -78,9 +71,8 @@ inline CompiledFileSections validate_compiled_file_sections(const FileHeader& he
     }
 
     const size_t pixel_blob_size = label_offset - pixel_offset;
-    const auto expected_pixel_blob_size =
-        checked_cast<size_t>(static_cast<uint64_t>(header.num_images) * header.image_stride,
-                             "pixel blob size overflow");
+    const auto expected_pixel_blob_size = checked_cast<size_t>(
+        static_cast<uint64_t>(header.num_images) * header.image_stride, "pixel blob size overflow");
     if (pixel_blob_size != expected_pixel_blob_size) {
         throw std::runtime_error("compiled pixel blob size mismatch");
     }
@@ -100,4 +92,4 @@ inline CompiledFileSections validate_compiled_file_sections(const FileHeader& he
     };
 }
 
-} // namespace mmltk
+}  // namespace mmltk

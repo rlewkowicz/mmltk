@@ -10,10 +10,10 @@
 
 namespace Catch {
 
-    struct LeakDetector {
-        LeakDetector();
-        ~LeakDetector();
-    };
+struct LeakDetector {
+    LeakDetector();
+    ~LeakDetector();
+};
 
-}
-#endif // CATCH_LEAK_DETECTOR_HPP_INCLUDED
+}  // namespace Catch
+#endif  // CATCH_LEAK_DETECTOR_HPP_INCLUDED

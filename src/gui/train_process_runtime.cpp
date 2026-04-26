@@ -1,5 +1,6 @@
 #include "train_process_runtime.h"
 #include "subprocess_utils.h"
+#include "mmltk/rfdetr/workflow_requests.h"
 
 #include <nlohmann/json.hpp>
 
@@ -37,12 +38,12 @@ enum class ChildSetupFailureStage : std::uint8_t {
 
 const char* child_setup_failure_stage_label(const ChildSetupFailureStage stage) {
     switch (stage) {
-    case ChildSetupFailureStage::kSetpgid:
-        return "setpgid";
-    case ChildSetupFailureStage::kDup2:
-        return "dup2";
-    case ChildSetupFailureStage::kExecv:
-        return "execv";
+        case ChildSetupFailureStage::kSetpgid:
+            return "setpgid";
+        case ChildSetupFailureStage::kDup2:
+            return "dup2";
+        case ChildSetupFailureStage::kExecv:
+            return "execv";
     }
     return "unknown";
 }
@@ -149,8 +150,7 @@ std::optional<TrainArtifactProgress> read_train_artifact_progress(const std::fil
     }
     if (const auto results_json = read_json_object(output_dir / "results.json"); results_json.has_value()) {
         if (progress->checkpoint_path.empty()) {
-            progress->checkpoint_path =
-                results_json->value("best_checkpoint", results_json->value("checkpoint", ""));
+            progress->checkpoint_path = results_json->value("best_checkpoint", results_json->value("checkpoint", ""));
         }
     }
     return progress;
@@ -181,15 +181,14 @@ bool process_group_alive(const int process_group_id) {
     return errno == EPERM;
 }
 
-} // namespace
+}  // namespace
 
 struct LocalTrainSession::Impl {
     mutable std::mutex mutex;
     std::thread worker;
     LocalTrainSessionState state;
 
-    void start(const mmltk::rfdetr::TrainRequest& request,
-               const std::filesystem::path& cli_path,
+    void start(const mmltk::rfdetr::TrainRequest& request, const std::filesystem::path& cli_path,
                std::string fallback_preset_name) {
         shutdown();
         {
@@ -200,11 +199,7 @@ struct LocalTrainSession::Impl {
             state.last_summary = "starting local training...";
             state.output_dir = request.output_dir;
         }
-        worker = std::thread(&Impl::worker_main,
-                             this,
-                             request,
-                             cli_path,
-                             std::move(fallback_preset_name));
+        worker = std::thread(&Impl::worker_main, this, request, cli_path, std::move(fallback_preset_name));
     }
 
     void request_stop(const bool force) {
@@ -215,8 +210,7 @@ struct LocalTrainSession::Impl {
         state.stop_requested = true;
         state.force_kill_requested = state.force_kill_requested || force;
         state.last_error.clear();
-        state.last_summary = force ? "force kill requested for local training"
-                                   : "stop requested for local training";
+        state.last_summary = force ? "force kill requested for local training" : "stop requested for local training";
     }
 
     void shutdown() {
@@ -240,14 +234,12 @@ struct LocalTrainSession::Impl {
         return state.running;
     }
 
-    void worker_main(const mmltk::rfdetr::TrainRequest& request,
-                     const std::filesystem::path& cli_path,
+    void worker_main(const mmltk::rfdetr::TrainRequest& request, const std::filesystem::path& cli_path,
                      const std::string& fallback_preset_name) {
         int stdout_fd = -1;
         int setup_error_fd = -1;
         try {
-            const std::vector<std::string> args =
-                build_train_command_arguments(request, fallback_preset_name);
+            const std::vector<std::string> args = build_train_command_arguments(request, fallback_preset_name);
             const std::filesystem::path output_dir = request.output_dir;
             std::error_code ignored_error;
             std::filesystem::remove(output_dir / "progress.json", ignored_error);
@@ -267,8 +259,7 @@ struct LocalTrainSession::Impl {
             argv.push_back(nullptr);
 
             subprocess::CapturedChildProcess child = subprocess::spawn_captured_child_process(
-                "local train subprocess",
-                [&](const int output_fd, const int setup_fd) {
+                "local train subprocess", [&](const int output_fd, const int setup_fd) {
                     if (::setpgid(0, 0) != 0) {
                         (void)subprocess::write_child_setup_failure(setup_fd, ChildSetupFailureStage::kSetpgid);
                         std::_Exit(127);
@@ -399,24 +390,20 @@ struct LocalTrainSession::Impl {
         }
     }
 
-    void finalize_process(const int status,
-                          const int stdout_fd,
-                          const int setup_error_fd,
-                          const int process_group_id,
+    void finalize_process(const int status, const int stdout_fd, const int setup_error_fd, const int process_group_id,
                           const std::filesystem::path& output_dir) {
         const std::string output_chunk =
             subprocess::read_fd(stdout_fd, "failed to read local train subprocess output: ", true);
         ::close(stdout_fd);
         const auto progress = read_train_artifact_progress(output_dir);
-        const auto child_setup_failure =
-            subprocess::read_child_setup_failure<ChildSetupFailureStage>(setup_error_fd);
+        const auto child_setup_failure = subprocess::read_child_setup_failure<ChildSetupFailureStage>(setup_error_fd);
         ::close(setup_error_fd);
 
         std::lock_guard<std::mutex> lock(mutex);
         if (WIFEXITED(status)) {
             state.exit_code = WEXITSTATUS(status);
-            state.last_error =
-                state.exit_code == 0 ? std::string{} : "local train exited with code " + std::to_string(state.exit_code);
+            state.last_error = state.exit_code == 0 ? std::string{}
+                                                    : "local train exited with code " + std::to_string(state.exit_code);
         } else if (WIFSIGNALED(status)) {
             state.exit_code = 128 + WTERMSIG(status);
             state.last_error = "local train terminated with signal " + std::to_string(WTERMSIG(status));
@@ -438,10 +425,8 @@ struct LocalTrainSession::Impl {
         if (child_setup_failure.has_value()) {
             state.exit_code = 127;
             state.last_summary.clear();
-            state.last_error = subprocess::format_child_setup_failure(
-                *child_setup_failure,
-                child_setup_failure_stage_label,
-                "local train");
+            state.last_error = subprocess::format_child_setup_failure(*child_setup_failure,
+                                                                      child_setup_failure_stage_label, "local train");
             if (!state.output_tail.empty()) {
                 state.last_error += "\n";
                 state.last_error += state.output_tail;
@@ -453,8 +438,7 @@ struct LocalTrainSession::Impl {
             state.last_summary = state.force_kill_requested ? "local train killed" : "local train stopped";
             return;
         }
-        if ((state.exit_code == 0 ||
-             (state.progress.has_value() && state.progress->phase == "complete")) &&
+        if ((state.exit_code == 0 || (state.progress.has_value() && state.progress->phase == "complete")) &&
             state.last_error.empty()) {
             state.last_summary = summarize_train_process(state);
             return;
@@ -475,15 +459,13 @@ struct LocalTrainSession::Impl {
     }
 };
 
-LocalTrainSession::LocalTrainSession()
-    : impl_(std::make_unique<Impl>()) {}
+LocalTrainSession::LocalTrainSession() : impl_(std::make_unique<Impl>()) {}
 
 LocalTrainSession::~LocalTrainSession() {
     shutdown();
 }
 
-void LocalTrainSession::start(const mmltk::rfdetr::TrainRequest& request,
-                              const std::filesystem::path& cli_path,
+void LocalTrainSession::start(const mmltk::rfdetr::TrainRequest& request, const std::filesystem::path& cli_path,
                               std::string fallback_preset_name) {
     impl_->start(request, cli_path, std::move(fallback_preset_name));
 }
@@ -504,4 +486,4 @@ bool LocalTrainSession::running() const {
     return impl_->running();
 }
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

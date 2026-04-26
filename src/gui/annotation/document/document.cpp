@@ -8,47 +8,26 @@ namespace mmltk::gui {
 
 namespace {
 
-bool color_range_equal(const AnnotationColorRange& lhs,
-                       const AnnotationColorRange& rhs) {
-    return lhs.center.hue_degrees == rhs.center.hue_degrees &&
-           lhs.center.saturation == rhs.center.saturation &&
-           lhs.center.value == rhs.center.value &&
-           lhs.tolerance.hue_minus_pct == rhs.tolerance.hue_minus_pct &&
-           lhs.tolerance.hue_plus_pct == rhs.tolerance.hue_plus_pct &&
-           lhs.tolerance.saturation_minus_pct == rhs.tolerance.saturation_minus_pct &&
-           lhs.tolerance.saturation_plus_pct == rhs.tolerance.saturation_plus_pct &&
-           lhs.tolerance.value_minus_pct == rhs.tolerance.value_minus_pct &&
-           lhs.tolerance.value_plus_pct == rhs.tolerance.value_plus_pct &&
-           lhs.sampling == rhs.sampling;
-}
-
-bool skeleton_shape_equal(const AnnotationSkeletonShape& lhs,
-                          const AnnotationSkeletonShape& rhs) {
-    if (lhs.nodes.size() != rhs.nodes.size() ||
-        lhs.edges.size() != rhs.edges.size()) {
+bool skeleton_shape_equal(const AnnotationSkeletonShape& lhs, const AnnotationSkeletonShape& rhs) {
+    if (lhs.nodes.size() != rhs.nodes.size() || lhs.edges.size() != rhs.edges.size()) {
         return false;
     }
 
-    const auto nodes_equal = [] (const AnnotationSkeletonNode& lhs_node,
-                                 const AnnotationSkeletonNode& rhs_node) {
-        return lhs_node.key == rhs_node.key &&
-               lhs_node.point.x == rhs_node.point.x &&
-               lhs_node.point.y == rhs_node.point.y &&
-               lhs_node.visible == rhs_node.visible;
+    const auto nodes_equal = [](const AnnotationSkeletonNode& lhs_node, const AnnotationSkeletonNode& rhs_node) {
+        return lhs_node.key == rhs_node.key && lhs_node.point.x == rhs_node.point.x &&
+               lhs_node.point.y == rhs_node.point.y && lhs_node.visible == rhs_node.visible;
     };
     if (!std::equal(lhs.nodes.begin(), lhs.nodes.end(), rhs.nodes.begin(), nodes_equal)) {
         return false;
     }
 
-    const auto edges_equal = [] (const AnnotationSkeletonEdge& lhs_edge,
-                                 const AnnotationSkeletonEdge& rhs_edge) {
-        return lhs_edge.source_index == rhs_edge.source_index &&
-               lhs_edge.target_index == rhs_edge.target_index;
+    const auto edges_equal = [](const AnnotationSkeletonEdge& lhs_edge, const AnnotationSkeletonEdge& rhs_edge) {
+        return lhs_edge.source_index == rhs_edge.source_index && lhs_edge.target_index == rhs_edge.target_index;
     };
     return std::equal(lhs.edges.begin(), lhs.edges.end(), rhs.edges.begin(), edges_equal);
 }
 
-} // namespace
+}  // namespace
 
 const AnnotationObject* AnnotationDocument::object(const std::size_t index) const noexcept {
     return index < objects_.size() ? &objects_[index] : nullptr;
@@ -126,8 +105,7 @@ bool AnnotationDocument::redo() {
     return true;
 }
 
-void AnnotationDocument::set_objects(std::vector<AnnotationObject> objects,
-                                     const bool clear_history) {
+void AnnotationDocument::set_objects(std::vector<AnnotationObject> objects, const bool clear_history) {
     objects_ = std::move(objects);
     ++generation_;
     if (clear_history) {
@@ -145,7 +123,7 @@ void AnnotationDocument::clear_history() {
 
 bool AnnotationDocument::apply_without_history(const AnnotationCommand& command) {
     return std::visit(
-        [this] (const auto& typed_command) {
+        [this](const auto& typed_command) {
             using T = std::decay_t<decltype(typed_command)>;
             if constexpr (std::is_same_v<T, AnnotationSetObjectsCommand>) {
                 objects_ = typed_command.objects;
@@ -202,8 +180,7 @@ bool AnnotationDocument::apply_without_history(const AnnotationCommand& command)
                     return false;
                 }
                 AnnotationObject& object = objects_[typed_command.index];
-                if (color_range_equal(object.sup, typed_command.sup) &&
-                    color_range_equal(object.nosup, typed_command.nosup)) {
+                if (object.sup == typed_command.sup && object.nosup == typed_command.nosup) {
                     return false;
                 }
                 object.sup = typed_command.sup;
@@ -219,44 +196,33 @@ bool AnnotationDocument::apply_without_history(const AnnotationCommand& command)
                 if (typed_command.index >= objects_.size()) {
                     return false;
                 }
-                return translate_annotation_object(&objects_[typed_command.index],
-                                                   typed_command.dx,
-                                                   typed_command.dy,
-                                                   typed_command.capture_width,
-                                                   typed_command.capture_height);
+                return translate_annotation_object(&objects_[typed_command.index], typed_command.dx, typed_command.dy,
+                                                   typed_command.capture_width, typed_command.capture_height);
             } else if constexpr (std::is_same_v<T, AnnotationResizeObjectCommand>) {
                 if (typed_command.index >= objects_.size()) {
                     return false;
                 }
-                return resize_annotation_object_to_box(&objects_[typed_command.index],
-                                                       typed_command.box,
-                                                       typed_command.capture_width,
-                                                       typed_command.capture_height);
+                return resize_annotation_object_to_box(&objects_[typed_command.index], typed_command.box,
+                                                       typed_command.capture_width, typed_command.capture_height);
             } else if constexpr (std::is_same_v<T, AnnotationSetObjectBoxCommand>) {
                 if (typed_command.index >= objects_.size()) {
                     return false;
                 }
-                return set_annotation_object_box(&objects_[typed_command.index],
-                                                 typed_command.box,
-                                                 typed_command.capture_width,
-                                                 typed_command.capture_height);
+                return set_annotation_object_box(&objects_[typed_command.index], typed_command.box,
+                                                 typed_command.capture_width, typed_command.capture_height);
             } else if constexpr (std::is_same_v<T, AnnotationSetPointPositionCommand>) {
                 if (typed_command.index >= objects_.size()) {
                     return false;
                 }
-                return set_point_annotation_position(&objects_[typed_command.index],
-                                                     typed_command.point,
-                                                     typed_command.capture_width,
-                                                     typed_command.capture_height);
+                return set_point_annotation_position(&objects_[typed_command.index], typed_command.point,
+                                                     typed_command.capture_width, typed_command.capture_height);
             } else if constexpr (std::is_same_v<T, AnnotationSetHandlePositionCommand>) {
                 if (typed_command.handle.object_index >= objects_.size()) {
                     return false;
                 }
                 return set_annotation_object_handle_position(&objects_[typed_command.handle.object_index],
-                                                             typed_command.handle,
-                                                             typed_command.point,
-                                                             typed_command.capture_width,
-                                                             typed_command.capture_height);
+                                                             typed_command.handle, typed_command.point,
+                                                             typed_command.capture_width, typed_command.capture_height);
             } else if constexpr (std::is_same_v<T, AnnotationAppendSplineKnotCommand>) {
                 if (typed_command.index >= objects_.size()) {
                     return false;
@@ -266,15 +232,13 @@ bool AnnotationDocument::apply_without_history(const AnnotationCommand& command)
                 if (typed_command.index >= objects_.size()) {
                     return false;
                 }
-                return insert_spline_knot(&objects_[typed_command.index],
-                                          typed_command.segment_index,
+                return insert_spline_knot(&objects_[typed_command.index], typed_command.segment_index,
                                           typed_command.point);
             } else if constexpr (std::is_same_v<T, AnnotationRemoveSplineKnotCommand>) {
                 if (typed_command.index >= objects_.size()) {
                     return false;
                 }
-                return remove_spline_knot(&objects_[typed_command.index],
-                                          typed_command.knot_index);
+                return remove_spline_knot(&objects_[typed_command.index], typed_command.knot_index);
             } else if constexpr (std::is_same_v<T, AnnotationCloseSplineCommand>) {
                 if (typed_command.index >= objects_.size()) {
                     return false;
@@ -289,8 +253,7 @@ bool AnnotationDocument::apply_without_history(const AnnotationCommand& command)
                 if (typed_command.index >= objects_.size()) {
                     return false;
                 }
-                return set_spline_knot_handle_mode(&objects_[typed_command.index],
-                                                   typed_command.knot_index,
+                return set_spline_knot_handle_mode(&objects_[typed_command.index], typed_command.knot_index,
                                                    typed_command.mode);
             } else if constexpr (std::is_same_v<T, AnnotationPlaceSkeletonNodeCommand>) {
                 if (typed_command.index >= objects_.size()) {
@@ -301,50 +264,39 @@ bool AnnotationDocument::apply_without_history(const AnnotationCommand& command)
                 if (typed_command.index >= objects_.size()) {
                     return false;
                 }
-                return place_skeleton_node_at(&objects_[typed_command.index],
-                                              typed_command.node_index,
+                return place_skeleton_node_at(&objects_[typed_command.index], typed_command.node_index,
                                               typed_command.point);
             } else if constexpr (std::is_same_v<T, AnnotationSetSkeletonNodeVisibilityCommand>) {
                 if (typed_command.index >= objects_.size()) {
                     return false;
                 }
-                return set_skeleton_node_visibility(&objects_[typed_command.index],
-                                                    typed_command.node_index,
+                return set_skeleton_node_visibility(&objects_[typed_command.index], typed_command.node_index,
                                                     typed_command.visible);
             } else if constexpr (std::is_same_v<T, AnnotationResetSkeletonNodeCommand>) {
                 if (typed_command.index >= objects_.size()) {
                     return false;
                 }
-                return reset_skeleton_node(&objects_[typed_command.index],
-                                           typed_command.node_index);
+                return reset_skeleton_node(&objects_[typed_command.index], typed_command.node_index);
             } else if constexpr (std::is_same_v<T, AnnotationPaintMaskCommand>) {
                 if (typed_command.index >= objects_.size()) {
                     return false;
                 }
-                return paint_annotation_object_mask(&objects_[typed_command.index],
-                                                    typed_command.capture_x,
-                                                    typed_command.capture_y,
-                                                    typed_command.radius,
-                                                    typed_command.erase,
-                                                    typed_command.capture_width,
-                                                    typed_command.capture_height);
+                return paint_annotation_object_mask(&objects_[typed_command.index], typed_command.capture_x,
+                                                    typed_command.capture_y, typed_command.radius, typed_command.erase,
+                                                    typed_command.capture_width, typed_command.capture_height);
             } else if constexpr (std::is_same_v<T, AnnotationFillMaskCommand>) {
                 if (typed_command.index >= objects_.size()) {
                     return false;
                 }
-                return fill_annotation_object_mask(&objects_[typed_command.index],
-                                                   typed_command.capture_x,
-                                                   typed_command.capture_y,
-                                                   typed_command.capture_width,
+                return fill_annotation_object_mask(&objects_[typed_command.index], typed_command.capture_x,
+                                                   typed_command.capture_y, typed_command.capture_width,
                                                    typed_command.capture_height);
             } else if constexpr (std::is_same_v<T, AnnotationCleanupMaskCommand>) {
                 if (typed_command.index >= objects_.size()) {
                     return false;
                 }
-                return cleanup_annotation_object_mask(&objects_[typed_command.index],
-                                                      typed_command.op,
-                                                      typed_command.radius,
-                                                      typed_command.capture_width,
+                return cleanup_annotation_object_mask(&objects_[typed_command.index], typed_command.op,
+                                                      typed_command.radius, typed_command.capture_width,
                                                       typed_command.capture_height);
             } else {
                 return false;
@@ -354,8 +306,7 @@ bool AnnotationDocument::apply_without_history(const AnnotationCommand& command)
 }
 
 bool AnnotationDocument::apply(const AnnotationCommand& command) {
-    const std::vector<AnnotationObject> before =
-        transaction_active_ ? std::vector<AnnotationObject>{} : objects_;
+    const std::vector<AnnotationObject> before = transaction_active_ ? std::vector<AnnotationObject>{} : objects_;
     const bool changed = apply_without_history(command);
     if (!changed) {
         return false;
@@ -379,4 +330,4 @@ void AnnotationDocument::clear() {
     ++generation_;
 }
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

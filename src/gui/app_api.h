@@ -3,7 +3,12 @@
 #include <memory>
 #include <string>
 
-struct GLFWwindow;
+namespace mmltk::browser {
+
+struct IntentMessage;
+struct StateSnapshot;
+
+}  // namespace mmltk::browser
 
 namespace mmltk::gui {
 
@@ -15,10 +20,10 @@ struct AppDeleter {
 
 using AppHandle = std::unique_ptr<App, AppDeleter>;
 
-void apply_app_style();
-AppHandle make_app(GLFWwindow* main_window, std::string vast_api_key, std::string settings_path);
-void poll_background_work(App& app);
-void render(App& app);
+AppHandle make_app(std::string vast_api_key, std::string settings_path);
+void drain_background_work(App& app);
 void shutdown(App& app);
+[[nodiscard]] mmltk::browser::StateSnapshot browser_state_snapshot(App& app);
+void apply_browser_intent(App& app, const mmltk::browser::IntentMessage& intent);
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

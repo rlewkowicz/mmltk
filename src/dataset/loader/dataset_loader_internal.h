@@ -91,10 +91,8 @@ struct DatasetLoader::Impl {
     void prepare_slot(BatchSlot& slot, size_t batch_id);
     [[nodiscard]] int acquire_transferable_slot_locked() const;
     void notify_slot_prepared_locked(size_t slot_idx);
-    [[nodiscard]] bool slot_state_matches(SlotState state,
-                                          std::initializer_list<SlotState> allowed_states) const;
-    BatchSlot& require_batch_slot_locked(const Batch& batch,
-                                         const char* operation,
+    [[nodiscard]] bool slot_state_matches(SlotState state, std::initializer_list<SlotState> allowed_states) const;
+    BatchSlot& require_batch_slot_locked(const Batch& batch, const char* operation,
                                          std::initializer_list<SlotState> allowed_states,
                                          const char* required_state_message);
     BatchSlot& checked_out_slot_locked(const Batch& batch, const char* operation);
@@ -112,4 +110,4 @@ struct DatasetLoader::Impl {
     void refill_pipeline_locked();
 };
 
-} // namespace mmltk
+}  // namespace mmltk

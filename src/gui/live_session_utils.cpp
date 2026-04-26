@@ -42,22 +42,15 @@ AnnotationBox full_capture_box_for_source(const SourceSelectionState& source) {
 
 bool crop_box_is_full_capture(const AnnotationBox& box, const SourceSelectionState& source) {
     const AnnotationBox normalized =
-        normalize_annotation_box(box,
-                                 static_cast<std::uint32_t>(std::max(1, source.capture_width)),
+        normalize_annotation_box(box, static_cast<std::uint32_t>(std::max(1, source.capture_width)),
                                  static_cast<std::uint32_t>(std::max(1, source.capture_height)));
     const AnnotationBox full = full_capture_box_for_source(source);
-    return normalized.x1 == full.x1 &&
-           normalized.y1 == full.y1 &&
-           normalized.x2 == full.x2 &&
-           normalized.y2 == full.y2;
+    return normalized.x1 == full.x1 && normalized.y1 == full.y1 && normalized.x2 == full.x2 && normalized.y2 == full.y2;
 }
 
 mmltk::live::LiveCaptureRegion preview_region_for_source(const LiveCaptureRegion& texture_region,
-                                                         const SourceSelectionState& source,
-                                                         const bool full_frame) {
-    if (texture_region.width == 0U ||
-        texture_region.height == 0U ||
-        full_frame ||
+                                                         const SourceSelectionState& source, const bool full_frame) {
+    if (texture_region.width == 0U || texture_region.height == 0U || full_frame ||
         source.kind != SourceKind::VideoStream) {
         return texture_region;
     }
@@ -95,8 +88,7 @@ void persist_crop_box_to_source(const AnnotationBox& box, SourceSelectionState* 
     }
 
     const AnnotationBox normalized =
-        normalize_annotation_box(box,
-                                 static_cast<std::uint32_t>(std::max(1, source->capture_width)),
+        normalize_annotation_box(box, static_cast<std::uint32_t>(std::max(1, source->capture_width)),
                                  static_cast<std::uint32_t>(std::max(1, source->capture_height)));
     if (!annotation_box_has_area(normalized) || crop_box_is_full_capture(normalized, *source)) {
         clear_persisted_video_crop(source);
@@ -106,34 +98,31 @@ void persist_crop_box_to_source(const AnnotationBox& box, SourceSelectionState* 
     (void)assign_video_crop_box(*source, normalized);
 }
 
-void publish_runtime_crop_box(mmltk::live::UiCropState& ui_crop_state,
-                              const SourceSelectionState& source,
+void publish_runtime_crop_box(mmltk::live::UiCropState& ui_crop_state, const SourceSelectionState& source,
                               const AnnotationBox& box) {
     const AnnotationBox normalized =
-        normalize_annotation_box(box,
-                                 static_cast<std::uint32_t>(std::max(1, source.capture_width)),
+        normalize_annotation_box(box, static_cast<std::uint32_t>(std::max(1, source.capture_width)),
                                  static_cast<std::uint32_t>(std::max(1, source.capture_height)));
     if (!annotation_box_has_area(normalized) || crop_box_is_full_capture(normalized, source)) {
         ui_crop_state.clear();
         return;
     }
 
-    ui_crop_state.set(clamp_region_to_capture(LiveCaptureRegion{
-                                                  static_cast<std::uint32_t>(normalized.x1),
-                                                  static_cast<std::uint32_t>(normalized.y1),
-                                                  static_cast<std::uint32_t>(std::max(1, normalized.x2 - normalized.x1)),
-                                                  static_cast<std::uint32_t>(std::max(1, normalized.y2 - normalized.y1)),
-                                              },
-                                              source));
+    ui_crop_state.set(clamp_region_to_capture(
+        LiveCaptureRegion{
+            static_cast<std::uint32_t>(normalized.x1),
+            static_cast<std::uint32_t>(normalized.y1),
+            static_cast<std::uint32_t>(std::max(1, normalized.x2 - normalized.x1)),
+            static_cast<std::uint32_t>(std::max(1, normalized.y2 - normalized.y1)),
+        },
+        source));
 }
 
-void seed_runtime_crop_from_source(mmltk::live::UiCropState& ui_crop_state,
-                                   const SourceSelectionState& source) {
+void seed_runtime_crop_from_source(mmltk::live::UiCropState& ui_crop_state, const SourceSelectionState& source) {
     publish_runtime_crop_box(ui_crop_state, source, resolved_video_crop_box(source));
 }
 
-void mirror_runtime_crop_snapshot_to_source(const mmltk::live::UiCropSnapshot& snapshot,
-                                            SourceSelectionState* source) {
+void mirror_runtime_crop_snapshot_to_source(const mmltk::live::UiCropSnapshot& snapshot, SourceSelectionState* source) {
     if (source == nullptr) {
         return;
     }
@@ -154,8 +143,7 @@ void mirror_runtime_crop_snapshot_to_source(const mmltk::live::UiCropSnapshot& s
     persist_crop_box_to_source(crop_box, source);
 }
 
-void mirror_runtime_crop_to_source(const mmltk::live::UiCropState& ui_crop_state,
-                                   SourceSelectionState* source) {
+void mirror_runtime_crop_to_source(const mmltk::live::UiCropState& ui_crop_state, SourceSelectionState* source) {
     const auto snapshot = ui_crop_state.snapshot();
     if (!snapshot) {
         clear_persisted_video_crop(source);
@@ -178,23 +166,19 @@ AnnotationBox runtime_crop_box_for_ui_state(const mmltk::live::UiCropState& ui_c
 
 bool annotation_frames_match_for_save(const AnnotationFrame& lhs, const AnnotationFrame& rhs) {
     if (lhs.live_frame_id.has_value() || rhs.live_frame_id.has_value()) {
-        return lhs.live_frame_id.has_value() &&
-               rhs.live_frame_id.has_value() &&
+        return lhs.live_frame_id.has_value() && rhs.live_frame_id.has_value() &&
                *lhs.live_frame_id == *rhs.live_frame_id;
     }
     return lhs.frame_id == rhs.frame_id;
 }
 
-bool annotation_frame_matches_saved_identity(
-    const AnnotationFrame& frame,
-    const std::uint64_t saved_frame_id,
-    const std::optional<mmltk::live::LiveFrameId>& saved_live_frame_id) {
+bool annotation_frame_matches_saved_identity(const AnnotationFrame& frame, const std::uint64_t saved_frame_id,
+                                             const std::optional<mmltk::live::LiveFrameId>& saved_live_frame_id) {
     if (frame.live_frame_id.has_value() || saved_live_frame_id.has_value()) {
-        return frame.live_frame_id.has_value() &&
-               saved_live_frame_id.has_value() &&
+        return frame.live_frame_id.has_value() && saved_live_frame_id.has_value() &&
                *frame.live_frame_id == *saved_live_frame_id;
     }
     return frame.frame_id == saved_frame_id;
 }
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

@@ -18,8 +18,7 @@ namespace fs = std::filesystem;
 
 fs::path make_temp_dir(const char* label) {
     const fs::path dir =
-        fs::temp_directory_path() /
-        (std::string(label) + "-" + std::to_string(static_cast<long long>(::getpid())));
+        fs::temp_directory_path() / (std::string(label) + "-" + std::to_string(static_cast<long long>(::getpid())));
     std::error_code error;
     fs::create_directories(dir, error);
     assert(!error);
@@ -47,11 +46,8 @@ fs::path locate_repo_wrapper_path() {
         for (int depth = 0; depth < 8; ++depth) {
             const fs::path candidate = current / "mmltk";
             std::error_code error;
-            if (fs::is_regular_file(candidate, error) &&
-                !error &&
-                candidate != cli_path &&
-                fs::exists(current / "CMakeLists.txt") &&
-                fs::exists(current / "README.md")) {
+            if (fs::is_regular_file(candidate, error) && !error && candidate != cli_path &&
+                fs::exists(current / "CMakeLists.txt") && fs::exists(current / "README.md")) {
                 return candidate;
             }
             if (!current.has_parent_path() || current.parent_path() == current) {
@@ -63,8 +59,7 @@ fs::path locate_repo_wrapper_path() {
     };
 
     const fs::path cli_path = mmltk_cli_path();
-    if (const char* repo_root = std::getenv("MMLTK_REPO_ROOT");
-        repo_root != nullptr && repo_root[0] != '\0') {
+    if (const char* repo_root = std::getenv("MMLTK_REPO_ROOT"); repo_root != nullptr && repo_root[0] != '\0') {
         const fs::path wrapper = find_repo_wrapper(fs::path(repo_root), cli_path);
         if (!wrapper.empty()) {
             return wrapper;
@@ -140,10 +135,8 @@ fs::path write_fake_docker_script(const fs::path& root) {
               "printf 'unexpected docker command: %s\\n' \"${command}\" >&2\n"
               "exit 1\n";
     stream.close();
-    fs::permissions(script_path,
-                    fs::perms::owner_read | fs::perms::owner_write | fs::perms::owner_exec,
-                    fs::perm_options::replace,
-                    error);
+    fs::permissions(script_path, fs::perms::owner_read | fs::perms::owner_write | fs::perms::owner_exec,
+                    fs::perm_options::replace, error);
     assert(!error);
     return script_path;
 }
@@ -159,6 +152,12 @@ std::string prepend_path_env(const fs::path& prefix_dir) {
 
 void assert_contains_line(const std::vector<std::string>& lines, const std::string& expected) {
     assert(std::find(lines.begin(), lines.end(), expected) != lines.end());
+}
+
+void assert_contains_substring(const std::vector<std::string>& lines, const std::string& expected) {
+    const auto match = std::find_if(lines.begin(), lines.end(),
+                                    [&](const std::string& line) { return line.find(expected) != std::string::npos; });
+    assert(match != lines.end());
 }
 
 void test_top_level_help_lists_test_bundle_docs() {
@@ -325,15 +324,19 @@ void test_invalid_log_level_env_reports_error_on_stderr() {
     assert(result.stderr_text.find("invalid MMLTK log level: banana") != std::string::npos);
 }
 
+void prepare_fake_docker_state(const fs::path& temp_dir, const fs::path& state_dir) {
+    std::error_code error;
+    fs::create_directories(state_dir, error);
+    assert(!error);
+    write_fake_docker_script(temp_dir);
+}
+
 void test_wrapper_env_logging_overrides_are_forwarded_to_docker_exec() {
     const fs::path temp_dir = make_temp_dir("mmltk-wrapper-log-env");
     const fs::path state_dir = temp_dir / "state";
     const fs::path log_path = temp_dir / "wrapper.log";
     const fs::path log_dir = temp_dir / "logs";
-    std::error_code error;
-    fs::create_directories(state_dir, error);
-    assert(!error);
-    write_fake_docker_script(temp_dir);
+    prepare_fake_docker_state(temp_dir, state_dir);
 
     const SubprocessResult result = run_subprocess_capture_output({
         "env",
@@ -364,10 +367,7 @@ void test_wrapper_cli_logging_flags_are_forwarded_to_container_command() {
     const fs::path state_dir = temp_dir / "state";
     const fs::path log_path = temp_dir / "explicit.log";
     const fs::path log_dir = temp_dir / "logdir";
-    std::error_code error;
-    fs::create_directories(state_dir, error);
-    assert(!error);
-    write_fake_docker_script(temp_dir);
+    prepare_fake_docker_state(temp_dir, state_dir);
 
     const SubprocessResult result = run_subprocess_capture_output({
         "env",
@@ -398,7 +398,47 @@ void test_wrapper_cli_logging_flags_are_forwarded_to_container_command() {
     cleanup_temp_dir(temp_dir);
 }
 
-} // namespace
+void test_wrapper_gui_tmpfs_uses_target_uid_gid() {
+    const fs::path temp_dir = make_temp_dir("mmltk-wrapper-gui-tmpfs");
+    const fs::path state_dir = temp_dir / "state";
+    const fs::path runtime_dir = temp_dir / "runtime";
+    const fs::path wayland_socket_path = runtime_dir / "wayland-0";
+    std::error_code error;
+    fs::create_directories(state_dir, error);
+    assert(!error);
+    fs::create_directories(runtime_dir, error);
+    assert(!error);
+    {
+        std::ofstream stream(wayland_socket_path, std::ios::trunc);
+        assert(stream.is_open());
+        stream << "fake-wayland-socket";
+    }
+    write_fake_docker_script(temp_dir);
+
+    const SubprocessResult result = run_subprocess_capture_output({
+        "env",
+        "PATH=" + prepend_path_env(temp_dir / "bin"),
+        "MMLTK_FAKE_DOCKER_STATE=" + state_dir.string(),
+        "MMLTK_IMAGE=fake-mmltk",
+        "WAYLAND_DISPLAY=wayland-0",
+        "XDG_RUNTIME_DIR=" + runtime_dir.string(),
+        locate_repo_wrapper_path().string(),
+        "--gui",
+    });
+
+    assert(result.exit_code == 0);
+    const std::vector<std::string> run_args = read_text_lines(state_dir / "run_args.txt");
+    const std::string expected_tmpfs =
+        "/tmp/mmltk-gui-runtime:rw,mode=700,uid=" + std::to_string(::getuid()) + ",gid=" + std::to_string(::getgid());
+    assert_contains_line(run_args, "--tmpfs");
+    assert_contains_line(run_args, expected_tmpfs);
+    assert_contains_substring(run_args, "com.mmltk.runtime=");
+    assert_contains_substring(run_args, "tmpfs=" + expected_tmpfs);
+
+    cleanup_temp_dir(temp_dir);
+}
+
+}  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[core][cli][test_bundles]", test_top_level_help_lists_test_bundle_docs);
 MMLTK_REGISTER_TEST_CASE("[core][cli][test_bundles]", test_test_list_lists_available_bundles);
@@ -412,5 +452,8 @@ MMLTK_REGISTER_TEST_CASE("[core][cli][logging]", test_env_log_file_creates_reque
 MMLTK_REGISTER_TEST_CASE("[core][cli][logging]", test_env_log_dir_creates_default_log_file);
 MMLTK_REGISTER_TEST_CASE("[core][cli][logging]", test_invalid_log_level_flag_reports_error_on_stderr);
 MMLTK_REGISTER_TEST_CASE("[core][cli][logging]", test_invalid_log_level_env_reports_error_on_stderr);
-MMLTK_REGISTER_TEST_CASE("[core][cli][logging][wrapper]", test_wrapper_env_logging_overrides_are_forwarded_to_docker_exec);
-MMLTK_REGISTER_TEST_CASE("[core][cli][logging][wrapper]", test_wrapper_cli_logging_flags_are_forwarded_to_container_command);
+MMLTK_REGISTER_TEST_CASE("[core][cli][logging][wrapper]",
+                         test_wrapper_env_logging_overrides_are_forwarded_to_docker_exec);
+MMLTK_REGISTER_TEST_CASE("[core][cli][logging][wrapper]",
+                         test_wrapper_cli_logging_flags_are_forwarded_to_container_command);
+MMLTK_REGISTER_TEST_CASE("[core][cli][wrapper][gui]", test_wrapper_gui_tmpfs_uses_target_uid_gid);

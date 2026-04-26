@@ -15,46 +15,43 @@
 
 namespace Catch {
 
-    class SonarQubeReporter final : public CumulativeReporterBase {
-    public:
-        SonarQubeReporter(ReporterConfig&& config)
-        : CumulativeReporterBase(CATCH_MOVE(config))
-        , xml(m_stream) {
-            m_preferences.shouldRedirectStdOut = true;
-            m_preferences.shouldReportAllAssertions = false;
-            m_preferences.shouldReportAllAssertionStarts = false;
-            m_shouldStoreSuccesfulAssertions = false;
-        }
+class SonarQubeReporter final : public CumulativeReporterBase {
+   public:
+    SonarQubeReporter(ReporterConfig&& config) : CumulativeReporterBase(CATCH_MOVE(config)), xml(m_stream) {
+        m_preferences.shouldRedirectStdOut = true;
+        m_preferences.shouldReportAllAssertions = false;
+        m_preferences.shouldReportAllAssertionStarts = false;
+        m_shouldStoreSuccesfulAssertions = false;
+    }
 
-        static std::string getDescription() {
-            using namespace std::string_literals;
-            return "Reports test results in the Generic Test Data SonarQube XML format"s;
-        }
+    static std::string getDescription() {
+        using namespace std::string_literals;
+        return "Reports test results in the Generic Test Data SonarQube XML format"s;
+    }
 
-        void testRunStarting( TestRunInfo const& testRunInfo ) override;
+    void testRunStarting(TestRunInfo const& testRunInfo) override;
 
-        void testRunEndedCumulative() override {
-            writeRun( *m_testRun );
-            xml.endElement();
-        }
+    void testRunEndedCumulative() override {
+        writeRun(*m_testRun);
+        xml.endElement();
+    }
 
-        void writeRun( TestRunNode const& runNode );
+    void writeRun(TestRunNode const& runNode);
 
-        void writeTestFile(StringRef filename, std::vector<TestCaseNode const*> const& testCaseNodes);
+    void writeTestFile(StringRef filename, std::vector<TestCaseNode const*> const& testCaseNodes);
 
-        void writeTestCase(TestCaseNode const& testCaseNode);
+    void writeTestCase(TestCaseNode const& testCaseNode);
 
-        void writeSection(std::string const& rootName, SectionNode const& sectionNode, bool okToFail);
+    void writeSection(std::string const& rootName, SectionNode const& sectionNode, bool okToFail);
 
-        void writeAssertions(SectionNode const& sectionNode, bool okToFail);
+    void writeAssertions(SectionNode const& sectionNode, bool okToFail);
 
-        void writeAssertion(AssertionStats const& stats, bool okToFail);
+    void writeAssertion(AssertionStats const& stats, bool okToFail);
 
-    private:
-        XmlWriter xml;
-    };
+   private:
+    XmlWriter xml;
+};
 
+}  // namespace Catch
 
-} // end namespace Catch
-
-#endif // CATCH_REPORTER_SONARQUBE_HPP_INCLUDED
+#endif  // CATCH_REPORTER_SONARQUBE_HPP_INCLUDED

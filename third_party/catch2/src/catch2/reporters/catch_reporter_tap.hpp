@@ -13,31 +13,30 @@
 
 namespace Catch {
 
-    class TAPReporter final : public StreamingReporterBase {
-    public:
-        TAPReporter( ReporterConfig&& config ):
-            StreamingReporterBase( CATCH_MOVE(config) ) {
-            m_preferences.shouldReportAllAssertions = true;
-            m_preferences.shouldReportAllAssertionStarts = false;
-        }
+class TAPReporter final : public StreamingReporterBase {
+   public:
+    TAPReporter(ReporterConfig&& config) : StreamingReporterBase(CATCH_MOVE(config)) {
+        m_preferences.shouldReportAllAssertions = true;
+        m_preferences.shouldReportAllAssertionStarts = false;
+    }
 
-        static std::string getDescription() {
-            using namespace std::string_literals;
-            return "Reports test results in TAP format, suitable for test harnesses"s;
-        }
+    static std::string getDescription() {
+        using namespace std::string_literals;
+        return "Reports test results in TAP format, suitable for test harnesses"s;
+    }
 
-        void testRunStarting( TestRunInfo const& testInfo ) override;
+    void testRunStarting(TestRunInfo const& testInfo) override;
 
-        void noMatchingTestCases( StringRef unmatchedSpec ) override;
+    void noMatchingTestCases(StringRef unmatchedSpec) override;
 
-        void assertionEnded(AssertionStats const& _assertionStats) override;
+    void assertionEnded(AssertionStats const& _assertionStats) override;
 
-        void testRunEnded(TestRunStats const& _testRunStats) override;
+    void testRunEnded(TestRunStats const& _testRunStats) override;
 
-    private:
-        std::size_t counter = 0;
-    };
+   private:
+    std::size_t counter = 0;
+};
 
-} // end namespace Catch
+}  // namespace Catch
 
-#endif // CATCH_REPORTER_TAP_HPP_INCLUDED
+#endif  // CATCH_REPORTER_TAP_HPP_INCLUDED

@@ -19,4 +19,4 @@ const WeightAsset* find_weight_asset(std::string_view filename);
 std::optional<WeightAsset> resolve_weight_asset_for_path(const std::string& path);
 bool is_registered_weight_asset(std::string_view filename);
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

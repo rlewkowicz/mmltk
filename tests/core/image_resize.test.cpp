@@ -65,8 +65,7 @@ void test_same_size_copy_preserves_pixels() {
 void test_parallel_worker_local_resizers_are_stable() {
     const std::vector<uint8_t> source = make_test_image(211, 157);
     std::vector<std::vector<uint8_t>> outputs(
-        8,
-        std::vector<uint8_t>(static_cast<size_t>(332) * static_cast<size_t>(332) * 3U));
+        8, std::vector<uint8_t>(static_cast<size_t>(332) * static_cast<size_t>(332) * 3U));
     std::vector<std::thread> threads;
     threads.reserve(outputs.size());
     for (auto& output : outputs) {
@@ -83,7 +82,7 @@ void test_parallel_worker_local_resizers_are_stable() {
     }
 }
 
-} // namespace
+}  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[core][image_resize]", test_resize_plan_respects_budget);
 MMLTK_REGISTER_TEST_CASE("[core][image_resize]", test_single_thread_resize_is_stable);

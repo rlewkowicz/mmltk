@@ -75,36 +75,21 @@ struct RectLayerFrameResult {
     AnnotationBox box{};
 };
 
-CanvasViewport make_canvas_viewport(float screen_x,
-                                    float screen_y,
-                                    float screen_width,
-                                    float screen_height,
-                                    std::uint32_t image_width,
-                                    std::uint32_t image_height);
+CanvasViewport make_canvas_viewport(float screen_x, float screen_y, float screen_width, float screen_height,
+                                    std::uint32_t image_width, std::uint32_t image_height);
 CanvasScreenRect canvas_rect_from_box(const CanvasViewport& viewport, const AnnotationBox& box);
-RectDragKind rectangle_hover_kind(const CanvasPointerState& pointer,
-                                  const CanvasViewport& viewport,
+RectDragKind rectangle_hover_kind(const CanvasPointerState& pointer, const CanvasViewport& viewport,
                                   const AnnotationBox& box);
-RectDragKind rectangle_hover_kind_with_options(const CanvasPointerState& pointer,
-                                               const CanvasViewport& viewport,
-                                               const AnnotationBox& box,
-                                               bool edge_only_move,
-                                               float edge_hit_half_width = 6.0f,
-                                               float corner_hit_size = 18.0f);
-AnnotationBox apply_rect_drag(const RectDragState& state,
-                              const CanvasPointerState& pointer,
-                              const CanvasViewport& viewport,
-                              int max_width,
-                              int max_height,
-                              int min_size);
-RectLayerFrameResult update_rect_layers(RectLayerState& state,
-                                        const RectLayerSpec* layers,
-                                        std::size_t layer_count,
-                                        const CanvasViewport& viewport,
-                                        const CanvasPointerState& pointer);
+RectDragKind rectangle_hover_kind_with_options(const CanvasPointerState& pointer, const CanvasViewport& viewport,
+                                               const AnnotationBox& box, bool edge_only_move,
+                                               float edge_hit_half_width = 6.0f, float corner_hit_size = 18.0f);
+AnnotationBox apply_rect_drag(const RectDragState& state, const CanvasPointerState& pointer,
+                              const CanvasViewport& viewport, int max_width, int max_height, int min_size);
+RectLayerFrameResult update_rect_layers(RectLayerState& state, const RectLayerSpec* layers, std::size_t layer_count,
+                                        const CanvasViewport& viewport, const CanvasPointerState& pointer);
 void clear_rect_layer_state(RectLayerState& state);
 ResolvedVideoCrop resolve_video_crop(const SourceSelectionState& state);
 AnnotationBox resolved_video_crop_box(const SourceSelectionState& state);
 bool assign_video_crop_box(SourceSelectionState& state, const AnnotationBox& box);
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

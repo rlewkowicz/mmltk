@@ -36,7 +36,6 @@ ParsedTestRequest parse_test_request(int argc, char** argv);
 std::vector<BundledTestBundle> discover_bundled_test_bundles();
 std::string bundled_test_help_text(const std::vector<BundledTestBundle>& bundles);
 void print_bundled_test_bundles(FILE* stream, const std::vector<BundledTestBundle>& bundles);
-int handle_bundled_test_request(const ParsedTestRequest& request,
-                                const std::vector<BundledTestBundle>& bundles);
+int handle_bundled_test_request(const ParsedTestRequest& request, const std::vector<BundledTestBundle>& bundles);
 
-} // namespace mmltk::cli_support
+}  // namespace mmltk::cli_support

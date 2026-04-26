@@ -14,8 +14,7 @@ using OnnxInitializerMap = std::unordered_map<std::string, at::Tensor>;
 
 int onnx_tensor_data_type(at::ScalarType scalar_type);
 void validate_supported_onnx_export_opset(int opset_version);
-void lower_graph_for_onnx_export(
-    const std::shared_ptr<torch::jit::Graph>& graph,
-    const OnnxInitializerMap* initializers = nullptr);
+void lower_graph_for_onnx_export(const std::shared_ptr<torch::jit::Graph>& graph,
+                                 const OnnxInitializerMap* initializers = nullptr);
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

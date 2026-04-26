@@ -12,30 +12,30 @@ namespace {
 std::string onnx_tensor_dtype_name(int elem_type) {
     using DataType = ONNX_NAMESPACE::TensorProto_DataType;
     switch (static_cast<DataType>(elem_type)) {
-    case DataType::TensorProto_DataType_FLOAT:
-        return "float32";
-    case DataType::TensorProto_DataType_FLOAT16:
-        return "float16";
-    case DataType::TensorProto_DataType_DOUBLE:
-        return "float64";
-    case DataType::TensorProto_DataType_INT8:
-        return "int8";
-    case DataType::TensorProto_DataType_INT16:
-        return "int16";
-    case DataType::TensorProto_DataType_INT32:
-        return "int32";
-    case DataType::TensorProto_DataType_INT64:
-        return "int64";
-    case DataType::TensorProto_DataType_UINT8:
-        return "uint8";
-    case DataType::TensorProto_DataType_UINT16:
-        return "uint16";
-    case DataType::TensorProto_DataType_BOOL:
-        return "bool";
-    case DataType::TensorProto_DataType_BFLOAT16:
-        return "bfloat16";
-    default:
-        return "unknown";
+        case DataType::TensorProto_DataType_FLOAT:
+            return "float32";
+        case DataType::TensorProto_DataType_FLOAT16:
+            return "float16";
+        case DataType::TensorProto_DataType_DOUBLE:
+            return "float64";
+        case DataType::TensorProto_DataType_INT8:
+            return "int8";
+        case DataType::TensorProto_DataType_INT16:
+            return "int16";
+        case DataType::TensorProto_DataType_INT32:
+            return "int32";
+        case DataType::TensorProto_DataType_INT64:
+            return "int64";
+        case DataType::TensorProto_DataType_UINT8:
+            return "uint8";
+        case DataType::TensorProto_DataType_UINT16:
+            return "uint16";
+        case DataType::TensorProto_DataType_BOOL:
+            return "bool";
+        case DataType::TensorProto_DataType_BFLOAT16:
+            return "bfloat16";
+        default:
+            return "unknown";
     }
 }
 
@@ -72,7 +72,7 @@ void infer_rfdetr_output_layout(ModelInfo& info) {
     }
 }
 
-} // namespace
+}  // namespace
 
 ModelInfo load_onnx_model_info(const std::filesystem::path& model_path) {
     const ONNX_NAMESPACE::ModelProto model = load_onnx_model(model_path);
@@ -110,4 +110,4 @@ ModelInfo load_onnx_model_info(const std::filesystem::path& model_path) {
     return info;
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

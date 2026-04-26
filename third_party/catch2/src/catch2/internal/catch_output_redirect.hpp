@@ -15,63 +15,62 @@
 
 namespace Catch {
 
-    class OutputRedirect {
-        bool m_redirectActive = false;
-        virtual void activateImpl() = 0;
-        virtual void deactivateImpl() = 0;
-    public:
-        enum Kind {
-            //! No redirect (noop implementation)
-            None,
-            //! Redirect std::cout/std::cerr/std::clog streams internally
-            Streams,
-            //! Redirect the stdout/stderr file descriptors into files
-            FileDescriptors,
-        };
+class OutputRedirect {
+    bool m_redirectActive = false;
+    virtual void activateImpl() = 0;
+    virtual void deactivateImpl() = 0;
 
-        virtual ~OutputRedirect(); // = default;
-
-        // TODO: Do we want to check that redirect is not active before retrieving the output?
-        virtual std::string getStdout() = 0;
-        virtual std::string getStderr() = 0;
-        virtual void clearBuffers() = 0;
-        bool isActive() const { return m_redirectActive; }
-        void activate() {
-            assert( !m_redirectActive && "redirect is already active" );
-            activateImpl();
-            m_redirectActive = true;
-        }
-        void deactivate() {
-            assert( m_redirectActive && "redirect is not active" );
-            deactivateImpl();
-            m_redirectActive = false;
-        }
+   public:
+    enum Kind {
+        None,
+        Streams,
+        FileDescriptors,
     };
 
-    bool isRedirectAvailable( OutputRedirect::Kind kind);
-    Detail::unique_ptr<OutputRedirect> makeOutputRedirect( bool actual );
+    virtual ~OutputRedirect();
 
-    class RedirectGuard {
-        OutputRedirect* m_redirect;
-        bool m_activate;
-        bool m_previouslyActive;
-        bool m_moved = false;
+    // TODO: Do we want to check that redirect is not active before retrieving the output?
+    virtual std::string getStdout() = 0;
+    virtual std::string getStderr() = 0;
+    virtual void clearBuffers() = 0;
+    bool isActive() const {
+        return m_redirectActive;
+    }
+    void activate() {
+        assert(!m_redirectActive && "redirect is already active");
+        activateImpl();
+        m_redirectActive = true;
+    }
+    void deactivate() {
+        assert(m_redirectActive && "redirect is not active");
+        deactivateImpl();
+        m_redirectActive = false;
+    }
+};
 
-    public:
-        RedirectGuard( bool activate, OutputRedirect& redirectImpl );
-        ~RedirectGuard() noexcept( false );
+bool isRedirectAvailable(OutputRedirect::Kind kind);
+Detail::unique_ptr<OutputRedirect> makeOutputRedirect(bool actual);
 
-        RedirectGuard( RedirectGuard const& ) = delete;
-        RedirectGuard& operator=( RedirectGuard const& ) = delete;
+class RedirectGuard {
+    OutputRedirect* m_redirect;
+    bool m_activate;
+    bool m_previouslyActive;
+    bool m_moved = false;
 
-        // C++14 needs move-able guards to return them from functions
-        RedirectGuard( RedirectGuard&& rhs ) noexcept;
-        RedirectGuard& operator=( RedirectGuard&& rhs ) noexcept;
-    };
+   public:
+    RedirectGuard(bool activate, OutputRedirect& redirectImpl);
+    ~RedirectGuard() noexcept(false);
 
-    RedirectGuard scopedActivate( OutputRedirect& redirectImpl );
-    RedirectGuard scopedDeactivate( OutputRedirect& redirectImpl );
+    RedirectGuard(RedirectGuard const&) = delete;
+    RedirectGuard& operator=(RedirectGuard const&) = delete;
 
-} // end namespace Catch
+    RedirectGuard(RedirectGuard&& rhs) noexcept;
+    RedirectGuard& operator=(RedirectGuard&& rhs) noexcept;
+};
 
-#endif // CATCH_OUTPUT_REDIRECT_HPP_INCLUDED
+RedirectGuard scopedActivate(OutputRedirect& redirectImpl);
+RedirectGuard scopedDeactivate(OutputRedirect& redirectImpl);
+
+}  // namespace Catch
+
+#endif  // CATCH_OUTPUT_REDIRECT_HPP_INCLUDED

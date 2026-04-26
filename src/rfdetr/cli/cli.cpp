@@ -33,7 +33,7 @@
 namespace mmltk::rfdetr {
 
 class RfdetrCliRegistrar final {
-public:
+   public:
     int run(int argc, char** argv) const;
 };
 
@@ -150,19 +150,17 @@ void run_compile(const CompileCliOptions& options) {
         size_t total = 0;
         size_t progress_pulse = 0;
         spdmon::ProgressBar bar("compile " + split, 0, "img");
-        DatasetCompiler::compile(
-            config,
-            [&bar, &last_done, &total, &progress_pulse](const CompileProgress& progress) {
-                if (progress.total != total) {
-                    total = progress.total;
-                    bar.set_total(total);
-                }
-                if (progress.done > last_done) {
-                    bar.add(progress.done - last_done);
-                    last_done = progress.done;
-                }
-                bar.set_postfix(spdmon::format_compile_postfix(progress, progress_pulse++));
-            });
+        DatasetCompiler::compile(config, [&bar, &last_done, &total, &progress_pulse](const CompileProgress& progress) {
+            if (progress.total != total) {
+                total = progress.total;
+                bar.set_total(total);
+            }
+            if (progress.done > last_done) {
+                bar.add(progress.done - last_done);
+                last_done = progress.done;
+            }
+            bar.set_postfix(spdmon::format_compile_postfix(progress, progress_pulse++));
+        });
         bar.close();
     }
 }
@@ -180,86 +178,71 @@ void configure_rfdetr_cli_app(CLI::App& app, RegisteredRfdetrCli& cli) {
 }
 
 void register_rfdetr_commands(CLI::App& app, RegisteredRfdetrCli& cli) {
-    cli.compile_cmd = app.add_subcommand(
-        "compile",
-        "Compile train and val splits for RF-DETR experiments");
+    cli.compile_cmd = app.add_subcommand("compile", "Compile train and val splits for RF-DETR experiments");
     auto* compile_dataset = cli.compile_cmd->add_option_group("Dataset");
-    cli_shared::add_path_option(compile_dataset, "--source-dir", cli.compile_options.source_dir,
-                                "Source dataset root");
+    cli_shared::add_path_option(compile_dataset, "--source-dir", cli.compile_options.source_dir, "Source dataset root");
     cli_shared::add_path_option(compile_dataset, "--output-dir", cli.compile_options.output_dir,
                                 "Output directory for compiled train/val binaries");
-    compile_dataset->add_option("--resolution", cli.compile_options.resolution,
-                                "Square image resolution for both splits")
+    compile_dataset
+        ->add_option("--resolution", cli.compile_options.resolution, "Square image resolution for both splits")
         ->type_name("INT");
-    compile_dataset->add_option("--workers", cli.compile_options.num_workers,
-                                "Total CPU worker budget for compile; 0 or negative selects all available CPUs")
+    compile_dataset
+        ->add_option("--workers", cli.compile_options.num_workers,
+                     "Total CPU worker budget for compile; 0 or negative selects all available CPUs")
         ->type_name("INT");
-    compile_dataset->add_option("--cuda-mask-batch-size", cli.compile_options.cuda_mask_batch_size,
-                                "Batched CUDA mask-resize task count; 0 disables GPU mask resizing")
+    compile_dataset
+        ->add_option("--cuda-mask-batch-size", cli.compile_options.cuda_mask_batch_size,
+                     "Batched CUDA mask-resize task count; 0 disables GPU mask resizing")
         ->type_name("INT");
-    compile_dataset->add_option("--cuda-device-id", cli.compile_options.cuda_device_id,
-                                "CUDA device id used for batched mask resizing")
+    compile_dataset
+        ->add_option("--cuda-device-id", cli.compile_options.cuda_device_id,
+                     "CUDA device id used for batched mask resizing")
         ->type_name("INT");
 
-    cli.info_cmd = app.add_subcommand(
-        "info",
-        "Inspect ONNX or TensorRT model metadata");
+    cli.info_cmd = app.add_subcommand("info", "Inspect ONNX or TensorRT model metadata");
     auto* info_model = cli.info_cmd->add_option_group("Model input");
     cli_shared::add_path_option(info_model, "--onnx", cli.info_options.onnx_path, "ONNX model path");
     cli_shared::add_path_option(info_model, "--tensorrt", cli.info_options.tensorrt_path,
                                 "TensorRT engine path or ONNX path to build from");
-    cli.info_cmd->add_option("--device-id", cli.info_options.device_id, "CUDA device id")
-        ->type_name("INT");
+    cli.info_cmd->add_option("--device-id", cli.info_options.device_id, "CUDA device id")->type_name("INT");
 
-    cli.build_engine_cmd = app.add_subcommand(
-        "build-engine",
-        "Build a TensorRT engine from an ONNX model");
+    cli.build_engine_cmd = app.add_subcommand("build-engine", "Build a TensorRT engine from an ONNX model");
     auto* build_engine_io = cli.build_engine_cmd->add_option_group("Input and output");
     auto* build_engine_exec = cli.build_engine_cmd->add_option_group("Execution");
     cli_shared::add_build_engine_request_options(build_engine_io, build_engine_exec, cli.build_engine_request);
 
-    cli.export_onnx_cmd = app.add_subcommand(
-        "export-onnx",
-        "Export .pt weights to ONNX format");
+    cli.export_onnx_cmd = app.add_subcommand("export-onnx", "Export .pt weights to ONNX format");
     auto* export_onnx_io = cli.export_onnx_cmd->add_option_group("Input and output");
     auto* export_onnx_exec = cli.export_onnx_cmd->add_option_group("Execution");
     cli_shared::add_export_onnx_request_options(export_onnx_io, export_onnx_exec, cli.export_onnx_request);
 
-    cli.predict_cmd = app.add_subcommand(
-        "predict",
-        "Run RF-DETR inference and write predictions to JSON");
+    cli.predict_cmd = app.add_subcommand("predict", "Run RF-DETR inference and write predictions to JSON");
     cli.predict_state = cli_shared::add_predict_command_options(cli.predict_cmd);
 
-    cli.evaluate_cmd = app.add_subcommand(
-        "evaluate",
-        "Run RF-DETR evaluation on a compiled dataset split");
+    cli.evaluate_cmd = app.add_subcommand("evaluate", "Run RF-DETR evaluation on a compiled dataset split");
     cli.evaluate_cmd->alias("eval");
     cli.evaluate_cmd->alias("val");
     auto* evaluate_dataset = cli.evaluate_cmd->add_option_group("Dataset");
     cli_shared::add_path_option(evaluate_dataset, "--compiled", cli.evaluate_state.options.compiled_path,
                                 "Compiled dataset split (.bin)");
     auto* evaluate_model = cli.evaluate_cmd->add_option_group("Model input");
-    cli_shared::add_model_input_options(
-        evaluate_model,
-        cli.evaluate_state.options,
-        "TensorRT engine path or ONNX path to build from");
+    cli_shared::add_model_input_options(evaluate_model, cli.evaluate_state.options,
+                                        "TensorRT engine path or ONNX path to build from");
     auto* evaluate_execution = cli.evaluate_cmd->add_option_group("Execution");
-    evaluate_execution->add_option("--batch-size", cli.evaluate_state.options.batch_size,
-                                   "Batch size for evaluation")
+    evaluate_execution->add_option("--batch-size", cli.evaluate_state.options.batch_size, "Batch size for evaluation")
         ->type_name("INT");
     evaluate_execution->add_option("--device-id", cli.evaluate_state.options.device_id, "CUDA device id")
         ->type_name("INT");
-    evaluate_execution->add_option("--limit-images", cli.evaluate_state.options.limit_images,
-                                   "Limit the number of evaluated images")
+    evaluate_execution
+        ->add_option("--limit-images", cli.evaluate_state.options.limit_images, "Limit the number of evaluated images")
         ->type_name("INT");
-    evaluate_execution->add_option("--eval-max-dets", cli.evaluate_state.options.eval_max_dets,
-                                   "Maximum detections per image during evaluation")
+    evaluate_execution
+        ->add_option("--eval-max-dets", cli.evaluate_state.options.eval_max_dets,
+                     "Maximum detections per image during evaluation")
         ->type_name("INT");
-    evaluate_execution->add_option("--workers", cli.evaluate_state.options.workers,
-                                   "Dataset worker count")
+    evaluate_execution->add_option("--workers", cli.evaluate_state.options.workers, "Dataset worker count")
         ->type_name("INT");
-    evaluate_execution->add_option("--lanes", cli.evaluate_state.options.lanes,
-                                   "Parallel backend lane count")
+    evaluate_execution->add_option("--lanes", cli.evaluate_state.options.lanes, "Parallel backend lane count")
         ->type_name("INT");
     evaluate_execution->add_option("--cpu-affinity", cli.evaluate_state.options.cpu_affinity,
                                    "Linux CPU list or range string for workers");
@@ -271,23 +254,19 @@ void register_rfdetr_commands(CLI::App& app, RegisteredRfdetrCli& cli) {
                                  "Render interactive progress output");
     cli_shared::add_compile_mode_option(evaluate_execution, cli.evaluate_state.compile_mode);
 
-    cli.train_cmd = app.add_subcommand(
-        "train",
-        "Train RF-DETR natively against compiled datasets");
+    cli.train_cmd = app.add_subcommand("train", "Train RF-DETR natively against compiled datasets");
     cli.train_state = cli_shared::add_train_command_options(cli.train_cmd);
 
-    cli.normalize_cmd = app.add_subcommand(
-        "normalize-weights",
-        "Convert an upstream RF-DETR checkpoint into mmltk's native format");
+    cli.normalize_cmd =
+        app.add_subcommand("normalize-weights", "Convert an upstream RF-DETR checkpoint into mmltk's native format");
     auto* normalize_io = cli.normalize_cmd->add_option_group("Input and output");
     cli_shared::add_path_option(normalize_io, "--input", cli.normalize_options.input_path,
                                 "Input upstream checkpoint path");
     cli_shared::add_path_option(normalize_io, "--output", cli.normalize_options.output_path,
                                 "Output native checkpoint path");
 
-    cli.validate_cmd = app.add_subcommand(
-        "validate",
-        "Compare ONNX and TensorRT backends against a compiled dataset split");
+    cli.validate_cmd =
+        app.add_subcommand("validate", "Compare ONNX and TensorRT backends against a compiled dataset split");
     cli.validate_state = cli_shared::add_validate_command_options(cli.validate_cmd);
 }
 
@@ -338,32 +317,22 @@ int run_info_command(const InfoOptions& options) {
     if (!options.onnx_path.empty()) {
         exec_onnx_info_tool(options.onnx_path);
     }
-    std::unique_ptr<InferenceBackend> backend =
-        make_tensorrt_backend(options.tensorrt_path, options.device_id, true);
+    std::unique_ptr<InferenceBackend> backend = make_tensorrt_backend(options.tensorrt_path, options.device_id, true);
     print_model_metadata(backend->info(), 0, 0, ValidationLogMode::Interactive);
     return 0;
 }
 
 int run_build_engine_command(const BuildEngineRequest& request) {
     validate_build_engine_request(request);
-    make_tensorrt_backend(
-        request.onnx_path,
-        request.device_id,
-        request.allow_fp16,
-        request.output_path);
-    mmltk::logging::logger("rfdetr.cli")->info("tensorrt: wrote engine to {}",
-                                              request.output_path.string());
+    make_tensorrt_backend(request.onnx_path, request.device_id, request.allow_fp16, request.output_path);
+    mmltk::logging::logger("rfdetr.cli")->info("tensorrt: wrote engine to {}", request.output_path.string());
     return 0;
 }
 
 int run_export_onnx_command(const ExportOnnxRequest& request) {
     validate_export_onnx_request(request);
-    export_weights_to_onnx(
-        request.weights_path,
-        request.output_path,
-        request.device_id,
-        request.opset_version,
-        request.simplify);
+    export_weights_to_onnx(request.weights_path, request.output_path, request.device_id, request.opset_version,
+                           request.simplify);
     return 0;
 }
 
@@ -396,13 +365,10 @@ int run_train_command(cli_shared::TrainCommandSpec& state, int argc, char** argv
 
 int run_normalize_command(NormalizeWeightsOptions& options) {
     finalize_normalize_options(options);
-    const NativeCheckpoint checkpoint =
-        normalize_checkpoint_to_native(options.input_path, options.output_path);
-    mmltk::logging::logger("rfdetr.cli")->info(
-        "rfdetr.normalize-weights: wrote {} tensors for preset={} to {}",
-        checkpoint.state_dict.size(),
-        checkpoint.metadata.preset_name,
-        options.output_path.string());
+    const NativeCheckpoint checkpoint = normalize_checkpoint_to_native(options.input_path, options.output_path);
+    mmltk::logging::logger("rfdetr.cli")
+        ->info("rfdetr.normalize-weights: wrote {} tensors for preset={} to {}", checkpoint.state_dict.size(),
+               checkpoint.metadata.preset_name, options.output_path.string());
     return 0;
 }
 
@@ -455,7 +421,7 @@ int execute_rfdetr_cli_command(RegisteredRfdetrCli& cli, int argc, char** argv) 
     return 1;
 }
 
-} // namespace
+}  // namespace
 
 int RfdetrCliRegistrar::run(int argc, char** argv) const {
     if (argc < 2 || std::string(argv[1]) != "rfdetr") {
@@ -482,4 +448,4 @@ int handle_cli(int argc, char** argv) {
     return registrar.run(argc, argv);
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

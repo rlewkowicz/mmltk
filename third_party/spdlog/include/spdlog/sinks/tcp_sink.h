@@ -19,37 +19,22 @@
 
 #pragma once
 
-// Simple tcp client sink
-// Connects to remote address and send the formatted log.
-// Will attempt to reconnect if connection drops.
-// If more complicated behaviour is needed (i.e get responses), you can inherit it and override the
-// sink_it_ method.
-
 namespace spdlog {
 namespace sinks {
 
 struct tcp_sink_config {
     std::string server_host;
     int server_port;
-    int timeout_ms =
-        0;  // The timeout for all 3 major socket operations that is connect, send, and recv
-    bool lazy_connect = false;  // if true connect on first log call instead of on construction
+    int timeout_ms = 0;
+    bool lazy_connect = false;
 
-    tcp_sink_config(std::string host, int port)
-        : server_host{std::move(host)},
-          server_port{port} {}
+    tcp_sink_config(std::string host, int port) : server_host{std::move(host)}, server_port{port} {}
 };
 
 template <typename Mutex>
 class tcp_sink : public spdlog::sinks::base_sink<Mutex> {
-public:
-    // connect to tcp host/port or throw if failed
-    // host can be hostname or ip address
-
-    explicit tcp_sink(const std::string &host,
-                      int port,
-                      int timeout_ms = 0,
-                      bool lazy_connect = false)
+   public:
+    explicit tcp_sink(const std::string& host, int port, int timeout_ms = 0, bool lazy_connect = false)
         : config_{host, port} {
         config_.timeout_ms = timeout_ms;
         config_.lazy_connect = lazy_connect;
@@ -58,8 +43,7 @@ public:
         }
     }
 
-    explicit tcp_sink(tcp_sink_config sink_config)
-        : config_{std::move(sink_config)} {
+    explicit tcp_sink(tcp_sink_config sink_config) : config_{std::move(sink_config)} {
         if (!config_.lazy_connect) {
             client_.connect(config_.server_host, config_.server_port, config_.timeout_ms);
         }
@@ -67,8 +51,8 @@ public:
 
     ~tcp_sink() override = default;
 
-protected:
-    void sink_it_(const spdlog::details::log_msg &msg) override {
+   protected:
+    void sink_it_(const spdlog::details::log_msg& msg) override {
         spdlog::memory_buf_t formatted;
         spdlog::sinks::base_sink<Mutex>::formatter_->format(msg, formatted);
         if (!client_.is_connected()) {

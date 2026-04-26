@@ -14,36 +14,28 @@
 namespace spdlog {
 namespace sinks {
 
-/**
- * This sink prefixes the output with an ANSI escape sequence color code
- * depending on the severity
- * of the message.
- * If no color terminal detected, omit the escape codes.
- */
-
 template <typename ConsoleMutex>
 class ansicolor_sink : public sink {
-public:
+   public:
     using mutex_t = typename ConsoleMutex::mutex_t;
-    ansicolor_sink(FILE *target_file, color_mode mode);
+    ansicolor_sink(FILE* target_file, color_mode mode);
     ~ansicolor_sink() override = default;
 
-    ansicolor_sink(const ansicolor_sink &other) = delete;
-    ansicolor_sink(ansicolor_sink &&other) = delete;
+    ansicolor_sink(const ansicolor_sink& other) = delete;
+    ansicolor_sink(ansicolor_sink&& other) = delete;
 
-    ansicolor_sink &operator=(const ansicolor_sink &other) = delete;
-    ansicolor_sink &operator=(ansicolor_sink &&other) = delete;
+    ansicolor_sink& operator=(const ansicolor_sink& other) = delete;
+    ansicolor_sink& operator=(ansicolor_sink&& other) = delete;
 
     void set_color(level::level_enum color_level, string_view_t color);
     void set_color_mode(color_mode mode);
     bool should_color() const;
 
-    void log(const details::log_msg &msg) override;
+    void log(const details::log_msg& msg) override;
     void flush() override;
-    void set_pattern(const std::string &pattern) override;
+    void set_pattern(const std::string& pattern) override;
     void set_formatter(std::unique_ptr<spdlog::formatter> sink_formatter) override;
 
-    // Formatting codes
     const string_view_t reset = "\033[m";
     const string_view_t bold = "\033[1m";
     const string_view_t dark = "\033[2m";
@@ -53,7 +45,6 @@ public:
     const string_view_t concealed = "\033[8m";
     const string_view_t clear_line = "\033[K";
 
-    // Foreground colors
     const string_view_t black = "\033[30m";
     const string_view_t red = "\033[31m";
     const string_view_t green = "\033[32m";
@@ -63,7 +54,6 @@ public:
     const string_view_t cyan = "\033[36m";
     const string_view_t white = "\033[37m";
 
-    /// Background colors
     const string_view_t on_black = "\033[40m";
     const string_view_t on_red = "\033[41m";
     const string_view_t on_green = "\033[42m";
@@ -73,34 +63,33 @@ public:
     const string_view_t on_cyan = "\033[46m";
     const string_view_t on_white = "\033[47m";
 
-    /// Bold colors
     const string_view_t yellow_bold = "\033[33m\033[1m";
     const string_view_t red_bold = "\033[31m\033[1m";
     const string_view_t bold_on_red = "\033[1m\033[41m";
 
-protected:
-    FILE *target_file_;
+   protected:
+    FILE* target_file_;
 
-private:
-    mutex_t &mutex_;
+   private:
+    mutex_t& mutex_;
     bool should_do_colors_;
     std::unique_ptr<spdlog::formatter> formatter_;
     std::array<std::string, level::n_levels> colors_;
     void set_color_mode_(color_mode mode);
-    void print_ccode_(const string_view_t &color_code) const;
-    void print_range_(const memory_buf_t &formatted, size_t start, size_t end) const;
-    static std::string to_string_(const string_view_t &sv);
+    void print_ccode_(const string_view_t& color_code) const;
+    void print_range_(const memory_buf_t& formatted, size_t start, size_t end) const;
+    static std::string to_string_(const string_view_t& sv);
 };
 
 template <typename ConsoleMutex>
 class ansicolor_stdout_sink : public ansicolor_sink<ConsoleMutex> {
-public:
+   public:
     explicit ansicolor_stdout_sink(color_mode mode = color_mode::automatic);
 };
 
 template <typename ConsoleMutex>
 class ansicolor_stderr_sink : public ansicolor_sink<ConsoleMutex> {
-public:
+   public:
     explicit ansicolor_stderr_sink(color_mode mode = color_mode::automatic);
 };
 

@@ -12,19 +12,17 @@
 
 namespace Catch {
 
-    // Use this in variadic streaming macros to allow
-    //    << +StreamEndStop
-    // as well as
-    //    << stuff +StreamEndStop
-    struct StreamEndStop {
-        constexpr StringRef operator+() const { return StringRef(); }
+struct StreamEndStop {
+    constexpr StringRef operator+() const {
+        return StringRef();
+    }
 
-        template <typename T>
-        constexpr friend T const& operator+( T const& value, StreamEndStop ) {
-            return value;
-        }
-    };
+    template <typename T>
+    constexpr friend T const& operator+(T const& value, StreamEndStop) {
+        return value;
+    }
+};
 
-} // namespace Catch
+}  // namespace Catch
 
-#endif // CATCH_STREAM_END_STOP_HPP_INCLUDED
+#endif  // CATCH_STREAM_END_STOP_HPP_INCLUDED

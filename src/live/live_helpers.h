@@ -19,8 +19,7 @@ inline void ensure_cuda_ok(const cudaError_t status, const char* context) {
     }
 }
 
-inline bool event_ready(const cudaEvent_t event,
-                        const char* context = "cudaEventQuery") {
+inline bool event_ready(const cudaEvent_t event, const char* context = "cudaEventQuery") {
     if (event == nullptr) {
         return true;
     }
@@ -51,16 +50,16 @@ static_assert(sizeof(Rgba32Pixel) == 4U, "Rgba32Pixel must stay tightly packed")
 
 template <typename T>
 class PinnedUploadBuffer {
-public:
+   public:
     PinnedUploadBuffer() = default;
-    ~PinnedUploadBuffer() { reset(); }
+    ~PinnedUploadBuffer() {
+        reset();
+    }
 
     PinnedUploadBuffer(const PinnedUploadBuffer&) = delete;
     PinnedUploadBuffer& operator=(const PinnedUploadBuffer&) = delete;
 
-    PinnedUploadBuffer(PinnedUploadBuffer&& other) noexcept
-        : data_(other.data_),
-          capacity_(other.capacity_) {
+    PinnedUploadBuffer(PinnedUploadBuffer&& other) noexcept : data_(other.data_), capacity_(other.capacity_) {
         other.data_ = nullptr;
         other.capacity_ = 0;
     }
@@ -86,9 +85,7 @@ public:
         if (data_ != nullptr) {
             ensure_cuda_ok(cudaFreeHost(data_), context);
         }
-        ensure_cuda_ok(cudaHostAlloc(reinterpret_cast<void**>(&data_),
-                                     value_count * sizeof(T),
-                                     cudaHostAllocPortable),
+        ensure_cuda_ok(cudaHostAlloc(reinterpret_cast<void**>(&data_), value_count * sizeof(T), cudaHostAllocPortable),
                        context);
         capacity_ = value_count;
     }
@@ -101,28 +98,37 @@ public:
         capacity_ = 0;
     }
 
-    [[nodiscard]] T* data() noexcept { return data_; }
-    [[nodiscard]] const T* data() const noexcept { return data_; }
-    [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
-    [[nodiscard]] bool empty() const noexcept { return data_ == nullptr; }
+    [[nodiscard]] T* data() noexcept {
+        return data_;
+    }
+    [[nodiscard]] const T* data() const noexcept {
+        return data_;
+    }
+    [[nodiscard]] std::size_t capacity() const noexcept {
+        return capacity_;
+    }
+    [[nodiscard]] bool empty() const noexcept {
+        return data_ == nullptr;
+    }
 
-private:
+   private:
     T* data_ = nullptr;
     std::size_t capacity_ = 0;
 };
 
 template <typename T>
 class DeviceUploadBuffer {
-public:
+   public:
     DeviceUploadBuffer() = default;
-    ~DeviceUploadBuffer() { reset(); }
+    ~DeviceUploadBuffer() {
+        reset();
+    }
 
     DeviceUploadBuffer(const DeviceUploadBuffer&) = delete;
     DeviceUploadBuffer& operator=(const DeviceUploadBuffer&) = delete;
 
     DeviceUploadBuffer(DeviceUploadBuffer&& other) noexcept
-        : device_ptr_(other.device_ptr_),
-          capacity_(other.capacity_) {
+        : device_ptr_(other.device_ptr_), capacity_(other.capacity_) {
         other.device_ptr_ = 0;
         other.capacity_ = 0;
     }
@@ -148,8 +154,7 @@ public:
         if (device_ptr_ != 0) {
             ensure_cuda_ok(cudaFree(device_ptr_as_void(device_ptr_)), context);
         }
-        ensure_cuda_ok(cudaMalloc(reinterpret_cast<void**>(&device_ptr_), value_count * sizeof(T)),
-                       context);
+        ensure_cuda_ok(cudaMalloc(reinterpret_cast<void**>(&device_ptr_), value_count * sizeof(T)), context);
         capacity_ = value_count;
     }
 
@@ -161,20 +166,28 @@ public:
         capacity_ = 0;
     }
 
-    [[nodiscard]] CUdeviceptr data() const noexcept { return device_ptr_; }
-    [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
-    [[nodiscard]] bool empty() const noexcept { return device_ptr_ == 0; }
+    [[nodiscard]] CUdeviceptr data() const noexcept {
+        return device_ptr_;
+    }
+    [[nodiscard]] std::size_t capacity() const noexcept {
+        return capacity_;
+    }
+    [[nodiscard]] bool empty() const noexcept {
+        return device_ptr_ == 0;
+    }
 
-private:
+   private:
     CUdeviceptr device_ptr_ = 0;
     std::size_t capacity_ = 0;
 };
 
 template <typename T = std::uint8_t>
 class PitchedDeviceBuffer {
-public:
+   public:
     PitchedDeviceBuffer() = default;
-    ~PitchedDeviceBuffer() { reset(); }
+    ~PitchedDeviceBuffer() {
+        reset();
+    }
 
     PitchedDeviceBuffer(const PitchedDeviceBuffer&) = delete;
     PitchedDeviceBuffer& operator=(const PitchedDeviceBuffer&) = delete;
@@ -213,10 +226,8 @@ public:
             return;
         }
         reset();
-        ensure_cuda_ok(cudaMallocPitch(reinterpret_cast<void**>(&device_ptr_),
-                                       &pitch_bytes_,
-                                       static_cast<std::size_t>(width) * sizeof(T),
-                                       height),
+        ensure_cuda_ok(cudaMallocPitch(reinterpret_cast<void**>(&device_ptr_), &pitch_bytes_,
+                                       static_cast<std::size_t>(width) * sizeof(T), height),
                        context);
         width_ = width;
         height_ = height;
@@ -232,13 +243,23 @@ public:
         height_ = 0;
     }
 
-    [[nodiscard]] CUdeviceptr data() const noexcept { return device_ptr_; }
-    [[nodiscard]] std::size_t pitch_bytes() const noexcept { return pitch_bytes_; }
-    [[nodiscard]] std::uint32_t width() const noexcept { return width_; }
-    [[nodiscard]] std::uint32_t height() const noexcept { return height_; }
-    [[nodiscard]] bool empty() const noexcept { return device_ptr_ == 0; }
+    [[nodiscard]] CUdeviceptr data() const noexcept {
+        return device_ptr_;
+    }
+    [[nodiscard]] std::size_t pitch_bytes() const noexcept {
+        return pitch_bytes_;
+    }
+    [[nodiscard]] std::uint32_t width() const noexcept {
+        return width_;
+    }
+    [[nodiscard]] std::uint32_t height() const noexcept {
+        return height_;
+    }
+    [[nodiscard]] bool empty() const noexcept {
+        return device_ptr_ == 0;
+    }
 
-private:
+   private:
     CUdeviceptr device_ptr_ = 0;
     std::size_t pitch_bytes_ = 0;
     std::uint32_t width_ = 0;
@@ -249,9 +270,11 @@ using BgrPitchedDeviceBuffer = PitchedDeviceBuffer<Bgr24Pixel>;
 using RgbaPitchedDeviceBuffer = PitchedDeviceBuffer<Rgba32Pixel>;
 
 class CudaStreamHandle {
-public:
+   public:
     CudaStreamHandle() = default;
-    ~CudaStreamHandle() { reset(); }
+    ~CudaStreamHandle() {
+        reset();
+    }
 
     CudaStreamHandle(const CudaStreamHandle&) = delete;
     CudaStreamHandle& operator=(const CudaStreamHandle&) = delete;
@@ -280,22 +303,28 @@ public:
         stream_ = stream;
     }
 
-    [[nodiscard]] cudaStream_t get() const noexcept { return stream_; }
+    [[nodiscard]] cudaStream_t get() const noexcept {
+        return stream_;
+    }
     [[nodiscard]] cudaStream_t release() noexcept {
         cudaStream_t stream = stream_;
         stream_ = nullptr;
         return stream;
     }
-    [[nodiscard]] bool empty() const noexcept { return stream_ == nullptr; }
+    [[nodiscard]] bool empty() const noexcept {
+        return stream_ == nullptr;
+    }
 
-private:
+   private:
     cudaStream_t stream_ = nullptr;
 };
 
 class CudaEventHandle {
-public:
+   public:
     CudaEventHandle() = default;
-    ~CudaEventHandle() { reset(); }
+    ~CudaEventHandle() {
+        reset();
+    }
 
     CudaEventHandle(const CudaEventHandle&) = delete;
     CudaEventHandle& operator=(const CudaEventHandle&) = delete;
@@ -321,23 +350,26 @@ public:
         event_ = event;
     }
 
-    [[nodiscard]] cudaEvent_t get() const noexcept { return event_; }
+    [[nodiscard]] cudaEvent_t get() const noexcept {
+        return event_;
+    }
     [[nodiscard]] cudaEvent_t release() noexcept {
         cudaEvent_t event = event_;
         event_ = nullptr;
         return event;
     }
-    [[nodiscard]] bool empty() const noexcept { return event_ == nullptr; }
+    [[nodiscard]] bool empty() const noexcept {
+        return event_ == nullptr;
+    }
 
-private:
+   private:
     cudaEvent_t event_ = nullptr;
 };
 
 template <typename Slot, typename Output, typename BuildOutput>
 bool try_acquire_published_slot(Slot& slot, Output* out, BuildOutput&& build_output) {
     std::uint32_t expected = to_slot_state_value(SlotState::kPublished);
-    if (!slot.state.compare_exchange_strong(expected,
-                                            to_slot_state_value(SlotState::kAcquired),
+    if (!slot.state.compare_exchange_strong(expected, to_slot_state_value(SlotState::kAcquired),
                                             std::memory_order_acq_rel)) {
         return false;
     }
@@ -349,18 +381,15 @@ bool try_acquire_published_slot(Slot& slot, Output* out, BuildOutput&& build_out
 template <typename Slot>
 void release_acquired_slot(Slot& slot, const char* context) {
     std::uint32_t expected = to_slot_state_value(SlotState::kAcquired);
-    if (!slot.state.compare_exchange_strong(expected,
-                                            to_slot_state_value(SlotState::kFree),
+    if (!slot.state.compare_exchange_strong(expected, to_slot_state_value(SlotState::kFree),
                                             std::memory_order_acq_rel)) {
         throw std::runtime_error(context);
     }
 }
 
 template <typename Slot, typename Output, typename BuildOutput>
-bool try_acquire_latest_published_slot(std::vector<std::unique_ptr<Slot>>& slots,
-                                       const std::atomic<int>& latest_index,
-                                       Output* out,
-                                       BuildOutput&& build_output) {
+bool try_acquire_latest_published_slot(std::vector<std::unique_ptr<Slot>>& slots, const std::atomic<int>& latest_index,
+                                       Output* out, BuildOutput&& build_output) {
     const int latest = latest_index.load(std::memory_order_acquire);
     if (latest >= 0 && latest < static_cast<int>(slots.size()) &&
         try_acquire_published_slot(*slots[static_cast<std::size_t>(latest)], out, build_output)) {
@@ -379,15 +408,11 @@ bool try_acquire_latest_published_slot(std::vector<std::unique_ptr<Slot>>& slots
 }
 
 template <typename Slot, typename ResetSlot, typename ReadyEventAccessor>
-Slot* reserve_writable_slot(std::vector<std::unique_ptr<Slot>>& slots,
-                            std::atomic<int>& latest_index,
-                            ResetSlot&& reset_slot,
-                            ReadyEventAccessor&& ready_event_of,
-                            const char* event_context) {
+Slot* reserve_writable_slot(std::vector<std::unique_ptr<Slot>>& slots, std::atomic<int>& latest_index,
+                            ResetSlot&& reset_slot, ReadyEventAccessor&& ready_event_of, const char* event_context) {
     for (auto& slot : slots) {
         std::uint32_t expected = to_slot_state_value(SlotState::kFree);
-        if (slot->state.compare_exchange_strong(expected,
-                                                to_slot_state_value(SlotState::kWriting),
+        if (slot->state.compare_exchange_strong(expected, to_slot_state_value(SlotState::kWriting),
                                                 std::memory_order_acq_rel)) {
             return slot.get();
         }
@@ -396,14 +421,13 @@ Slot* reserve_writable_slot(std::vector<std::unique_ptr<Slot>>& slots,
             !event_ready(ready_event_of(*slot), event_context)) {
             continue;
         }
+        if (latest_index.load(std::memory_order_acquire) == static_cast<int>(slot->slot_index)) {
+            continue;
+        }
 
         expected = to_slot_state_value(SlotState::kPublished);
-        if (slot->state.compare_exchange_strong(expected,
-                                                to_slot_state_value(SlotState::kWriting),
+        if (slot->state.compare_exchange_strong(expected, to_slot_state_value(SlotState::kWriting),
                                                 std::memory_order_acq_rel)) {
-            if (latest_index.load(std::memory_order_acquire) == static_cast<int>(slot->slot_index)) {
-                latest_index.store(-1, std::memory_order_release);
-            }
             reset_slot(*slot);
             return slot.get();
         }
@@ -411,13 +435,13 @@ Slot* reserve_writable_slot(std::vector<std::unique_ptr<Slot>>& slots,
     return nullptr;
 }
 
-inline void store_error_message(std::shared_ptr<const std::string>* target, std::string error_message) {
+inline void store_error_message(std::atomic<std::shared_ptr<const std::string>>* target, std::string error_message) {
     if (target == nullptr) {
         return;
     }
     auto next = std::make_shared<std::string>(std::move(error_message));
     std::shared_ptr<const std::string> immutable = std::move(next);
-    std::atomic_store_explicit(target, std::move(immutable), std::memory_order_release);
+    target->store(std::move(immutable), std::memory_order_release);
 }
 
-} // namespace mmltk::live
+}  // namespace mmltk::live

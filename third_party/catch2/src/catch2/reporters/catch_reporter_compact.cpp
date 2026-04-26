@@ -21,25 +21,23 @@
 namespace Catch {
 namespace {
 
-    // Colour::LightGrey
-    static constexpr Colour::Code compactDimColour = Colour::FileName;
+static constexpr Colour::Code compactDimColour = Colour::FileName;
 
 #ifdef CATCH_PLATFORM_MAC
-    static constexpr Catch::StringRef compactFailedString = "FAILED"_sr;
-    static constexpr Catch::StringRef compactPassedString = "PASSED"_sr;
+static constexpr Catch::StringRef compactFailedString = "FAILED"_sr;
+static constexpr Catch::StringRef compactPassedString = "PASSED"_sr;
 #else
-    static constexpr Catch::StringRef compactFailedString = "failed"_sr;
-    static constexpr Catch::StringRef compactPassedString = "passed"_sr;
+static constexpr Catch::StringRef compactFailedString = "failed"_sr;
+static constexpr Catch::StringRef compactPassedString = "passed"_sr;
 #endif
 
-// Implementation of CompactReporter formatting
 class AssertionPrinter : Detail::SharedAssertionPrinter {
-public:
-    AssertionPrinter& operator= (AssertionPrinter const&) = delete;
+   public:
+    AssertionPrinter& operator=(AssertionPrinter const&) = delete;
     AssertionPrinter(AssertionPrinter const&) = delete;
-    AssertionPrinter(std::ostream& _stream, AssertionStats const& _stats, bool _printInfoMessages, ColourImpl* colourImpl_)
-        : SharedAssertionPrinter(_stream, _stats, _printInfoMessages, colourImpl_, compactDimColour)
-    {}
+    AssertionPrinter(std::ostream& _stream, AssertionStats const& _stats, bool _printInfoMessages,
+                     ColourImpl* colourImpl_)
+        : SharedAssertionPrinter(_stream, _stats, _printInfoMessages, colourImpl_, compactDimColour) {}
 
     void print() {
         printSourceInfo();
@@ -47,77 +45,70 @@ public:
         resetMessages();
 
         switch (result.getResultType()) {
-        case ResultWas::Ok:
-            printResultType(Colour::ResultSuccess, compactPassedString);
-            printOriginalExpression();
-            printReconstructedExpression();
-            if (!result.hasExpression())
-                printRemainingMessages(Colour::None);
-            else
+            case ResultWas::Ok:
+                printResultType(Colour::ResultSuccess, compactPassedString);
+                printExpressionAndMessages(false, Colour::None, compactDimColour);
+                break;
+            case ResultWas::ExpressionFailed:
+                if (result.isOk())
+                    printResultType(Colour::ResultSuccess, compactFailedString + " - but was ok"_sr);
+                else
+                    printResultType(Colour::Error, compactFailedString);
+                printOriginalExpression();
+                printReconstructedExpression();
                 printRemainingMessages();
-            break;
-        case ResultWas::ExpressionFailed:
-            if (result.isOk())
-                printResultType(Colour::ResultSuccess, compactFailedString + " - but was ok"_sr);
-            else
+                break;
+            case ResultWas::ThrewException:
                 printResultType(Colour::Error, compactFailedString);
-            printOriginalExpression();
-            printReconstructedExpression();
-            printRemainingMessages();
-            break;
-        case ResultWas::ThrewException:
-            printResultType(Colour::Error, compactFailedString);
-            printIssue("unexpected exception with message:");
-            printMessage();
-            printExpressionWas();
-            printRemainingMessages();
-            break;
-        case ResultWas::FatalErrorCondition:
-            printResultType(Colour::Error, compactFailedString);
-            printIssue("fatal error condition with message:");
-            printMessage();
-            printExpressionWas();
-            printRemainingMessages();
-            break;
-        case ResultWas::DidntThrowException:
-            printResultType(Colour::Error, compactFailedString);
-            printIssue("expected exception, got none");
-            printExpressionWas();
-            printRemainingMessages();
-            break;
-        case ResultWas::Info:
-            printResultType(Colour::None, "info"_sr);
-            printMessage();
-            printRemainingMessages();
-            break;
-        case ResultWas::Warning:
-            printResultType(Colour::None, "warning"_sr);
-            printMessage();
-            printRemainingMessages();
-            break;
-        case ResultWas::ExplicitFailure:
-            printResultType(Colour::Error, compactFailedString);
-            printIssue("explicitly");
-            printRemainingMessages(Colour::None);
-            break;
-        case ResultWas::ExplicitSkip:
-            printResultType(Colour::Skip, "skipped"_sr);
-            printMessage();
-            printRemainingMessages();
-            break;
-            // These cases are here to prevent compiler warnings
-        case ResultWas::Unknown:
-        case ResultWas::FailureBit:
-        case ResultWas::Exception:
-            printResultType(Colour::Error, "** internal error **");
-            break;
+                printIssue("unexpected exception with message:");
+                printMessage();
+                printExpressionWas();
+                printRemainingMessages();
+                break;
+            case ResultWas::FatalErrorCondition:
+                printResultType(Colour::Error, compactFailedString);
+                printIssue("fatal error condition with message:");
+                printMessage();
+                printExpressionWas();
+                printRemainingMessages();
+                break;
+            case ResultWas::DidntThrowException:
+                printResultType(Colour::Error, compactFailedString);
+                printIssue("expected exception, got none");
+                printExpressionWas();
+                printRemainingMessages();
+                break;
+            case ResultWas::Info:
+                printResultType(Colour::None, "info"_sr);
+                printMessage();
+                printRemainingMessages();
+                break;
+            case ResultWas::Warning:
+                printResultType(Colour::None, "warning"_sr);
+                printMessage();
+                printRemainingMessages();
+                break;
+            case ResultWas::ExplicitFailure:
+                printResultType(Colour::Error, compactFailedString);
+                printIssue("explicitly");
+                printRemainingMessages(Colour::None);
+                break;
+            case ResultWas::ExplicitSkip:
+                printResultType(Colour::Skip, "skipped"_sr);
+                printMessage();
+                printRemainingMessages();
+                break;
+            case ResultWas::Unknown:
+            case ResultWas::FailureBit:
+            case ResultWas::Exception:
+                printResultType(Colour::Error, "** internal error **");
+                break;
         }
     }
 
-private:
+   private:
     void printSourceInfo() const {
-        stream << colourImpl->guardColour( Colour::FileName )
-               << result.getSourceInfo() << ':';
+        stream << colourImpl->guardColour(Colour::FileName) << result.getSourceInfo() << ':';
     }
 
     void printResultType(Colour::Code colour, StringRef passOrFail) const {
@@ -136,58 +127,53 @@ private:
     }
 };
 
-} // anon namespace
+}  // namespace
 
-        std::string CompactReporter::getDescription() {
-            return "Reports test results on a single line, suitable for IDEs";
-        }
+std::string CompactReporter::getDescription() {
+    return "Reports test results on a single line, suitable for IDEs";
+}
 
-        void CompactReporter::noMatchingTestCases( StringRef unmatchedSpec ) {
-            m_stream << "No test cases matched '" << unmatchedSpec << "'\n";
-        }
+void CompactReporter::noMatchingTestCases(StringRef unmatchedSpec) {
+    m_stream << "No test cases matched '" << unmatchedSpec << "'\n";
+}
 
-        void CompactReporter::testRunStarting( TestRunInfo const& ) {
-            if ( m_config->testSpec().hasFilters() ) {
-                m_stream << m_colour->guardColour( Colour::BrightYellow )
-                         << "Filters: "
-                         << m_config->testSpec()
-                         << '\n';
-            }
-            m_stream << "RNG seed: " << getSeed() << '\n'
-                     << std::flush;
-        }
+void CompactReporter::testRunStarting(TestRunInfo const&) {
+    if (m_config->testSpec().hasFilters()) {
+        m_stream << m_colour->guardColour(Colour::BrightYellow) << "Filters: " << m_config->testSpec() << '\n';
+    }
+    m_stream << "RNG seed: " << getSeed() << '\n' << std::flush;
+}
 
-        void CompactReporter::assertionEnded( AssertionStats const& _assertionStats ) {
-            AssertionResult const& result = _assertionStats.assertionResult;
+void CompactReporter::assertionEnded(AssertionStats const& _assertionStats) {
+    AssertionResult const& result = _assertionStats.assertionResult;
 
-            bool printInfoMessages = true;
+    bool printInfoMessages = true;
 
-            // Drop out if result was successful and we're not printing those
-            if( !m_config->includeSuccessfulResults() && result.isOk() ) {
-                if( result.getResultType() != ResultWas::Warning && result.getResultType() != ResultWas::ExplicitSkip )
-                    return;
-                printInfoMessages = false;
-            }
+    if (!m_config->includeSuccessfulResults() && result.isOk()) {
+        if (result.getResultType() != ResultWas::Warning && result.getResultType() != ResultWas::ExplicitSkip)
+            return;
+        printInfoMessages = false;
+    }
 
-            AssertionPrinter printer( m_stream, _assertionStats, printInfoMessages, m_colour.get() );
-            printer.print();
+    AssertionPrinter printer(m_stream, _assertionStats, printInfoMessages, m_colour.get());
+    printer.print();
 
-            m_stream << '\n' << std::flush;
-        }
+    m_stream << '\n' << std::flush;
+}
 
-        void CompactReporter::sectionEnded(SectionStats const& _sectionStats) {
-            double dur = _sectionStats.durationInSeconds;
-            if ( shouldShowDuration( *m_config, dur ) ) {
-                m_stream << getFormattedDuration( dur ) << " s: " << _sectionStats.sectionInfo.name << '\n' << std::flush;
-            }
-        }
+void CompactReporter::sectionEnded(SectionStats const& _sectionStats) {
+    double dur = _sectionStats.durationInSeconds;
+    if (shouldShowDuration(*m_config, dur)) {
+        m_stream << getFormattedDuration(dur) << " s: " << _sectionStats.sectionInfo.name << '\n' << std::flush;
+    }
+}
 
-        void CompactReporter::testRunEnded( TestRunStats const& _testRunStats ) {
-            printTestRunTotals( m_stream, *m_colour, _testRunStats.totals );
-            m_stream << "\n\n" << std::flush;
-            StreamingReporterBase::testRunEnded( _testRunStats );
-        }
+void CompactReporter::testRunEnded(TestRunStats const& _testRunStats) {
+    printTestRunTotals(m_stream, *m_colour, _testRunStats.totals);
+    m_stream << "\n\n" << std::flush;
+    StreamingReporterBase::testRunEnded(_testRunStats);
+}
 
-        CompactReporter::~CompactReporter() = default;
+CompactReporter::~CompactReporter() = default;
 
-} // end namespace Catch
+}  // namespace Catch

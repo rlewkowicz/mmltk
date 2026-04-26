@@ -23,7 +23,7 @@ struct ModelModuleCapabilities {
 };
 
 class ModelModule {
-public:
+   public:
     virtual ~ModelModule() = default;
 
     [[nodiscard]] virtual std::string_view module_id() const = 0;
@@ -35,7 +35,7 @@ public:
 };
 
 class ModelRegistry {
-public:
+   public:
     void register_module(std::shared_ptr<const ModelModule> module);
 
     [[nodiscard]] const ModelModule* find_module(std::string_view module_id) const;
@@ -44,8 +44,8 @@ public:
     [[nodiscard]] std::vector<ModelPresetDescriptor> presets() const;
     [[nodiscard]] bool empty() const noexcept;
 
-private:
+   private:
     std::vector<std::shared_ptr<const ModelModule>> modules_;
 };
 
-} // namespace mmltk::model
+}  // namespace mmltk::model

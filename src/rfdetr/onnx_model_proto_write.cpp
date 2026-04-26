@@ -6,19 +6,25 @@
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <string>
 
 namespace mmltk::rfdetr {
 
 namespace {
 
 std::runtime_error onnx_proto_write_error(const char* message, const std::filesystem::path& path) {
-    return std::runtime_error(std::string(message) + ": " + path.string());
+    const std::string path_string = path.string();
+    std::string error_message;
+    error_message.reserve(std::strlen(message) + 2U + path_string.size());
+    error_message.append(message);
+    error_message.append(": ");
+    error_message.append(path_string);
+    return std::runtime_error(error_message);
 }
 
-} // namespace
+}  // namespace
 
-std::string serialize_onnx_model_proto(
-    const std::shared_ptr<ONNX_NAMESPACE::ModelProto>& model_proto) {
+std::string serialize_onnx_model_proto(const std::shared_ptr<ONNX_NAMESPACE::ModelProto>& model_proto) {
     if (model_proto == nullptr) {
         throw std::runtime_error("torch::jit::export_onnx returned a null ONNX model");
     }
@@ -39,4 +45,4 @@ void write_onnx_model_proto(const std::shared_ptr<ONNX_NAMESPACE::ModelProto>& m
     out.close();
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

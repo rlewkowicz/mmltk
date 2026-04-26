@@ -1,0 +1,139 @@
+@use "sass:map";
+@use "tokens" as *;
+
+@mixin emit-theme-vars {
+  :root,
+  :root[data-theme="light"] {
+    $theme: map.get($themes, light);
+
+    color-scheme: map.get($theme, scheme);
+    font-family: $font-sans;
+
+    @each $name, $value in map.get($theme, vars) {
+      --#{$name}: #{$value};
+    }
+  }
+
+  :root[data-theme="dark"] {
+    $theme: map.get($themes, dark);
+
+    color-scheme: map.get($theme, scheme);
+
+    @each $name, $value in map.get($theme, vars) {
+      --#{$name}: #{$value};
+    }
+  }
+}
+
+@mixin row-center($gap: null) {
+  display: flex;
+  align-items: center;
+
+  @if $gap != null {
+    gap: $gap;
+  }
+}
+
+@mixin row-between($gap: null) {
+  @include row-center($gap);
+  justify-content: space-between;
+}
+
+@mixin stack($gap: null) {
+  display: flex;
+  flex-direction: column;
+
+  @if $gap != null {
+    gap: $gap;
+  }
+}
+
+@mixin grid($columns, $gap: space-token(md)) {
+  display: grid;
+  grid-template-columns: $columns;
+  gap: $gap;
+}
+
+@mixin surface-transition {
+  transition:
+    border-color 140ms ease,
+    background-color 140ms ease,
+    color 140ms ease,
+    box-shadow 140ms ease;
+}
+
+@mixin focus-ring($color: primary, $opacity: 0.22) {
+  border-color: alpha-token($color, 0.52);
+  box-shadow: 0 0 0 3px alpha-token($color, $opacity);
+}
+
+@mixin panel-surface(
+  $padding: space-token(lg),
+  $fill: var(--panel-fill),
+  $border: var(--panel-border),
+  $radius: radius-token(md)
+) {
+  border: 1px solid $border;
+  border-radius: $radius;
+  background: $fill;
+  padding: $padding;
+}
+
+@mixin inset-surface(
+  $padding: space-token(lg),
+  $fill: var(--inset-fill),
+  $border: var(--control-border),
+  $radius: radius-token(md)
+) {
+  border: 1px solid $border;
+  border-radius: $radius;
+  background: $fill;
+  padding: $padding;
+}
+
+@mixin control-surface(
+  $fill: var(--control-fill),
+  $border: var(--control-border),
+  $radius: radius-token(sm)
+) {
+  border: 1px solid $border;
+  border-radius: $radius;
+  background: $fill;
+  color: var(--text-0);
+}
+
+@mixin uppercase-label($size: 0.72rem, $color: var(--text-2)) {
+  color: $color;
+  font-size: $size;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+@mixin copy-block($color: var(--text-1), $line-height: 1.45) {
+  color: $color;
+  line-height: $line-height;
+}
+
+@mixin selected-surface($color: primary, $accent: lime) {
+  border-color: var(--selected-border);
+  background: var(--selected-fill);
+  box-shadow: inset 0 0 0 1px alpha-token($accent, 0.08);
+}
+
+@mixin tone-surface($tone) {
+  $tone-map: map.get($status-tones, $tone);
+
+  @if $tone-map == null {
+    @error "Unknown status tone `#{$tone}`.";
+  }
+
+  border: 1px solid map.get($tone-map, border);
+  background: map.get($tone-map, fill);
+  color: map.get($tone-map, text);
+}
+
+@mixin respond-max($breakpoint) {
+  @media (max-width: breakpoint-token($breakpoint)) {
+    @content;
+  }
+}

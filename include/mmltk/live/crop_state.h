@@ -15,9 +15,8 @@ struct UiCropSnapshot {
 };
 
 class UiCropState {
-public:
-    UiCropState()
-        : snapshot_(std::make_shared<UiCropSnapshot>()) {}
+   public:
+    UiCropState() : snapshot_(std::make_shared<UiCropSnapshot>()) {}
 
     void set(const LiveCaptureRegion& region) {
         publish(true, region);
@@ -28,13 +27,12 @@ public:
     }
 
     [[nodiscard]] std::shared_ptr<const UiCropSnapshot> snapshot() const {
-        return std::atomic_load_explicit(&snapshot_, std::memory_order_acquire);
+        return snapshot_.load(std::memory_order_acquire);
     }
 
-private:
+   private:
     void publish(bool has_crop, const LiveCaptureRegion& region) {
-        const std::shared_ptr<const UiCropSnapshot> current =
-            std::atomic_load_explicit(&snapshot_, std::memory_order_acquire);
+        const std::shared_ptr<const UiCropSnapshot> current = snapshot_.load(std::memory_order_acquire);
 
         auto next = std::make_shared<UiCropSnapshot>();
         next->has_crop = has_crop;
@@ -42,10 +40,10 @@ private:
         next->generation = current ? current->generation + 1U : 1U;
 
         std::shared_ptr<const UiCropSnapshot> immutable = next;
-        std::atomic_store_explicit(&snapshot_, std::move(immutable), std::memory_order_release);
+        snapshot_.store(std::move(immutable), std::memory_order_release);
     }
 
-    std::shared_ptr<const UiCropSnapshot> snapshot_;
+    std::atomic<std::shared_ptr<const UiCropSnapshot>> snapshot_;
 };
 
 struct RuntimeCropState {
@@ -69,4 +67,4 @@ struct RuntimeCropState {
     }
 };
 
-} // namespace mmltk::live
+}  // namespace mmltk::live

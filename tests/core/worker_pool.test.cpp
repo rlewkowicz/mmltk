@@ -31,9 +31,7 @@ void test_enqueue_and_wait() {
     WorkerPool pool(2);
     std::atomic<int> counter{0};
     for (int i = 0; i < 32; ++i) {
-        pool.enqueue([&counter] {
-            counter.fetch_add(1, std::memory_order_relaxed);
-        });
+        pool.enqueue([&counter] { counter.fetch_add(1, std::memory_order_relaxed); });
     }
     pool.wait_idle();
     assert(counter.load(std::memory_order_relaxed) == 32);
@@ -130,7 +128,7 @@ void test_parallel_for_range_threads_are_pinned() {
     assert(observed.size() == masks.size());
 }
 
-} // namespace
+}  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[core][worker_pool]", test_cpu_affinity_helpers);
 MMLTK_REGISTER_TEST_CASE("[core][worker_pool]", test_enqueue_and_wait);

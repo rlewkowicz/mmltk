@@ -18,171 +18,164 @@ namespace Catch {
 
 namespace Detail {
 
-    namespace {
-        const int hexThreshold = 255;
+namespace {
+const int hexThreshold = 255;
 
-        struct Endianness {
-            enum Arch : uint8_t {
-                Big,
-                Little
-            };
+struct Endianness {
+    enum Arch : uint8_t {
+        Big,
+        Little
+    };
 
-            static Arch which() {
-                int one = 1;
-                // If the lowest byte we read is non-zero, we can assume
-                // that little endian format is used.
-                auto value = *reinterpret_cast<char*>(&one);
-                return value ? Little : Big;
-            }
-        };
+    static Arch which() {
+        int one = 1;
+        auto value = *reinterpret_cast<char*>(&one);
+        return value ? Little : Big;
+    }
+};
 
-        template<typename T>
-        std::string fpToString(T value, int precision) {
-            if (Catch::isnan(value)) {
-                return "nan";
-            }
-
-            ReusableStringStream rss;
-            rss << std::setprecision(precision)
-                << std::fixed
-                << value;
-            std::string d = rss.str();
-            std::size_t i = d.find_last_not_of('0');
-            if (i != std::string::npos && i != d.size() - 1) {
-                if (d[i] == '.')
-                    i++;
-                d = d.substr(0, i + 1);
-            }
-            return d;
-        }
-    } // end unnamed namespace
-
-    std::size_t catch_strnlen( const char* str, std::size_t n ) {
-        auto ret = std::char_traits<char>::find( str, n, '\0' );
-        if ( ret != nullptr ) { return static_cast<std::size_t>( ret - str ); }
-        return n;
+template <typename T>
+std::string fpToString(T value, int precision) {
+    if (Catch::isnan(value)) {
+        return "nan";
     }
 
-    std::string formatTimeT(std::time_t time) {
-#ifdef _MSC_VER
-        std::tm timeInfo = {};
-        const auto err = gmtime_s( &timeInfo, &time );
-        if ( err ) {
-            return "gmtime from provided timepoint has failed. This "
-                   "happens e.g. with pre-1970 dates using Microsoft libc";
-        }
-#else
-        std::tm* timeInfo = std::gmtime( &time );
-#endif
-
-        auto const timeStampSize = sizeof( "2017-01-16T17:06:45Z" );
-        char timeStamp[timeStampSize];
-        const char* const fmt = "%Y-%m-%dT%H:%M:%SZ";
-
-#ifdef _MSC_VER
-        std::strftime( timeStamp, timeStampSize, fmt, &timeInfo );
-#else
-        std::strftime( timeStamp, timeStampSize, fmt, timeInfo );
-#endif
-        return std::string( timeStamp, timeStampSize - 1 );
+    ReusableStringStream rss;
+    rss << std::setprecision(precision) << std::fixed << value;
+    std::string d = rss.str();
+    std::size_t i = d.find_last_not_of('0');
+    if (i != std::string::npos && i != d.size() - 1) {
+        if (d[i] == '.')
+            i++;
+        d = d.substr(0, i + 1);
     }
+    return d;
+}
+}  // namespace
 
-    std::string convertIntoString(StringRef string, bool escapeInvisibles) {
-        std::string ret;
-        // This is enough for the "don't escape invisibles" case, and a good
-        // lower bound on the "escape invisibles" case.
-        ret.reserve( string.size() + 2 );
+std::size_t catch_strnlen(const char* str, std::size_t n) {
+    auto ret = std::char_traits<char>::find(str, n, '\0');
+    if (ret != nullptr) {
+        return static_cast<std::size_t>(ret - str);
+    }
+    return n;
+}
 
-        if ( !escapeInvisibles ) {
-            ret += '"';
-            ret += string;
-            ret += '"';
-            return ret;
-        }
+std::string formatTimeT(std::time_t time) {
+#ifdef _MSC_VER
+    std::tm timeInfo = {};
+    const auto err = gmtime_s(&timeInfo, &time);
+    if (err) {
+        return "gmtime from provided timepoint has failed. This "
+               "happens e.g. with pre-1970 dates using Microsoft libc";
+    }
+#else
+    std::tm* timeInfo = std::gmtime(&time);
+#endif
 
-        size_t last_start = 0;
-        auto write_to = [&]( size_t idx ) {
-            if ( last_start < idx ) {
-                ret += string.substr( last_start, idx - last_start );
-            }
-            last_start = idx + 1;
-        };
+    auto const timeStampSize = sizeof("2017-01-16T17:06:45Z");
+    char timeStamp[timeStampSize];
+    const char* const fmt = "%Y-%m-%dT%H:%M:%SZ";
 
+#ifdef _MSC_VER
+    std::strftime(timeStamp, timeStampSize, fmt, &timeInfo);
+#else
+    std::strftime(timeStamp, timeStampSize, fmt, timeInfo);
+#endif
+    return std::string(timeStamp, timeStampSize - 1);
+}
+
+std::string convertIntoString(StringRef string, bool escapeInvisibles) {
+    std::string ret;
+    ret.reserve(string.size() + 2);
+
+    if (!escapeInvisibles) {
         ret += '"';
-        for ( size_t i = 0; i < string.size(); ++i ) {
-            const char c = string[i];
-            if ( c == '\r' || c == '\n' || c == '\t' || c == '\f' ) {
-                write_to( i );
-                if ( c == '\r' ) { ret.append( "\\r" ); }
-                if ( c == '\n' ) { ret.append( "\\n" ); }
-                if ( c == '\t' ) { ret.append( "\\t" ); }
-                if ( c == '\f' ) { ret.append( "\\f" ); }
-            }
-        }
-        write_to( string.size() );
+        ret += string;
         ret += '"';
-
         return ret;
     }
 
-    std::string convertIntoString(StringRef string) {
-        return convertIntoString(string, getCurrentContext().getConfig()->showInvisibles());
-    }
-
-    std::string rawMemoryToString( const void *object, std::size_t size ) {
-        // Reverse order for little endian architectures
-        int i = 0, end = static_cast<int>( size ), inc = 1;
-        if( Endianness::which() == Endianness::Little ) {
-            i = end-1;
-            end = inc = -1;
+    size_t last_start = 0;
+    auto write_to = [&](size_t idx) {
+        if (last_start < idx) {
+            ret += string.substr(last_start, idx - last_start);
         }
+        last_start = idx + 1;
+    };
 
-        unsigned char const *bytes = static_cast<unsigned char const *>(object);
-        ReusableStringStream rss;
-        rss << "0x" << std::setfill('0') << std::hex;
-        for( ; i != end; i += inc )
-             rss << std::setw(2) << static_cast<unsigned>(bytes[i]);
-       return rss.str();
+    ret += '"';
+    for (size_t i = 0; i < string.size(); ++i) {
+        const char c = string[i];
+        if (c == '\r' || c == '\n' || c == '\t' || c == '\f') {
+            write_to(i);
+            if (c == '\r') {
+                ret.append("\\r");
+            }
+            if (c == '\n') {
+                ret.append("\\n");
+            }
+            if (c == '\t') {
+                ret.append("\\t");
+            }
+            if (c == '\f') {
+                ret.append("\\f");
+            }
+        }
+    }
+    write_to(string.size());
+    ret += '"';
+
+    return ret;
+}
+
+std::string convertIntoString(StringRef string) {
+    return convertIntoString(string, getCurrentContext().getConfig()->showInvisibles());
+}
+
+std::string rawMemoryToString(const void* object, std::size_t size) {
+    int i = 0, end = static_cast<int>(size), inc = 1;
+    if (Endianness::which() == Endianness::Little) {
+        i = end - 1;
+        end = inc = -1;
     }
 
-    std::string makeExceptionHappenedString() {
-        return "{ stringification failed with an exception: \"" +
-               translateActiveException() + "\" }";
+    unsigned char const* bytes = static_cast<unsigned char const*>(object);
+    ReusableStringStream rss;
+    rss << "0x" << std::setfill('0') << std::hex;
+    for (; i != end; i += inc)
+        rss << std::setw(2) << static_cast<unsigned>(bytes[i]);
+    return rss.str();
+}
 
-    }
+std::string makeExceptionHappenedString() {
+    return "{ stringification failed with an exception: \"" + translateActiveException() + "\" }";
+}
 
-} // end Detail namespace
-
-
-
-//// ======================================================= ////
-//
-//   Out-of-line defs for full specialization of StringMaker
-//
-//// ======================================================= ////
+}  // namespace Detail
 
 std::string StringMaker<std::string>::convert(const std::string& str) {
-    return Detail::convertIntoString( str );
+    return Detail::convertIntoString(str);
 }
 
 #ifdef CATCH_CONFIG_CPP17_STRING_VIEW
 std::string StringMaker<std::string_view>::convert(std::string_view str) {
-    return Detail::convertIntoString( StringRef( str.data(), str.size() ) );
+    return Detail::convertIntoString(StringRef(str.data(), str.size()));
 }
 #endif
 
 std::string StringMaker<char const*>::convert(char const* str) {
     if (str) {
-        return Detail::convertIntoString( str );
+        return Detail::convertIntoString(str);
     } else {
-        return{ "{null string}" };
+        return {"{null string}"};
     }
 }
-std::string StringMaker<char*>::convert(char* str) { // NOLINT(readability-non-const-parameter)
+std::string StringMaker<char*>::convert(char* str) {  // NOLINT(readability-non-const-parameter)
     if (str) {
-        return Detail::convertIntoString( str );
+        return Detail::convertIntoString(str);
     } else {
-        return{ "{null string}" };
+        return {"{null string}"};
     }
 }
 
@@ -196,24 +189,24 @@ std::string StringMaker<std::wstring>::convert(const std::wstring& wstr) {
     return ::Catch::Detail::stringify(s);
 }
 
-# ifdef CATCH_CONFIG_CPP17_STRING_VIEW
+#ifdef CATCH_CONFIG_CPP17_STRING_VIEW
 std::string StringMaker<std::wstring_view>::convert(std::wstring_view str) {
     return StringMaker<std::wstring>::convert(std::wstring(str));
 }
-# endif
+#endif
 
-std::string StringMaker<wchar_t const*>::convert(wchar_t const * str) {
+std::string StringMaker<wchar_t const*>::convert(wchar_t const* str) {
     if (str) {
-        return ::Catch::Detail::stringify(std::wstring{ str });
+        return ::Catch::Detail::stringify(std::wstring{str});
     } else {
-        return{ "{null string}" };
+        return {"{null string}"};
     }
 }
-std::string StringMaker<wchar_t *>::convert(wchar_t * str) {
+std::string StringMaker<wchar_t*>::convert(wchar_t* str) {
     if (str) {
-        return ::Catch::Detail::stringify(std::wstring{ str });
+        return ::Catch::Detail::stringify(std::wstring{str});
     } else {
-        return{ "{null string}" };
+        return {"{null string}"};
     }
 }
 #endif
@@ -223,7 +216,7 @@ std::string StringMaker<wchar_t *>::convert(wchar_t * str) {
 std::string StringMaker<std::byte>::convert(std::byte value) {
     return ::Catch::Detail::stringify(std::to_integer<unsigned long long>(value));
 }
-#endif // defined(CATCH_CONFIG_CPP17_BYTE)
+#endif  // defined(CATCH_CONFIG_CPP17_BYTE)
 
 std::string StringMaker<int>::convert(int value) {
     return ::Catch::Detail::stringify(static_cast<long long>(value));
@@ -291,4 +284,4 @@ std::string StringMaker<double>::convert(double value) {
     return Detail::fpToString(value, precision);
 }
 
-} // end namespace Catch
+}  // namespace Catch

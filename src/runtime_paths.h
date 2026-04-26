@@ -16,8 +16,7 @@ namespace mmltk::runtime_paths {
     while (true) {
         const ssize_t bytes = ::readlink("/proc/self/exe", buffer.data(), buffer.size() - 1U);
         if (bytes < 0) {
-            throw std::runtime_error(std::string("failed to resolve current executable path: ") +
-                                     std::strerror(errno));
+            throw std::runtime_error(std::string("failed to resolve current executable path: ") + std::strerror(errno));
         }
         if (static_cast<std::size_t>(bytes) < buffer.size() - 1U) {
             buffer[static_cast<std::size_t>(bytes)] = '\0';
@@ -35,6 +34,14 @@ namespace mmltk::runtime_paths {
     return install_prefix() / "share" / "mmltk";
 }
 
+[[nodiscard]] inline std::filesystem::path browser_app_root() {
+    return share_root() / "browser-app";
+}
+
+[[nodiscard]] inline std::filesystem::path cef_runtime_root() {
+    return install_prefix() / "lib" / "cef";
+}
+
 [[nodiscard]] inline std::filesystem::path python_asset_path(const char* filename) {
     return share_root() / "python" / filename;
 }
@@ -43,4 +50,4 @@ namespace mmltk::runtime_paths {
     return share_root() / "fonts" / filename;
 }
 
-} // namespace mmltk::runtime_paths
+}  // namespace mmltk::runtime_paths

@@ -15,99 +15,47 @@
 
 namespace Catch {
 
-    namespace Generators {
-        class GeneratorUntypedBase {
-            // Caches result from `toStringImpl`, assume that when it is an
-            // empty string, the cache is invalidated.
-            mutable std::string m_stringReprCache;
+namespace Generators {
+class GeneratorUntypedBase {
+    mutable std::string m_stringReprCache;
 
-            // Counts based on `next` returning true
-            std::size_t m_currentElementIndex = 0;
+    std::size_t m_currentElementIndex = 0;
 
-            /**
-             * Attempts to move the generator to the next element
-             *
-             * Returns true iff the move succeeded (and a valid element
-             * can be retrieved).
-             */
-            virtual bool next() = 0;
+    virtual bool next() = 0;
 
-            //! Customization point for `currentElementAsString`
-            virtual std::string stringifyImpl() const = 0;
+    virtual std::string stringifyImpl() const = 0;
 
-            /**
-             * Customization point for skipping to the n-th element
-             *
-             * Defaults to successively calling `countedNext`. If there
-             * are not enough elements to reach the nth one, will throw
-             * an error.
-             */
-            virtual void skipToNthElementImpl( std::size_t n );
+    virtual void skipToNthElementImpl(std::size_t n);
 
-        public:
-            GeneratorUntypedBase() = default;
-            // Generation of copy ops is deprecated (and Clang will complain)
-            // if there is a user destructor defined
-            GeneratorUntypedBase(GeneratorUntypedBase const&) = default;
-            GeneratorUntypedBase& operator=(GeneratorUntypedBase const&) = default;
+   public:
+    GeneratorUntypedBase() = default;
+    GeneratorUntypedBase(GeneratorUntypedBase const&) = default;
+    GeneratorUntypedBase& operator=(GeneratorUntypedBase const&) = default;
 
-            virtual ~GeneratorUntypedBase(); // = default;
+    virtual ~GeneratorUntypedBase();
 
-            /**
-             * Attempts to move the generator to the next element
-             *
-             * Serves as a non-virtual interface to `next`, so that the
-             * top level interface can provide sanity checking and shared
-             * features.
-             *
-             * As with `next`, returns true iff the move succeeded and
-             * the generator has new valid element to provide.
-             */
-            bool countedNext();
+    bool countedNext();
 
-            std::size_t currentElementIndex() const { return m_currentElementIndex; }
+    std::size_t currentElementIndex() const {
+        return m_currentElementIndex;
+    }
 
-            /**
-             * Moves the generator forward **to** the n-th element
-             *
-             * Cannot move backwards. Can stay in place.
-             */
-            void skipToNthElement( std::size_t n );
+    void skipToNthElement(std::size_t n);
 
-            /**
-             * Returns generator's current element as user-friendly string.
-             *
-             * By default returns string equivalent to calling
-             * `Catch::Detail::stringify` on the current element, but generators
-             * can customize their implementation as needed.
-             *
-             * Not thread-safe due to internal caching.
-             *
-             * The returned ref is valid only until the generator instance
-             * is destructed, or it moves onto the next element, whichever
-             * comes first.
-             */
-            StringRef currentElementAsString() const;
+    StringRef currentElementAsString() const;
 
-            /**
-             * Returns true if calls to `next` will eventually return false
-             *
-             * Note that for backwards compatibility this is currently defaulted
-             * to return `true`, but in the future all generators will have to
-             * provide their own implementation.
-             */
-            virtual bool isFinite() const;
-        };
-        using GeneratorBasePtr = Catch::Detail::unique_ptr<GeneratorUntypedBase>;
+    virtual bool isFinite() const;
+};
+using GeneratorBasePtr = Catch::Detail::unique_ptr<GeneratorUntypedBase>;
 
-    } // namespace Generators
+}  // namespace Generators
 
-    class IGeneratorTracker {
-    public:
-        virtual ~IGeneratorTracker(); // = default;
-        virtual auto getGenerator() const -> Generators::GeneratorBasePtr const& = 0;
-    };
+class IGeneratorTracker {
+   public:
+    virtual ~IGeneratorTracker();
+    virtual auto getGenerator() const -> Generators::GeneratorBasePtr const& = 0;
+};
 
-} // namespace Catch
+}  // namespace Catch
 
-#endif // CATCH_INTERFACES_GENERATORTRACKER_HPP_INCLUDED
+#endif  // CATCH_INTERFACES_GENERATORTRACKER_HPP_INCLUDED

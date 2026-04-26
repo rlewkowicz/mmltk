@@ -1,4 +1,5 @@
 #include "gui/gui_settings.h"
+#include "gui/view_state.h"
 
 #include "support/catch2_compat.hpp"
 #include <chrono>
@@ -14,21 +15,11 @@ namespace {
 
 using namespace mmltk::gui;
 
-GuiSettingsSnapshot make_snapshot(UiSettingsState& ui,
-                                  TrainViewState& train,
-                                  ValidateViewState& validate,
-                                  PredictViewState& predict,
-                                  AnnotateViewState& annotate,
+GuiSettingsSnapshot make_snapshot(UiSettingsState& ui, TrainViewState& train, ValidateViewState& validate,
+                                  PredictViewState& predict, AnnotateViewState& annotate,
                                   ExportViewState& export_state) {
     return GuiSettingsSnapshot{
-        View::Annotate,
-        "rf-detr-seg-medium",
-        &ui,
-        &train,
-        &validate,
-        &predict,
-        &annotate,
-        &export_state,
+        View::Annotate, "rf-detr-seg-medium", &ui, &train, &validate, &predict, &annotate, &export_state,
     };
 }
 
@@ -40,6 +31,7 @@ nlohmann::json load_json_file(const std::filesystem::path& path) {
 
 void test_ui_settings_round_trip() {
     UiSettingsState ui;
+    ui.dark_mode = true;
     ui.ui_scale = 1.35f;
     ui.font_size = 18.0f;
     ui.secondary_font_size = 15.0f;
@@ -107,14 +99,7 @@ void test_ui_settings_round_trip() {
     AnnotateViewState loaded_annotate;
     ExportViewState loaded_export;
     GuiSettingsSnapshot loaded{
-        View::Train,
-        {},
-        &loaded_ui,
-        &loaded_train,
-        &loaded_validate,
-        &loaded_predict,
-        &loaded_annotate,
-        &loaded_export,
+        View::Train, {}, &loaded_ui, &loaded_train, &loaded_validate, &loaded_predict, &loaded_annotate, &loaded_export,
     };
 
     apply_gui_settings(saved, loaded);
@@ -137,6 +122,7 @@ void test_ui_settings_round_trip() {
     assert(loaded_annotate.full_frame);
     assert(loaded_export.output_path == "/tmp/export.engine");
     assert(!loaded_export.allow_fp16);
+    assert(loaded_ui.dark_mode);
     assert(loaded_ui.ui_scale == 1.35f);
     assert(loaded_ui.font_size == 18.0f);
     assert(loaded_ui.secondary_font_size == 15.0f);
@@ -168,14 +154,14 @@ void test_persistence_migrates_schema2_to_schema3() {
             {"train",
              {
                  {"train_compiled_path", "/legacy/train.bin"},
-                {"val_compiled_path", "/legacy/val.bin"},
-                {"output_dir", "/legacy/train-output"},
-                {"weights_path", "/legacy/weights.pt"},
-                {"cpu_affinity", "0-1"},
-                {"batch_size", 4},
-                {"amp", false},
-                {"progress_bar", true},
-            }},
+                 {"val_compiled_path", "/legacy/val.bin"},
+                 {"output_dir", "/legacy/train-output"},
+                 {"weights_path", "/legacy/weights.pt"},
+                 {"cpu_affinity", "0-1"},
+                 {"batch_size", 4},
+                 {"amp", false},
+                 {"progress_bar", true},
+             }},
             {"validate",
              {
                  {"compiled_path", "/legacy/validate.bin"},
@@ -207,14 +193,8 @@ void test_persistence_migrates_schema2_to_schema3() {
     AnnotateViewState legacy_annotate;
     ExportViewState legacy_export;
     GuiSettingsSnapshot legacy_snapshot{
-        View::Train,
-        "sentinel",
-        &legacy_ui,
-        &legacy_train,
-        &legacy_validate,
-        &legacy_predict,
-        &legacy_annotate,
-        &legacy_export,
+        View::Train,      "sentinel",      &legacy_ui,       &legacy_train,
+        &legacy_validate, &legacy_predict, &legacy_annotate, &legacy_export,
     };
 
     {
@@ -269,14 +249,8 @@ void test_persistence_rejects_unsupported_schema_and_malformed_files() {
     AnnotateViewState unsupported_annotate;
     ExportViewState unsupported_export;
     GuiSettingsSnapshot unsupported_snapshot{
-        View::Train,
-        "sentinel",
-        &unsupported_ui,
-        &unsupported_train,
-        &unsupported_validate,
-        &unsupported_predict,
-        &unsupported_annotate,
-        &unsupported_export,
+        View::Train,           "sentinel",           &unsupported_ui,       &unsupported_train,
+        &unsupported_validate, &unsupported_predict, &unsupported_annotate, &unsupported_export,
     };
 
     {
@@ -305,14 +279,8 @@ void test_persistence_rejects_unsupported_schema_and_malformed_files() {
     AnnotateViewState malformed_annotate;
     ExportViewState malformed_export;
     GuiSettingsSnapshot malformed_snapshot{
-        View::Export,
-        "malformed",
-        &malformed_ui,
-        &malformed_train,
-        &malformed_validate,
-        &malformed_predict,
-        &malformed_annotate,
-        &malformed_export,
+        View::Export,        "malformed",        &malformed_ui,       &malformed_train,
+        &malformed_validate, &malformed_predict, &malformed_annotate, &malformed_export,
     };
 
     {
@@ -375,7 +343,7 @@ void test_persistence_coalesces_to_latest_snapshot() {
     std::filesystem::remove(temp_root, cleanup_error);
 }
 
-} // namespace
+}  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_ui_settings_round_trip);
 MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_persistence_migrates_schema2_to_schema3);

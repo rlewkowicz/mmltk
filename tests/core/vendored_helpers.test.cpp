@@ -19,9 +19,8 @@ namespace {
 using namespace mmltk::testsupport;
 
 class FixedFormatter final : public spdlog::formatter {
-public:
-    explicit FixedFormatter(std::string text)
-        : text_(std::move(text)) {}
+   public:
+    explicit FixedFormatter(std::string text) : text_(std::move(text)) {}
 
     void format(const spdlog::details::log_msg&, spdlog::memory_buf_t& dest) override {
         dest.clear();
@@ -32,7 +31,7 @@ public:
         return std::make_unique<FixedFormatter>(text_);
     }
 
-private:
+   private:
     std::string text_;
 };
 
@@ -62,8 +61,7 @@ void test_spdlog_log_msg_payload_helpers_preserve_raw_payload_and_apply_formatti
     FixedFormatter formatter("formatted payload");
     spdlog::memory_buf_t formatted;
 
-    const spdlog::string_view_t raw_payload =
-        spdlog::details::format_log_msg_payload(false, formatter, msg, formatted);
+    const spdlog::string_view_t raw_payload = spdlog::details::format_log_msg_payload(false, formatter, msg, formatted);
     assert(raw_payload == msg.payload);
     assert(formatted.size() == 0U);
     assert(spdlog::details::log_msg_payload_length(raw_payload) == static_cast<int>(msg.payload.size()));
@@ -76,12 +74,10 @@ void test_spdlog_log_msg_payload_helpers_preserve_raw_payload_and_apply_formatti
 
 void test_spdlog_log_msg_payload_helpers_clamp_large_lengths_to_int_max() {
     constexpr std::array<char, 2> kSentinel{'x', '\0'};
-    const std::size_t oversized_length =
-        static_cast<std::size_t>(std::numeric_limits<int>::max()) + 128U;
+    const std::size_t oversized_length = static_cast<std::size_t>(std::numeric_limits<int>::max()) + 128U;
     const spdlog::string_view_t oversized_payload(kSentinel.data(), oversized_length);
 
-    assert(spdlog::details::log_msg_payload_length(oversized_payload) ==
-           std::numeric_limits<int>::max());
+    assert(spdlog::details::log_msg_payload_length(oversized_payload) == std::numeric_limits<int>::max());
 }
 
 void test_catch2_compact_reporter_formats_shared_assertion_details() {
@@ -103,7 +99,7 @@ void test_catch2_tap_reporter_formats_shared_assertion_details() {
     assert(result.output_text.find("with 1 message: 'vendored reporter info'") != std::string::npos);
 }
 
-} // namespace
+}  // namespace
 
 TEST_CASE("vendored_catch2_reporter_fixture", "[.][core][vendored][reporter_fixture]") {
     const int fixture_value = 1;
@@ -111,7 +107,8 @@ TEST_CASE("vendored_catch2_reporter_fixture", "[.][core][vendored][reporter_fixt
     REQUIRE(fixture_value == 2);
 }
 
-MMLTK_REGISTER_TEST_CASE("[core][vendored]", test_spdlog_log_msg_payload_helpers_preserve_raw_payload_and_apply_formatting);
+MMLTK_REGISTER_TEST_CASE("[core][vendored]",
+                         test_spdlog_log_msg_payload_helpers_preserve_raw_payload_and_apply_formatting);
 MMLTK_REGISTER_TEST_CASE("[core][vendored]", test_spdlog_log_msg_payload_helpers_clamp_large_lengths_to_int_max);
 MMLTK_REGISTER_TEST_CASE("[core][vendored]", test_catch2_compact_reporter_formats_shared_assertion_details);
 MMLTK_REGISTER_TEST_CASE("[core][vendored]", test_catch2_tap_reporter_formats_shared_assertion_details);

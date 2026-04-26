@@ -13,78 +13,73 @@
 #include <catch2/internal/catch_move_and_forward.hpp>
 
 namespace Catch {
-    namespace Matchers {
-
-        class IsEmptyMatcher final : public MatcherGenericBase {
-        public:
-            template <typename RangeLike>
-            bool match(RangeLike&& rng) const {
+namespace Matchers {
+namespace Detail {
+template <typename RangeLike>
+auto rangeSize(RangeLike&& rng) -> decltype(size(rng)) {
 #if defined(CATCH_CONFIG_POLYFILL_NONMEMBER_CONTAINER_ACCESS)
-                using Catch::Detail::empty;
+    using Catch::Detail::size;
 #else
-                using std::empty;
+    using std::size;
 #endif
-                return empty(rng);
-            }
+    return size(rng);
+}
+}  // namespace Detail
 
-            std::string describe() const override;
-        };
-
-        class HasSizeMatcher final : public MatcherGenericBase {
-            std::size_t m_target_size;
-        public:
-            explicit HasSizeMatcher(std::size_t target_size):
-                m_target_size(target_size)
-            {}
-
-            template <typename RangeLike>
-            bool match(RangeLike&& rng) const {
+class IsEmptyMatcher final : public MatcherGenericBase {
+   public:
+    template <typename RangeLike>
+    bool match(RangeLike&& rng) const {
 #if defined(CATCH_CONFIG_POLYFILL_NONMEMBER_CONTAINER_ACCESS)
-                using Catch::Detail::size;
+        using Catch::Detail::empty;
 #else
-                using std::size;
+        using std::empty;
 #endif
-                return size(rng) == m_target_size;
-            }
+        return empty(rng);
+    }
 
-            std::string describe() const override;
-        };
+    std::string describe() const override;
+};
 
-        template <typename Matcher>
-        class SizeMatchesMatcher final : public MatcherGenericBase {
-            Matcher m_matcher;
-        public:
-            explicit SizeMatchesMatcher(Matcher m):
-                m_matcher(CATCH_MOVE(m))
-            {}
+class HasSizeMatcher final : public MatcherGenericBase {
+    std::size_t m_target_size;
 
-            template <typename RangeLike>
-            bool match(RangeLike&& rng) const {
-#if defined(CATCH_CONFIG_POLYFILL_NONMEMBER_CONTAINER_ACCESS)
-                using Catch::Detail::size;
-#else
-                using std::size;
-#endif
-                return m_matcher.match(size(rng));
-            }
+   public:
+    explicit HasSizeMatcher(std::size_t target_size) : m_target_size(target_size) {}
 
-            std::string describe() const override {
-                return "size matches " + m_matcher.describe();
-            }
-        };
+    template <typename RangeLike>
+    bool match(RangeLike&& rng) const {
+        return Detail::rangeSize(rng) == m_target_size;
+    }
 
+    std::string describe() const override;
+};
 
-        //! Creates a matcher that accepts empty ranges/containers
-        IsEmptyMatcher IsEmpty();
-        //! Creates a matcher that accepts ranges/containers with specific size
-        HasSizeMatcher SizeIs(std::size_t sz);
-        template <typename Matcher>
-        std::enable_if_t<Detail::is_matcher_v<Matcher>,
-        SizeMatchesMatcher<Matcher>> SizeIs(Matcher&& m) {
-            return SizeMatchesMatcher<Matcher>{CATCH_FORWARD(m)};
-        }
+template <typename Matcher>
+class SizeMatchesMatcher final : public MatcherGenericBase {
+    Matcher m_matcher;
 
-    } // end namespace Matchers
-} // end namespace Catch
+   public:
+    explicit SizeMatchesMatcher(Matcher m) : m_matcher(CATCH_MOVE(m)) {}
 
-#endif // CATCH_MATCHERS_CONTAINER_PROPERTIES_HPP_INCLUDED
+    template <typename RangeLike>
+    bool match(RangeLike&& rng) const {
+        return m_matcher.match(Detail::rangeSize(rng));
+    }
+
+    std::string describe() const override {
+        return "size matches " + m_matcher.describe();
+    }
+};
+
+IsEmptyMatcher IsEmpty();
+HasSizeMatcher SizeIs(std::size_t sz);
+template <typename Matcher>
+std::enable_if_t<Detail::is_matcher_v<Matcher>, SizeMatchesMatcher<Matcher>> SizeIs(Matcher&& m) {
+    return SizeMatchesMatcher<Matcher>{CATCH_FORWARD(m)};
+}
+
+}  // namespace Matchers
+}  // namespace Catch
+
+#endif  // CATCH_MATCHERS_CONTAINER_PROPERTIES_HPP_INCLUDED

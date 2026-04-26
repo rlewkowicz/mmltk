@@ -5,7 +5,6 @@
 //        https://www.boost.org/LICENSE_1_0.txt)
 
 // SPDX-License-Identifier: BSL-1.0
-// Adapted from donated nonius code.
 
 #ifndef CATCH_SAMPLE_ANALYSIS_HPP_INCLUDED
 #define CATCH_SAMPLE_ANALYSIS_HPP_INCLUDED
@@ -17,15 +16,15 @@
 #include <vector>
 
 namespace Catch {
-    namespace Benchmark {
-        struct SampleAnalysis {
-            std::vector<FDuration> samples;
-            Estimate<FDuration> mean;
-            Estimate<FDuration> standard_deviation;
-            OutlierClassification outliers;
-            double outlier_variance;
-        };
-    } // namespace Benchmark
-} // namespace Catch
+namespace Benchmark {
+struct SampleAnalysis {
+    std::vector<FDuration> samples;
+    Estimate<FDuration> mean;
+    Estimate<FDuration> standard_deviation;
+    OutlierClassification outliers;
+    double outlier_variance;
+};
+}  // namespace Benchmark
+}  // namespace Catch
 
-#endif // CATCH_SAMPLE_ANALYSIS_HPP_INCLUDED
+#endif  // CATCH_SAMPLE_ANALYSIS_HPP_INCLUDED

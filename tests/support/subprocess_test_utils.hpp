@@ -39,8 +39,7 @@ inline std::string mmltk_cli_path() {
     const ssize_t bytes_read = ::readlink("/proc/self/exe", buffer.data(), buffer.size() - 1U);
     if (bytes_read > 0) {
         buffer[static_cast<std::size_t>(bytes_read)] = '\0';
-        const std::filesystem::path sibling_cli =
-            std::filesystem::path(buffer.data()).parent_path() / "mmltk";
+        const std::filesystem::path sibling_cli = std::filesystem::path(buffer.data()).parent_path() / "mmltk";
         error.clear();
         if (std::filesystem::exists(sibling_cli, error) && !error) {
             return sibling_cli.string();
@@ -103,7 +102,7 @@ inline void append_available_output(int& fd, std::string& text, std::string& com
     }
 }
 
-} // namespace
+}  // namespace
 
 inline SubprocessResult run_subprocess_capture_output(const std::vector<std::string>& args) {
     if (args.empty()) {
@@ -200,4 +199,4 @@ inline SubprocessResult run_subprocess_capture_output(const std::vector<std::str
     };
 }
 
-} // namespace mmltk::testsupport
+}  // namespace mmltk::testsupport

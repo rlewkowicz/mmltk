@@ -69,9 +69,8 @@ Options parse_options(int argc, char** argv) {
         }
     }
 
-    if (opts.width <= 0 || opts.height <= 0 || opts.num_images <= 0 ||
-        opts.batch_size <= 0 || opts.num_epochs <= 0 || opts.shuffle_prefetch <= 0 ||
-        opts.repetitions <= 0 || opts.warmup_runs < 0) {
+    if (opts.width <= 0 || opts.height <= 0 || opts.num_images <= 0 || opts.batch_size <= 0 || opts.num_epochs <= 0 ||
+        opts.shuffle_prefetch <= 0 || opts.repetitions <= 0 || opts.warmup_runs < 0) {
         std::fprintf(stderr, "numeric options must be positive except warmup-runs, which may be zero\n");
         std::exit(1);
     }
@@ -87,24 +86,18 @@ std::string metric_name(const char* label, const char* suffix) {
     return std::string("benchmark.") + label + "." + suffix;
 }
 
-void record_duration_metric(const char* label,
-                            const char* suffix,
-                            const std::chrono::steady_clock::time_point& start,
+void record_duration_metric(const char* label, const char* suffix, const std::chrono::steady_clock::time_point& start,
                             const std::chrono::steady_clock::time_point& end) {
     profile_record_duration_ns(
         metric_name(label, suffix).c_str(),
-        static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count()));
+        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count()));
 }
 
 void record_value_metric(const char* label, const char* suffix, std::uint64_t value) {
     profile_add_value(metric_name(label, suffix).c_str(), value);
 }
 
-void run_loader_case(const char* label,
-                     const DatasetLoader::Config& cfg,
-                     int num_epochs,
-                     bool overlap_consumer) {
+void run_loader_case(const char* label, const DatasetLoader::Config& cfg, int num_epochs, bool overlap_consumer) {
     const auto init_start = std::chrono::steady_clock::now();
     DatasetLoader loader(cfg);
     const auto init_end = std::chrono::steady_clock::now();
@@ -128,10 +121,8 @@ void run_loader_case(const char* label,
             total += batch.num_images;
             if (overlap_consumer) {
                 loader.handoff_batch(batch, consumer_stream);
-                CUDA_ASSERT_OK(cudaMemsetAsync(const_cast<float*>(batch.device_images),
-                                               0,
-                                               batch.num_images * loader.image_stride(),
-                                               consumer_stream));
+                CUDA_ASSERT_OK(cudaMemsetAsync(const_cast<float*>(batch.device_images), 0,
+                                               batch.num_images * loader.image_stride(), consumer_stream));
                 loader.release_batch(batch, consumer_stream);
             } else {
                 loader.release_batch(batch);
@@ -143,18 +134,12 @@ void run_loader_case(const char* label,
         loader.cuda().sync();
         const auto epoch_end = std::chrono::steady_clock::now();
         const double secs = seconds_since(epoch_start, epoch_end);
-        std::printf("%s epoch=%d images=%zu sec=%.6f img_per_sec=%.2f\n",
-                    label,
-                    epoch,
-                    total,
-                    secs,
+        std::printf("%s epoch=%d images=%zu sec=%.6f img_per_sec=%.2f\n", label, epoch, total, secs,
                     static_cast<double>(total) / secs);
         record_duration_metric(label, "epoch", epoch_start, epoch_end);
         record_value_metric(label, "epoch_images", total);
-        record_value_metric(label,
-                            "epoch_img_per_sec_x100",
-                            static_cast<std::uint64_t>(
-                                (static_cast<double>(total) / secs) * 100.0));
+        record_value_metric(label, "epoch_img_per_sec_x100",
+                            static_cast<std::uint64_t>((static_cast<double>(total) / secs) * 100.0));
     }
 
     if (consumer_stream) {
@@ -176,8 +161,7 @@ void run_profile_iteration(const FixtureSpec& fixture, const Options& opts) {
     const auto compile_end = std::chrono::steady_clock::now();
     const std::string bin_path = compiled_bin_path(fixture);
 
-    std::printf("compile sec=%.6f file_bytes=%zu\n",
-                seconds_since(compile_start, compile_end),
+    std::printf("compile sec=%.6f file_bytes=%zu\n", seconds_since(compile_start, compile_end),
                 static_cast<size_t>(fs::file_size(bin_path)));
     record_duration_metric("compile", "total", compile_start, compile_end);
     record_value_metric("compile", "file_bytes", static_cast<std::uint64_t>(fs::file_size(bin_path)));
@@ -197,22 +181,17 @@ void run_profile_iteration(const FixtureSpec& fixture, const Options& opts) {
     run_loader_case("loader_shuffle_overlap", shuffle_cfg, opts.num_epochs, true);
 }
 
-} // namespace
+}  // namespace
 
 int main(int argc, char** argv) {
     MMLTK_PROFILE_PROCESS_LABEL("profile.core");
     MMLTK_PROFILE_RUN_LABEL("core");
-    const mmltk::ExecutionPolicySnapshot execution_snapshot =
-        mmltk::apply_process_execution_policy();
+    const mmltk::ExecutionPolicySnapshot execution_snapshot = mmltk::apply_process_execution_policy();
     mmltk::log_process_execution_policy("mmltk_profile_runner", execution_snapshot, false, true);
     const Options opts = parse_options(argc, argv);
 
     const FixtureSpec fixture{
-        opts.test_dir,
-        "train",
-        opts.width,
-        opts.height,
-        opts.num_images,
+        opts.test_dir, "train", opts.width, opts.height, opts.num_images,
     };
 
     create_synthetic_dataset(fixture);
@@ -229,10 +208,7 @@ int main(int argc, char** argv) {
         run_profile_iteration(fixture, opts);
 
         std::array<char, 64> iteration_label{};
-        std::snprintf(iteration_label.data(),
-                      iteration_label.size(),
-                      "core[%02d]",
-                      repetition + 1);
+        std::snprintf(iteration_label.data(), iteration_label.size(), "core[%02d]", repetition + 1);
         MMLTK_PROFILE_CAPTURE_ITERATION(iteration_label.data());
     }
 

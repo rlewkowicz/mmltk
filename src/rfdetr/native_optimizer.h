@@ -25,7 +25,7 @@ struct NativeAdamWGroupConfig {
 };
 
 class NativeAdamW {
-public:
+   public:
     struct Group {
         NativeAdamWGroupConfig config;
         std::vector<size_t> param_indices;
@@ -37,9 +37,7 @@ public:
     };
 
     NativeAdamW() = default;
-    NativeAdamW(std::vector<Group> groups,
-                std::vector<NamedParameter> params,
-                NativeOptimizerBackend backend);
+    NativeAdamW(std::vector<Group> groups, std::vector<NamedParameter> params, NativeOptimizerBackend backend);
 
     std::vector<torch::Tensor>& parameters();
     [[nodiscard]] const std::vector<torch::Tensor>& parameters() const;
@@ -56,7 +54,7 @@ public:
     void save(torch::serialize::OutputArchive& archive) const;
     void load(torch::serialize::InputArchive& archive);
 
-private:
+   private:
     struct ParamState {
         torch::Tensor step;
         torch::Tensor exp_avg;
@@ -90,7 +88,7 @@ struct NativeMuonGroupConfig {
 };
 
 class NativeMuonWithAuxAdam {
-public:
+   public:
     struct Group {
         NativeMuonGroupConfig config;
         std::vector<size_t> param_indices;
@@ -102,8 +100,7 @@ public:
     };
 
     NativeMuonWithAuxAdam() = default;
-    NativeMuonWithAuxAdam(std::vector<Group> groups,
-                          std::vector<NamedParameter> params);
+    NativeMuonWithAuxAdam(std::vector<Group> groups, std::vector<NamedParameter> params);
 
     std::vector<torch::Tensor>& parameters();
     [[nodiscard]] const std::vector<torch::Tensor>& parameters() const;
@@ -116,11 +113,10 @@ public:
     void set_lrs(const std::vector<double>& base_lrs, double scale);
     void set_muon_momentum(double momentum);
     void step();
-
     void save(torch::serialize::OutputArchive& archive) const;
     void load(torch::serialize::InputArchive& archive);
 
-private:
+   private:
     struct ParamState {
         int64_t step = 0;
         torch::Tensor momentum_buffer;
@@ -138,7 +134,7 @@ private:
 };
 
 class NativeOptimizer {
-public:
+   public:
     NativeOptimizer() = default;
     explicit NativeOptimizer(NativeAdamW optimizer);
     explicit NativeOptimizer(NativeMuonWithAuxAdam optimizer);
@@ -155,14 +151,13 @@ public:
     void set_lrs(const std::vector<double>& base_lrs, double scale);
     void set_muon_momentum(double momentum);
     void step();
-
     void save(torch::serialize::OutputArchive& archive) const;
     void load(torch::serialize::InputArchive& archive);
 
-private:
+   private:
     std::variant<NativeAdamW, NativeMuonWithAuxAdam> storage_;
 };
 
 const char* train_optimizer_kind_name(TrainOptimizerKind kind);
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

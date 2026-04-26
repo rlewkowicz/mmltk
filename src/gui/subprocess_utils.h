@@ -91,8 +91,7 @@ inline std::optional<ChildSetupFailure<Stage>> read_child_setup_failure(const in
 }
 
 template <typename Stage, typename StageLabelFn>
-inline std::string format_child_setup_failure(const ChildSetupFailure<Stage>& failure,
-                                              StageLabelFn&& stage_label,
+inline std::string format_child_setup_failure(const ChildSetupFailure<Stage>& failure, StageLabelFn&& stage_label,
                                               const std::string_view process_name) {
     std::ostringstream stream;
     stream << process_name << " child " << stage_label(failure.stage)
@@ -162,10 +161,9 @@ inline void close_captured_child_process(CapturedChildProcess& process) noexcept
 }
 
 template <typename ChildSetupFn>
-inline CapturedChildProcess spawn_captured_child_process(
-    const std::string_view process_name,
-    ChildSetupFn&& child_setup,
-    const bool nonblocking_output = true) {
+inline CapturedChildProcess spawn_captured_child_process(const std::string_view process_name,
+                                                         ChildSetupFn&& child_setup,
+                                                         const bool nonblocking_output = true) {
     std::array<int, 2> stdout_pipe{-1, -1};
     create_pipe(stdout_pipe, std::string(process_name) + " output pipe");
 
@@ -219,16 +217,13 @@ inline CapturedChildProcess spawn_captured_child_process(
 
 template <typename Stage, typename ChildSetupFn>
 inline CapturedChildProcessResult<Stage> run_captured_child_process(
-    const std::string_view process_name,
-    const std::string_view output_error_prefix,
-    ChildSetupFn&& child_setup,
+    const std::string_view process_name, const std::string_view output_error_prefix, ChildSetupFn&& child_setup,
     const std::chrono::milliseconds poll_interval = std::chrono::milliseconds{20}) {
     CapturedChildProcess process = spawn_captured_child_process(process_name, std::forward<ChildSetupFn>(child_setup));
     CapturedChildProcessResult<Stage> result;
     try {
         while (true) {
-            result.output += mmltk::gui::console_output::read_fd(
-                process.stdout_fd, output_error_prefix, true);
+            result.output += mmltk::gui::console_output::read_fd(process.stdout_fd, output_error_prefix, true);
 
             int status = 0;
             const pid_t waited = ::waitpid(process.pid, &status, WNOHANG);
@@ -248,8 +243,7 @@ inline CapturedChildProcessResult<Stage> run_captured_child_process(
             break;
         }
 
-        result.output += mmltk::gui::console_output::read_fd(
-            process.stdout_fd, output_error_prefix, true);
+        result.output += mmltk::gui::console_output::read_fd(process.stdout_fd, output_error_prefix, true);
         result.setup_failure = read_child_setup_failure<Stage>(process.setup_error_fd);
         close_captured_child_process(process);
         return result;
@@ -267,4 +261,4 @@ using mmltk::gui::console_output::append_console_output;
 using mmltk::gui::console_output::read_fd;
 using mmltk::gui::console_output::trim_output_tail;
 
-} // namespace mmltk::gui::subprocess
+}  // namespace mmltk::gui::subprocess

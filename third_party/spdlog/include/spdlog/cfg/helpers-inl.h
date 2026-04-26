@@ -19,30 +19,20 @@ namespace spdlog {
 namespace cfg {
 namespace helpers {
 
-// inplace convert to lowercase
-inline std::string &to_lower_(std::string &str) {
-    std::transform(str.begin(), str.end(), str.begin(), [](char ch) {
-        return static_cast<char>((ch >= 'A' && ch <= 'Z') ? ch + ('a' - 'A') : ch);
-    });
+inline std::string& to_lower_(std::string& str) {
+    std::transform(str.begin(), str.end(), str.begin(),
+                   [](char ch) { return static_cast<char>((ch >= 'A' && ch <= 'Z') ? ch + ('a' - 'A') : ch); });
     return str;
 }
 
-// inplace trim spaces
-inline std::string &trim_(std::string &str) {
-    const char *spaces = " \n\r\t";
+inline std::string& trim_(std::string& str) {
+    const char* spaces = " \n\r\t";
     str.erase(str.find_last_not_of(spaces) + 1);
     str.erase(0, str.find_first_not_of(spaces));
     return str;
 }
 
-// return (name,value) trimmed pair from the given "name = value" string.
-// return empty string on missing parts
-// "key=val" => ("key", "val")
-// " key  =  val " => ("key", "val")
-// "key=" => ("key", "")
-// "val" => ("", "val")
-
-inline std::pair<std::string, std::string> extract_kv_(char sep, const std::string &str) {
+inline std::pair<std::string, std::string> extract_kv_(char sep, const std::string& str) {
     auto n = str.find(sep);
     std::string k, v;
     if (n == std::string::npos) {
@@ -54,9 +44,7 @@ inline std::pair<std::string, std::string> extract_kv_(char sep, const std::stri
     return std::make_pair(trim_(k), trim_(v));
 }
 
-// return vector of key/value pairs from a sequence of "K1=V1,K2=V2,.."
-// "a=AAA,b=BBB,c=CCC,.." => {("a","AAA"),("b","BBB"),("c", "CCC"),...}
-inline std::unordered_map<std::string, std::string> extract_key_vals_(const std::string &str) {
+inline std::unordered_map<std::string, std::string> extract_key_vals_(const std::string& str) {
     std::string token;
     std::istringstream token_stream(str);
     std::unordered_map<std::string, std::string> rv{};
@@ -70,7 +58,7 @@ inline std::unordered_map<std::string, std::string> extract_key_vals_(const std:
     return rv;
 }
 
-SPDLOG_INLINE void load_levels(const std::string &levels_spec) {
+SPDLOG_INLINE void load_levels(const std::string& levels_spec) {
     if (levels_spec.empty() || levels_spec.size() >= 32768) {
         return;
     }
@@ -80,16 +68,14 @@ SPDLOG_INLINE void load_levels(const std::string &levels_spec) {
     level::level_enum global_level = level::info;
     bool global_level_found = false;
 
-    for (auto &name_level : key_vals) {
-        const auto &logger_name = name_level.first;
-        const auto &level_name = to_lower_(name_level.second);
+    for (auto& name_level : key_vals) {
+        const auto& logger_name = name_level.first;
+        const auto& level_name = to_lower_(name_level.second);
         const auto level = level::from_str(level_name);
-        // ignore unrecognized level names
         if (level == level::off && level_name != "off") {
             continue;
         }
-        if (logger_name.empty())  // no logger name indicates global level
-        {
+        if (logger_name.empty()) {
             global_level_found = true;
             global_level = level;
         } else {
@@ -97,8 +83,7 @@ SPDLOG_INLINE void load_levels(const std::string &levels_spec) {
         }
     }
 
-    details::registry::instance().set_levels(std::move(levels),
-                                             global_level_found ? &global_level : nullptr);
+    details::registry::instance().set_levels(std::move(levels), global_level_found ? &global_level : nullptr);
 }
 
 }  // namespace helpers

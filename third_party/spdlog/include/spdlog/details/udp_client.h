@@ -3,9 +3,6 @@
 
 #pragma once
 
-// Helper RAII over unix udp client socket.
-// Will throw on construction if the socket creation failed.
-
 #ifdef _WIN32
 #error "include udp_client-windows.h instead"
 #endif
@@ -37,16 +34,16 @@ class udp_client {
         }
     }
 
-public:
-    udp_client(const std::string &host, uint16_t port) {
+   public:
+    udp_client(const std::string& host, uint16_t port) {
         socket_ = ::socket(PF_INET, SOCK_DGRAM, 0);
         if (socket_ < 0) {
             throw_spdlog_ex("error: Create Socket Failed!");
         }
 
         int option_value = TX_BUFFER_SIZE;
-        if (::setsockopt(socket_, SOL_SOCKET, SO_SNDBUF,
-                         reinterpret_cast<const char *>(&option_value), sizeof(option_value)) < 0) {
+        if (::setsockopt(socket_, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&option_value),
+                         sizeof(option_value)) < 0) {
             cleanup_();
             throw_spdlog_ex("error: setsockopt(SO_SNDBUF) Failed!");
         }
@@ -62,16 +59,17 @@ public:
         ::memset(sockAddr_.sin_zero, 0x00, sizeof(sockAddr_.sin_zero));
     }
 
-    ~udp_client() { cleanup_(); }
+    ~udp_client() {
+        cleanup_();
+    }
 
-    int fd() const { return socket_; }
+    int fd() const {
+        return socket_;
+    }
 
-    // Send exactly n_bytes of the given data.
-    // On error close the connection and throw.
-    void send(const char *data, size_t n_bytes) {
+    void send(const char* data, size_t n_bytes) {
         socklen_t tolen = sizeof(sockAddr_);
-        if (::sendto(socket_, data, n_bytes, 0, reinterpret_cast<const sockaddr *>(&sockAddr_),
-                     tolen) == -1) {
+        if (::sendto(socket_, data, n_bytes, 0, reinterpret_cast<const sockaddr*>(&sockAddr_), tolen) == -1) {
             throw_spdlog_ex("sendto(2) failed", errno);
         }
     }

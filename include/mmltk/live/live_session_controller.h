@@ -38,7 +38,7 @@ struct LiveSessionStatus {
 };
 
 class LiveSessionController {
-public:
+   public:
     explicit LiveSessionController(LiveSessionConfig config);
     ~LiveSessionController();
 
@@ -51,8 +51,9 @@ public:
     [[nodiscard]] std::string last_error() const;
     [[nodiscard]] LiveSessionStatus snapshot_status() const;
 
-    [[nodiscard]] bool try_acquire_latest_output(OutputBundle* out);
-    void release_output(std::uint32_t slot_index);
+    [[nodiscard]] bool try_acquire_latest_workspace(WorkspaceOutputBundle* out);
+    void release_workspace(std::uint32_t slot_index);
+    void set_workspace_ready_callback(LiveCompositor::WorkspaceReadyCallback callback);
 
     [[nodiscard]] bool try_acquire_latest_detect(DetectBundle* out);
     void release_detect(std::uint32_t slot_index);
@@ -66,11 +67,8 @@ public:
     void clear_analyzer();
     void set_persistent_analysis_overlay(bool enabled);
     [[nodiscard]] bool persistent_analysis_overlay() const noexcept;
-    [[nodiscard]] bool readback_raw_base(const LiveFrameId& frame_id,
-                                         std::vector<std::uint8_t>* pixels_bgr,
-                                         std::uint32_t* width,
-                                         std::uint32_t* height,
-                                         LiveCaptureRegion* region,
+    [[nodiscard]] bool readback_raw_base(const LiveFrameId& frame_id, std::vector<std::uint8_t>* pixels_bgr,
+                                         std::uint32_t* width, std::uint32_t* height, LiveCaptureRegion* region,
                                          std::string* error_message);
 
     [[nodiscard]] LiveVideoIngress& ingress() noexcept;
@@ -84,16 +82,9 @@ public:
     [[nodiscard]] LiveCompositor& compositor() noexcept;
     [[nodiscard]] const LiveCompositor& compositor() const noexcept;
 
-private:
-    LiveSessionConfig config_{};
-    UiCropState ui_crop_state_{};
-    ManualOverlayDocument manual_overlay_document_{};
-    std::unique_ptr<LiveVideoIngress> ingress_;
-    std::unique_ptr<LiveFrameFanout> fanout_;
-    std::unique_ptr<LiveAnalyzerWorker> analyzer_worker_;
-    std::unique_ptr<LiveManualOverlayWorker> manual_overlay_worker_;
-    std::unique_ptr<LiveCompositor> compositor_;
-    std::atomic<bool> running_{false};
+   private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
-} // namespace mmltk::live
+}  // namespace mmltk::live

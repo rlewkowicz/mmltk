@@ -12,4 +12,4 @@ namespace mmltk::rfdetr {
 
 void run_onnx_simplify(ONNX_NAMESPACE::ModelProto& model);
 
-} // namespace mmltk::rfdetr
+}

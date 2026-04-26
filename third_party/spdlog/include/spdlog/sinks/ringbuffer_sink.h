@@ -14,14 +14,10 @@
 
 namespace spdlog {
 namespace sinks {
-/*
- * Ring buffer sink
- */
 template <typename Mutex>
 class ringbuffer_sink final : public base_sink<Mutex> {
-public:
-    explicit ringbuffer_sink(size_t n_items)
-        : q_{n_items} {
+   public:
+    explicit ringbuffer_sink(size_t n_items) : q_{n_items} {
         if (n_items == 0) {
             throw_spdlog_ex("ringbuffer_sink: n_items cannot be zero");
         }
@@ -53,13 +49,13 @@ public:
         return ret;
     }
 
-protected:
-    void sink_it_(const details::log_msg &msg) override {
+   protected:
+    void sink_it_(const details::log_msg& msg) override {
         q_.push_back(details::log_msg_buffer{msg});
     }
     void flush_() override {}
 
-private:
+   private:
     details::circular_q<details::log_msg_buffer> q_;
 };
 

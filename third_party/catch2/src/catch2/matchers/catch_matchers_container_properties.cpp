@@ -12,23 +12,23 @@
 namespace Catch {
 namespace Matchers {
 
-    std::string IsEmptyMatcher::describe() const {
-        return "is empty";
-    }
+std::string IsEmptyMatcher::describe() const {
+    return "is empty";
+}
 
-    std::string HasSizeMatcher::describe() const {
-        ReusableStringStream sstr;
-        sstr << "has size == " << m_target_size;
-        return sstr.str();
-    }
+std::string HasSizeMatcher::describe() const {
+    ReusableStringStream sstr;
+    sstr << "has size == " << m_target_size;
+    return sstr.str();
+}
 
-    IsEmptyMatcher IsEmpty() {
-        return {};
-    }
+IsEmptyMatcher IsEmpty() {
+    return {};
+}
 
-    HasSizeMatcher SizeIs(std::size_t sz) {
-        return HasSizeMatcher{ sz };
-    }
+HasSizeMatcher SizeIs(std::size_t sz) {
+    return HasSizeMatcher{sz};
+}
 
-} // end namespace Matchers
-} // end namespace Catch
+}  // namespace Matchers
+}  // namespace Catch

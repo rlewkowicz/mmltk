@@ -32,9 +32,8 @@ spdlog::level::level_enum g_level = spdlog::level::info;
 
 bool is_known_level_name(std::string_view value) {
     const std::string lowered = strings::to_lower(value);
-    return lowered == "trace" || lowered == "debug" || lowered == "info" ||
-           lowered == "warn" || lowered == "warning" || lowered == "error" ||
-           lowered == "err" || lowered == "critical" || lowered == "off";
+    return lowered == "trace" || lowered == "debug" || lowered == "info" || lowered == "warn" || lowered == "warning" ||
+           lowered == "error" || lowered == "err" || lowered == "critical" || lowered == "off";
 }
 
 std::optional<spdlog::level::level_enum> parse_level_impl(std::string_view value) {
@@ -78,8 +77,7 @@ std::filesystem::path resolve_relative_to_install_prefix(const std::filesystem::
 }
 
 std::filesystem::path resolve_log_file_path(const LoggingConfig& config) {
-    const std::filesystem::path default_dir =
-        mmltk::runtime_paths::install_prefix() / ".mmltk-data" / "logs";
+    const std::filesystem::path default_dir = mmltk::runtime_paths::install_prefix() / ".mmltk-data" / "logs";
 
     if (config.log_file.has_value()) {
         std::filesystem::path path = *config.log_file;
@@ -129,11 +127,8 @@ void install_logger_locked(LoggingConfig config) {
 
     g_sinks.clear();
     g_sinks.push_back(std::make_shared<spdlog::sinks::stderr_color_sink_mt>());
-    g_sinks.push_back(std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
-        log_path.string(),
-        kLogRotationBytes,
-        kLogRotationFiles,
-        true));
+    g_sinks.push_back(std::make_shared<spdlog::sinks::rotating_file_sink_mt>(log_path.string(), kLogRotationBytes,
+                                                                             kLogRotationFiles, true));
 
     auto root = std::make_shared<spdlog::logger>(config.app_name, g_sinks.begin(), g_sinks.end());
     spdlog::initialize_logger(root);
@@ -146,7 +141,7 @@ void install_logger_locked(LoggingConfig config) {
     g_root_logger = std::move(root);
 }
 
-} // namespace
+}  // namespace
 
 LoggingConfig default_config(std::string app_name) {
     LoggingConfig config;
@@ -171,8 +166,7 @@ CliOverrides scan_cli_overrides(int argc, char** argv) {
     for (int index = 1; index < argc; ++index) {
         const std::string_view arg = argv[index];
         auto has_prefix = [&](const std::string_view prefix) {
-            return arg.size() >= prefix.size() &&
-                   arg.compare(0, prefix.size(), prefix) == 0;
+            return arg.size() >= prefix.size() && arg.compare(0, prefix.size(), prefix) == 0;
         };
         auto capture_next = [&](std::optional<std::filesystem::path>& out) {
             if (index + 1 < argc) {
@@ -307,4 +301,4 @@ void set_level(spdlog::level::level_enum new_level) {
     });
 }
 
-} // namespace mmltk::logging
+}  // namespace mmltk::logging

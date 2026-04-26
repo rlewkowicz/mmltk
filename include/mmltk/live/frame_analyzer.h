@@ -32,7 +32,7 @@ struct AnalyzerResult {
 };
 
 class FrameAnalyzer {
-public:
+   public:
     virtual ~FrameAnalyzer() = default;
 
     [[nodiscard]] virtual AnalyzerResult analyze(const DetectBundle& bundle) = 0;
@@ -41,4 +41,4 @@ public:
     [[nodiscard]] virtual int num_classes() const = 0;
 };
 
-} // namespace mmltk::live
+}  // namespace mmltk::live

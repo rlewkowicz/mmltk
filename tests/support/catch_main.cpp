@@ -13,8 +13,7 @@ namespace {
 
 bool is_logging_option(std::string_view arg, std::string_view name) {
     const std::string prefix = std::string(name) + "=";
-    return arg == name ||
-           (arg.size() >= prefix.size() && arg.compare(0, prefix.size(), prefix) == 0);
+    return arg == name || (arg.size() >= prefix.size() && arg.compare(0, prefix.size(), prefix) == 0);
 }
 
 std::vector<std::string> filter_logging_args(int argc, char** argv) {
@@ -26,11 +25,9 @@ std::vector<std::string> filter_logging_args(int argc, char** argv) {
 
     for (int index = 1; index < argc; ++index) {
         const std::string_view arg = argv[index];
-        if (is_logging_option(arg, "--log-level") ||
-            is_logging_option(arg, "--log-file") ||
+        if (is_logging_option(arg, "--log-level") || is_logging_option(arg, "--log-file") ||
             is_logging_option(arg, "--log-dir")) {
-            if ((arg == "--log-level" || arg == "--log-file" || arg == "--log-dir") &&
-                index + 1 < argc) {
+            if ((arg == "--log-level" || arg == "--log-file" || arg == "--log-dir") && index + 1 < argc) {
                 ++index;
             }
             continue;
@@ -41,13 +38,12 @@ std::vector<std::string> filter_logging_args(int argc, char** argv) {
     return filtered;
 }
 
-} // namespace
+}  // namespace
 
 int main(int argc, char** argv) {
     try {
-        const std::string app_name = argc > 0 && argv[0] != nullptr
-            ? std::filesystem::path(argv[0]).filename().string()
-            : std::string("mmltk_tests");
+        const std::string app_name = argc > 0 && argv[0] != nullptr ? std::filesystem::path(argv[0]).filename().string()
+                                                                    : std::string("mmltk_tests");
         const mmltk::logging::CliOverrides overrides = mmltk::logging::scan_cli_overrides(argc, argv);
         mmltk::logging::initialize(mmltk::logging::merge(mmltk::logging::config_from_env(app_name), overrides));
 

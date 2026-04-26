@@ -10,13 +10,8 @@ namespace {
 
 void test_parse_single_onnx_tool_args_supports_logging_flags() {
     std::vector<std::string> argv_storage{
-        "mmltk-rfdetr-onnx-info",
-        "--log-level=warn",
-        "--log-file",
-        "/tmp/onnx-info.log",
-        "--log-dir",
-        "/tmp/onnx-info-logs",
-        "/tmp/model.onnx",
+        "mmltk-rfdetr-onnx-info", "--log-level=warn", "--log-file", "/tmp/onnx-info.log", "--log-dir",
+        "/tmp/onnx-info-logs",    "/tmp/model.onnx",
     };
     std::vector<char*> argv;
     argv.reserve(argv_storage.size());
@@ -25,8 +20,7 @@ void test_parse_single_onnx_tool_args_supports_logging_flags() {
     }
 
     const auto parsed = mmltk::rfdetr::parse_single_onnx_tool_args(
-        static_cast<int>(argv.size()),
-        argv.data(),
+        static_cast<int>(argv.size()), argv.data(),
         "usage: mmltk-rfdetr-onnx-info [--log-level LEVEL] [--log-file PATH] [--log-dir PATH] MODEL.onnx");
     assert(parsed.model_path == "/tmp/model.onnx");
     assert(parsed.logging.level.has_value());
@@ -50,8 +44,7 @@ void test_parse_single_onnx_tool_args_requires_model_path() {
     bool threw = false;
     try {
         (void)mmltk::rfdetr::parse_single_onnx_tool_args(
-            static_cast<int>(argv.size()),
-            argv.data(),
+            static_cast<int>(argv.size()), argv.data(),
             "usage: mmltk-rfdetr-onnx-simplify [--log-level LEVEL] [--log-file PATH] [--log-dir PATH] MODEL.onnx");
     } catch (const std::runtime_error& error) {
         threw = true;
@@ -61,7 +54,7 @@ void test_parse_single_onnx_tool_args_requires_model_path() {
     assert(threw);
 }
 
-} // namespace
+}  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][onnx_tool_args]", test_parse_single_onnx_tool_args_supports_logging_flags);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][onnx_tool_args]", test_parse_single_onnx_tool_args_requires_model_path);

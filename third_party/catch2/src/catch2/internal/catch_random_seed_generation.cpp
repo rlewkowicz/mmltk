@@ -16,20 +16,20 @@
 
 namespace Catch {
 
-    std::uint32_t generateRandomSeed( GenerateFrom from ) {
-        switch ( from ) {
+std::uint32_t generateRandomSeed(GenerateFrom from) {
+    switch (from) {
         case GenerateFrom::Time:
-            return static_cast<std::uint32_t>( std::time( nullptr ) );
+            return static_cast<std::uint32_t>(std::time(nullptr));
 
         case GenerateFrom::Default:
         case GenerateFrom::RandomDevice: {
             std::random_device rd;
-            return Detail::fillBitsFrom<std::uint32_t>( rd );
+            return Detail::fillBitsFrom<std::uint32_t>(rd);
         }
 
         default:
             CATCH_ERROR("Unknown generation method");
-        }
     }
+}
 
-} // end namespace Catch
+}  // namespace Catch

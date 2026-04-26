@@ -53,11 +53,7 @@ void test_roundtrip_end_to_end() {
     MMLTK_PROFILE_RUN_LABEL("test_roundtrip");
     const TestOptions opts;
     const FixtureSpec fixture{
-        opts.test_dir,
-        "train",
-        opts.width,
-        opts.height,
-        opts.num_images,
+        opts.test_dir, "train", opts.width, opts.height, opts.num_images,
     };
     const std::string test_dir = fixture.root_dir;
     const std::string dataset_dir_path = dataset_dir(fixture);
@@ -92,14 +88,12 @@ void test_roundtrip_end_to_end() {
     resized_cpu_cfg.target_width = std::max(32, W - 13);
     resized_cpu_cfg.target_height = std::max(32, H - 9);
     std::vector<size_t> resized_progress_steps;
-    DatasetCompiler::compile(resized_cpu_cfg, [&](const CompileProgress& progress) {
-        resized_progress_steps.push_back(progress.done);
-    });
+    DatasetCompiler::compile(resized_cpu_cfg,
+                             [&](const CompileProgress& progress) { resized_progress_steps.push_back(progress.done); });
     const bool saw_intermediate_pixel_progress =
-        std::any_of(resized_progress_steps.begin(),
-                    resized_progress_steps.end(),
-                    [&](size_t done) { return done > static_cast<size_t>(NUM_IMAGES) &&
-                                              done < (static_cast<size_t>(NUM_IMAGES) * 2U); });
+        std::any_of(resized_progress_steps.begin(), resized_progress_steps.end(), [&](size_t done) {
+            return done > static_cast<size_t>(NUM_IMAGES) && done < (static_cast<size_t>(NUM_IMAGES) * 2U);
+        });
     assert(saw_intermediate_pixel_progress);
 
     const std::string bin_path = compiled_bin_path(fixture);
@@ -130,8 +124,7 @@ void test_roundtrip_end_to_end() {
     assert(direct_loader.image_stride() == IMAGE_STRIDE);
 
     const fs::path first_image_path = fs::path(dataset_dir_path) / split / "000001.png";
-    const std::vector<float> expected_first_image =
-        expected_nchw_stub(first_image_path.string(), W, H);
+    const std::vector<float> expected_first_image = expected_nchw_stub(first_image_path.string(), W, H);
     assert_image_matches(direct_loader.pixel_blob(), expected_first_image);
 
     for (size_t i = 0; i < 100; ++i) {
@@ -164,19 +157,15 @@ void test_roundtrip_end_to_end() {
             assert(entry.num_instances == (idx >= 10 ? 1 : 0));
             if (entry.num_instances > 0) {
                 const PackedInstance& inst = batch.labels[entry.label_begin];
-                assert(inst.class_id ==
-                       static_cast<uint8_t>((idx - 10) % direct_loader.num_classes()));
+                assert(inst.class_id == static_cast<uint8_t>((idx - 10) % direct_loader.num_classes()));
                 assert(inst.mask_rle_pairs == static_cast<uint16_t>(std::min(H - 1, 30) - 10));
-                const RLEPair& first_pair =
-                    batch.rle_pairs[inst.mask_rle_offset / sizeof(RLEPair)];
+                const RLEPair& first_pair = batch.rle_pairs[inst.mask_rle_offset / sizeof(RLEPair)];
                 assert(first_pair.start == static_cast<uint32_t>(10 * W + 10));
                 assert(first_pair.length == static_cast<uint32_t>(std::min(W - 1, 30) - 10));
             }
         }
         direct_loader.handoff_batch(batch, compute_stream);
-        CUDA_ASSERT_OK(cudaMemsetAsync(const_cast<float*>(batch.device_images),
-                                       0,
-                                       batch.num_images * IMAGE_STRIDE,
+        CUDA_ASSERT_OK(cudaMemsetAsync(const_cast<float*>(batch.device_images), 0, batch.num_images * IMAGE_STRIDE,
                                        compute_stream));
         direct_loader.release_batch(batch, compute_stream);
         next_expected_idx += batch.num_images;
@@ -201,8 +190,8 @@ void test_roundtrip_end_to_end() {
     if (direct_loader.next_batch(batch)) {
         direct_loader.wait_batch(batch);
         direct_loader.handoff_batch(batch, nullptr);
-        CUDA_ASSERT_OK(cudaMemsetAsync(
-            const_cast<float*>(batch.device_images), 0, batch.num_images * IMAGE_STRIDE, nullptr));
+        CUDA_ASSERT_OK(
+            cudaMemsetAsync(const_cast<float*>(batch.device_images), 0, batch.num_images * IMAGE_STRIDE, nullptr));
         direct_loader.release_batch(batch, nullptr);
     }
     while (direct_loader.next_batch(batch)) {
@@ -231,9 +220,7 @@ void test_roundtrip_end_to_end() {
             }
         }
         shuffled_loader.handoff_batch(batch, compute_stream);
-        CUDA_ASSERT_OK(cudaMemsetAsync(const_cast<float*>(batch.device_images),
-                                       0,
-                                       batch.num_images * IMAGE_STRIDE,
+        CUDA_ASSERT_OK(cudaMemsetAsync(const_cast<float*>(batch.device_images), 0, batch.num_images * IMAGE_STRIDE,
                                        compute_stream));
         shuffled_loader.release_batch(batch, compute_stream);
     }
@@ -325,9 +312,7 @@ void test_roundtrip_end_to_end() {
     for (uint32_t i = 0; i < static_cast<uint32_t>(sharded_seen.size()); ++i) {
         assert(sharded_seen[i] == i);
     }
-    printf("Batch sharding: %zu images across %u shards\n",
-           sharded_seen.size(),
-           shard0_cfg.batch_shard_count);
+    printf("Batch sharding: %zu images across %u shards\n", sharded_seen.size(), shard0_cfg.batch_shard_count);
 
     CUDA_ASSERT_OK(cudaStreamDestroy(compute_stream));
 

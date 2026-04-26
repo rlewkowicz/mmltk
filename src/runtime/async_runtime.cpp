@@ -2,11 +2,9 @@
 
 namespace mmltk::runtime {
 
-TaskCancellation::TaskCancellation()
-    : state_(std::make_shared<State>()) {}
+TaskCancellation::TaskCancellation() : state_(std::make_shared<State>()) {}
 
-TaskCancellation::TaskCancellation(std::shared_ptr<State> state)
-    : state_(std::move(state)) {}
+TaskCancellation::TaskCancellation(std::shared_ptr<State> state) : state_(std::move(state)) {}
 
 void TaskCancellation::cancel() const noexcept {
     if (state_) {
@@ -23,8 +21,11 @@ bool TaskCancellation::finished() const noexcept {
 }
 
 void UiCallbackQueue::post(std::function<void()> callback) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    callbacks_.push_back(std::move(callback));
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        callbacks_.push_back(std::move(callback));
+    }
+    wake();
 }
 
 std::size_t UiCallbackQueue::drain(std::size_t max_callbacks) {
@@ -52,8 +53,26 @@ bool UiCallbackQueue::empty() const {
     return callbacks_.empty();
 }
 
-BackgroundExecutor::BackgroundExecutor(std::size_t worker_count,
-                                       std::vector<int> cpu_affinity,
+void UiCallbackQueue::set_wake_callback(std::function<void()> callback) {
+    if (!callback) {
+        wake_callback_.store(nullptr, std::memory_order_release);
+        return;
+    }
+    wake_callback_.store(std::make_shared<const std::function<void()>>(std::move(callback)), std::memory_order_release);
+}
+
+void UiCallbackQueue::wake() noexcept {
+    const std::shared_ptr<const std::function<void()>> callback = wake_callback_.load(std::memory_order_acquire);
+    if (!callback || !*callback) {
+        return;
+    }
+    try {
+        (*callback)();
+    } catch (...) {
+    }
+}
+
+BackgroundExecutor::BackgroundExecutor(std::size_t worker_count, std::vector<int> cpu_affinity,
                                        std::string thread_name_prefix)
     : worker_pool_(worker_count, std::move(cpu_affinity), std::move(thread_name_prefix)) {}
 
@@ -65,4 +84,4 @@ void BackgroundExecutor::wait_idle() {
     worker_pool_.wait_idle();
 }
 
-} // namespace mmltk::runtime
+}  // namespace mmltk::runtime

@@ -55,15 +55,12 @@ struct StateDictLoadSummary {
 
 bool is_native_checkpoint_file(const std::filesystem::path& checkpoint_path);
 NativeCheckpoint load_checkpoint(const std::filesystem::path& checkpoint_path);
-StateDictLoadSummary apply_checkpoint_to_module(torch::nn::Module& module,
-                                               const NativeCheckpoint& checkpoint,
-                                               bool strict = true);
-StateDictLoadSummary apply_checkpoint_to_module(torch::nn::Module& module,
-                                               const std::filesystem::path& checkpoint_path,
-                                               bool strict = true);
-void save_native_checkpoint(const std::filesystem::path& checkpoint_path,
-                            const NativeCheckpoint& checkpoint);
+StateDictLoadSummary apply_checkpoint_to_module(torch::nn::Module& module, const NativeCheckpoint& checkpoint,
+                                                bool strict = true);
+StateDictLoadSummary apply_checkpoint_to_module(torch::nn::Module& module, const std::filesystem::path& checkpoint_path,
+                                                bool strict = true);
+void save_native_checkpoint(const std::filesystem::path& checkpoint_path, const NativeCheckpoint& checkpoint);
 NativeCheckpoint normalize_checkpoint_to_native(const std::filesystem::path& input_path,
-                                               const std::filesystem::path& output_path);
+                                                const std::filesystem::path& output_path);
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

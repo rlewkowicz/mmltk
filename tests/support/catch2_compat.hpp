@@ -17,6 +17,6 @@
 #define assert(...) REQUIRE((__VA_ARGS__))
 
 #define MMLTK_REGISTER_TEST_CASE(tags, fn) \
-    TEST_CASE(#fn, tags) {                \
-        fn();                             \
+    TEST_CASE(#fn, tags) {                 \
+        fn();                              \
     }

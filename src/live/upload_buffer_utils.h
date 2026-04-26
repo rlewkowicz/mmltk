@@ -9,8 +9,7 @@
 namespace mmltk::live {
 
 template <typename T>
-inline void ensure_pinned_upload_capacity(const std::size_t value_count,
-                                          PinnedUploadBuffer<T>* buffer,
+inline void ensure_pinned_upload_capacity(const std::size_t value_count, PinnedUploadBuffer<T>* buffer,
                                           const char* context) {
     if (value_count == 0U || buffer == nullptr) {
         return;
@@ -19,8 +18,7 @@ inline void ensure_pinned_upload_capacity(const std::size_t value_count,
 }
 
 template <typename T>
-inline void ensure_device_upload_capacity(const std::size_t value_count,
-                                          DeviceUploadBuffer<T>* buffer,
+inline void ensure_device_upload_capacity(const std::size_t value_count, DeviceUploadBuffer<T>* buffer,
                                           const char* context) {
     if (value_count == 0U || buffer == nullptr) {
         return;
@@ -63,12 +61,8 @@ struct DeviceBufferView {
 
 template <typename T>
 inline DeviceBufferView view_of(const PitchedDeviceBuffer<T>& buffer) {
-    return {
-        device_ptr_as_bytes(buffer.data()),
-        buffer.pitch_bytes(),
-        static_cast<int>(buffer.width()),
-        static_cast<int>(buffer.height())
-    };
+    return {device_ptr_as_bytes(buffer.data()), buffer.pitch_bytes(), static_cast<int>(buffer.width()),
+            static_cast<int>(buffer.height())};
 }
 
-} // namespace mmltk::live
+}  // namespace mmltk::live

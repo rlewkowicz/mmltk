@@ -12,15 +12,14 @@
 
 namespace Catch {
 
-    enum class GenerateFrom {
-        Time,
-        RandomDevice,
-        //! Currently equivalent to RandomDevice, but can change at any point
-        Default
-    };
+enum class GenerateFrom {
+    Time,
+    RandomDevice,
+    Default
+};
 
-    std::uint32_t generateRandomSeed(GenerateFrom from);
+std::uint32_t generateRandomSeed(GenerateFrom from);
 
-} // end namespace Catch
+}  // namespace Catch
 
-#endif // CATCH_RANDOM_SEED_GENERATION_HPP_INCLUDED
+#endif  // CATCH_RANDOM_SEED_GENERATION_HPP_INCLUDED

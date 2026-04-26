@@ -1,6 +1,7 @@
 #include "train_command.h"
 #include "runtime_paths.h"
 #include "rfdetr/cli/workflow_cli_shared.h"
+#include "mmltk/rfdetr/workflow_requests.h"
 
 #include <cuda_runtime_api.h>
 
@@ -29,7 +30,7 @@ std::vector<LocalGpuInfo> enumerate_local_gpus(std::string* error) {
     std::vector<LocalGpuInfo> devices;
     devices.reserve(static_cast<size_t>(std::max(0, device_count)));
     for (int device_id = 0; device_id < device_count; ++device_id) {
-        cudaDeviceProp properties {};
+        cudaDeviceProp properties{};
         const cudaError_t property_status = ::cudaGetDeviceProperties(&properties, device_id);
         if (property_status != cudaSuccess) {
             if (error != nullptr) {
@@ -75,4 +76,4 @@ std::filesystem::path resolve_sibling_mmltk_cli(const std::filesystem::path& exe
     return cli_path;
 }
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

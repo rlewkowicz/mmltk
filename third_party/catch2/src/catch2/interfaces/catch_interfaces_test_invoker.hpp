@@ -10,14 +10,14 @@
 
 namespace Catch {
 
-    class ITestInvoker {
-    public:
-        virtual void prepareTestCase();
-        virtual void tearDownTestCase();
-        virtual void invoke() const = 0;
-        virtual ~ITestInvoker(); // = default
-    };
+class ITestInvoker {
+   public:
+    virtual void prepareTestCase();
+    virtual void tearDownTestCase();
+    virtual void invoke() const = 0;
+    virtual ~ITestInvoker();
+};
 
-} // namespace Catch
+}  // namespace Catch
 
-#endif // CATCH_INTERFACES_TEST_INVOKER_HPP_INCLUDED
+#endif  // CATCH_INTERFACES_TEST_INVOKER_HPP_INCLUDED

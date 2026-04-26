@@ -11,9 +11,8 @@
 
 namespace mmltk::gui {
 
-using VastOfferQueryFn = std::function<std::vector<VastOfferSummary>(
-    const VastQueryConfig&,
-    const std::vector<RemoteGpuFamily>&)>;
+using VastOfferQueryFn =
+    std::function<std::vector<VastOfferSummary>(const VastQueryConfig&, const std::vector<RemoteGpuFamily>&)>;
 
 struct VastQueryState {
     bool running = false;
@@ -23,15 +22,13 @@ struct VastQueryState {
 };
 
 class VastQueryController {
-public:
+   public:
     VastQueryController(mmltk::runtime::BackgroundExecutor& background_executor,
                         mmltk::runtime::UiCallbackQueue& ui_callbacks);
     VastQueryController(mmltk::runtime::BackgroundExecutor& background_executor,
-                        mmltk::runtime::UiCallbackQueue& ui_callbacks,
-                        VastOfferQueryFn query_offers_fn);
+                        mmltk::runtime::UiCallbackQueue& ui_callbacks, VastOfferQueryFn query_offers_fn);
 
-    void launch(std::string api_key,
-                const std::vector<RemoteGpuFamily>& families,
+    void launch(const std::string& api_key, const std::vector<RemoteGpuFamily>& families,
                 std::function<void(const std::string&)> on_error = {});
     void arm_offer(const VastOfferSummary& offer);
     void clear_armed_offer();
@@ -41,7 +38,7 @@ public:
     [[nodiscard]] const std::optional<VastOfferSummary>& armed_offer() const noexcept;
     [[nodiscard]] std::string armed_offer_summary() const;
 
-private:
+   private:
     mmltk::runtime::BackgroundExecutor& background_executor_;
     mmltk::runtime::UiCallbackQueue& ui_callbacks_;
     VastOfferQueryFn query_offers_fn_;
@@ -49,4 +46,4 @@ private:
     std::optional<VastOfferSummary> armed_offer_;
 };
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

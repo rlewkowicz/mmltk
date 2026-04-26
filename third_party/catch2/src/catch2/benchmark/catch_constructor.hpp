@@ -5,7 +5,6 @@
 //        https://www.boost.org/LICENSE_1_0.txt)
 
 // SPDX-License-Identifier: BSL-1.0
-// Adapted from donated nonius code.
 
 #ifndef CATCH_CONSTRUCTOR_HPP_INCLUDED
 #define CATCH_CONSTRUCTOR_HPP_INCLUDED
@@ -15,68 +14,67 @@
 #include <type_traits>
 
 namespace Catch {
-    namespace Benchmark {
-        namespace Detail {
-            template <typename T, bool Destruct>
-            struct ObjectStorage
-            {
-                ObjectStorage() = default;
+namespace Benchmark {
+namespace Detail {
+template <typename T, bool Destruct>
+struct ObjectStorage {
+    ObjectStorage() = default;
 
-                ObjectStorage(const ObjectStorage& other)
-                {
-                    new(&data) T(other.stored_object());
-                }
+    ObjectStorage(const ObjectStorage& other) {
+        new (&data) T(other.stored_object());
+    }
 
-                ObjectStorage(ObjectStorage&& other)
-                {
-                    new(data) T(CATCH_MOVE(other.stored_object()));
-                }
+    ObjectStorage(ObjectStorage&& other) {
+        new (data) T(CATCH_MOVE(other.stored_object()));
+    }
 
-                ~ObjectStorage() { destruct_on_exit<T>(); }
+    ~ObjectStorage() {
+        destruct_on_exit<T>();
+    }
 
-                template <typename... Args>
-                void construct(Args&&... args)
-                {
-                    new (data) T(CATCH_FORWARD(args)...);
-                }
+    template <typename... Args>
+    void construct(Args&&... args) {
+        new (data) T(CATCH_FORWARD(args)...);
+    }
 
-                template <bool AllowManualDestruction = !Destruct>
-                std::enable_if_t<AllowManualDestruction> destruct()
-                {
-                    stored_object().~T();
-                }
+    template <bool AllowManualDestruction = !Destruct>
+    std::enable_if_t<AllowManualDestruction> destruct() {
+        stored_object().~T();
+    }
 
-            private:
-                // If this is a constructor benchmark, destruct the underlying object
-                template <typename U>
-                void destruct_on_exit(std::enable_if_t<Destruct, U>* = nullptr) { destruct<true>(); }
-                // Otherwise, don't
-                template <typename U>
-                void destruct_on_exit(std::enable_if_t<!Destruct, U>* = nullptr) { }
+   private:
+    template <typename U>
+    void destruct_on_exit(std::enable_if_t<Destruct, U>* = nullptr) {
+        destruct<true>();
+    }
+    template <typename U>
+    void destruct_on_exit(std::enable_if_t<!Destruct, U>* = nullptr) {}
 
-#if defined( __GNUC__ ) && __GNUC__ <= 6
-#    pragma GCC diagnostic push
-#    pragma GCC diagnostic ignored "-Wstrict-aliasing"
+#if defined(__GNUC__) && __GNUC__ <= 6
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstrict-aliasing"
 #endif
-                T& stored_object() { return *reinterpret_cast<T*>( data ); }
+    T& stored_object() {
+        return *reinterpret_cast<T*>(data);
+    }
 
-                T const& stored_object() const {
-                    return *reinterpret_cast<T const*>( data );
-                }
-#if defined( __GNUC__ ) && __GNUC__ <= 6
-#    pragma GCC diagnostic pop
+    T const& stored_object() const {
+        return *reinterpret_cast<T const*>(data);
+    }
+#if defined(__GNUC__) && __GNUC__ <= 6
+#pragma GCC diagnostic pop
 #endif
 
-                alignas( T ) unsigned char data[sizeof( T )]{};
-            };
-        } // namespace Detail
+    alignas(T) unsigned char data[sizeof(T)]{};
+};
+}  // namespace Detail
 
-        template <typename T>
-        using storage_for = Detail::ObjectStorage<T, true>;
+template <typename T>
+using storage_for = Detail::ObjectStorage<T, true>;
 
-        template <typename T>
-        using destructable_object = Detail::ObjectStorage<T, false>;
-    } // namespace Benchmark
-} // namespace Catch
+template <typename T>
+using destructable_object = Detail::ObjectStorage<T, false>;
+}  // namespace Benchmark
+}  // namespace Catch
 
-#endif // CATCH_CONSTRUCTOR_HPP_INCLUDED
+#endif  // CATCH_CONSTRUCTOR_HPP_INCLUDED

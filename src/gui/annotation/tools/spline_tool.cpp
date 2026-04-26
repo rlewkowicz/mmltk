@@ -10,8 +10,10 @@ namespace mmltk::gui {
 namespace {
 
 class SplineTool final : public AnnotationTool {
-public:
-    [[nodiscard]] AnnotationToolKind kind() const noexcept override { return AnnotationToolKind::Spline; }
+   public:
+    [[nodiscard]] AnnotationToolKind kind() const noexcept override {
+        return AnnotationToolKind::Spline;
+    }
 
     void reset_active_drawing(AnnotationSession& session) override {
         session.clear_transient_state();
@@ -32,17 +34,16 @@ public:
         return make_spline_annotation_object(request.object_count, request.category_index);
     }
 
-    void on_object_created(AnnotationDocument& document,
-                           AnnotationSession& session,
+    void on_object_created(AnnotationDocument& document, AnnotationSession& session,
                            const std::size_t object_index) const override {
         tool_detail::finalize_created_spline_object(document, session, object_index);
     }
 };
 
-} // namespace
+}  // namespace
 
 std::unique_ptr<AnnotationTool> make_spline_annotation_tool() {
     return std::make_unique<SplineTool>();
 }
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

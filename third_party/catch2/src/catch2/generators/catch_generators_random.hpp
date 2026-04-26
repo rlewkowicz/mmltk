@@ -17,10 +17,7 @@
 namespace Catch {
 namespace Generators {
 namespace Detail {
-    // Returns a suitable seed for a random floating generator based off
-    // the primary internal rng. It does so by taking current value from
-    // the rng and returning it as the seed.
-    std::uint32_t getSeed();
+std::uint32_t getSeed();
 }
 
 template <typename Float>
@@ -28,10 +25,9 @@ class RandomFloatingGenerator final : public IGenerator<Float> {
     Catch::SimplePcg32 m_rng;
     Catch::uniform_floating_point_distribution<Float> m_dist;
     Float m_current_number;
-public:
-    RandomFloatingGenerator( Float a, Float b, std::uint32_t seed ):
-        m_rng(seed),
-        m_dist(a, b) {
+
+   public:
+    RandomFloatingGenerator(Float a, Float b, std::uint32_t seed) : m_rng(seed), m_dist(a, b) {
         static_cast<void>(next());
     }
 
@@ -42,24 +38,26 @@ public:
         m_current_number = m_dist(m_rng);
         return true;
     }
-    bool isFinite() const override { return false; }
+    bool isFinite() const override {
+        return false;
+    }
 };
 
 template <>
 class RandomFloatingGenerator<long double> final : public IGenerator<long double> {
-    // We still rely on <random> for this specialization, but we don't
-    // want to drag it into the header.
     struct PImpl;
     Catch::Detail::unique_ptr<PImpl> m_pimpl;
     long double m_current_number;
 
-public:
-    RandomFloatingGenerator( long double a, long double b, std::uint32_t seed );
+   public:
+    RandomFloatingGenerator(long double a, long double b, std::uint32_t seed);
 
-    long double const& get() const override { return m_current_number; }
+    long double const& get() const override {
+        return m_current_number;
+    }
     bool next() override;
 
-    ~RandomFloatingGenerator() override; // = default
+    ~RandomFloatingGenerator() override;
     bool isFinite() const override;
 };
 
@@ -68,10 +66,9 @@ class RandomIntegerGenerator final : public IGenerator<Integer> {
     Catch::SimplePcg32 m_rng;
     Catch::uniform_integer_distribution<Integer> m_dist;
     Integer m_current_number;
-public:
-    RandomIntegerGenerator( Integer a, Integer b, std::uint32_t seed ):
-        m_rng(seed),
-        m_dist(a, b) {
+
+   public:
+    RandomIntegerGenerator(Integer a, Integer b, std::uint32_t seed) : m_rng(seed), m_dist(a, b) {
         static_cast<void>(next());
     }
 
@@ -82,29 +79,22 @@ public:
         m_current_number = m_dist(m_rng);
         return true;
     }
-    bool isFinite() const override { return false; }
+    bool isFinite() const override {
+        return false;
+    }
 };
 
 template <typename T>
-std::enable_if_t<std::is_integral<T>::value, GeneratorWrapper<T>>
-random(T a, T b) {
-    return GeneratorWrapper<T>(
-        Catch::Detail::make_unique<RandomIntegerGenerator<T>>(a, b, Detail::getSeed())
-    );
+std::enable_if_t<std::is_integral<T>::value, GeneratorWrapper<T>> random(T a, T b) {
+    return GeneratorWrapper<T>(Catch::Detail::make_unique<RandomIntegerGenerator<T>>(a, b, Detail::getSeed()));
 }
 
 template <typename T>
-std::enable_if_t<std::is_floating_point<T>::value,
-GeneratorWrapper<T>>
-random(T a, T b) {
-    return GeneratorWrapper<T>(
-        Catch::Detail::make_unique<RandomFloatingGenerator<T>>(a, b, Detail::getSeed())
-    );
+std::enable_if_t<std::is_floating_point<T>::value, GeneratorWrapper<T>> random(T a, T b) {
+    return GeneratorWrapper<T>(Catch::Detail::make_unique<RandomFloatingGenerator<T>>(a, b, Detail::getSeed()));
 }
 
+}  // namespace Generators
+}  // namespace Catch
 
-} // namespace Generators
-} // namespace Catch
-
-
-#endif // CATCH_GENERATORS_RANDOM_HPP_INCLUDED
+#endif  // CATCH_GENERATORS_RANDOM_HPP_INCLUDED

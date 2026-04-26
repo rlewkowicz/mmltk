@@ -74,10 +74,10 @@ using predict_internal::StagedPredictionRecord;
 
 const char* predict_source_kind_name(PredictSourceKind kind) {
     switch (kind) {
-    case PredictSourceKind::CompiledDataset:
-        return "compiled_dataset";
-    case PredictSourceKind::ImageFiles:
-        return "image_files";
+        case PredictSourceKind::CompiledDataset:
+            return "compiled_dataset";
+        case PredictSourceKind::ImageFiles:
+            return "image_files";
     }
     return "unknown";
 }
@@ -93,12 +93,15 @@ ModelInfo native_model_info(const ResolvedModelArtifacts& artifacts, size_t batc
         "float32",
     };
     info.outputs = {
-        TensorInfo{"pred_logits", {reported_batch, artifacts.config.num_queries, artifacts.config.num_classes}, "float32"},
+        TensorInfo{
+            "pred_logits", {reported_batch, artifacts.config.num_queries, artifacts.config.num_classes}, "float32"},
         TensorInfo{"pred_boxes", {reported_batch, artifacts.config.num_queries, 4}, "float32"},
     };
     if (artifacts.config.segmentation) {
-        info.outputs.push_back(
-            TensorInfo{"pred_masks", {reported_batch, artifacts.config.num_queries, artifacts.config.resolution, artifacts.config.resolution}, "float32"});
+        info.outputs.push_back(TensorInfo{
+            "pred_masks",
+            {reported_batch, artifacts.config.num_queries, artifacts.config.resolution, artifacts.config.resolution},
+            "float32"});
     }
     info.num_queries = artifacts.config.num_queries;
     info.num_classes = artifacts.config.num_classes;
@@ -110,17 +113,12 @@ size_t lane_slot_count(const RuntimeSplit& split) {
     return predict_internal::prediction_lane_slot_count(split);
 }
 
-/// RAII guard that owns the per-prediction timing, grad suppression, device
-/// guard, and progress bar.  The destructor closes the bar and finalizes the
-/// result so every return path gets consistent cleanup.
 struct PredictionScope {
     PredictionRunResult& result;
     std::unique_ptr<spdmon::ProgressBar> bar;
     bool sort_records;
 
-    PredictionScope(PredictionRunResult& result_ref,
-                    std::unique_ptr<spdmon::ProgressBar> bar_ptr,
-                    int device_id,
+    PredictionScope(PredictionRunResult& result_ref, std::unique_ptr<spdmon::ProgressBar> bar_ptr, int device_id,
                     bool sort = false)
         : result(result_ref),
           bar(std::move(bar_ptr)),
@@ -139,15 +137,215 @@ struct PredictionScope {
     PredictionScope(const PredictionScope&) = delete;
     PredictionScope& operator=(const PredictionScope&) = delete;
 
-private:
+   private:
     std::chrono::steady_clock::time_point started_at_;
     torch::NoGradGuard no_grad_;
     c10::cuda::CUDAGuard device_guard_;
 };
 
+auto make_compiled_prediction_setup_for_backend_path(const PredictOptions& options,
+                                                     const ResolvedModelArtifacts& artifacts,
+                                                     const std::string& backend_name) {
+    return make_compiled_prediction_setup(options, artifacts, backend_name,
+                                          effective_lane_count(options.batch_size, options.lanes), 1);
+}
+
+struct CompiledPredictionSetupRefs {
+    RuntimeContext& runtime;
+    DatasetLoader& loader;
+    PredictionRunResult& result;
+    const std::vector<int>& image_ids;
+};
+
+template <typename SetupT>
+CompiledPredictionSetupRefs bind_compiled_prediction_setup(SetupT& setup) {
+    return {setup.runtime, *setup.loader, setup.result, setup.image_ids};
+}
+
+template <typename... Args>
+std::vector<StagedPredictionRecord> make_staged_prediction_record_list(Args&&... args) {
+    std::vector<StagedPredictionRecord> records;
+    records.reserve(1);
+    records.push_back(make_staged_prediction_record(std::forward<Args>(args)...));
+    return records;
+}
+
+template <typename LoaderT>
+auto make_prediction_batch_generator(LoaderT& loader, Batch& batch) {
+    return [&loader, &batch](size_t) { return loader.next_batch(batch); };
+}
+
+template <typename LoaderT>
+auto make_limited_prediction_batch_generator(LoaderT& loader, Batch& batch, const size_t limit_images,
+                                             const size_t& submitted_records) {
+    return [&loader, &batch, limit_images, &submitted_records](size_t) {
+        if (limit_images > 0 && submitted_records >= limit_images) {
+            return false;
+        }
+        return loader.next_batch(batch);
+    };
+}
+
+template <typename ModelT>
+void optimize_native_prediction_model(ModelT& model, const PredictOptions& options) {
+    const size_t effective_batch_size = std::max<size_t>(1, options.batch_size);
+    if (effective_batch_size > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("batch_size exceeds supported inference compilation range");
+    }
+    model.optimize_for_inference(static_cast<int>(effective_batch_size), false, options.compilation_mode);
+}
+
+template <typename StreamT, typename RunNormalizedBatchFn>
+auto run_compiled_prediction_on_stream(Batch& batch, DatasetLoader& loader, const StreamT& stream, int device_id,
+                                       int64_t image_height, int64_t image_width, const torch::Tensor& mean,
+                                       const torch::Tensor& std_t, RunNormalizedBatchFn&& run_normalized_batch) {
+    loader.wait_batch(batch);
+    void* consumer_stream = reinterpret_cast<void*>(stream.stream());
+    loader.handoff_batch(batch, consumer_stream);
+    c10::cuda::CUDAStreamGuard stream_guard(stream);
+    auto outputs = run_compiled_prediction_batch(
+        batch, device_id, image_height, image_width, mean, std_t,
+        [&](const torch::Tensor& normalized_batch) { return run_normalized_batch(normalized_batch); });
+    loader.release_batch(batch, consumer_stream);
+    return std::pair{std::move(outputs), consumer_stream};
+}
+
+template <typename LaneT, typename RunNormalizedBatchFn>
+StagedPredictionRecord run_compiled_prediction_lane_batch(LaneT& lane, Batch& batch, DatasetLoader& loader,
+                                                          const std::vector<int>& image_ids, int64_t image_height,
+                                                          int64_t image_width, const torch::Tensor& mean,
+                                                          const torch::Tensor& std_t, std::size_t max_queries,
+                                                          std::size_t category_count, std::size_t max_dets,
+                                                          int device_id, RunNormalizedBatchFn&& run_normalized_batch) {
+    PredictionBufferLease lease = lane.slot_pool->acquire();
+
+    torch::NoGradGuard lane_no_grad;
+    c10::cuda::CUDAGuard lane_device_guard(checked_device_index(device_id));
+    auto [outputs, consumer_stream] =
+        run_compiled_prediction_on_stream(batch, loader, lane.stream, device_id, image_height, image_width, mean, std_t,
+                                          [&](const torch::Tensor& normalized_batch) {
+                                              auto lane_outputs = run_normalized_batch(normalized_batch);
+                                              normalized_batch.record_stream(lane.stream);
+                                              return lane_outputs;
+                                          });
+
+    auto outputs_postprocessed =
+        postprocess_outputs_fixed_size(outputs, image_height, image_width, static_cast<int64_t>(max_queries));
+    const auto dataset_index = static_cast<int64_t>(batch.image_indices[0]);
+    const int64_t image_id = image_id_for_dataset_index(image_ids, dataset_index);
+    return make_staged_prediction_record(dataset_index, image_id, {}, outputs_postprocessed.front(), category_count,
+                                         max_dets, std::move(lease), device_id,
+                                         reinterpret_cast<void*>(lane.stream.stream()));
+}
+
+template <typename LaneCollection, typename MaxQueriesFn, typename CategoryCountFn, typename RunNormalizedBatchFn>
+auto enqueue_compiled_prediction_lane_batch(WorkerPool& lane_pool, LaneCollection& lanes, DatasetLoader& loader,
+                                            const std::vector<int>& image_ids, Batch batch, size_t item_index,
+                                            size_t max_dets, int64_t image_height, int64_t image_width,
+                                            const torch::Tensor& mean, const torch::Tensor& std_t, int device_id,
+                                            MaxQueriesFn&& max_queries_for_lane,
+                                            CategoryCountFn&& category_count_for_lane,
+                                            RunNormalizedBatchFn&& run_normalized_batch) {
+    const size_t lane_index = item_index % lanes.size();
+    return lane_pool.enqueue(
+        [&lanes, &loader, &image_ids, batch, lane_index, max_dets, image_height, image_width, mean, std_t, device_id,
+         max_queries_for_lane = std::forward<MaxQueriesFn>(max_queries_for_lane),
+         category_count_for_lane = std::forward<CategoryCountFn>(category_count_for_lane),
+         run_normalized_batch = std::forward<RunNormalizedBatchFn>(run_normalized_batch)]() mutable {
+            auto& lane = lanes[lane_index];
+            return run_compiled_prediction_lane_batch(
+                lane, batch, loader, image_ids, image_height, image_width, mean, std_t, max_queries_for_lane(lane),
+                category_count_for_lane(lane), max_dets, device_id,
+                [&](const torch::Tensor& normalized_batch) { return run_normalized_batch(lane, normalized_batch); });
+        });
+}
+
+template <typename LaneCollection, typename MaxQueriesFn, typename CategoryCountFn, typename RunNormalizedBatchFn>
+void run_compiled_prediction_parallel_with_lanes(
+    PredictionRunResult& result, std::unique_ptr<spdmon::ProgressBar>& bar, WorkerPool& cpu_pool,
+    const RuntimeSplit& split, WorkerPool& lane_pool, LaneCollection& lanes, DatasetLoader& loader,
+    const std::vector<int>& image_ids, const size_t max_dets, const int64_t image_height, const int64_t image_width,
+    const torch::Tensor& mean, const torch::Tensor& std_t, const int device_id, const float threshold,
+    const size_t limit_images, MaxQueriesFn&& max_queries_for_lane, CategoryCountFn&& category_count_for_lane,
+    RunNormalizedBatchFn&& run_normalized_batch) {
+    loader.begin_epoch();
+    Batch batch{};
+    size_t submitted_records = 0;
+    auto max_queries_for_lane_fn = std::forward<MaxQueriesFn>(max_queries_for_lane);
+    auto category_count_for_lane_fn = std::forward<CategoryCountFn>(category_count_for_lane);
+    auto run_normalized_batch_fn = std::forward<RunNormalizedBatchFn>(run_normalized_batch);
+    auto generator = make_limited_prediction_batch_generator(loader, batch, limit_images, submitted_records);
+    auto enqueue_fn = [&](size_t item_index) {
+        if (limit_images > 0) {
+            ++submitted_records;
+        }
+        return enqueue_compiled_prediction_lane_batch(
+            lane_pool, lanes, loader, image_ids, batch, item_index, max_dets, image_height, image_width, mean, std_t,
+            device_id, max_queries_for_lane_fn, category_count_for_lane_fn, run_normalized_batch_fn);
+    };
+    predict_internal::run_parallel_prediction_pipeline(result, bar, cpu_pool, split, threshold, generator, enqueue_fn);
+}
+
+template <typename MakeLanesFn, typename MaxQueriesFn, typename CategoryCountFn, typename RunNormalizedBatchFn>
+void run_compiled_prediction_parallel(const PredictOptions& options, RuntimeContext& runtime, DatasetLoader& loader,
+                                      PredictionRunResult& result, std::unique_ptr<spdmon::ProgressBar>& bar,
+                                      const std::vector<int>& image_ids, const int64_t image_height,
+                                      const int64_t image_width, const torch::Tensor& mean, const torch::Tensor& std_t,
+                                      const size_t limit_images, MakeLanesFn&& make_lanes,
+                                      MaxQueriesFn&& max_queries_for_lane, CategoryCountFn&& category_count_for_lane,
+                                      RunNormalizedBatchFn&& run_normalized_batch) {
+    const RuntimeSplit& split = runtime.split();
+    const size_t slot_count = lane_slot_count(split);
+    auto lanes = make_lanes(split, slot_count);
+    WorkerPool lane_pool(static_cast<size_t>(lanes.size()), runtime.lane_cpus(), "rfdpredlane");
+    WorkerPool& cpu_pool = runtime.cpu_pool();
+
+    run_compiled_prediction_parallel_with_lanes(
+        result, bar, cpu_pool, split, lane_pool, lanes, loader, image_ids, options.max_dets_per_image, image_height,
+        image_width, mean, std_t, options.device_id, options.threshold, limit_images,
+        std::forward<MaxQueriesFn>(max_queries_for_lane), std::forward<CategoryCountFn>(category_count_for_lane),
+        std::forward<RunNormalizedBatchFn>(run_normalized_batch));
+}
+
+template <typename MakeLanesFn, typename MaxQueriesFn, typename CategoryCountFn, typename RunNormalizedBatchFn>
+void run_compiled_prediction_parallel_for_loader(const PredictOptions& options, RuntimeContext& runtime,
+                                                 DatasetLoader& loader, PredictionRunResult& result,
+                                                 std::unique_ptr<spdmon::ProgressBar>& bar,
+                                                 const std::vector<int>& image_ids, const torch::Tensor& mean,
+                                                 const torch::Tensor& std_t, const size_t limit_images,
+                                                 MakeLanesFn&& make_lanes, MaxQueriesFn&& max_queries_for_lane,
+                                                 CategoryCountFn&& category_count_for_lane,
+                                                 RunNormalizedBatchFn&& run_normalized_batch) {
+    run_compiled_prediction_parallel(
+        options, runtime, loader, result, bar, image_ids, static_cast<int64_t>(loader.image_height()),
+        static_cast<int64_t>(loader.image_width()), mean, std_t, limit_images, std::forward<MakeLanesFn>(make_lanes),
+        std::forward<MaxQueriesFn>(max_queries_for_lane), std::forward<CategoryCountFn>(category_count_for_lane),
+        std::forward<RunNormalizedBatchFn>(run_normalized_batch));
+}
+
+template <typename StreamT, typename ItemsT, typename WorkspaceT, typename RunModelFn>
+std::vector<TensorMap> run_raw_prediction_batch_on_stream(const StreamT& stream, const torch::Tensor& batch_cpu_view,
+                                                          const torch::Tensor& batch_gpu_view, const ItemsT& items,
+                                                          WorkspaceT& workspace, const torch::Tensor& mean,
+                                                          const torch::Tensor& std_t, const std::size_t max_queries,
+                                                          RunModelFn&& run_model) {
+    c10::cuda::CUDAStreamGuard stream_guard(stream);
+    return run_raw_prediction_batch(batch_cpu_view, batch_gpu_view, items, workspace, mean, std_t, max_queries,
+                                    std::forward<RunModelFn>(run_model));
+}
+
+template <typename InferBatchFn>
+void run_raw_prediction_batches_with_workspace(const PredictOptions& options, const ResolvedModelArtifacts& artifacts,
+                                               WorkerPool& cpu_pool, const std::size_t category_count,
+                                               RawImageBatchWorkspace& workspace, InferBatchFn&& infer_batch,
+                                               PredictionRunResult& result, std::unique_ptr<spdmon::ProgressBar>& bar) {
+    run_raw_prediction_batches(options, artifacts, cpu_pool, options.image_inputs, category_count, workspace.batch_cpu,
+                               workspace.batch_gpu, workspace.resize_scratch_slots,
+                               std::forward<InferBatchFn>(infer_batch), result.records, bar);
+}
+
 template <typename Request>
-void apply_compiled_evaluation_common(const EvaluateOptions& options,
-                                      Request& request) {
+void apply_compiled_evaluation_common(const EvaluateOptions& options, Request& request) {
     request.compiled_path = options.compiled_path;
     request.device_id = options.device_id;
     request.workers = options.workers;
@@ -191,34 +389,18 @@ ValidationOptions make_backend_evaluation_options(const EvaluateOptions& options
     return validation_options;
 }
 
-PredictionRunResult run_prediction_native(const PredictOptions& options,
-                                          const ResolvedModelArtifacts& artifacts,
+PredictionRunResult run_prediction_native(const PredictOptions& options, const ResolvedModelArtifacts& artifacts,
                                           size_t limit_images = 0) {
-    auto setup = make_compiled_prediction_setup(options,
-                                                artifacts,
-                                                "weights",
-                                                1,
-                                                std::max<size_t>(1, options.batch_size));
-    RuntimeContext& runtime = setup.runtime;
-    DatasetLoader& loader = *setup.loader;
-    PredictionRunResult& result = setup.result;
-    const std::vector<int>& image_ids = setup.image_ids;
+    auto setup =
+        make_compiled_prediction_setup(options, artifacts, "weights", 1, std::max<size_t>(1, options.batch_size));
+    auto [runtime, loader, result, image_ids] = bind_compiled_prediction_setup(setup);
     auto model = load_native_model(artifacts, options.device_id);
-    const size_t effective_batch_size = std::max<size_t>(1, options.batch_size);
-    if (effective_batch_size > static_cast<size_t>(std::numeric_limits<int>::max())) {
-        throw std::runtime_error("batch_size exceeds supported inference compilation range");
-    }
-    model->optimize_for_inference(
-        static_cast<int>(effective_batch_size),
-        false,
-        options.compilation_mode);
+    optimize_native_prediction_model(*model, options);
 
-    PredictionScope scope(result,
-        make_prediction_bar(options.progress_bar, "weights.predict", loader, limit_images),
-        options.device_id);
+    PredictionScope scope(result, make_prediction_bar(options.progress_bar, "weights.predict", loader, limit_images),
+                          options.device_id);
 
-    const auto inference_stream =
-        get_high_priority_cuda_stream(options.device_id);
+    const auto inference_stream = get_high_priority_cuda_stream(options.device_id);
     torch::Tensor mean;
     torch::Tensor std;
     WorkerPool& cpu_pool = runtime.cpu_pool();
@@ -232,42 +414,30 @@ PredictionRunResult run_prediction_native(const PredictOptions& options,
         auto normalization = initialize_normalization_tensors(options.device_id, inference_stream);
         mean = std::move(normalization.first);
         std = std::move(normalization.second);
-        nested_mask = torch::zeros(
-            {static_cast<int64_t>(std::max<size_t>(1, options.batch_size)), image_height, image_width},
-            torch::TensorOptions().dtype(torch::kBool).device(torch::kCUDA, options.device_id));
+        nested_mask =
+            torch::zeros({static_cast<int64_t>(std::max<size_t>(1, options.batch_size)), image_height, image_width},
+                         torch::TensorOptions().dtype(torch::kBool).device(torch::kCUDA, options.device_id));
     }
 
     loader.begin_epoch();
     Batch batch{};
     size_t submitted_records = 0;
-    auto generator = [&](size_t) {
-        if (limit_images > 0 && submitted_records >= limit_images) {
-            return false;
-        }
-        return loader.next_batch(batch);
-    };
+    auto generator = make_limited_prediction_batch_generator(loader, batch, limit_images, submitted_records);
     auto process_fn = [&](size_t) {
-        loader.wait_batch(batch);
-        void* consumer_stream = reinterpret_cast<void*>(inference_stream.stream());
-        loader.handoff_batch(batch, consumer_stream);
+        void* consumer_stream = nullptr;
         std::vector<TensorMap> processed;
         {
-            c10::cuda::CUDAStreamGuard stream_guard(inference_stream);
-            auto outputs = run_compiled_prediction_batch(
-                batch,
-                options.device_id,
-                image_height,
-                image_width,
-                mean,
-                std,
-                [&](const torch::Tensor& normalized) {
-                    return to_output_tensors(model->forward(NestedTensor{
-                        normalized,
-                        nested_mask.narrow(0, 0, normalized.size(0)),
-                    }));
-                });
-            loader.release_batch(batch, consumer_stream);
-            processed = postprocess_outputs_fixed_size(outputs, image_height, image_width, static_cast<int64_t>(max_queries));
+            auto compiled =
+                run_compiled_prediction_on_stream(batch, loader, inference_stream, options.device_id, image_height,
+                                                  image_width, mean, std, [&](const torch::Tensor& normalized) {
+                                                      return to_output_tensors(model->forward(NestedTensor{
+                                                          normalized,
+                                                          nested_mask.narrow(0, 0, normalized.size(0)),
+                                                      }));
+                                                  });
+            consumer_stream = compiled.second;
+            processed = postprocess_outputs_fixed_size(compiled.first, image_height, image_width,
+                                                       static_cast<int64_t>(max_queries));
         }
 
         const size_t processed_count = std::min(processed.size(), batch.num_images);
@@ -281,161 +451,69 @@ PredictionRunResult run_prediction_native(const PredictOptions& options,
             const auto dataset_index = static_cast<int64_t>(batch.image_indices[image_pos]);
             const int64_t image_id = image_id_for_dataset_index(image_ids, dataset_index);
             staged_records.push_back(make_staged_prediction_record(
-                dataset_index,
-                image_id,
-                {},
-                processed[image_pos],
-                loader.num_classes(),
-                options.max_dets_per_image,
-                slot_pool->acquire(),
-                options.device_id,
-                consumer_stream));
+                dataset_index, image_id, {}, processed[image_pos], loader.num_classes(), options.max_dets_per_image,
+                slot_pool->acquire(), options.device_id, consumer_stream));
         }
         submitted_records += stage_count;
         return staged_records;
     };
-    predict_internal::run_sequential_prediction_pipeline(result, scope.bar, cpu_pool, split, options.threshold, generator, process_fn);
+    predict_internal::run_sequential_prediction_pipeline(result, scope.bar, cpu_pool, split, options.threshold,
+                                                         generator, process_fn);
     return result;
 }
 
 PredictionRunResult run_prediction_native_parallel(const PredictOptions& options,
-                                                   const ResolvedModelArtifacts& artifacts,
-                                                   size_t limit_images = 0) {
+                                                   const ResolvedModelArtifacts& artifacts, size_t limit_images = 0) {
     auto setup = make_compiled_prediction_setup(options, artifacts, "weights", options.lanes, 1);
-    RuntimeContext& runtime = setup.runtime;
-    DatasetLoader& loader = *setup.loader;
-    PredictionRunResult& result = setup.result;
-    const std::vector<int>& image_ids = setup.image_ids;
+    auto [runtime, loader, result, image_ids] = bind_compiled_prediction_setup(setup);
 
     auto model = load_native_model(artifacts, options.device_id);
-    model->optimize_for_inference(1, false, options.compilation_mode);
-    PredictionScope scope(result,
-        make_prediction_bar(options.progress_bar, "weights.predict", loader, limit_images),
-        options.device_id, /*sort=*/true);
+    optimize_native_prediction_model(*model, options);
+    PredictionScope scope(result, make_prediction_bar(options.progress_bar, "weights.predict", loader, limit_images),
+                          options.device_id, true);
 
     torch::Tensor mean;
     torch::Tensor std;
     std::tie(mean, std) = initialize_normalization_tensors(options.device_id);
 
-    const auto image_height = static_cast<int64_t>(loader.image_height());
-    const auto image_width = static_cast<int64_t>(loader.image_width());
-    const RuntimeSplit& split = runtime.split();
     const std::size_t max_queries = prediction_max_queries(artifacts);
-    const size_t slot_count = lane_slot_count(split);
-    std::vector<predict_internal::NativePredictionLane> lanes =
-        make_native_prediction_lanes(options.device_id,
-                                     image_height,
-                                     image_width,
-                                     split.lane_threads,
-                                     slot_count);
-
-    WorkerPool lane_pool(static_cast<size_t>(lanes.size()), runtime.lane_cpus(), "rfdpredlane");
-    WorkerPool& cpu_pool = runtime.cpu_pool();
-
-    loader.begin_epoch();
-    Batch batch{};
-    size_t submitted_records = 0;
-    auto generator = [&](size_t) {
-        if (limit_images > 0 && submitted_records >= limit_images) {
-            return false;
-        }
-        return loader.next_batch(batch);
-    };
-    auto enqueue_fn = [&](size_t item_index) {
-        const auto dataset_index = static_cast<int64_t>(batch.image_indices[0]);
-        const int64_t image_id = image_id_for_dataset_index(image_ids, dataset_index);
-
-        const size_t lane_index = item_index % lanes.size();
-        ++submitted_records;
-        return lane_pool.enqueue([&lanes,
-                                  &loader,
-                                  batch,
-                                  model,
-                                  lane_index,
-                                  dataset_index,
-                                  image_id,
-                                  category_count = loader.num_classes(),
-                                  max_dets = options.max_dets_per_image,
-                                  image_height,
-                                  image_width,
-                                  max_queries,
-                                  mean,
-                                  std_t = std,
-                                  device_id = options.device_id]() mutable {
-            auto& lane = lanes[lane_index];
-            PredictionBufferLease lease = lane.slot_pool->acquire();
-
-            loader.wait_batch(batch);
-            void* consumer_stream = reinterpret_cast<void*>(lane.stream.stream());
-            loader.handoff_batch(batch, consumer_stream);
-
-            torch::NoGradGuard lane_no_grad;
-            c10::cuda::CUDAGuard lane_device_guard(checked_device_index(device_id));
-            c10::cuda::CUDAStreamGuard stream_guard(lane.stream);
-
-            auto outputs = run_compiled_prediction_batch(
-                batch,
-                device_id,
-                image_height,
-                image_width,
-                mean,
-                std_t,
-                [&](const torch::Tensor& normalized_batch) {
-                    auto outputs = to_output_tensors(model->forward(NestedTensor{
-                        normalized_batch,
-                        lane.nested_mask.narrow(0, 0, normalized_batch.size(0)),
-                    }));
-                    normalized_batch.record_stream(lane.stream);
-                    return outputs;
-                });
-            loader.release_batch(batch, consumer_stream);
-            auto outputs_postprocessed =
-                postprocess_outputs_fixed_size(outputs, image_height, image_width, static_cast<int64_t>(max_queries));
-            return make_staged_prediction_record(dataset_index,
-                                                 image_id,
-                                                 {},
-                                                 outputs_postprocessed.front(),
-                                                 category_count,
-                                                 max_dets,
-                                                 std::move(lease),
-                                                 device_id,
-                                                 reinterpret_cast<void*>(lane.stream.stream()));
+    run_compiled_prediction_parallel_for_loader(
+        options, runtime, loader, result, scope.bar, image_ids, mean, std, limit_images,
+        [&](const RuntimeSplit& split, const size_t slot_count) {
+            return make_native_prediction_lanes(options.device_id, static_cast<int64_t>(loader.image_height()),
+                                                static_cast<int64_t>(loader.image_width()), split.lane_threads,
+                                                slot_count);
+        },
+        [max_queries](const auto&) { return max_queries; },
+        [&loader](const auto&) { return static_cast<std::size_t>(loader.num_classes()); },
+        [model](auto& lane, const torch::Tensor& normalized_batch) {
+            return to_output_tensors(model->forward(NestedTensor{
+                normalized_batch,
+                lane.nested_mask.narrow(0, 0, normalized_batch.size(0)),
+            }));
         });
-    };
-    predict_internal::run_parallel_prediction_pipeline(result, scope.bar, cpu_pool, split, options.threshold, generator, enqueue_fn);
     return result;
 }
 
-PredictionRunResult run_prediction_weights(const PredictOptions& options,
-                                           const ResolvedModelArtifacts& artifacts,
+PredictionRunResult run_prediction_weights(const PredictOptions& options, const ResolvedModelArtifacts& artifacts,
                                            size_t limit_images = 0) {
     if (options.lanes > 1) {
         if (options.batch_size != 1) {
-            throw std::runtime_error(
-                "RF-DETR weights overlap requires --batch-size 1 when --lanes > 1");
+            throw std::runtime_error("RF-DETR weights overlap requires --batch-size 1 when --lanes > 1");
         }
         return run_prediction_native_parallel(options, artifacts, limit_images);
     }
     return run_prediction_native(options, artifacts, limit_images);
 }
 
-PredictionRunResult run_prediction_sequential(const PredictOptions& options,
-                                              const ResolvedModelArtifacts& artifacts,
+PredictionRunResult run_prediction_sequential(const PredictOptions& options, const ResolvedModelArtifacts& artifacts,
                                               const std::string& backend_name) {
-    auto setup = make_compiled_prediction_setup(options,
-                                                artifacts,
-                                                backend_name,
-                                                effective_lane_count(options.batch_size, options.lanes),
-                                                1);
-    RuntimeContext& runtime = setup.runtime;
-    DatasetLoader& loader = *setup.loader;
-    PredictionRunResult& result = setup.result;
-    const std::vector<int>& image_ids = setup.image_ids;
+    auto setup = make_compiled_prediction_setup_for_backend_path(options, artifacts, backend_name);
+    auto [runtime, loader, result, image_ids] = bind_compiled_prediction_setup(setup);
 
     auto backend = make_backend(artifacts, backend_name, options.device_id, options.allow_fp16);
-    PredictionScope scope(result,
-        make_prediction_bar(options.progress_bar, backend_name + ".predict", loader),
-        options.device_id);
+    PredictionScope scope(result, make_prediction_bar(options.progress_bar, backend_name + ".predict", loader),
+                          options.device_id);
 
     const predict_internal::BackendExecutionSpec backend_execution =
         predict_internal::describe_backend_execution(*backend, artifacts, options.device_id);
@@ -449,211 +527,87 @@ PredictionRunResult run_prediction_sequential(const PredictOptions& options,
 
     loader.begin_epoch();
     Batch batch{};
-    auto generator = [&](size_t) {
-        return loader.next_batch(batch);
-    };
+    auto generator = make_prediction_batch_generator(loader, batch);
     auto process_fn = [&](size_t) {
-        loader.wait_batch(batch);
         const auto dataset_index = static_cast<int64_t>(batch.image_indices[0]);
         const int64_t image_id = image_id_for_dataset_index(image_ids, dataset_index);
-        void* consumer_stream = reinterpret_cast<void*>(backend_execution.stream.stream());
-        loader.handoff_batch(batch, consumer_stream);
-        c10::cuda::CUDAStreamGuard stream_guard(backend_execution.stream);
-        auto outputs = run_compiled_prediction_batch(
-            batch,
-            options.device_id,
-            static_cast<int64_t>(loader.image_height()),
-            static_cast<int64_t>(loader.image_width()),
-            mean,
-            std,
+        auto compiled = run_compiled_prediction_on_stream(
+            batch, loader, backend_execution.stream, options.device_id, static_cast<int64_t>(loader.image_height()),
+            static_cast<int64_t>(loader.image_width()), mean, std,
             [&](const torch::Tensor& normalized_batch) { return backend->run(normalized_batch); });
-        loader.release_batch(batch, consumer_stream);
-        auto processed = postprocess_outputs_fixed_size(
-            outputs,
-            static_cast<int64_t>(loader.image_height()),
-            static_cast<int64_t>(loader.image_width()),
-            backend_execution.num_queries);
-            
-        std::vector<StagedPredictionRecord> staged_records;
-        staged_records.push_back(make_staged_prediction_record(
-            dataset_index,
-            image_id,
-            {},
-            processed.front(),
-            backend_execution.category_count,
-            options.max_dets_per_image,
-            PredictionBufferLease{},
-            options.device_id,
-            nullptr));
-        return staged_records;
+        auto processed =
+            postprocess_outputs_fixed_size(compiled.first, static_cast<int64_t>(loader.image_height()),
+                                           static_cast<int64_t>(loader.image_width()), backend_execution.num_queries);
+        return make_staged_prediction_record_list(dataset_index, image_id, std::string{}, processed.front(),
+                                                  backend_execution.category_count, options.max_dets_per_image,
+                                                  PredictionBufferLease{}, options.device_id, nullptr);
     };
     WorkerPool& cpu_pool = runtime.cpu_pool();
-    predict_internal::run_sequential_prediction_pipeline(result, scope.bar, cpu_pool, runtime.split(), options.threshold, generator, process_fn);
+    predict_internal::run_sequential_prediction_pipeline(result, scope.bar, cpu_pool, runtime.split(),
+                                                         options.threshold, generator, process_fn);
     return result;
 }
 
-PredictionRunResult run_prediction_parallel(const PredictOptions& options,
-                                            const ResolvedModelArtifacts& artifacts,
+PredictionRunResult run_prediction_parallel(const PredictOptions& options, const ResolvedModelArtifacts& artifacts,
                                             const std::string& backend_name) {
-    auto setup = make_compiled_prediction_setup(options,
-                                                artifacts,
-                                                backend_name,
-                                                effective_lane_count(options.batch_size, options.lanes),
-                                                1);
-    RuntimeContext& runtime = setup.runtime;
-    DatasetLoader& loader = *setup.loader;
-    PredictionRunResult& result = setup.result;
-    const std::vector<int>& image_ids = setup.image_ids;
+    auto setup = make_compiled_prediction_setup_for_backend_path(options, artifacts, backend_name);
+    auto [runtime, loader, result, image_ids] = bind_compiled_prediction_setup(setup);
 
-    PredictionScope scope(result,
-        make_prediction_bar(options.progress_bar, backend_name + ".predict", loader),
-        options.device_id, /*sort=*/true);
+    PredictionScope scope(result, make_prediction_bar(options.progress_bar, backend_name + ".predict", loader),
+                          options.device_id, true);
 
     torch::Tensor mean;
     torch::Tensor std;
     std::tie(mean, std) = initialize_normalization_tensors(options.device_id);
 
-    const RuntimeSplit& split = runtime.split();
-    const size_t slot_count = lane_slot_count(split);
-    std::vector<predict_internal::BackendInferenceLane> lanes =
-        make_backend_prediction_lanes(artifacts,
-                                      backend_name,
-                                      options.device_id,
-                                      options.allow_fp16,
-                                      split.lane_threads,
-                                      slot_count);
-
-    WorkerPool lane_pool(static_cast<size_t>(lanes.size()), runtime.lane_cpus(), "rfdpredlane");
-    WorkerPool& cpu_pool = runtime.cpu_pool();
-
-    loader.begin_epoch();
-    Batch batch{};
-    const auto image_height = static_cast<int64_t>(loader.image_height());
-    const auto image_width = static_cast<int64_t>(loader.image_width());
-    auto generator = [&](size_t) {
-        return loader.next_batch(batch);
-    };
-    auto enqueue_fn = [&](size_t item_index) {
-        const auto dataset_index = static_cast<int64_t>(batch.image_indices[0]);
-        const int64_t image_id = image_id_for_dataset_index(image_ids, dataset_index);
-
-        const size_t lane_index = item_index % lanes.size();
-        return lane_pool.enqueue([&lanes,
-                                  &loader,
-                                  batch,
-                                  lane_index,
-                                  dataset_index,
-                                  image_id,
-                                  max_dets = options.max_dets_per_image,
-                                  image_height,
-                                  image_width,
-                                  mean,
-                                  std_t = std,
-                                  device_id = options.device_id]() mutable {
-            auto& lane = lanes[lane_index];
-            PredictionBufferLease lease = lane.slot_pool->acquire();
-
-            loader.wait_batch(batch);
-            void* consumer_stream = reinterpret_cast<void*>(lane.stream.stream());
-            loader.handoff_batch(batch, consumer_stream);
-
-            torch::NoGradGuard lane_no_grad;
-            c10::cuda::CUDAGuard lane_device_guard(checked_device_index(device_id));
-            c10::cuda::CUDAStreamGuard stream_guard(lane.stream);
-            auto outputs = run_compiled_prediction_batch(
-                batch,
-                device_id,
-                image_height,
-                image_width,
-                mean,
-                std_t,
-                [&](const torch::Tensor& normalized_batch) {
-                    auto outputs = lane.backend->run(normalized_batch);
-                    normalized_batch.record_stream(lane.stream);
-                    return outputs;
-                });
-            loader.release_batch(batch, consumer_stream);
-            auto outputs_postprocessed =
-                postprocess_outputs_fixed_size(outputs, image_height, image_width, lane.num_queries);
-            return make_staged_prediction_record(dataset_index,
-                                                 image_id,
-                                                 {},
-                                                 outputs_postprocessed.front(),
-                                                 lane.category_count,
-                                                 max_dets,
-                                                 std::move(lease),
-                                                 device_id,
-                                                 reinterpret_cast<void*>(lane.stream.stream()));
-        });
-    };
-    predict_internal::run_parallel_prediction_pipeline(result, scope.bar, cpu_pool, split, options.threshold, generator, enqueue_fn);
+    run_compiled_prediction_parallel_for_loader(
+        options, runtime, loader, result, scope.bar, image_ids, mean, std, 0,
+        [&](const RuntimeSplit& split, const size_t slot_count) {
+            return make_backend_prediction_lanes(artifacts, backend_name, options.device_id, options.allow_fp16,
+                                                 split.lane_threads, slot_count);
+        },
+        [](const auto& lane) { return lane.num_queries; }, [](const auto& lane) { return lane.category_count; },
+        [](auto& lane, const torch::Tensor& normalized_batch) { return lane.backend->run(normalized_batch); });
     return result;
 }
 
-PredictionRunResult run_prediction_raw_weights(const PredictOptions& options,
-                                               const ResolvedModelArtifacts& artifacts) {
+PredictionRunResult run_prediction_raw_weights(const PredictOptions& options, const ResolvedModelArtifacts& artifacts) {
     if (options.lanes > 1) {
-        throw std::runtime_error(
-            "RF-DETR raw-image weights predict does not support --lanes > 1");
+        throw std::runtime_error("RF-DETR raw-image weights predict does not support --lanes > 1");
     }
 
     PredictionRunResult result = make_prediction_result(artifacts, "weights");
     auto model = load_native_model(artifacts, options.device_id);
-    const size_t effective_batch_size = std::max<size_t>(1, options.batch_size);
-    if (effective_batch_size > static_cast<size_t>(std::numeric_limits<int>::max())) {
-        throw std::runtime_error("batch_size exceeds supported inference compilation range");
-    }
-    model->optimize_for_inference(
-        static_cast<int>(effective_batch_size),
-        false,
-        options.compilation_mode);
+    optimize_native_prediction_model(*model, options);
 
     PredictionScope scope(result,
-        make_prediction_bar(options.progress_bar, "weights.predict", options.image_inputs.size()),
-        options.device_id);
+                          make_prediction_bar(options.progress_bar, "weights.predict", options.image_inputs.size()),
+                          options.device_id);
 
-    const auto inference_stream =
-        get_high_priority_cuda_stream(options.device_id);
+    const auto inference_stream = get_high_priority_cuda_stream(options.device_id);
     RawPredictionRuntimeSetup setup =
         make_raw_prediction_runtime_setup(options, 1, options.device_id, inference_stream);
     RuntimeContext& runtime = setup.runtime;
     torch::Tensor mean = std::move(setup.mean);
     torch::Tensor std = std::move(setup.std);
-    RawImageBatchWorkspace workspace = make_raw_image_batch_workspace(
-        effective_batch_size, artifacts.config.resolution, options.device_id);
+    RawImageBatchWorkspace workspace = make_raw_image_batch_workspace(std::max<size_t>(1, options.batch_size),
+                                                                      artifacts.config.resolution, options.device_id);
     const std::size_t max_queries = prediction_max_queries(artifacts);
 
     WorkerPool& cpu_pool = runtime.cpu_pool();
-    auto infer_batch = [&](const torch::Tensor& batch_cpu_view,
-                           const torch::Tensor& batch_gpu_view,
+    auto infer_batch = [&](const torch::Tensor& batch_cpu_view, const torch::Tensor& batch_gpu_view,
                            const std::vector<RawImageBatchItem>& items) {
-        c10::cuda::CUDAStreamGuard stream_guard(inference_stream);
-        return run_raw_prediction_batch(
-            batch_cpu_view,
-            batch_gpu_view,
-            items,
-            workspace,
-            mean,
-            std,
-            max_queries,
-            [&](const torch::Tensor& normalized) {
-                return to_output_tensors(model->forward(NestedTensor{
-                    normalized,
-                    workspace.nested_mask.narrow(0, 0, normalized.size(0)),
-                }));
-            });
+        return run_raw_prediction_batch_on_stream(inference_stream, batch_cpu_view, batch_gpu_view, items, workspace,
+                                                  mean, std, max_queries, [&](const torch::Tensor& normalized) {
+                                                      return to_output_tensors(model->forward(NestedTensor{
+                                                          normalized,
+                                                          workspace.nested_mask.narrow(0, 0, normalized.size(0)),
+                                                      }));
+                                                  });
     };
-    run_raw_prediction_batches(options,
-                               artifacts,
-                               cpu_pool,
-                               options.image_inputs,
-                               static_cast<size_t>(artifacts.config.num_classes),
-                               workspace.batch_cpu,
-                               workspace.batch_gpu,
-                               workspace.resize_scratch_slots,
-                               infer_batch,
-                               result.records,
-                               scope.bar);
+    run_raw_prediction_batches_with_workspace(options, artifacts, cpu_pool,
+                                              static_cast<size_t>(artifacts.config.num_classes), workspace, infer_batch,
+                                              result, scope.bar);
     return result;
 }
 
@@ -663,8 +617,8 @@ PredictionRunResult run_prediction_raw_sequential(const PredictOptions& options,
     PredictionRunResult result = make_prediction_result(artifacts, backend_name);
 
     auto backend = make_backend(artifacts, backend_name, options.device_id, options.allow_fp16);
-    PredictionScope scope(result,
-        make_prediction_bar(options.progress_bar, backend_name + ".predict", options.image_inputs.size()),
+    PredictionScope scope(
+        result, make_prediction_bar(options.progress_bar, backend_name + ".predict", options.image_inputs.size()),
         options.device_id);
 
     const predict_internal::BackendExecutionSpec backend_execution =
@@ -679,47 +633,27 @@ PredictionRunResult run_prediction_raw_sequential(const PredictOptions& options,
     const std::size_t max_queries = backend_execution.num_queries;
 
     WorkerPool& cpu_pool = runtime.cpu_pool();
-    auto infer_batch = [&](const torch::Tensor& batch_cpu_view,
-                           const torch::Tensor& batch_gpu_view,
+    auto infer_batch = [&](const torch::Tensor& batch_cpu_view, const torch::Tensor& batch_gpu_view,
                            const std::vector<RawImageBatchItem>& items) {
-        c10::cuda::CUDAStreamGuard stream_guard(backend_execution.stream);
-        return run_raw_prediction_batch(
-            batch_cpu_view,
-            batch_gpu_view,
-            items,
-            workspace,
-            mean,
-            std,
-            max_queries,
+        return run_raw_prediction_batch_on_stream(
+            backend_execution.stream, batch_cpu_view, batch_gpu_view, items, workspace, mean, std, max_queries,
             [&](const torch::Tensor& normalized) { return backend->run(normalized); });
     };
-    run_raw_prediction_batches(options,
-                               artifacts,
-                               cpu_pool,
-                               options.image_inputs,
-                               backend_execution.category_count,
-                               workspace.batch_cpu,
-                               workspace.batch_gpu,
-                               workspace.resize_scratch_slots,
-                               infer_batch,
-                               result.records,
-                               scope.bar);
+    run_raw_prediction_batches_with_workspace(options, artifacts, cpu_pool, backend_execution.category_count, workspace,
+                                              infer_batch, result, scope.bar);
     return result;
 }
 
-PredictionRunResult run_prediction_raw_parallel(const PredictOptions& options,
-                                                const ResolvedModelArtifacts& artifacts,
+PredictionRunResult run_prediction_raw_parallel(const PredictOptions& options, const ResolvedModelArtifacts& artifacts,
                                                 const std::string& backend_name) {
     PredictionRunResult result = make_prediction_result(artifacts, backend_name);
 
-    PredictionScope scope(result,
-        make_prediction_bar(options.progress_bar, backend_name + ".predict", options.image_inputs.size()),
-        options.device_id, /*sort=*/true);
+    PredictionScope scope(
+        result, make_prediction_bar(options.progress_bar, backend_name + ".predict", options.image_inputs.size()),
+        options.device_id, true);
 
     RawPredictionRuntimeSetup setup = make_raw_prediction_runtime_setup(
-        options,
-        effective_lane_count(options.batch_size, options.lanes),
-        options.device_id);
+        options, effective_lane_count(options.batch_size, options.lanes), options.device_id);
     RuntimeContext& runtime = setup.runtime;
     torch::Tensor mean = std::move(setup.mean);
     torch::Tensor std = std::move(setup.std);
@@ -727,73 +661,45 @@ PredictionRunResult run_prediction_raw_parallel(const PredictOptions& options,
     const RuntimeSplit& split = runtime.split();
     const size_t slot_count = lane_slot_count(split);
     std::vector<predict_internal::RawImagePredictionLane> lanes =
-        make_raw_prediction_lanes(artifacts,
-                                  backend_name,
-                                  options.device_id,
-                                  options.allow_fp16,
-                                  split.lane_threads,
-                                  slot_count,
-                                  artifacts.config.resolution);
+        make_raw_prediction_lanes(artifacts, backend_name, options.device_id, options.allow_fp16, split.lane_threads,
+                                  slot_count, artifacts.config.resolution);
 
     WorkerPool lane_pool(static_cast<size_t>(lanes.size()), runtime.lane_cpus(), "rfdpredlane");
     WorkerPool& cpu_pool = runtime.cpu_pool();
 
-    auto generator = [&](size_t item_index) {
-        return item_index < options.image_inputs.size();
-    };
+    auto generator = [&](size_t item_index) { return item_index < options.image_inputs.size(); };
     auto enqueue_fn = [&](size_t item_index) {
         PredictImageInput input = options.image_inputs[item_index];
         const auto dataset_index = static_cast<int64_t>(item_index);
         const auto image_id = input.image_id != 0 ? input.image_id : static_cast<int64_t>(item_index + 1);
 
         const size_t lane_index = item_index % lanes.size();
-        return lane_pool.enqueue([&lanes,
-                                  input = std::move(input),
-                                  lane_index,
-                                  dataset_index,
-                                  image_id,
-                                  max_dets = options.max_dets_per_image,
-                                  mean,
-                                  std_t = std,
+        return lane_pool.enqueue([&lanes, input = std::move(input), lane_index, dataset_index, image_id,
+                                  max_dets = options.max_dets_per_image, mean, std_t = std,
                                   device_id = options.device_id]() mutable {
             auto& lane = lanes[lane_index];
             PredictionBufferLease lease = lane.slot_pool->acquire();
-            RawImageBatchItem item = decode_raw_image_into_tensor(
-                input,
-                dataset_index,
-                image_id,
-                static_cast<int>(lane.batch_cpu.size(2)),
-                lane.batch_cpu[0].data_ptr<float>(),
-                lane.resize_scratch);
+            RawImageBatchItem item =
+                decode_raw_image_into_tensor(input, dataset_index, image_id, static_cast<int>(lane.batch_cpu.size(2)),
+                                             lane.batch_cpu[0].data_ptr<float>(), lane.resize_scratch);
 
             torch::NoGradGuard lane_no_grad;
             c10::cuda::CUDAGuard lane_device_guard(checked_device_index(device_id));
             c10::cuda::CUDAStreamGuard stream_guard(lane.stream);
             auto outputs = run_raw_prediction_batch(
-                lane.batch_cpu.narrow(0, 0, 1),
-                lane.batch_gpu.narrow(0, 0, 1),
-                item,
-                lane,
-                mean,
-                std_t,
-                lane.num_queries,
-                [&](const torch::Tensor& normalized) { return lane.backend->run(normalized); });
-            return make_staged_prediction_record(item.dataset_index,
-                                                 item.image_id,
-                                                 item.source_name,
-                                                 outputs.front(),
-                                                 lane.category_count,
-                                                 max_dets,
-                                                 std::move(lease),
-                                                 device_id,
+                lane.batch_cpu.narrow(0, 0, 1), lane.batch_gpu.narrow(0, 0, 1), item, lane, mean, std_t,
+                lane.num_queries, [&](const torch::Tensor& normalized) { return lane.backend->run(normalized); });
+            return make_staged_prediction_record(item.dataset_index, item.image_id, item.source_name, outputs.front(),
+                                                 lane.category_count, max_dets, std::move(lease), device_id,
                                                  reinterpret_cast<void*>(lane.stream.stream()));
         });
     };
-    predict_internal::run_parallel_prediction_pipeline(result, scope.bar, cpu_pool, split, options.threshold, generator, enqueue_fn);
+    predict_internal::run_parallel_prediction_pipeline(result, scope.bar, cpu_pool, split, options.threshold, generator,
+                                                       enqueue_fn);
     return result;
 }
 
-} // namespace
+}  // namespace
 
 PredictionRunResult run_prediction(const PredictOptions& options) {
     if (options.output_path.empty()) {
@@ -905,11 +811,8 @@ EvaluationRunResult run_evaluation(const EvaluateOptions& options) {
 
     if (out.backend_name == "weights") {
         const PredictOptions predict_options = make_weights_evaluation_predict_options(options);
-        print_model_metadata(
-            native_model_info(out.artifacts, options.batch_size),
-            dataset.num_images(),
-            dataset.num_categories(),
-            ValidationLogMode::Interactive);
+        print_model_metadata(native_model_info(out.artifacts, options.batch_size), dataset.num_images(),
+                             dataset.num_categories(), ValidationLogMode::Interactive);
         auto predictions = run_prediction_weights(predict_options, out.artifacts, options.limit_images);
         for (const auto& record : predictions.records) {
             dataset.add_predictions(record.detections);
@@ -923,11 +826,7 @@ EvaluationRunResult run_evaluation(const EvaluateOptions& options) {
     auto backend = make_backend(out.artifacts, out.backend_name, options.device_id, options.allow_fp16);
     const ValidationOptions validation_options = make_backend_evaluation_options(options);
 
-    print_model_metadata(
-        backend->info(),
-        dataset.num_images(),
-        dataset.num_categories(),
-        validation_options.log_mode);
+    print_model_metadata(backend->info(), dataset.num_images(), dataset.num_categories(), validation_options.log_mode);
     out.result = run_validation_backend(validation_options, dataset, *backend);
     return out;
 }
@@ -936,4 +835,4 @@ void print_evaluation_summary(const EvaluateOptions& options, const EvaluationRu
     mmltk::logging::logger("rfdetr.evaluate")->info("{}", predict_internal::format_evaluation_summary(options, result));
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

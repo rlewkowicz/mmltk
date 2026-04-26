@@ -11,20 +11,16 @@
 #include <catch2/internal/catch_stringref.hpp>
 
 namespace Catch {
-    namespace Detail {
-        //! Provides case-insensitive `op<` semantics when called
-        struct CaseInsensitiveLess {
-            bool operator()( StringRef lhs,
-                             StringRef rhs ) const;
-        };
+namespace Detail {
+struct CaseInsensitiveLess {
+    bool operator()(StringRef lhs, StringRef rhs) const;
+};
 
-        //! Provides case-insensitive `op==` semantics when called
-        struct CaseInsensitiveEqualTo {
-            bool operator()( StringRef lhs,
-                             StringRef rhs ) const;
-        };
+struct CaseInsensitiveEqualTo {
+    bool operator()(StringRef lhs, StringRef rhs) const;
+};
 
-    } // namespace Detail
-} // namespace Catch
+}  // namespace Detail
+}  // namespace Catch
 
-#endif // CATCH_CASE_INSENSITIVE_COMPARISONS_HPP_INCLUDED
+#endif  // CATCH_CASE_INSENSITIVE_COMPARISONS_HPP_INCLUDED

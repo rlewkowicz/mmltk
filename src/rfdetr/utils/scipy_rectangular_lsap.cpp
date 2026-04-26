@@ -55,18 +55,10 @@ std::vector<intptr_t> argsort_iter(const std::vector<T>& values) {
     return index;
 }
 
-intptr_t augmenting_path(intptr_t num_cols,
-                         double* cost,
-                         std::vector<double>& u,
-                         std::vector<double>& v,
-                         std::vector<intptr_t>& path,
-                         std::vector<intptr_t>& row_for_col,
-                         std::vector<double>& shortest_path_costs,
-                         intptr_t row,
-                         std::vector<bool>& visited_rows,
-                         std::vector<bool>& visited_cols,
-                         std::vector<intptr_t>& remaining,
-                         double* min_value) {
+intptr_t augmenting_path(intptr_t num_cols, double* cost, std::vector<double>& u, std::vector<double>& v,
+                         std::vector<intptr_t>& path, std::vector<intptr_t>& row_for_col,
+                         std::vector<double>& shortest_path_costs, intptr_t row, std::vector<bool>& visited_rows,
+                         std::vector<bool>& visited_cols, std::vector<intptr_t>& remaining, double* min_value) {
     double current_min = 0.0;
     intptr_t num_remaining = num_cols;
     for (intptr_t i = 0; i < num_cols; ++i) {
@@ -85,8 +77,8 @@ intptr_t augmenting_path(intptr_t num_cols,
 
         for (intptr_t i = 0; i < num_remaining; ++i) {
             const intptr_t col = remaining[static_cast<size_t>(i)];
-            const double reduced_cost = current_min + cost[row * num_cols + col] - u[static_cast<size_t>(row)] -
-                                        v[static_cast<size_t>(col)];
+            const double reduced_cost =
+                current_min + cost[row * num_cols + col] - u[static_cast<size_t>(row)] - v[static_cast<size_t>(col)];
             if (reduced_cost < shortest_path_costs[static_cast<size_t>(col)]) {
                 path[static_cast<size_t>(col)] = row;
                 shortest_path_costs[static_cast<size_t>(col)] = reduced_cost;
@@ -119,12 +111,8 @@ intptr_t augmenting_path(intptr_t num_cols,
     return sink;
 }
 
-RectangularLsApStatus solve_impl(intptr_t num_rows,
-                                 intptr_t num_cols,
-                                 double* input_cost,
-                                 bool maximize,
-                                 int64_t* row_indices,
-                                 int64_t* col_indices) {
+RectangularLsApStatus solve_impl(intptr_t num_rows, intptr_t num_cols, double* input_cost, bool maximize,
+                                 int64_t* row_indices, int64_t* col_indices) {
     if (num_rows == 0 || num_cols == 0) {
         return RectangularLsApStatus::kOk;
     }
@@ -171,20 +159,8 @@ RectangularLsApStatus solve_impl(intptr_t num_rows,
 
     for (intptr_t row = 0; row < num_rows; ++row) {
         double min_value = 0.0;
-        const intptr_t sink = augmenting_path(
-            num_cols,
-            input_cost,
-            u,
-            v,
-            path,
-            row_for_col,
-            shortest_path_costs,
-            row,
-            visited_rows,
-            visited_cols,
-            remaining,
-            &min_value
-        );
+        const intptr_t sink = augmenting_path(num_cols, input_cost, u, v, path, row_for_col, shortest_path_costs, row,
+                                              visited_rows, visited_cols, remaining, &min_value);
         if (sink < 0) {
             return RectangularLsApStatus::kInfeasible;
         }
@@ -229,20 +205,13 @@ RectangularLsApStatus solve_impl(intptr_t num_rows,
     return RectangularLsApStatus::kOk;
 }
 
-} // namespace
+}  // namespace
 
-RectangularLsApStatus solve_rectangular_linear_sum_assignment(int64_t num_rows,
-                                                             int64_t num_cols,
-                                                             const double* cost_matrix,
-                                                             bool maximize,
-                                                             int64_t* row_indices,
-                                                             int64_t* col_indices) {
-    return solve_impl(static_cast<intptr_t>(num_rows),
-                      static_cast<intptr_t>(num_cols),
-                      const_cast<double*>(cost_matrix),
-                      maximize,
-                      row_indices,
-                      col_indices);
+RectangularLsApStatus solve_rectangular_linear_sum_assignment(int64_t num_rows, int64_t num_cols,
+                                                              const double* cost_matrix, bool maximize,
+                                                              int64_t* row_indices, int64_t* col_indices) {
+    return solve_impl(static_cast<intptr_t>(num_rows), static_cast<intptr_t>(num_cols),
+                      const_cast<double*>(cost_matrix), maximize, row_indices, col_indices);
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

@@ -14,13 +14,7 @@
 
 namespace Catch {
 
-    /**
-     * Parses unsigned int from the input, using provided base
-     *
-     * Effectively a wrapper around std::stoul but with better error checking
-     * e.g. "-1" is rejected, instead of being parsed as UINT_MAX.
-     */
-    Optional<unsigned int> parseUInt(std::string const& input, int base = 10);
+Optional<unsigned int> parseUInt(std::string const& input, int base = 10);
 }
 
-#endif // CATCH_PARSE_NUMBERS_HPP_INCLUDED
+#endif  // CATCH_PARSE_NUMBERS_HPP_INCLUDED

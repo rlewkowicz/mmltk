@@ -1,8 +1,10 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -57,7 +59,7 @@ struct ManualOverlayDocumentSnapshot {
 };
 
 class ManualOverlayDocument {
-public:
+   public:
     ManualOverlayDocument();
 
     void publish_snapshot(ManualOverlayDocumentSnapshot snapshot);
@@ -66,9 +68,14 @@ public:
     [[nodiscard]] std::shared_ptr<const ManualOverlayDocumentSnapshot> snapshot() const;
     [[nodiscard]] std::shared_ptr<const ManualOverlayDocumentSnapshot> snapshot_if_changed(
         std::uint64_t last_seen_generation) const;
+    [[nodiscard]] std::shared_ptr<const ManualOverlayDocumentSnapshot> wait_snapshot_if_changed(
+        std::uint64_t last_seen_generation, const std::atomic<bool>& stop_requested) const;
+    void notify_waiters() noexcept;
 
-private:
-    std::shared_ptr<const ManualOverlayDocumentSnapshot> snapshot_;
+   private:
+    std::atomic<std::shared_ptr<const ManualOverlayDocumentSnapshot>> snapshot_;
+    mutable std::mutex wait_mutex_;
+    mutable std::condition_variable wait_cv_;
 };
 
-} // namespace mmltk::live
+}  // namespace mmltk::live

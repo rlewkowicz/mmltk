@@ -164,32 +164,15 @@ struct AnnotationCleanupMaskCommand {
 };
 
 using AnnotationCommand = std::variant<
-    AnnotationSetObjectsCommand,
-    AnnotationInsertObjectCommand,
-    AnnotationReplaceObjectCommand,
-    AnnotationSetObjectEnabledCommand,
-    AnnotationSetObjectCategoryCommand,
-    AnnotationRemapSkeletonCategoryCommand,
-    AnnotationSetObjectColorRangesCommand,
-    AnnotationRemoveObjectCommand,
-    AnnotationTranslateObjectCommand,
-    AnnotationResizeObjectCommand,
-    AnnotationSetObjectBoxCommand,
-    AnnotationSetPointPositionCommand,
-    AnnotationSetHandlePositionCommand,
-    AnnotationAppendSplineKnotCommand,
-    AnnotationInsertSplineKnotCommand,
-    AnnotationRemoveSplineKnotCommand,
-    AnnotationCloseSplineCommand,
-    AnnotationReopenSplineCommand,
-    AnnotationSetSplineKnotHandleModeCommand,
-    AnnotationPlaceSkeletonNodeCommand,
-    AnnotationPlaceSkeletonNodeAtCommand,
-    AnnotationSetSkeletonNodeVisibilityCommand,
-    AnnotationResetSkeletonNodeCommand,
-    AnnotationPaintMaskCommand,
-    AnnotationFillMaskCommand,
-    AnnotationCleanupMaskCommand>;
+    AnnotationSetObjectsCommand, AnnotationInsertObjectCommand, AnnotationReplaceObjectCommand,
+    AnnotationSetObjectEnabledCommand, AnnotationSetObjectCategoryCommand, AnnotationRemapSkeletonCategoryCommand,
+    AnnotationSetObjectColorRangesCommand, AnnotationRemoveObjectCommand, AnnotationTranslateObjectCommand,
+    AnnotationResizeObjectCommand, AnnotationSetObjectBoxCommand, AnnotationSetPointPositionCommand,
+    AnnotationSetHandlePositionCommand, AnnotationAppendSplineKnotCommand, AnnotationInsertSplineKnotCommand,
+    AnnotationRemoveSplineKnotCommand, AnnotationCloseSplineCommand, AnnotationReopenSplineCommand,
+    AnnotationSetSplineKnotHandleModeCommand, AnnotationPlaceSkeletonNodeCommand, AnnotationPlaceSkeletonNodeAtCommand,
+    AnnotationSetSkeletonNodeVisibilityCommand, AnnotationResetSkeletonNodeCommand, AnnotationPaintMaskCommand,
+    AnnotationFillMaskCommand, AnnotationCleanupMaskCommand>;
 
 struct AnnotationDocumentSnapshot {
     std::uint64_t generation = 0;
@@ -197,15 +180,31 @@ struct AnnotationDocumentSnapshot {
 };
 
 class AnnotationDocument {
-public:
-    [[nodiscard]] std::uint64_t generation() const noexcept { return generation_; }
-    [[nodiscard]] const std::vector<AnnotationObject>& objects() const noexcept { return objects_; }
-    [[nodiscard]] std::vector<AnnotationObject>& objects() noexcept { return objects_; }
-    [[nodiscard]] bool empty() const noexcept { return objects_.empty(); }
-    [[nodiscard]] std::size_t size() const noexcept { return objects_.size(); }
-    [[nodiscard]] bool can_undo() const noexcept { return !undo_stack_.empty(); }
-    [[nodiscard]] bool can_redo() const noexcept { return !redo_stack_.empty(); }
-    [[nodiscard]] bool transaction_active() const noexcept { return transaction_active_; }
+   public:
+    [[nodiscard]] std::uint64_t generation() const noexcept {
+        return generation_;
+    }
+    [[nodiscard]] const std::vector<AnnotationObject>& objects() const noexcept {
+        return objects_;
+    }
+    [[nodiscard]] std::vector<AnnotationObject>& objects() noexcept {
+        return objects_;
+    }
+    [[nodiscard]] bool empty() const noexcept {
+        return objects_.empty();
+    }
+    [[nodiscard]] std::size_t size() const noexcept {
+        return objects_.size();
+    }
+    [[nodiscard]] bool can_undo() const noexcept {
+        return !undo_stack_.empty();
+    }
+    [[nodiscard]] bool can_redo() const noexcept {
+        return !redo_stack_.empty();
+    }
+    [[nodiscard]] bool transaction_active() const noexcept {
+        return transaction_active_;
+    }
     [[nodiscard]] const AnnotationObject* object(std::size_t index) const noexcept;
     [[nodiscard]] AnnotationObject* object(std::size_t index) noexcept;
     [[nodiscard]] AnnotationDocumentSnapshot snapshot() const;
@@ -220,7 +219,7 @@ public:
     bool apply(const AnnotationCommand& command);
     void clear();
 
-private:
+   private:
     bool apply_without_history(const AnnotationCommand& command);
 
     std::vector<AnnotationObject> objects_;
@@ -232,4 +231,4 @@ private:
     std::vector<AnnotationObject> transaction_before_;
 };
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

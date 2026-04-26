@@ -7,6 +7,7 @@
 
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -15,14 +16,16 @@ namespace mmltk::rfdetr {
 class SharedCudaEvent;
 
 torch::Tensor inverse_sigmoid(const torch::Tensor& x, double eps = 1e-5);
+torch::Tensor ms_deform_attn_reference(const torch::Tensor& value, const torch::Tensor& spatial_shapes,
+                                       const torch::Tensor& sampling_locations, const torch::Tensor& attention_weights);
 
 class MlpImpl : public torch::nn::Module {
-public:
+   public:
     MlpImpl(int64_t input_dim, int64_t hidden_dim, int64_t output_dim, int64_t num_layers);
 
     torch::Tensor forward(torch::Tensor x);
 
-private:
+   private:
     int64_t num_layers_ = 0;
     torch::nn::ModuleList layers{nullptr};
 };
@@ -32,7 +35,7 @@ using RfDetrMlpImpl = MlpImpl;
 using RfDetrMlp = Mlp;
 
 class DetectionHeadImpl : public torch::nn::Module {
-public:
+   public:
     DetectionHeadImpl(int64_t hidden_dim, int64_t num_classes);
 
     std::pair<torch::Tensor, torch::Tensor> forward(const torch::Tensor& hs);
@@ -43,22 +46,16 @@ public:
 TORCH_MODULE(DetectionHead);
 
 class PositionEmbeddingSineImpl : public torch::nn::Module {
-public:
-    PositionEmbeddingSineImpl(int64_t num_pos_feats = 64,
-                              double temperature = 10000.0,
-                              bool normalize = false,
+   public:
+    PositionEmbeddingSineImpl(int64_t num_pos_feats = 64, double temperature = 10000.0, bool normalize = false,
                               c10::optional<double> scale = c10::nullopt);
 
-    // Native callers typically want BCHW. Pass align_dim_orders=true for the upstream H,W,B,C layout.
     torch::Tensor forward(const NestedTensor& tensor_list, bool align_dim_orders = false) const;
     torch::Tensor forward_mask(const torch::Tensor& mask, bool align_dim_orders = false) const;
-    torch::Tensor forward_full_valid(int64_t batch_size,
-                                     int64_t height,
-                                     int64_t width,
-                                     const torch::Device& device,
+    torch::Tensor forward_full_valid(int64_t batch_size, int64_t height, int64_t width, const torch::Device& device,
                                      bool align_dim_orders = false) const;
 
-private:
+   private:
     struct FullValidCacheEntry {
         c10::DeviceType device_type = c10::DeviceType::CPU;
         int device_index = -1;
@@ -69,10 +66,11 @@ private:
         std::shared_ptr<SharedCudaEvent> ready_event;
     };
 
-    torch::Tensor build_full_valid_base(int64_t height,
-                                        int64_t width,
-                                        const torch::Device& device,
+    torch::Tensor build_full_valid_base(int64_t height, int64_t width, const torch::Device& device,
                                         bool align_dim_orders) const;
+    std::optional<FullValidCacheEntry> find_full_valid_cache_entry(int device_index, int64_t height, int64_t width,
+                                                                   const torch::Device& device,
+                                                                   bool align_dim_orders) const;
 
     int64_t num_pos_feats_ = 64;
     double temperature_ = 10000.0;
@@ -84,7 +82,7 @@ private:
 TORCH_MODULE(PositionEmbeddingSine);
 
 class DepthwiseConvBlockImpl : public torch::nn::Module {
-public:
+   public:
     explicit DepthwiseConvBlockImpl(int64_t dim, double layer_scale_init_value = 0.0);
 
     torch::Tensor forward(torch::Tensor x);
@@ -98,7 +96,7 @@ public:
 TORCH_MODULE(DepthwiseConvBlock);
 
 class MlpBlockImpl : public torch::nn::Module {
-public:
+   public:
     explicit MlpBlockImpl(int64_t dim, double layer_scale_init_value = 0.0);
 
     torch::Tensor forward(torch::Tensor x);
@@ -113,22 +111,18 @@ using SegmentationMlpBlockImpl = MlpBlockImpl;
 using SegmentationMlpBlock = MlpBlock;
 
 class SegmentationHeadImpl : public torch::nn::Module {
-public:
-    SegmentationHeadImpl(int64_t in_dim,
-                         int64_t num_blocks,
-                         c10::optional<int64_t> bottleneck_ratio = 1,
+   public:
+    SegmentationHeadImpl(int64_t in_dim, int64_t num_blocks, c10::optional<int64_t> bottleneck_ratio = 1,
                          int64_t downsample_ratio = 4);
 
     std::vector<torch::Tensor> forward(const torch::Tensor& spatial_features,
                                        const std::vector<torch::Tensor>& query_features,
-                                       std::pair<int64_t, int64_t> image_size,
-                                       bool skip_blocks = false);
+                                       std::pair<int64_t, int64_t> image_size, bool skip_blocks = false);
 
-    std::vector<OutputLayer::SparsePredMasks> sparse_forward(
-        const torch::Tensor& spatial_features,
-        const std::vector<torch::Tensor>& query_features,
-        std::pair<int64_t, int64_t> image_size,
-        bool skip_blocks = false);
+    std::vector<OutputLayer::SparsePredMasks> sparse_forward(const torch::Tensor& spatial_features,
+                                                             const std::vector<torch::Tensor>& query_features,
+                                                             std::pair<int64_t, int64_t> image_size,
+                                                             bool skip_blocks = false);
 
     torch::nn::ModuleList blocks{nullptr};
     torch::nn::Conv2d spatial_features_proj{nullptr};
@@ -136,7 +130,7 @@ public:
     torch::nn::Linear query_features_proj{nullptr};
     torch::Tensor bias;
 
-private:
+   private:
     torch::Tensor project_spatial_features(const torch::Tensor& spatial_features);
     torch::Tensor project_query_features(const torch::Tensor& query_features);
     torch::Tensor resize_spatial_features(const torch::Tensor& spatial_features,
@@ -149,4 +143,4 @@ private:
 };
 TORCH_MODULE(SegmentationHead);
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

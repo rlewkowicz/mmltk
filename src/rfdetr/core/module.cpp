@@ -12,7 +12,7 @@ namespace mmltk::rfdetr {
 namespace {
 
 class RfdetrModelModule final : public mmltk::model::ModelModule {
-public:
+   public:
     [[nodiscard]] std::string_view module_id() const override {
         return "rfdetr";
     }
@@ -39,7 +39,8 @@ public:
         return mmltk::rfdetr::find_model_preset(preset_name) != nullptr;
     }
 
-    [[nodiscard]] std::string infer_preset_from_artifact_path(const std::filesystem::path& artifact_path) const override {
+    [[nodiscard]] std::string infer_preset_from_artifact_path(
+        const std::filesystem::path& artifact_path) const override {
         if (const auto* preset = mmltk::rfdetr::infer_model_preset_from_path(artifact_path)) {
             return std::string(preset->preset_name);
         }
@@ -48,19 +49,15 @@ public:
 
     [[nodiscard]] mmltk::model::ModelModuleCapabilities capabilities() const override {
         return {
-            true,
-            true,
-            true,
-            true,
-            true,
+            true, true, true, true, true,
         };
     }
 };
 
-} // namespace
+}  // namespace
 
 std::shared_ptr<const mmltk::model::ModelModule> make_model_module() {
     return std::make_shared<RfdetrModelModule>();
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

@@ -80,7 +80,7 @@ struct AnnotationToolMutation {
 };
 
 class AnnotationTool {
-public:
+   public:
     virtual ~AnnotationTool() = default;
 
     [[nodiscard]] virtual AnnotationToolKind kind() const noexcept = 0;
@@ -92,26 +92,21 @@ public:
     virtual bool handle_handle_drag(const AnnotationToolContext&, const AnnotationToolHandleDragEvent&);
     virtual bool handle_brush_sample(const AnnotationToolContext&, const AnnotationToolBrushEvent&);
     virtual bool handle_fill(const AnnotationToolContext&, const AnnotationToolFillEvent&);
-    virtual AnnotationToolMutation handle_action(const AnnotationToolContext&,
-                                                 const AnnotationToolActionEvent&);
-    [[nodiscard]] virtual std::optional<AnnotationObject> make_object(
-        const AnnotationToolCreateObjectRequest&) const;
-    virtual void on_object_created(AnnotationDocument& document,
-                                   AnnotationSession& session,
+    virtual AnnotationToolMutation handle_action(const AnnotationToolContext&, const AnnotationToolActionEvent&);
+    [[nodiscard]] virtual std::optional<AnnotationObject> make_object(const AnnotationToolCreateObjectRequest&) const;
+    virtual void on_object_created(AnnotationDocument& document, AnnotationSession& session,
                                    std::size_t object_index) const;
 };
 
 class AnnotationToolManager {
-public:
+   public:
     void register_tool(std::unique_ptr<AnnotationTool> tool);
     [[nodiscard]] AnnotationTool* find_tool(AnnotationToolKind kind) noexcept;
     [[nodiscard]] const AnnotationTool* find_tool(AnnotationToolKind kind) const noexcept;
-    bool set_active_tool(AnnotationToolKind kind,
-                         AnnotationDocument& document,
-                         AnnotationSession& session);
+    bool set_active_tool(AnnotationToolKind kind, AnnotationDocument& document, AnnotationSession& session);
 
-private:
+   private:
     std::array<std::unique_ptr<AnnotationTool>, annotation_tool_kind_count()> tools_{};
 };
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

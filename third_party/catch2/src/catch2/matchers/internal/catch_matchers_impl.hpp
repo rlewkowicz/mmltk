@@ -18,92 +18,76 @@
 
 namespace Catch {
 
-#ifdef __clang__
-#    pragma clang diagnostic push
-#    pragma clang diagnostic ignored "-Wsign-compare"
-#    pragma clang diagnostic ignored "-Wnon-virtual-dtor"
-#elif defined __GNUC__
-#    pragma GCC diagnostic push
-#    pragma GCC diagnostic ignored "-Wsign-compare"
-#    pragma GCC diagnostic ignored "-Wnon-virtual-dtor"
-#endif
+CATCH_INTERNAL_START_WARNINGS_SUPPRESSION
+CATCH_INTERNAL_SUPPRESS_SIGN_COMPARE_WARNINGS
+CATCH_INTERNAL_SUPPRESS_NON_VIRTUAL_DTOR_WARNINGS
 
-    template<typename ArgT, typename MatcherT>
-    class MatchExpr : public ITransientExpression {
-        ArgT && m_arg;
-        MatcherT const& m_matcher;
-    public:
-        constexpr MatchExpr( ArgT && arg, MatcherT const& matcher )
-        :   ITransientExpression{ true, matcher.match( arg ) }, // not forwarding arg here on purpose
-            m_arg( CATCH_FORWARD(arg) ),
-            m_matcher( matcher )
-        {}
+template <typename ArgT, typename MatcherT>
+class MatchExpr : public ITransientExpression {
+    ArgT&& m_arg;
+    MatcherT const& m_matcher;
 
-        void streamReconstructedExpression( std::ostream& os ) const override {
-            os << Catch::Detail::stringify( m_arg )
-               << ' '
-               << m_matcher.toString();
-        }
-    };
+   public:
+    constexpr MatchExpr(ArgT&& arg, MatcherT const& matcher)
+        : ITransientExpression{true, matcher.match(arg)}, m_arg(CATCH_FORWARD(arg)), m_matcher(matcher) {}
 
-#ifdef __clang__
-#    pragma clang diagnostic pop
-#elif defined __GNUC__
-#    pragma GCC diagnostic pop
-#endif
-
-
-    namespace Matchers {
-        template <typename ArgT>
-        class MatcherBase;
+    void streamReconstructedExpression(std::ostream& os) const override {
+        os << Catch::Detail::stringify(m_arg) << ' ' << m_matcher.toString();
     }
+};
 
-    using StringMatcher = Matchers::MatcherBase<std::string>;
+CATCH_INTERNAL_STOP_WARNINGS_SUPPRESSION
 
-    void handleExceptionMatchExpr( AssertionHandler& handler, StringMatcher const& matcher );
+namespace Matchers {
+template <typename ArgT>
+class MatcherBase;
+}
 
-    template<typename ArgT, typename MatcherT>
-    constexpr MatchExpr<ArgT, MatcherT>
-    makeMatchExpr( ArgT&& arg, MatcherT const& matcher ) {
-        return MatchExpr<ArgT, MatcherT>( CATCH_FORWARD(arg), matcher );
-    }
+using StringMatcher = Matchers::MatcherBase<std::string>;
 
-} // namespace Catch
+void handleExceptionMatchExpr(AssertionHandler& handler, StringMatcher const& matcher);
 
+template <typename ArgT, typename MatcherT>
+constexpr MatchExpr<ArgT, MatcherT> makeMatchExpr(ArgT&& arg, MatcherT const& matcher) {
+    return MatchExpr<ArgT, MatcherT>(CATCH_FORWARD(arg), matcher);
+}
 
-///////////////////////////////////////////////////////////////////////////////
-#define INTERNAL_CHECK_THAT( macroName, matcher, resultDisposition, arg ) \
-    do { \
-        Catch::AssertionHandler catchAssertionHandler( macroName##_catch_sr, CATCH_INTERNAL_LINEINFO, CATCH_INTERNAL_STRINGIFY(arg) ", " CATCH_INTERNAL_STRINGIFY(matcher), resultDisposition ); \
-        INTERNAL_CATCH_TRY { \
-            catchAssertionHandler.handleExpr( Catch::makeMatchExpr( arg, matcher ) ); \
-        } INTERNAL_CATCH_CATCH( catchAssertionHandler ) \
-        catchAssertionHandler.complete(); \
-    } while( false )
+}  // namespace Catch
 
+#define INTERNAL_CHECK_THAT(macroName, matcher, resultDisposition, arg)                               \
+    do {                                                                                              \
+        Catch::AssertionHandler catchAssertionHandler(                                                \
+            macroName##_catch_sr, CATCH_INTERNAL_LINEINFO,                                            \
+            CATCH_INTERNAL_STRINGIFY(arg) ", " CATCH_INTERNAL_STRINGIFY(matcher), resultDisposition); \
+        INTERNAL_CATCH_TRY {                                                                          \
+            catchAssertionHandler.handleExpr(Catch::makeMatchExpr(arg, matcher));                     \
+        }                                                                                             \
+        INTERNAL_CATCH_CATCH(catchAssertionHandler)                                                   \
+        catchAssertionHandler.complete();                                                             \
+    } while (false)
 
-///////////////////////////////////////////////////////////////////////////////
-#define INTERNAL_CATCH_THROWS_MATCHES( macroName, exceptionType, resultDisposition, matcher, ... ) \
-    do { \
-        Catch::AssertionHandler catchAssertionHandler( macroName##_catch_sr, CATCH_INTERNAL_LINEINFO, CATCH_INTERNAL_STRINGIFY(__VA_ARGS__) ", " CATCH_INTERNAL_STRINGIFY(exceptionType) ", " CATCH_INTERNAL_STRINGIFY(matcher), resultDisposition ); \
-        if( catchAssertionHandler.allowThrows() ) \
-            try { \
-                CATCH_INTERNAL_START_WARNINGS_SUPPRESSION \
-                CATCH_INTERNAL_SUPPRESS_USELESS_CAST_WARNINGS \
-                static_cast<void>(__VA_ARGS__ ); \
-                CATCH_INTERNAL_STOP_WARNINGS_SUPPRESSION \
-                catchAssertionHandler.handleUnexpectedExceptionNotThrown(); \
-            } \
-            catch( exceptionType const& ex ) { \
-                catchAssertionHandler.handleExpr( Catch::makeMatchExpr( ex, matcher ) ); \
-            } \
-            catch( ... ) { \
-                catchAssertionHandler.handleUnexpectedInflightException(); \
-            } \
-        else \
-            catchAssertionHandler.handleThrowingCallSkipped(); \
-        catchAssertionHandler.complete(); \
-    } while( false )
+#define INTERNAL_CATCH_THROWS_MATCHES(macroName, exceptionType, resultDisposition, matcher, ...) \
+    do {                                                                                         \
+        Catch::AssertionHandler catchAssertionHandler(                                           \
+            macroName##_catch_sr, CATCH_INTERNAL_LINEINFO,                                       \
+            CATCH_INTERNAL_STRINGIFY(__VA_ARGS__) ", " CATCH_INTERNAL_STRINGIFY(                 \
+                exceptionType) ", " CATCH_INTERNAL_STRINGIFY(matcher),                           \
+            resultDisposition);                                                                  \
+        if (catchAssertionHandler.allowThrows())                                                 \
+            try {                                                                                \
+                CATCH_INTERNAL_START_WARNINGS_SUPPRESSION                                        \
+                CATCH_INTERNAL_SUPPRESS_USELESS_CAST_WARNINGS                                    \
+                static_cast<void>(__VA_ARGS__);                                                  \
+                CATCH_INTERNAL_STOP_WARNINGS_SUPPRESSION                                         \
+                catchAssertionHandler.handleUnexpectedExceptionNotThrown();                      \
+            } catch (exceptionType const& ex) {                                                  \
+                catchAssertionHandler.handleExpr(Catch::makeMatchExpr(ex, matcher));             \
+            } catch (...) {                                                                      \
+                catchAssertionHandler.handleUnexpectedInflightException();                       \
+            }                                                                                    \
+        else                                                                                     \
+            catchAssertionHandler.handleThrowingCallSkipped();                                   \
+        catchAssertionHandler.complete();                                                        \
+    } while (false)
 
-
-#endif // CATCH_MATCHERS_IMPL_HPP_INCLUDED
+#endif  // CATCH_MATCHERS_IMPL_HPP_INCLUDED

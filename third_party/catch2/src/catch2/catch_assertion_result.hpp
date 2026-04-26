@@ -18,43 +18,41 @@
 
 namespace Catch {
 
-    struct AssertionResultData
-    {
-        AssertionResultData() = delete;
+struct AssertionResultData {
+    AssertionResultData() = delete;
 
-        AssertionResultData( ResultWas::OfType _resultType, LazyExpression const& _lazyExpression );
+    AssertionResultData(ResultWas::OfType _resultType, LazyExpression const& _lazyExpression);
 
-        std::string message;
-        mutable std::string reconstructedExpression;
-        LazyExpression lazyExpression;
-        ResultWas::OfType resultType;
+    std::string message;
+    mutable std::string reconstructedExpression;
+    LazyExpression lazyExpression;
+    ResultWas::OfType resultType;
 
-        std::string reconstructExpression() const;
-    };
+    std::string reconstructExpression() const;
+};
 
-    class AssertionResult {
-    public:
-        AssertionResult() = delete;
-        AssertionResult( AssertionInfo const& info, AssertionResultData&& data );
+class AssertionResult {
+   public:
+    AssertionResult() = delete;
+    AssertionResult(AssertionInfo const& info, AssertionResultData&& data);
 
-        bool isOk() const;
-        bool succeeded() const;
-        ResultWas::OfType getResultType() const;
-        bool hasExpression() const;
-        bool hasMessage() const;
-        std::string getExpression() const;
-        std::string getExpressionInMacro() const;
-        bool hasExpandedExpression() const;
-        std::string getExpandedExpression() const;
-        StringRef getMessage() const;
-        SourceLineInfo getSourceInfo() const;
-        StringRef getTestMacroName() const;
+    bool isOk() const;
+    bool succeeded() const;
+    ResultWas::OfType getResultType() const;
+    bool hasExpression() const;
+    bool hasMessage() const;
+    std::string getExpression() const;
+    std::string getExpressionInMacro() const;
+    bool hasExpandedExpression() const;
+    std::string getExpandedExpression() const;
+    StringRef getMessage() const;
+    SourceLineInfo getSourceInfo() const;
+    StringRef getTestMacroName() const;
 
-    //protected:
-        AssertionInfo m_info;
-        AssertionResultData m_resultData;
-    };
+    AssertionInfo m_info;
+    AssertionResultData m_resultData;
+};
 
-} // end namespace Catch
+}  // namespace Catch
 
-#endif // CATCH_ASSERTION_RESULT_HPP_INCLUDED
+#endif  // CATCH_ASSERTION_RESULT_HPP_INCLUDED

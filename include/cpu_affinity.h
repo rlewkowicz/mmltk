@@ -13,4 +13,4 @@ std::string format_cpu_list(const std::vector<int>& cpus);
 void pin_thread_to_cpu(const std::vector<int>& cpus, size_t worker_index);
 void set_thread_name(const std::string& name);
 
-} // namespace mmltk
+}  // namespace mmltk

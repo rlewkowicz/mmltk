@@ -10,15 +10,12 @@ namespace mmltk {
 
 namespace {
 
-void populate_label_index(OwnedBuffer<LabelIndexEntry>& label_index,
-                          const std::vector<ImageEntry>& disk_index,
-                          const FileHeader& header,
-                          size_t label_count) {
+void populate_label_index(OwnedBuffer<LabelIndexEntry>& label_index, const std::vector<ImageEntry>& disk_index,
+                          const FileHeader& header, size_t label_count) {
     MMLTK_PROFILE_SCOPE("loader.load_runtime.populate_label_index");
     for (size_t i = 0; i < disk_index.size(); ++i) {
         const ImageEntry& entry = disk_index[i];
-        const uint64_t expected_pixel_entry =
-            header.pixel_offset + static_cast<uint64_t>(i) * header.image_stride;
+        const uint64_t expected_pixel_entry = header.pixel_offset + static_cast<uint64_t>(i) * header.image_stride;
         if (entry.pixel_offset != expected_pixel_entry) {
             throw std::runtime_error("compiled pixel index is inconsistent");
         }
@@ -30,8 +27,7 @@ void populate_label_index(OwnedBuffer<LabelIndexEntry>& label_index,
         }
 
         const uint32_t label_begin = entry.label_offset / sizeof(PackedInstance);
-        if (label_begin > label_count ||
-            static_cast<size_t>(entry.num_instances) > label_count - label_begin) {
+        if (label_begin > label_count || static_cast<size_t>(entry.num_instances) > label_count - label_begin) {
             throw std::runtime_error("image label span is out of bounds");
         }
 
@@ -49,17 +45,15 @@ size_t compute_used_rle_bytes(const OwnedBuffer<PackedInstance>& labels, size_t 
     for (size_t i = 0; i < labels.size(); ++i) {
         const PackedInstance& inst = labels.data()[i];
         const size_t rle_bytes = static_cast<size_t>(inst.mask_rle_pairs) * sizeof(RLEPair);
-        if (inst.mask_rle_offset > rle_region_bytes ||
-            rle_bytes > rle_region_bytes - inst.mask_rle_offset) {
+        if (inst.mask_rle_offset > rle_region_bytes || rle_bytes > rle_region_bytes - inst.mask_rle_offset) {
             throw std::runtime_error("instance RLE span is out of bounds");
         }
-        used_rle_bytes =
-            std::max(used_rle_bytes, static_cast<size_t>(inst.mask_rle_offset) + rle_bytes);
+        used_rle_bytes = std::max(used_rle_bytes, static_cast<size_t>(inst.mask_rle_offset) + rle_bytes);
     }
     return used_rle_bytes;
 }
 
-} // namespace
+}  // namespace
 
 void DatasetLoader::Impl::load_runtime_data() {
     MMLTK_PROFILE_SCOPE("loader.load_runtime_data");
@@ -102,8 +96,7 @@ void DatasetLoader::Impl::load_runtime_data() {
 
     {
         MMLTK_PROFILE_SCOPE("loader.load_runtime.read_rle");
-        rle_pairs =
-            load_hugepage_block<RLEPair>(file, used_rle_bytes / sizeof(RLEPair), sections.rle_offset);
+        rle_pairs = load_hugepage_block<RLEPair>(file, used_rle_bytes / sizeof(RLEPair), sections.rle_offset);
     }
     MMLTK_PROFILE_SET("loader.rle_bytes", rle_pairs.bytes());
 
@@ -114,19 +107,14 @@ void DatasetLoader::Impl::load_runtime_data() {
 
     {
         MMLTK_PROFILE_SCOPE("loader.load_runtime.map_pixel_blob");
-        pixel_file = MappedFile::open_readonly_range(config.compiled_path,
-                                                     sections.pixel_offset,
-                                                     sections.pixel_blob_size);
+        pixel_file =
+            MappedFile::open_readonly_range(config.compiled_path, sections.pixel_offset, sections.pixel_blob_size);
     }
     // cppcheck-suppress invalidPointerCast
     pixels = reinterpret_cast<const float*>(pixel_file.data());
 
-    MMLTK_DEBUG_LOG(
-        "[loader] labels in RAM: index=%zu bytes labels=%zu bytes rle=%zu bytes pixel_mmap=%zu bytes\n",
-        label_index.bytes(),
-        labels.bytes(),
-        rle_pairs.bytes(),
-        sections.pixel_blob_size);
+    MMLTK_DEBUG_LOG("[loader] labels in RAM: index=%zu bytes labels=%zu bytes rle=%zu bytes pixel_mmap=%zu bytes\n",
+                    label_index.bytes(), labels.bytes(), rle_pairs.bytes(), sections.pixel_blob_size);
 }
 
 void DatasetLoader::Impl::prescan() {
@@ -147,4 +135,4 @@ void DatasetLoader::Impl::prescan() {
     }
 }
 
-} // namespace mmltk
+}  // namespace mmltk

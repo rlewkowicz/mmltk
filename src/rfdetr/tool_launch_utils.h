@@ -10,8 +10,7 @@
 
 namespace mmltk::rfdetr {
 
-inline std::filesystem::path resolve_sibling_tool_path(std::string_view tool_name,
-                                                       std::string_view env_override = {}) {
+inline std::filesystem::path resolve_sibling_tool_path(std::string_view tool_name, std::string_view env_override = {}) {
     if (!env_override.empty()) {
         const std::string env_name(env_override);
         if (const char* override_path = std::getenv(env_name.c_str());
@@ -32,4 +31,4 @@ inline std::vector<char*> make_exec_argv(std::vector<std::string>& args) {
     return raw_args;
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

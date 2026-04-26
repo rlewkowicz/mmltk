@@ -65,46 +65,46 @@ void emit_tensorrt_log_line(const std::string& line) {
 
 std::string trt_dtype_name(nvinfer1::DataType dtype) {
     switch (dtype) {
-    case nvinfer1::DataType::kFLOAT:
-        return "float32";
-    case nvinfer1::DataType::kHALF:
-        return "float16";
-    case nvinfer1::DataType::kINT32:
-        return "int32";
-    case nvinfer1::DataType::kINT64:
-        return "int64";
-    default:
-        return "unsupported";
+        case nvinfer1::DataType::kFLOAT:
+            return "float32";
+        case nvinfer1::DataType::kHALF:
+            return "float16";
+        case nvinfer1::DataType::kINT32:
+            return "int32";
+        case nvinfer1::DataType::kINT64:
+            return "int64";
+        default:
+            return "unsupported";
     }
 }
 
 size_t trt_dtype_size(nvinfer1::DataType dtype) {
     switch (dtype) {
-    case nvinfer1::DataType::kFLOAT:
-        return sizeof(float);
-    case nvinfer1::DataType::kHALF:
-        return sizeof(uint16_t);
-    case nvinfer1::DataType::kINT32:
-        return sizeof(int32_t);
-    case nvinfer1::DataType::kINT64:
-        return sizeof(int64_t);
-    default:
-        throw std::runtime_error("unsupported TensorRT tensor dtype");
+        case nvinfer1::DataType::kFLOAT:
+            return sizeof(float);
+        case nvinfer1::DataType::kHALF:
+            return sizeof(uint16_t);
+        case nvinfer1::DataType::kINT32:
+            return sizeof(int32_t);
+        case nvinfer1::DataType::kINT64:
+            return sizeof(int64_t);
+        default:
+            throw std::runtime_error("unsupported TensorRT tensor dtype");
     }
 }
 
 torch::ScalarType trt_dtype_to_torch_scalar_type(nvinfer1::DataType dtype) {
     switch (dtype) {
-    case nvinfer1::DataType::kFLOAT:
-        return torch::kFloat32;
-    case nvinfer1::DataType::kHALF:
-        return torch::kFloat16;
-    case nvinfer1::DataType::kINT32:
-        return torch::kInt32;
-    case nvinfer1::DataType::kINT64:
-        return torch::kInt64;
-    default:
-        throw std::runtime_error("unsupported TensorRT tensor dtype");
+        case nvinfer1::DataType::kFLOAT:
+            return torch::kFloat32;
+        case nvinfer1::DataType::kHALF:
+            return torch::kFloat16;
+        case nvinfer1::DataType::kINT32:
+            return torch::kInt32;
+        case nvinfer1::DataType::kINT64:
+            return torch::kInt64;
+        default:
+            throw std::runtime_error("unsupported TensorRT tensor dtype");
     }
 }
 
@@ -133,8 +133,7 @@ size_t element_count(const std::vector<int64_t>& shape) {
     if (shape.empty()) {
         return 0;
     }
-    return static_cast<size_t>(std::accumulate(
-        shape.begin(), shape.end(), int64_t{1}, std::multiplies<>()));
+    return static_cast<size_t>(std::accumulate(shape.begin(), shape.end(), int64_t{1}, std::multiplies<>()));
 }
 
 std::streamsize checked_streamsize(size_t value, const char* context) {
@@ -206,7 +205,7 @@ void set_fp16_builder_flag(nvinfer1::IBuilderConfig& config) {
 }
 
 class TensorRtLogger final : public nvinfer1::ILogger {
-public:
+   public:
     explicit TensorRtLogger(Severity threshold) : threshold_(static_cast<int>(threshold)) {}
 
     void set_threshold(Severity threshold) noexcept {
@@ -223,25 +222,25 @@ public:
         }
         const char* prefix = "[trt]";
         switch (severity) {
-        case Severity::kINTERNAL_ERROR:
-        case Severity::kERROR:
-            prefix = "[trt:error]";
-            break;
-        case Severity::kWARNING:
-            prefix = "[trt:warn]";
-            break;
-        case Severity::kINFO:
-            break;
-        case Severity::kVERBOSE:
-            prefix = "[trt:verbose]";
-            break;
-        default:
-            break;
+            case Severity::kINTERNAL_ERROR:
+            case Severity::kERROR:
+                prefix = "[trt:error]";
+                break;
+            case Severity::kWARNING:
+                prefix = "[trt:warn]";
+                break;
+            case Severity::kINFO:
+                break;
+            case Severity::kVERBOSE:
+                prefix = "[trt:verbose]";
+                break;
+            default:
+                break;
         }
         emit_tensorrt_log_line(std::string(prefix) + " " + (message ? message : ""));
     }
 
-private:
+   private:
     std::atomic<int> threshold_;
 };
 
@@ -251,7 +250,7 @@ TensorRtLogger& tensor_rt_logger() {
 }
 
 class TensorRtLoggerThresholdScope {
-public:
+   public:
     explicit TensorRtLoggerThresholdScope(nvinfer1::ILogger::Severity threshold)
         : previous_(tensor_rt_logger().threshold()) {
         tensor_rt_logger().set_threshold(threshold);
@@ -261,12 +260,12 @@ public:
         tensor_rt_logger().set_threshold(previous_);
     }
 
-private:
+   private:
     nvinfer1::ILogger::Severity previous_;
 };
 
 class TensorRtBuildProgressMonitor final : public nvinfer1::IProgressMonitor {
-public:
+   public:
     void phaseStart(char const* phase_name, char const* parent_phase, int32_t nb_steps) noexcept override {
         std::lock_guard<std::mutex> lock(mutex_);
         const std::string key = phase_name ? phase_name : "<unnamed>";
@@ -301,7 +300,7 @@ public:
         emit_tensorrt_log_line("[trt:build] phase finish: " + key);
     }
 
-private:
+   private:
     std::mutex mutex_;
     std::unordered_map<std::string, int32_t> phase_steps_;
 };
@@ -317,10 +316,8 @@ template <typename T>
 using TensorRtUnique = std::unique_ptr<T, TensorRtDestroy<T>>;
 
 class TensorRtSharedState {
-public:
-    TensorRtSharedState(std::filesystem::path model_path,
-                        int device_id,
-                        bool allow_fp16,
+   public:
+    TensorRtSharedState(std::filesystem::path model_path, int device_id, bool allow_fp16,
                         std::filesystem::path save_engine_path)
         : model_path_(std::move(model_path)),
           device_id_(device_id),
@@ -338,12 +335,24 @@ public:
         initialize_tensor_info();
     }
 
-    [[nodiscard]] const ModelInfo& info() const { return info_; }
-    [[nodiscard]] nvinfer1::ICudaEngine& engine() const { return *engine_; }
-    [[nodiscard]] int device_id() const { return device_id_; }
-    [[nodiscard]] size_t boxes_output_index() const { return boxes_output_index_; }
-    [[nodiscard]] size_t logits_output_index() const { return logits_output_index_; }
-    [[nodiscard]] size_t masks_output_index() const { return masks_output_index_; }
+    [[nodiscard]] const ModelInfo& info() const {
+        return info_;
+    }
+    [[nodiscard]] nvinfer1::ICudaEngine& engine() const {
+        return *engine_;
+    }
+    [[nodiscard]] int device_id() const {
+        return device_id_;
+    }
+    [[nodiscard]] size_t boxes_output_index() const {
+        return boxes_output_index_;
+    }
+    [[nodiscard]] size_t logits_output_index() const {
+        return logits_output_index_;
+    }
+    [[nodiscard]] size_t masks_output_index() const {
+        return masks_output_index_;
+    }
 
     void save_engine(const std::filesystem::path& path) const {
         if (serialized_engine_ == nullptr) {
@@ -357,7 +366,7 @@ public:
                      checked_streamsize(serialized_engine_->size(), "TensorRT engine write"));
     }
 
-private:
+   private:
     std::vector<char> read_binary(const std::filesystem::path& path) {
         std::ifstream stream(path, std::ios::binary);
         if (!stream.is_open()) {
@@ -393,26 +402,22 @@ private:
         if (network == nullptr || config == nullptr) {
             throw std::runtime_error("failed to create TensorRT build objects");
         }
-        TensorRtUnique<nvonnxparser::IParser> parser(
-            nvonnxparser::createParser(*network, tensor_rt_logger()));
+        TensorRtUnique<nvonnxparser::IParser> parser(nvonnxparser::createParser(*network, tensor_rt_logger()));
         if (parser == nullptr) {
             throw std::runtime_error("failed to create TensorRT ONNX parser");
         }
         emit_tensorrt_log_line("[trt:build] parsing ONNX: " + onnx_path.string());
-        if (!parser->parseFromFile(
-                onnx_path.string().c_str(),
-                static_cast<int>(nvinfer1::ILogger::Severity::kVERBOSE))) {
+        if (!parser->parseFromFile(onnx_path.string().c_str(),
+                                   static_cast<int>(nvinfer1::ILogger::Severity::kVERBOSE))) {
             const std::string diagnostics = format_onnx_parser_errors(*parser);
-            throw std::runtime_error(
-                diagnostics.empty()
-                    ? "failed to parse RF-DETR ONNX file for TensorRT"
-                    : "failed to parse RF-DETR ONNX file for TensorRT:\n" + diagnostics);
+            throw std::runtime_error(diagnostics.empty()
+                                         ? "failed to parse RF-DETR ONNX file for TensorRT"
+                                         : "failed to parse RF-DETR ONNX file for TensorRT:\n" + diagnostics);
         }
         {
             std::ostringstream message;
             message << "[trt:build] parsed network: layers=" << network->getNbLayers()
-                    << " inputs=" << network->getNbInputs()
-                    << " outputs=" << network->getNbOutputs();
+                    << " inputs=" << network->getNbInputs() << " outputs=" << network->getNbOutputs();
             emit_tensorrt_log_line(message.str());
         }
         for (int index = 0; index < network->getNbInputs(); ++index) {
@@ -420,39 +425,30 @@ private:
             if (tensor == nullptr) {
                 continue;
             }
-            emit_tensorrt_log_line(
-                std::string("[trt:build] input[") + std::to_string(index) + "] " +
-                (tensor->getName() ? tensor->getName() : "<unnamed>") +
-                " dtype=" + trt_dtype_name(tensor->getType()) +
-                " dims=" + format_dims(tensor->getDimensions()));
+            emit_tensorrt_log_line(std::string("[trt:build] input[") + std::to_string(index) + "] " +
+                                   (tensor->getName() ? tensor->getName() : "<unnamed>") + " dtype=" +
+                                   trt_dtype_name(tensor->getType()) + " dims=" + format_dims(tensor->getDimensions()));
         }
         for (int index = 0; index < network->getNbOutputs(); ++index) {
             const nvinfer1::ITensor* tensor = network->getOutput(index);
             if (tensor == nullptr) {
                 continue;
             }
-            emit_tensorrt_log_line(
-                std::string("[trt:build] output[") + std::to_string(index) + "] " +
-                (tensor->getName() ? tensor->getName() : "<unnamed>") +
-                " dtype=" + trt_dtype_name(tensor->getType()) +
-                " dims=" + format_dims(tensor->getDimensions()));
+            emit_tensorrt_log_line(std::string("[trt:build] output[") + std::to_string(index) + "] " +
+                                   (tensor->getName() ? tensor->getName() : "<unnamed>") + " dtype=" +
+                                   trt_dtype_name(tensor->getType()) + " dims=" + format_dims(tensor->getDimensions()));
         }
         config->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, 1ULL << 30);
         config->setProfilingVerbosity(nvinfer1::ProfilingVerbosity::kDETAILED);
         TensorRtBuildProgressMonitor progress_monitor;
         config->setProgressMonitor(&progress_monitor);
         if (allow_fp16_) {
-            // TensorRT 10.12 deprecates kFP16 in favor of strongly typed networks.
-            // Our ONNX parser flow still relies on builder-selected mixed precision,
-            // so keep the behavior and suppress the warning locally until the export
-            // path is upgraded to emit a strongly typed FP16 network.
             set_fp16_builder_flag(*config);
         }
         {
             std::ostringstream message;
             message << "[trt:build] config: fp16=" << (allow_fp16_ ? "on" : "off")
-                    << " workspace_bytes=" << (1ULL << 30)
-                    << " opt_level=" << config->getBuilderOptimizationLevel()
+                    << " workspace_bytes=" << (1ULL << 30) << " opt_level=" << config->getBuilderOptimizationLevel()
                     << " profiling_verbosity=detailed";
             emit_tensorrt_log_line(message.str());
         }
@@ -462,8 +458,7 @@ private:
         if (serialized_engine_ == nullptr) {
             throw std::runtime_error("TensorRT buildSerializedNetwork failed");
         }
-        emit_tensorrt_log_line(
-            "[trt:build] serialized engine bytes=" + std::to_string(serialized_engine_->size()));
+        emit_tensorrt_log_line("[trt:build] serialized engine bytes=" + std::to_string(serialized_engine_->size()));
         if (!save_engine_path_.empty()) {
             emit_tensorrt_log_line("[trt:build] writing engine: " + save_engine_path_.string());
             std::ofstream stream(save_engine_path_, std::ios::binary);
@@ -542,7 +537,7 @@ private:
 };
 
 class TensorRtBackend final : public InferenceBackend {
-public:
+   public:
     explicit TensorRtBackend(std::shared_ptr<TensorRtSharedState> shared_state)
         : shared_state_(std::move(shared_state)) {
         MMLTK_PROFILE_SCOPE("rfdetr.native.tensorrt.construct");
@@ -566,8 +561,12 @@ public:
         }
     }
 
-    [[nodiscard]] const ModelInfo& info() const override { return shared_state_->info(); }
-    [[nodiscard]] void* stream() const override { return stream_; }
+    [[nodiscard]] const ModelInfo& info() const override {
+        return shared_state_->info();
+    }
+    [[nodiscard]] void* stream() const override {
+        return stream_;
+    }
 
     [[nodiscard]] std::vector<std::unique_ptr<InferenceBackend>> make_lanes(int count) const override {
         if (count <= 0) {
@@ -602,11 +601,11 @@ public:
             }
             std::vector<char const*> missing_tensor_names(static_cast<size_t>(infer_result), nullptr);
             const int32_t missing_count = context_->inferShapes(infer_result, missing_tensor_names.data());
-            const std::string missing = join_tensor_names(
-                missing_tensor_names.data(), missing_count > 0 ? missing_count : infer_result);
-            throw std::runtime_error(
-                missing.empty() ? "TensorRT input shapes or addresses remain unspecified"
-                                : "TensorRT input shapes or addresses remain unspecified: " + missing);
+            const std::string missing =
+                join_tensor_names(missing_tensor_names.data(), missing_count > 0 ? missing_count : infer_result);
+            throw std::runtime_error(missing.empty()
+                                         ? "TensorRT input shapes or addresses remain unspecified"
+                                         : "TensorRT input shapes or addresses remain unspecified: " + missing);
         }
 
         for (const TensorInfo& output : info().outputs) {
@@ -633,11 +632,11 @@ public:
         shared_state_->save_engine(path);
     }
 
-private:
+   private:
     void reserve_output_buffer(const std::string& tensor_name) {
         const auto shape = dims_to_shape(context_->getTensorShape(tensor_name.c_str()));
-        const size_t bytes = element_count(shape) *
-                             trt_dtype_size(shared_state_->engine().getTensorDataType(tensor_name.c_str()));
+        const size_t bytes =
+            element_count(shape) * trt_dtype_size(shared_state_->engine().getTensorDataType(tensor_name.c_str()));
         void*& buffer = output_buffers_[tensor_name];
         size_t& capacity = output_buffer_bytes_[tensor_name];
         if (bytes <= capacity && buffer != nullptr) {
@@ -654,12 +653,10 @@ private:
     torch::Tensor wrap_output(const TensorInfo& output) {
         const auto shape = dims_to_shape(context_->getTensorShape(output.name.c_str()));
         const auto dtype = shared_state_->engine().getTensorDataType(output.name.c_str());
-        return torch::from_blob(
-            output_buffers_.at(output.name),
-            shape,
-            torch::TensorOptions()
-                .dtype(trt_dtype_to_torch_scalar_type(dtype))
-                .device(torch::kCUDA, shared_state_->device_id()));
+        return torch::from_blob(output_buffers_.at(output.name), shape,
+                                torch::TensorOptions()
+                                    .dtype(trt_dtype_to_torch_scalar_type(dtype))
+                                    .device(torch::kCUDA, shared_state_->device_id()));
     }
 
     std::shared_ptr<TensorRtSharedState> shared_state_;
@@ -669,7 +666,7 @@ private:
     std::unordered_map<std::string, size_t> output_buffer_bytes_;
 };
 
-} // namespace
+}  // namespace
 
 ScopedTensorRtLogSink::ScopedTensorRtLogSink(TensorRtLogSink sink)
     : previous_sink_(exchange_tensorrt_log_sink(std::move(sink))) {}
@@ -682,8 +679,7 @@ void InferenceBackend::save_engine(const std::filesystem::path&) {
     throw std::runtime_error("this backend does not support saving TensorRT engines");
 }
 
-std::unique_ptr<InferenceBackend> make_tensorrt_backend(const std::filesystem::path& model_path,
-                                                        int device_id,
+std::unique_ptr<InferenceBackend> make_tensorrt_backend(const std::filesystem::path& model_path, int device_id,
                                                         bool allow_fp16,
                                                         const std::filesystem::path& save_engine_path) {
     auto backends = make_tensorrt_backend_lanes(model_path, device_id, allow_fp16, 1, save_engine_path);
@@ -692,19 +688,12 @@ std::unique_ptr<InferenceBackend> make_tensorrt_backend(const std::filesystem::p
 }
 
 std::vector<std::unique_ptr<InferenceBackend>> make_tensorrt_backend_lanes(
-    const std::filesystem::path& model_path,
-    int device_id,
-    bool allow_fp16,
-    int lane_count,
+    const std::filesystem::path& model_path, int device_id, bool allow_fp16, int lane_count,
     const std::filesystem::path& save_engine_path) {
     if (lane_count <= 0) {
         throw std::runtime_error("TensorRT backend lanes must be greater than zero");
     }
-    auto shared_state = std::make_shared<TensorRtSharedState>(
-        model_path,
-        device_id,
-        allow_fp16,
-        save_engine_path);
+    auto shared_state = std::make_shared<TensorRtSharedState>(model_path, device_id, allow_fp16, save_engine_path);
     std::vector<std::unique_ptr<InferenceBackend>> backends;
     backends.reserve(static_cast<size_t>(lane_count));
     for (int lane = 0; lane < lane_count; ++lane) {
@@ -713,4 +702,4 @@ std::vector<std::unique_ptr<InferenceBackend>> make_tensorrt_backend_lanes(
     return backends;
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

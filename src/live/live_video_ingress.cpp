@@ -32,8 +32,8 @@ std::uint64_t generate_session_nonce() {
     std::random_device random_device;
     const std::uint64_t random_component =
         (static_cast<std::uint64_t>(random_device()) << 32U) ^ static_cast<std::uint64_t>(random_device());
-    const std::uint64_t clock_component = static_cast<std::uint64_t>(
-        std::chrono::steady_clock::now().time_since_epoch().count());
+    const std::uint64_t clock_component =
+        static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
     std::uint64_t nonce = random_component ^ clock_component;
     if (nonce == 0U) {
         nonce = 1U;
@@ -58,10 +58,27 @@ std::runtime_error status_error(const char* action, const frameshow::Status& sta
     return std::runtime_error(message);
 }
 
-} // namespace
+SourceFrameView source_view_from_inference_frame(const frameshow::InferenceFrameView& frame,
+                                                 const std::uint64_t session_nonce) {
+    return SourceFrameView{
+        frame.buffer_index,
+        LiveFrameId{session_nonce, frame.frame_id},
+        frame.buffer.data,
+        frame.buffer.pitch_bytes,
+        frame.buffer.width_px,
+        frame.buffer.height_px,
+        frame.buffer.ready_event,
+        to_live_region(frameshow::CaptureRegion{frame.buffer.x_px, frame.buffer.y_px, frame.buffer.width_px,
+                                                frame.buffer.height_px}),
+        frame.capture_ns,
+        frame.ready_ns,
+        frame.short_frame,
+    };
+}
 
-LiveVideoIngress::LiveVideoIngress(frameshow::CaptureConfig config)
-    : config_(std::move(config)) {}
+}  // namespace
+
+LiveVideoIngress::LiveVideoIngress(frameshow::CaptureConfig config) : config_(std::move(config)) {}
 
 LiveVideoIngress::~LiveVideoIngress() {
     try {
@@ -87,12 +104,9 @@ void LiveVideoIngress::start() {
     session_ = std::move(session);
     running_.store(true, std::memory_order_release);
     log_live_ingress_message(
-        "info",
-        "started capture on " + config_.device_path +
-            " region=" + std::to_string(config_.initial_region.x) + "," +
-            std::to_string(config_.initial_region.y) + "," +
-            std::to_string(config_.initial_region.width) + "x" +
-            std::to_string(config_.initial_region.height));
+        "info", "started capture on " + config_.device_path + " region=" + std::to_string(config_.initial_region.x) +
+                    "," + std::to_string(config_.initial_region.y) + "," +
+                    std::to_string(config_.initial_region.width) + "x" + std::to_string(config_.initial_region.height));
 }
 
 void LiveVideoIngress::stop() {
@@ -105,6 +119,7 @@ void LiveVideoIngress::stop() {
         }
         session = std::move(session_);
         running_.store(false, std::memory_order_release);
+        session->notify_inference_waiters();
     }
 
     const frameshow::Status status = session->stop();
@@ -140,23 +155,45 @@ bool LiveVideoIngress::try_acquire_latest_source(SourceFrameView* out) {
         throw status_error("failed to acquire latest live source frame", status);
     }
 
-    *out = SourceFrameView{
-        frame.buffer_index,
-        LiveFrameId{session_nonce_.load(std::memory_order_acquire), frame.frame_id},
-        frame.buffer.data,
-        frame.buffer.pitch_bytes,
-        frame.buffer.width_px,
-        frame.buffer.height_px,
-        frame.buffer.ready_event,
-        to_live_region(frameshow::CaptureRegion{frame.buffer.x_px,
-                                                frame.buffer.y_px,
-                                                frame.buffer.width_px,
-                                                frame.buffer.height_px}),
-        frame.capture_ns,
-        frame.ready_ns,
-        frame.short_frame,
-    };
+    *out = source_view_from_inference_frame(frame, session_nonce_.load(std::memory_order_acquire));
     return true;
+}
+
+bool LiveVideoIngress::wait_acquire_latest_source(SourceFrameView* out, const std::atomic<bool>& stop_requested) {
+    if (out == nullptr) {
+        throw std::runtime_error("live ingress requires a non-null source frame output");
+    }
+    *out = {};
+    if (!running()) {
+        return false;
+    }
+    frameshow::CaptureSession* session = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+        if (!session_ || !running_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        session = session_.get();
+    }
+
+    frameshow::InferenceFrameView frame{};
+    const frameshow::Status status = session->wait_acquire_latest_inference_frame(&frame, stop_requested);
+    if (status.code == frameshow::StatusCode::kNotReady) {
+        return false;
+    }
+    if (!status.ok()) {
+        throw status_error("failed to acquire latest live source frame", status);
+    }
+
+    *out = source_view_from_inference_frame(frame, session_nonce_.load(std::memory_order_acquire));
+    return true;
+}
+
+void LiveVideoIngress::notify_source_waiters() noexcept {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    if (session_ != nullptr) {
+        session_->notify_inference_waiters();
+    }
 }
 
 void LiveVideoIngress::release_source(std::uint32_t buffer_index) {
@@ -181,12 +218,9 @@ void LiveVideoIngress::set_capture_region(const LiveCaptureRegion& region) {
     if (!status.ok()) {
         throw status_error("failed to update live ingress capture region", status);
     }
-    log_live_ingress_message(
-        "info",
-        "updated capture region to " + std::to_string(region.x) + "," +
-            std::to_string(region.y) + "," +
-            std::to_string(region.width) + "x" +
-            std::to_string(region.height));
+    log_live_ingress_message("info", "updated capture region to " + std::to_string(region.x) + "," +
+                                         std::to_string(region.y) + "," + std::to_string(region.width) + "x" +
+                                         std::to_string(region.height));
 }
 
 LiveCaptureRegion LiveVideoIngress::snapshot_capture_region() const {
@@ -219,4 +253,4 @@ std::uint64_t LiveVideoIngress::session_nonce() const noexcept {
     return session_nonce_.load(std::memory_order_acquire);
 }
 
-} // namespace mmltk::live
+}  // namespace mmltk::live

@@ -12,18 +12,18 @@
 
 namespace Catch {
 #if !defined(CATCH_CONFIG_DISABLE_EXCEPTIONS)
-    void StartupExceptionRegistry::add( std::exception_ptr const& exception ) noexcept {
-        CATCH_TRY {
-            m_exceptions.push_back(exception);
-        } CATCH_CATCH_ALL {
-            // If we run out of memory during start-up there's really not a lot more we can do about it
-            std::terminate();
-        }
+void StartupExceptionRegistry::add(std::exception_ptr const& exception) noexcept {
+    CATCH_TRY {
+        m_exceptions.push_back(exception);
     }
+    CATCH_CATCH_ALL {
+        std::terminate();
+    }
+}
 
-    std::vector<std::exception_ptr> const& StartupExceptionRegistry::getExceptions() const noexcept {
-        return m_exceptions;
-    }
+std::vector<std::exception_ptr> const& StartupExceptionRegistry::getExceptions() const noexcept {
+    return m_exceptions;
+}
 #endif
 
-} // end namespace Catch
+}  // namespace Catch

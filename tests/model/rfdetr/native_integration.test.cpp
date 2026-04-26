@@ -5,14 +5,11 @@
 
 #include "support/catch2_compat.hpp"
 #include "support/filesystem_test_utils.hpp"
-#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 #include <sys/wait.h>
 #include <unistd.h>
@@ -27,33 +24,6 @@ using mmltk::rfdetr::testsupport::kParityFixtureNumClasses;
 using mmltk::rfdetr::testsupport::log_fixture_phase;
 using mmltk::rfdetr::testsupport::parity_fixture_cases;
 using mmltk::rfdetr::testsupport::write_minimal_upstream_checkpoint;
-
-class ScopedTempDir {
-public:
-    explicit ScopedTempDir(const char* name_prefix) {
-        std::string pattern = (fs::temp_directory_path() / (std::string(name_prefix) + ".XXXXXX")).string();
-        std::vector<char> writable(pattern.begin(), pattern.end());
-        writable.push_back('\0');
-        const char* created = ::mkdtemp(writable.data());
-        if (created == nullptr) {
-            throw std::runtime_error(std::string("mkdtemp failed: ") + std::strerror(errno));
-        }
-        path_ = fs::path(created);
-    }
-
-    ~ScopedTempDir() {
-        if (!path_.empty()) {
-            mmltk::testsupport::remove_path_recursively_best_effort(path_);
-        }
-    }
-
-    [[nodiscard]] const fs::path& path() const {
-        return path_;
-    }
-
-private:
-    fs::path path_;
-};
 
 fs::path mmltk_cli_path() {
     const fs::path cli_path = mmltk::testsupport::mmltk_cli_path();
@@ -109,12 +79,11 @@ void run_subprocess(const std::vector<std::string>& args) {
         if (exit_code == 127) {
             throw std::runtime_error("subprocess exec failed for command: " + command);
         }
-        throw std::runtime_error(
-            "subprocess exited with code " + std::to_string(exit_code) + ": " + command);
+        throw std::runtime_error("subprocess exited with code " + std::to_string(exit_code) + ": " + command);
     }
     if (WIFSIGNALED(status)) {
-        throw std::runtime_error(
-            "subprocess terminated by signal " + std::to_string(WTERMSIG(status)) + ": " + command);
+        throw std::runtime_error("subprocess terminated by signal " + std::to_string(WTERMSIG(status)) + ": " +
+                                 command);
     }
     throw std::runtime_error("subprocess ended unexpectedly: " + command);
 }
@@ -147,22 +116,17 @@ void assert_native_checkpoint(const fs::path& path, const char* expected_preset)
 }
 
 void test_native_rfdetr_cli_checkpoint_smoke() {
-    const ScopedTempDir temp_dir("mmltk_rfdetr_native_integration");
+    const mmltk::testsupport::ScopedTempDir temp_dir("mmltk_rfdetr_native_integration");
     const fs::path& root = temp_dir.path();
     const fs::path cli_path = mmltk_cli_path();
 
     const auto& fixtures = parity_fixture_cases();
     for (size_t index = 0; index < fixtures.size(); ++index) {
         const auto& fixture = fixtures[index];
-        log_fixture_phase(
-            "test_rfdetr_native_integration",
-            index + 1,
-            fixtures.size(),
-            "normalize",
-            fixture.preset_name);
+        log_fixture_phase("test_rfdetr_native_integration", index + 1, fixtures.size(), "normalize",
+                          fixture.preset_name);
         const fs::path upstream_path = root / "weights" / fixture.upstream_filename;
-        const fs::path native_path =
-            root / "weights" / (std::string(fixture.preset_name) + ".native.pt");
+        const fs::path native_path = root / "weights" / (std::string(fixture.preset_name) + ".native.pt");
 
         write_minimal_upstream_checkpoint(upstream_path, fixture);
         run_subprocess({
@@ -204,7 +168,9 @@ void test_native_rfdetr_cached_nano_export_pipeline() {
     });
 }
 
-} // namespace
+}  // namespace
 
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_integration][cli][integration]", test_native_rfdetr_cli_checkpoint_smoke);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_integration][cli][integration]", test_native_rfdetr_cached_nano_export_pipeline);
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_integration][cli][integration]",
+                         test_native_rfdetr_cli_checkpoint_smoke);
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][native_integration][cli][integration]",
+                         test_native_rfdetr_cached_nano_export_pipeline);

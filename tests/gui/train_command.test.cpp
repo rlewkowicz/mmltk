@@ -1,7 +1,7 @@
 #include "gui/train_command.h"
 #include "rfdetr/train_recipe.h"
 
-#include "mmltk/rfdetr/train.h"
+#include "mmltk/rfdetr/workflow_requests.h"
 
 #include <algorithm>
 #include "support/catch2_compat.hpp"
@@ -152,9 +152,8 @@ void test_resume_input_is_serialized_without_weights() {
 }
 
 void test_muon_recipe_defaults_are_resolved() {
-    const auto recipe = mmltk::rfdetr::resolve_train_recipe(
-        "rf-detr-seg-medium",
-        mmltk::rfdetr::TrainOptimizerKind::Muon);
+    const auto recipe =
+        mmltk::rfdetr::resolve_train_recipe("rf-detr-seg-medium", mmltk::rfdetr::TrainOptimizerKind::Muon);
     assert(mmltk::rfdetr::train_recipe_value_matches(recipe.lr, 2.0e-4));
     assert(mmltk::rfdetr::train_recipe_value_matches(recipe.lr_encoder, 3.0e-4));
     assert(mmltk::rfdetr::train_recipe_value_matches(recipe.momentum, 0.9));
@@ -171,8 +170,7 @@ void test_recipe_application_respects_overrides() {
     mmltk::rfdetr::TrainRecipeFieldOverrides overrides;
     overrides.lr = true;
     mmltk::rfdetr::apply_train_recipe(
-        options,
-        mmltk::rfdetr::resolve_train_recipe("rf-detr-medium", mmltk::rfdetr::TrainOptimizerKind::Muon),
+        options, mmltk::rfdetr::resolve_train_recipe("rf-detr-medium", mmltk::rfdetr::TrainOptimizerKind::Muon),
         overrides);
     assert(mmltk::rfdetr::train_recipe_value_matches(options.lr, 9.0e-4));
     assert(mmltk::rfdetr::train_recipe_value_matches(options.lr_encoder, 3.0e-4));
@@ -180,7 +178,7 @@ void test_recipe_application_respects_overrides() {
     assert(mmltk::rfdetr::train_recipe_value_matches(options.warmup_momentum, 0.8));
 }
 
-} // namespace
+}  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[gui][train_command]", test_single_device_builds_device_id);
 MMLTK_REGISTER_TEST_CASE("[gui][train_command]", test_multi_device_builds_device_ids);

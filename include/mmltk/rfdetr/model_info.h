@@ -22,4 +22,4 @@ struct ModelInfo {
     bool has_masks = false;
 };
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

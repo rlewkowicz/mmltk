@@ -23,14 +23,7 @@ struct PredictImageInput {
     int64_t image_id = 0;
 };
 
-struct PredictOptions : ModelArtifactRequest {
-    PredictSourceKind source_kind = PredictSourceKind::CompiledDataset;
-    std::filesystem::path compiled_path;
-    std::vector<PredictImageInput> image_inputs;
-    std::filesystem::path output_path;
-    std::string backend = "auto";
-    size_t batch_size = 1;
-    size_t max_dets_per_image = 500;
+struct PredictRuntimeConfig {
     int device_id = 0;
     int workers = 0;
     int lanes = 0;
@@ -39,6 +32,16 @@ struct PredictOptions : ModelArtifactRequest {
     bool allow_fp16 = true;
     bool progress_bar = true;
     CompilationMode compilation_mode = CompilationMode::kSelective;
+};
+
+struct PredictOptions : ModelArtifactRequest, PredictRuntimeConfig {
+    PredictSourceKind source_kind = PredictSourceKind::CompiledDataset;
+    std::filesystem::path compiled_path;
+    std::vector<PredictImageInput> image_inputs;
+    std::filesystem::path output_path;
+    std::string backend = "auto";
+    size_t batch_size = 1;
+    size_t max_dets_per_image = 500;
 };
 
 struct EvaluateOptions : ModelArtifactRequest {
@@ -86,4 +89,4 @@ void print_prediction_summary(const PredictOptions& options, const PredictionRun
 EvaluationRunResult run_evaluation(const EvaluateOptions& options);
 void print_evaluation_summary(const EvaluateOptions& options, const EvaluationRunResult& result);
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

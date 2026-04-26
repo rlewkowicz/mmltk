@@ -9,16 +9,16 @@
 #ifndef CATCH_LIFETIMEBOUND_HPP_INCLUDED
 #define CATCH_LIFETIMEBOUND_HPP_INCLUDED
 
-#if !defined( __has_cpp_attribute )
-#    define CATCH_ATTR_LIFETIMEBOUND
-#elif __has_cpp_attribute( msvc::lifetimebound )
-#    define CATCH_ATTR_LIFETIMEBOUND [[msvc::lifetimebound]]
-#elif __has_cpp_attribute( clang::lifetimebound )
-#    define CATCH_ATTR_LIFETIMEBOUND [[clang::lifetimebound]]
-#elif __has_cpp_attribute( lifetimebound )
-#    define CATCH_ATTR_LIFETIMEBOUND [[lifetimebound]]
+#if !defined(__has_cpp_attribute)
+#define CATCH_ATTR_LIFETIMEBOUND
+#elif __has_cpp_attribute(msvc::lifetimebound)
+#define CATCH_ATTR_LIFETIMEBOUND [[msvc::lifetimebound]]
+#elif __has_cpp_attribute(clang::lifetimebound)
+#define CATCH_ATTR_LIFETIMEBOUND [[clang::lifetimebound]]
+#elif __has_cpp_attribute(lifetimebound)
+#define CATCH_ATTR_LIFETIMEBOUND [[lifetimebound]]
 #else
-#    define CATCH_ATTR_LIFETIMEBOUND
+#define CATCH_ATTR_LIFETIMEBOUND
 #endif
 
-#endif // CATCH_LIFETIMEBOUND_HPP_INCLUDED
+#endif  // CATCH_LIFETIMEBOUND_HPP_INCLUDED

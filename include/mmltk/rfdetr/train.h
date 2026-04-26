@@ -13,52 +13,122 @@
 
 namespace mmltk::rfdetr {
 
-struct TrainOptions {
-    size_t batch_size = 1;
-    size_t val_batch_size = 0;
-    double lr = 1.0e-4;
-    double lr_encoder = 1.5e-4;
-    double lr_component_decay = 0.7;
-    double encoder_layer_decay = 0.8;
-    double momentum = 0.95;
-    double weight_decay = 1.0e-4;
-    double warmup_epochs = 0.0;
-    double warmup_momentum = 0.0;
-    double lr_min_factor = 0.0;
+struct TrainOptimizerTuningConfig : TrainHyperparameterConfig {
     double clip_max_norm = 0.1;
-    double ema_decay = 0.993;
-    size_t eval_max_dets = 500;
+};
+
+template <typename PathType, typename SizeType, typename OptimizerType>
+struct TrainRuntimeSharedConfig {
+    PathType train_compiled_path;
+    PathType val_compiled_path;
+    PathType test_compiled_path;
+    PathType weights_path;
+    PathType resume_path;
+    SizeType batch_size = static_cast<SizeType>(1);
+    SizeType val_batch_size = static_cast<SizeType>(0);
+    SizeType eval_max_dets = static_cast<SizeType>(500);
     std::string cpu_affinity;
     std::string lr_scheduler = "step";
-    std::filesystem::path train_compiled_path;
-    std::filesystem::path val_compiled_path;
-    std::filesystem::path test_compiled_path;
-    std::filesystem::path output_dir;
-    std::filesystem::path weights_path;
-    std::filesystem::path resume_path;
-    std::filesystem::path distributed_store_path;
-    std::vector<int> device_ids;
     int epochs = 1;
     int grad_accum_steps = 1;
     int lr_drop = 100;
-    int ema_tau = 100;
     int print_freq = 100;
     int prefetch_factor = 2;
     int seed = 42;
-    int device_id = 0;
     int workers = 0;
     int lanes = 0;
-    int distributed_rank = 0;
-    int distributed_world_size = 1;
     bool use_ema = false;
     bool amp = true;
     bool progress_bar = true;
+    bool freeze_encoder = false;
+    OptimizerType optimizer = OptimizerType{};
+};
+
+using TrainOptionsSharedConfig = TrainRuntimeSharedConfig<std::filesystem::path, std::size_t, TrainOptimizerKind>;
+
+struct TrainOptions : TrainOptimizerTuningConfig, TrainOptionsSharedConfig {
+    std::filesystem::path output_dir;
+    double ema_decay = 0.993;
+    std::filesystem::path distributed_store_path;
+    std::vector<int> device_ids;
+    int ema_tau = 100;
+    int device_id = 0;
+    int distributed_rank = 0;
+    int distributed_world_size = 1;
     bool fused_optimizer = true;
     bool distributed_worker = false;
-    bool freeze_encoder = false;
-    TrainOptimizerKind optimizer = TrainOptimizerKind::AdamW;
     CompilationMode compilation_mode = CompilationMode::kSelective;
 };
+
+[[nodiscard]] constexpr const char* train_optimizer_cli_value(const TrainOptimizerKind kind) noexcept {
+    switch (kind) {
+        case TrainOptimizerKind::AdamW:
+            return "adamw";
+        case TrainOptimizerKind::Muon:
+            return "muon";
+    }
+    return "adamw";
+}
+
+[[nodiscard]] constexpr int compilation_mode_index(const CompilationMode mode) noexcept {
+    switch (mode) {
+        case CompilationMode::kNone:
+            return 0;
+        case CompilationMode::kSelective:
+            return 1;
+        case CompilationMode::kFullTrace:
+            return 2;
+    }
+    return 1;
+}
+
+[[nodiscard]] constexpr CompilationMode compilation_mode_from_index(const int index) noexcept {
+    switch (index) {
+        case 0:
+            return CompilationMode::kNone;
+        case 1:
+            return CompilationMode::kSelective;
+        case 2:
+            return CompilationMode::kFullTrace;
+        default:
+            return CompilationMode::kSelective;
+    }
+}
+
+[[nodiscard]] constexpr const char* compilation_mode_cli_value(const CompilationMode mode) noexcept {
+    switch (mode) {
+        case CompilationMode::kNone:
+            return "none";
+        case CompilationMode::kSelective:
+            return "selective";
+        case CompilationMode::kFullTrace:
+            return "full";
+    }
+    return "selective";
+}
+
+[[nodiscard]] constexpr const char* compilation_mode_display_label(const CompilationMode mode) noexcept {
+    switch (mode) {
+        case CompilationMode::kNone:
+            return "None";
+        case CompilationMode::kSelective:
+            return "Selective";
+        case CompilationMode::kFullTrace:
+            return "Full";
+    }
+    return "Unknown";
+}
+
+[[nodiscard]] constexpr const char* compilation_mode_display_label_from_index(const int index) noexcept {
+    switch (index) {
+        case 0:
+        case 1:
+        case 2:
+            return compilation_mode_display_label(compilation_mode_from_index(index));
+        default:
+            return "Unknown";
+    }
+}
 
 struct TrainEpochSummary {
     int epoch = 0;
@@ -85,4 +155,4 @@ struct TrainRunResult {
 TrainRunResult run_training(const TrainOptions& options);
 void print_training_summary(const TrainOptions& options, const TrainRunResult& result);
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

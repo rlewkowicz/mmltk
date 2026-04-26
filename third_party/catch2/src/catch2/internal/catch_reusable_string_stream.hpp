@@ -17,41 +17,37 @@
 
 namespace Catch {
 
-    class ReusableStringStream : Detail::NonCopyable {
-        std::size_t m_index;
-        std::ostream* m_oss;
-    public:
-        ReusableStringStream();
-        ~ReusableStringStream();
+class ReusableStringStream : Detail::NonCopyable {
+    std::size_t m_index;
+    std::ostream* m_oss;
 
-        //! Returns the serialized state
-        std::string str() const;
-        //! Sets internal state to `str`
-        void str(std::string const& str);
+   public:
+    ReusableStringStream();
+    ~ReusableStringStream();
+
+    std::string str() const;
+    void str(std::string const& str);
 
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic push
-// Old versions of GCC do not understand -Wnonnull-compare
 #pragma GCC diagnostic ignored "-Wpragmas"
-// Streaming a function pointer triggers Waddress and Wnonnull-compare
-// on GCC, because it implicitly converts it to bool and then decides
-// that the check it uses (a? true : false) is tautological and cannot
-// be null...
 #pragma GCC diagnostic ignored "-Waddress"
 #pragma GCC diagnostic ignored "-Wnonnull-compare"
 #endif
 
-        template<typename T>
-        auto operator << ( T const& value ) -> ReusableStringStream& {
-            *m_oss << value;
-            return *this;
-        }
+    template <typename T>
+    auto operator<<(T const& value) -> ReusableStringStream& {
+        *m_oss << value;
+        return *this;
+    }
 
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
-        auto get() -> std::ostream& { return *m_oss; }
-    };
-}
+    auto get() -> std::ostream& {
+        return *m_oss;
+    }
+};
+}  // namespace Catch
 
-#endif // CATCH_REUSABLE_STRING_STREAM_HPP_INCLUDED
+#endif  // CATCH_REUSABLE_STRING_STREAM_HPP_INCLUDED

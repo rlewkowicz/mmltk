@@ -3,12 +3,11 @@
 
 function(add_command NAME)
   set(_args "")
-  # use ARGV* instead of ARGN, because ARGN splits arrays into multiple arguments
   math(EXPR _last_arg ${ARGC}-1)
   foreach(_n RANGE 1 ${_last_arg})
     set(_arg "${ARGV${_n}}")
     if(_arg MATCHES "[^-./:a-zA-Z0-9_]")
-      set(_args "${_args} [==[${_arg}]==]") # form a bracket_argument
+      set(_args "${_args} [==[${_arg}]==]")
     else()
       set(_args "${_args} ${_arg}")
     endif()
@@ -51,7 +50,6 @@ function(catch_discover_tests_impl)
     set(dl_paths_variable_name LD_LIBRARY_PATH)
   endif()
 
-  # Run test executable to get list of available tests
   if(NOT EXISTS "${_TEST_EXECUTABLE}")
     message(FATAL_ERROR
       "Specified test executable '${_TEST_EXECUTABLE}' does not exist"
@@ -86,13 +84,9 @@ function(catch_discover_tests_impl)
     )
   endif()
 
-  # Prepare reporter
   if(reporter)
     set(reporter_arg "--reporter ${reporter}")
 
-    # Run test executable to check whether reporter is available
-    # note that the use of --list-reporters is not the important part,
-    # we only want to check whether the execution succeeds with ${reporter_arg}
     execute_process(
       COMMAND ${_TEST_EXECUTOR} "${_TEST_EXECUTABLE}" ${spec} ${reporter_arg} --list-reporters
       OUTPUT_VARIABLE reporter_check_output
@@ -112,7 +106,6 @@ function(catch_discover_tests_impl)
     endif()
   endif()
 
-  # Prepare output dir
   if(output_dir AND NOT IS_ABSOLUTE ${output_dir})
     set(output_dir "${_TEST_WORKING_DIR}/${output_dir}")
     if(NOT EXISTS ${output_dir})
@@ -134,22 +127,18 @@ function(catch_discover_tests_impl)
     endforeach()
   endif()
 
-  # Parse JSON output for list of tests/class names/tags
   string(JSON version GET "${listing_output}" "version")
   if(NOT version STREQUAL "1")
     message(FATAL_ERROR "Unsupported catch output version: '${version}'")
   endif()
 
-  # Speed-up reparsing by cutting away unneeded parts of JSON.
   string(JSON test_listing GET "${listing_output}" "listings" "tests")
   string(JSON num_tests LENGTH "${test_listing}")
 
-  # Exit early if no tests are detected
   if(num_tests STREQUAL "0")
     return()
   endif()
 
-  # CMake's foreach-RANGE is inclusive, so we have to subtract 1
   math(EXPR num_tests "${num_tests} - 1")
 
   foreach(idx RANGE ${num_tests})
@@ -157,19 +146,15 @@ function(catch_discover_tests_impl)
     string(JSON test_tags GET "${single_test}" "tags")
     string(JSON plain_name GET "${single_test}" "name")
 
-    # Escape characters in test case names that would be parsed by Catch2
-    # Note that the \ escaping must happen FIRST! Do not change the order.
     set(escaped_name "${plain_name}")
     foreach(char \\ , [ ] ;)
       string(REPLACE ${char} "\\${char}" escaped_name "${escaped_name}")
     endforeach(char)
-    # ...add output dir
     if(output_dir)
       string(REGEX REPLACE "[^A-Za-z0-9_]" "_" escaped_name_clean "${escaped_name}")
       set(output_dir_arg "--out ${output_dir}/${output_prefix}${escaped_name_clean}${output_suffix}")
     endif()
 
-    # ...and add to script
     add_command(add_test
       "${prefix}${plain_name}${suffix}"
       ${_TEST_EXECUTOR}
@@ -193,13 +178,6 @@ function(catch_discover_tests_impl)
       if(num_tags GREATER_EQUAL "0")
         foreach(tag_idx RANGE ${num_tags})
           string(JSON a_tag GET "${test_tags}" "${tag_idx}")
-          # Catch2's tags can contain semicolons, which are list element separators
-          # in CMake, so we have to escape them. Ideally we could use the [=[...]=]
-          # syntax for this, but CTest currently keeps the square quotes in the label
-          # name. So we add 2 backslashes to escape it instead.
-          # **IMPORTANT**: The number of backslashes depends on how many layers
-          #                of CMake the tag goes. If this script is changed, the
-          #                number of backslashes to escape may change as well.
           string(REPLACE ";" "\\;" a_tag "${a_tag}")
           list(APPEND tag_list "${a_tag}")
         endforeach()
@@ -222,11 +200,8 @@ function(catch_discover_tests_impl)
     list(APPEND tests "${prefix}${plain_name}${suffix}")
   endforeach()
 
-  # Create a list of all discovered tests, which users may use to e.g. set
-  # properties on the tests
   add_command(set ${_TEST_LIST} ${tests})
 
-  # Write CTest script
   file(WRITE "${_CTEST_FILE}" "${script}")
 endfunction()
 

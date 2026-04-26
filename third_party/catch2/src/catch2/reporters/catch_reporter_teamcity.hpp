@@ -14,54 +14,51 @@
 #include <cstring>
 
 #ifdef __clang__
-#   pragma clang diagnostic push
-#   pragma clang diagnostic ignored "-Wpadded"
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wpadded"
 #endif
 
 namespace Catch {
 
-    class TeamCityReporter final : public StreamingReporterBase {
-    public:
-        TeamCityReporter( ReporterConfig&& _config )
-        :   StreamingReporterBase( CATCH_MOVE(_config) )
-        {
-            m_preferences.shouldRedirectStdOut = true;
-            m_preferences.shouldReportAllAssertionStarts = false;
-        }
+class TeamCityReporter final : public StreamingReporterBase {
+   public:
+    TeamCityReporter(ReporterConfig&& _config) : StreamingReporterBase(CATCH_MOVE(_config)) {
+        m_preferences.shouldRedirectStdOut = true;
+        m_preferences.shouldReportAllAssertionStarts = false;
+    }
 
-        ~TeamCityReporter() override;
+    ~TeamCityReporter() override;
 
-        static std::string getDescription() {
-            using namespace std::string_literals;
-            return "Reports test results as TeamCity service messages"s;
-        }
+    static std::string getDescription() {
+        using namespace std::string_literals;
+        return "Reports test results as TeamCity service messages"s;
+    }
 
-        void testRunStarting( TestRunInfo const& runInfo ) override;
-        void testRunEnded( TestRunStats const& runStats ) override;
+    void testRunStarting(TestRunInfo const& runInfo) override;
+    void testRunEnded(TestRunStats const& runStats) override;
 
+    void assertionEnded(AssertionStats const& assertionStats) override;
 
-        void assertionEnded(AssertionStats const& assertionStats) override;
+    void sectionStarting(SectionInfo const& sectionInfo) override {
+        m_headerPrintedForThisSection = false;
+        StreamingReporterBase::sectionStarting(sectionInfo);
+    }
 
-        void sectionStarting(SectionInfo const& sectionInfo) override {
-            m_headerPrintedForThisSection = false;
-            StreamingReporterBase::sectionStarting( sectionInfo );
-        }
+    void testCaseStarting(TestCaseInfo const& testInfo) override;
 
-        void testCaseStarting(TestCaseInfo const& testInfo) override;
+    void testCaseEnded(TestCaseStats const& testCaseStats) override;
 
-        void testCaseEnded(TestCaseStats const& testCaseStats) override;
+   private:
+    void printSectionHeader(std::ostream& os);
 
-    private:
-        void printSectionHeader(std::ostream& os);
+    bool m_headerPrintedForThisSection = false;
+    Timer m_testTimer;
+};
 
-        bool m_headerPrintedForThisSection = false;
-        Timer m_testTimer;
-    };
-
-} // end namespace Catch
+}  // namespace Catch
 
 #ifdef __clang__
-#   pragma clang diagnostic pop
+#pragma clang diagnostic pop
 #endif
 
-#endif // CATCH_REPORTER_TEAMCITY_HPP_INCLUDED
+#endif  // CATCH_REPORTER_TEAMCITY_HPP_INCLUDED

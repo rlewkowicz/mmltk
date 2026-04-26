@@ -1,5 +1,10 @@
 .git
-.docker-cache/
+!.docker-cache/
+.docker-cache/*
+!.docker-cache/cef/
+!.docker-cache/cef/.gitkeep
+!.docker-cache/cef/*.tar.bz2
+!.docker-cache/cef/*.sha256
 .claude
 
 # Build outputs
@@ -50,6 +55,10 @@ __pycache__/
 *.json
 *.jsonl
 !CMakePresets.json
+!src/browser/app/package.json
+!src/browser/app/package-lock.json
+!src/browser/app/tsconfig.json
+!src/browser/app/tsconfig.tests.json
 
 # Large archives
 *.tar
@@ -69,3 +78,8 @@ engines
 a.out
 imgui.ini
 gltests/
+cef/
+webgpu-samples/
+src/browser/app/dist/
+src/browser/app/node_modules/
+src/browser/app/.test-dist/

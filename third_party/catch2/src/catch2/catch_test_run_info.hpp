@@ -12,11 +12,11 @@
 
 namespace Catch {
 
-    struct TestRunInfo {
-        constexpr TestRunInfo(StringRef _name) : name(_name) {}
-        StringRef name;
-    };
+struct TestRunInfo {
+    constexpr TestRunInfo(StringRef _name) : name(_name) {}
+    StringRef name;
+};
 
-} // end namespace Catch
+}  // namespace Catch
 
-#endif // CATCH_TEST_RUN_INFO_HPP_INCLUDED
+#endif  // CATCH_TEST_RUN_INFO_HPP_INCLUDED

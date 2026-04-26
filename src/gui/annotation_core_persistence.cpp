@@ -28,11 +28,7 @@ constexpr std::string_view kAnnotationMaskFormat = "rle_row_major_start_length";
 constexpr std::string_view kAnnotationBackgroundAnnotationPolicy = "empty_jsonl_file";
 constexpr std::string_view kAnnotationMaskRleEncoding = "row_major_start_length";
 constexpr std::array<std::string_view, 5> kAnnotationShapeTypes{
-    "box",
-    "mask",
-    "spline",
-    "point",
-    "skeleton",
+    "box", "mask", "spline", "point", "skeleton",
 };
 
 AnnotationShapeType annotation_shape_type_from_name(const std::string_view shape_type_name) {
@@ -67,8 +63,7 @@ void validate_annotation_categories_meta(const json& meta) {
             throw std::runtime_error("annotation categories meta: unexpected `shape_types`");
         }
         for (std::size_t index = 0; index < kAnnotationShapeTypes.size(); ++index) {
-            if (!(*field)[index].is_string() ||
-                (*field)[index].get<std::string>() != kAnnotationShapeTypes[index]) {
+            if (!(*field)[index].is_string() || (*field)[index].get<std::string>() != kAnnotationShapeTypes[index]) {
                 throw std::runtime_error("annotation categories meta: unexpected `shape_types`");
             }
         }
@@ -83,8 +78,7 @@ void validate_annotation_categories_meta(const json& meta) {
 }
 
 bool all_digits(std::string_view value) {
-    return !value.empty() &&
-           std::ranges::all_of(value, [](const unsigned char ch) { return std::isdigit(ch) != 0; });
+    return !value.empty() && std::ranges::all_of(value, [](const unsigned char ch) { return std::isdigit(ch) != 0; });
 }
 
 std::uint32_t next_scene_index(const std::filesystem::path& split_dir) {
@@ -162,8 +156,7 @@ json serialize_annotation_shape_payload(const AnnotationFrame& frame, const Anno
     return std::visit(
         [&frame](const auto& shape) -> json {
             using T = std::decay_t<decltype(shape)>;
-            if constexpr (std::is_same_v<T, AnnotationBoxShape> ||
-                          std::is_same_v<T, AnnotationMaskShape>) {
+            if constexpr (std::is_same_v<T, AnnotationBoxShape> || std::is_same_v<T, AnnotationMaskShape>) {
                 return json{
                     {"box_xyxy", box_to_json(annotation_box_to_frame(frame, shape.box))},
                 };
@@ -238,10 +231,8 @@ std::optional<AnnotationBox> annotation_box_from_json(const json& value) {
     };
 }
 
-std::optional<AnnotationBox> frame_box_to_capture_box(const AnnotationBox& frame_box,
-                                                      const std::uint32_t view_x,
-                                                      const std::uint32_t view_y,
-                                                      const std::uint32_t capture_width,
+std::optional<AnnotationBox> frame_box_to_capture_box(const AnnotationBox& frame_box, const std::uint32_t view_x,
+                                                      const std::uint32_t view_y, const std::uint32_t capture_width,
                                                       const std::uint32_t capture_height) {
     return normalize_annotation_box(
         AnnotationBox{
@@ -250,38 +241,31 @@ std::optional<AnnotationBox> frame_box_to_capture_box(const AnnotationBox& frame
             frame_box.x2 + static_cast<int>(view_x),
             frame_box.y2 + static_cast<int>(view_y),
         },
-        capture_width,
-        capture_height);
+        capture_width, capture_height);
 }
 
 std::vector<std::uint8_t> trim_dense_mask_to_bbox(const std::vector<std::uint8_t>& dense_mask,
-                                                  const std::uint32_t image_width,
-                                                  const AnnotationBox& bbox) {
+                                                  const std::uint32_t image_width, const AnnotationBox& bbox) {
     const std::uint32_t trimmed_width = static_cast<std::uint32_t>(std::max(0, bbox.x2 - bbox.x1));
     const std::uint32_t trimmed_height = static_cast<std::uint32_t>(std::max(0, bbox.y2 - bbox.y1));
-    std::vector<std::uint8_t> trimmed(static_cast<std::size_t>(trimmed_width) *
-                                          static_cast<std::size_t>(trimmed_height),
-                                      0U);
+    std::vector<std::uint8_t> trimmed(
+        static_cast<std::size_t>(trimmed_width) * static_cast<std::size_t>(trimmed_height), 0U);
     for (std::uint32_t row = 0; row < trimmed_height; ++row) {
         const std::size_t src_offset =
             static_cast<std::size_t>(bbox.y1 + static_cast<int>(row)) * static_cast<std::size_t>(image_width) +
             static_cast<std::size_t>(bbox.x1);
-        const std::size_t dst_offset =
-            static_cast<std::size_t>(row) * static_cast<std::size_t>(trimmed_width);
-        std::copy_n(dense_mask.begin() + static_cast<std::ptrdiff_t>(src_offset),
-                    trimmed_width,
+        const std::size_t dst_offset = static_cast<std::size_t>(row) * static_cast<std::size_t>(trimmed_width);
+        std::copy_n(dense_mask.begin() + static_cast<std::ptrdiff_t>(src_offset), trimmed_width,
                     trimmed.begin() + static_cast<std::ptrdiff_t>(dst_offset));
     }
     return trimmed;
 }
 
-AnnotationObject annotation_object_from_scene_record(const json& record,
-                                                     AnnotationCategories* categories) {
+AnnotationObject annotation_object_from_scene_record(const json& record, AnnotationCategories* categories) {
     const auto fail = [](const std::string& message) -> void {
         throw std::runtime_error("annotation scene record: " + message);
     };
-    const auto required_array_field =
-        [&](const char* key, const std::size_t expected_size) -> const json& {
+    const auto required_array_field = [&](const char* key, const std::size_t expected_size) -> const json& {
         const auto it = record.find(key);
         if (it == record.end() || !it->is_array() || it->size() != expected_size) {
             fail("missing required array field `" + std::string(key) + "`");
@@ -297,8 +281,7 @@ AnnotationObject annotation_object_from_scene_record(const json& record,
     };
 
     const std::string class_name = record.value("class", std::string{});
-    const std::size_t category_index =
-        categories != nullptr ? ensure_annotation_category(*categories, class_name) : 0U;
+    const std::size_t category_index = categories != nullptr ? ensure_annotation_category(*categories, class_name) : 0U;
 
     const auto shape_type_it = record.find("shape_type");
     if (shape_type_it == record.end() || !shape_type_it->is_string()) {
@@ -322,214 +305,203 @@ AnnotationObject annotation_object_from_scene_record(const json& record,
     object.category_index = category_index;
 
     switch (shape_type) {
-    case AnnotationShapeType::Point: {
-        const json& shape_payload = required_shape_object();
-        const auto xy = shape_payload.find("xy");
-        if (xy == shape_payload.end()) {
-            fail("point record is missing `shape.xy`");
-        }
-        const std::optional<AnnotationPoint> point = annotation_point_from_json(*xy);
-        if (!point.has_value()) {
-            fail("point record has invalid `shape.xy`");
-        }
-        const AnnotationPoint point_value = point.value_or(AnnotationPoint{});
-        object.shape = AnnotationPointShape{
-            annotation_frame_point_to_capture_unclipped(point_value, view_x, view_y),
-        };
-        break;
-    }
-    case AnnotationShapeType::Spline: {
-        const json& shape_payload = required_shape_object();
-        const auto knots = shape_payload.find("knots");
-        if (knots == shape_payload.end() || !knots->is_array()) {
-            fail("spline record is missing array `shape.knots`");
-        }
-        AnnotationSplineShape spline;
-        spline.closed = shape_payload.value("closed", false);
-        spline.knots.reserve(knots->size());
-        for (const auto& knot_entry : *knots) {
-            if (!knot_entry.is_object()) {
-                fail("spline record contains a non-object knot");
+        case AnnotationShapeType::Point: {
+            const json& shape_payload = required_shape_object();
+            const auto xy = shape_payload.find("xy");
+            if (xy == shape_payload.end()) {
+                fail("point record is missing `shape.xy`");
             }
-            const auto knot_xy = knot_entry.find("xy");
-            if (knot_xy == knot_entry.end()) {
-                fail("spline knot is missing `xy`");
+            const std::optional<AnnotationPoint> point = annotation_point_from_json(*xy);
+            if (!point.has_value()) {
+                fail("point record has invalid `shape.xy`");
             }
-            const std::optional<AnnotationPoint> knot_point = annotation_point_from_json(*knot_xy);
-            if (!knot_point.has_value()) {
-                fail("spline knot has invalid `xy`");
+            const AnnotationPoint point_value = point.value_or(AnnotationPoint{});
+            object.shape = AnnotationPointShape{
+                annotation_frame_point_to_capture_unclipped(point_value, view_x, view_y),
+            };
+            break;
+        }
+        case AnnotationShapeType::Spline: {
+            const json& shape_payload = required_shape_object();
+            const auto knots = shape_payload.find("knots");
+            if (knots == shape_payload.end() || !knots->is_array()) {
+                fail("spline record is missing array `shape.knots`");
             }
-            const AnnotationPoint knot_point_value =
-                knot_point.value_or(AnnotationPoint{});
+            AnnotationSplineShape spline;
+            spline.closed = shape_payload.value("closed", false);
+            spline.knots.reserve(knots->size());
+            for (const auto& knot_entry : *knots) {
+                if (!knot_entry.is_object()) {
+                    fail("spline record contains a non-object knot");
+                }
+                const auto knot_xy = knot_entry.find("xy");
+                if (knot_xy == knot_entry.end()) {
+                    fail("spline knot is missing `xy`");
+                }
+                const std::optional<AnnotationPoint> knot_point = annotation_point_from_json(*knot_xy);
+                if (!knot_point.has_value()) {
+                    fail("spline knot has invalid `xy`");
+                }
+                const AnnotationPoint knot_point_value = knot_point.value_or(AnnotationPoint{});
 
-            AnnotationSplineKnot knot;
-            knot.position = annotation_frame_point_to_capture_unclipped(knot_point_value, view_x, view_y);
-            knot.handle_mode = annotation_spline_handle_mode_from_name(
-                knot_entry.value("handle_mode", std::string("corner")));
-            if (const auto in_handle = knot_entry.find("in_handle_xy");
-                in_handle != knot_entry.end()) {
-                const std::optional<AnnotationPoint> handle_point = annotation_point_from_json(*in_handle);
-                if (!handle_point.has_value()) {
-                    fail("spline knot has invalid `in_handle_xy`");
+                AnnotationSplineKnot knot;
+                knot.position = annotation_frame_point_to_capture_unclipped(knot_point_value, view_x, view_y);
+                knot.handle_mode =
+                    annotation_spline_handle_mode_from_name(knot_entry.value("handle_mode", std::string("corner")));
+                if (const auto in_handle = knot_entry.find("in_handle_xy"); in_handle != knot_entry.end()) {
+                    const std::optional<AnnotationPoint> handle_point = annotation_point_from_json(*in_handle);
+                    if (!handle_point.has_value()) {
+                        fail("spline knot has invalid `in_handle_xy`");
+                    }
+                    const AnnotationPoint handle_point_value = handle_point.value_or(AnnotationPoint{});
+                    knot.in_handle.position =
+                        annotation_frame_point_to_capture_unclipped(handle_point_value, view_x, view_y);
+                    knot.in_handle.enabled = true;
                 }
-                const AnnotationPoint handle_point_value =
-                    handle_point.value_or(AnnotationPoint{});
-                knot.in_handle.position =
-                    annotation_frame_point_to_capture_unclipped(handle_point_value, view_x, view_y);
-                knot.in_handle.enabled = true;
-            }
-            if (const auto out_handle = knot_entry.find("out_handle_xy");
-                out_handle != knot_entry.end()) {
-                const std::optional<AnnotationPoint> handle_point = annotation_point_from_json(*out_handle);
-                if (!handle_point.has_value()) {
-                    fail("spline knot has invalid `out_handle_xy`");
+                if (const auto out_handle = knot_entry.find("out_handle_xy"); out_handle != knot_entry.end()) {
+                    const std::optional<AnnotationPoint> handle_point = annotation_point_from_json(*out_handle);
+                    if (!handle_point.has_value()) {
+                        fail("spline knot has invalid `out_handle_xy`");
+                    }
+                    const AnnotationPoint handle_point_value = handle_point.value_or(AnnotationPoint{});
+                    knot.out_handle.position =
+                        annotation_frame_point_to_capture_unclipped(handle_point_value, view_x, view_y);
+                    knot.out_handle.enabled = true;
                 }
-                const AnnotationPoint handle_point_value =
-                    handle_point.value_or(AnnotationPoint{});
-                knot.out_handle.position =
-                    annotation_frame_point_to_capture_unclipped(handle_point_value, view_x, view_y);
-                knot.out_handle.enabled = true;
+                spline.knots.push_back(knot);
             }
-            spline.knots.push_back(knot);
+            object.shape = std::move(spline);
+            break;
         }
-        object.shape = std::move(spline);
-        break;
-    }
-    case AnnotationShapeType::Skeleton: {
-        const json& shape_payload = required_shape_object();
-        const auto nodes = shape_payload.find("nodes");
-        if (nodes == shape_payload.end() || !nodes->is_array()) {
-            fail("skeleton record is missing array `shape.nodes`");
-        }
-        const auto edges = shape_payload.find("edges");
-        if (edges == shape_payload.end() || !edges->is_array()) {
-            fail("skeleton record is missing array `shape.edges`");
-        }
-        AnnotationSkeletonShape skeleton;
-        skeleton.nodes.reserve(nodes->size());
-        for (const auto& node_entry : *nodes) {
-            if (!node_entry.is_object()) {
-                fail("skeleton record contains a non-object node");
+        case AnnotationShapeType::Skeleton: {
+            const json& shape_payload = required_shape_object();
+            const auto nodes = shape_payload.find("nodes");
+            if (nodes == shape_payload.end() || !nodes->is_array()) {
+                fail("skeleton record is missing array `shape.nodes`");
             }
-            const auto node_xy = node_entry.find("xy");
-            if (node_xy == node_entry.end()) {
-                fail("skeleton node is missing `xy`");
+            const auto edges = shape_payload.find("edges");
+            if (edges == shape_payload.end() || !edges->is_array()) {
+                fail("skeleton record is missing array `shape.edges`");
             }
-            const std::optional<AnnotationPoint> node_point = annotation_point_from_json(*node_xy);
-            if (!node_point.has_value()) {
-                fail("skeleton node has invalid `xy`");
-            }
-            const AnnotationPoint node_point_value =
-                node_point.value_or(AnnotationPoint{});
-            const auto key = node_entry.find("key");
-            if (key == node_entry.end() || !key->is_string()) {
-                fail("skeleton node is missing string `key`");
-            }
-            skeleton.nodes.push_back(AnnotationSkeletonNode{
-                key->get<std::string>(),
-                annotation_frame_point_to_capture_unclipped(node_point_value, view_x, view_y),
-                node_entry.value("visible", true),
-            });
-        }
-        skeleton.edges.reserve(edges->size());
-        for (const auto& edge_entry : *edges) {
-            if (!edge_entry.is_array() || edge_entry.size() != 2U) {
-                fail("skeleton edge must contain exactly two indices");
-            }
-            skeleton.edges.push_back(AnnotationSkeletonEdge{
-                edge_entry.at(0).get<std::size_t>(),
-                edge_entry.at(1).get<std::size_t>(),
-            });
-        }
-        object.shape = std::move(skeleton);
-        if (categories != nullptr && object.category_index < categories->items.size()) {
-            AnnotationCategory& category = categories->items[object.category_index];
-            if (category.keypoints.empty()) {
-                category.keypoints.reserve(std::get<AnnotationSkeletonShape>(object.shape).nodes.size());
-                for (const AnnotationSkeletonNode& node : std::get<AnnotationSkeletonShape>(object.shape).nodes) {
-                    category.keypoints.push_back(node.key);
+            AnnotationSkeletonShape skeleton;
+            skeleton.nodes.reserve(nodes->size());
+            for (const auto& node_entry : *nodes) {
+                if (!node_entry.is_object()) {
+                    fail("skeleton record contains a non-object node");
                 }
+                const auto node_xy = node_entry.find("xy");
+                if (node_xy == node_entry.end()) {
+                    fail("skeleton node is missing `xy`");
+                }
+                const std::optional<AnnotationPoint> node_point = annotation_point_from_json(*node_xy);
+                if (!node_point.has_value()) {
+                    fail("skeleton node has invalid `xy`");
+                }
+                const AnnotationPoint node_point_value = node_point.value_or(AnnotationPoint{});
+                const auto key = node_entry.find("key");
+                if (key == node_entry.end() || !key->is_string()) {
+                    fail("skeleton node is missing string `key`");
+                }
+                skeleton.nodes.push_back(AnnotationSkeletonNode{
+                    key->get<std::string>(),
+                    annotation_frame_point_to_capture_unclipped(node_point_value, view_x, view_y),
+                    node_entry.value("visible", true),
+                });
             }
-            if (category.skeleton_edges.empty()) {
-                category.skeleton_edges.reserve(std::get<AnnotationSkeletonShape>(object.shape).edges.size());
-                for (const AnnotationSkeletonEdge& edge : std::get<AnnotationSkeletonShape>(object.shape).edges) {
-                    category.skeleton_edges.push_back(AnnotationCategorySkeletonEdge{
-                        edge.source_index,
-                        edge.target_index,
-                    });
+            skeleton.edges.reserve(edges->size());
+            for (const auto& edge_entry : *edges) {
+                if (!edge_entry.is_array() || edge_entry.size() != 2U) {
+                    fail("skeleton edge must contain exactly two indices");
+                }
+                skeleton.edges.push_back(AnnotationSkeletonEdge{
+                    edge_entry.at(0).get<std::size_t>(),
+                    edge_entry.at(1).get<std::size_t>(),
+                });
+            }
+            object.shape = std::move(skeleton);
+            if (categories != nullptr && object.category_index < categories->items.size()) {
+                AnnotationCategory& category = categories->items[object.category_index];
+                if (category.keypoints.empty()) {
+                    category.keypoints.reserve(std::get<AnnotationSkeletonShape>(object.shape).nodes.size());
+                    for (const AnnotationSkeletonNode& node : std::get<AnnotationSkeletonShape>(object.shape).nodes) {
+                        category.keypoints.push_back(node.key);
+                    }
+                }
+                if (category.skeleton_edges.empty()) {
+                    category.skeleton_edges.reserve(std::get<AnnotationSkeletonShape>(object.shape).edges.size());
+                    for (const AnnotationSkeletonEdge& edge : std::get<AnnotationSkeletonShape>(object.shape).edges) {
+                        category.skeleton_edges.push_back(AnnotationCategorySkeletonEdge{
+                            edge.source_index,
+                            edge.target_index,
+                        });
+                    }
                 }
             }
+            break;
         }
-        break;
-    }
-    case AnnotationShapeType::Mask: {
-        const json& shape_payload = required_shape_object();
-        const auto shape_box_xyxy = shape_payload.find("box_xyxy");
-        if (shape_box_xyxy == shape_payload.end()) {
-            fail("mask record is missing `shape.box_xyxy`");
+        case AnnotationShapeType::Mask: {
+            const json& shape_payload = required_shape_object();
+            const auto shape_box_xyxy = shape_payload.find("box_xyxy");
+            if (shape_box_xyxy == shape_payload.end()) {
+                fail("mask record is missing `shape.box_xyxy`");
+            }
+            const std::optional<AnnotationBox> shape_frame_box = annotation_box_from_json(*shape_box_xyxy);
+            if (!shape_frame_box.has_value()) {
+                fail("mask record has invalid `shape.box_xyxy`");
+            }
+            const AnnotationBox shape_frame_box_value = shape_frame_box.value_or(AnnotationBox{});
+            const std::optional<AnnotationBox> shape_capture_box =
+                frame_box_to_capture_box(shape_frame_box_value, view_x, view_y, capture_width, capture_height);
+            if (!shape_capture_box.has_value()) {
+                fail("mask shape box falls outside the declared capture bounds");
+            }
+            const AnnotationBox shape_capture_box_value = shape_capture_box.value_or(AnnotationBox{});
+            const auto mask_rle = record.find("mask_rle");
+            if (mask_rle == record.end() || !mask_rle->is_string()) {
+                fail("mask record is missing string `mask_rle`");
+            }
+            const auto mask_rle_encoding = record.find("mask_rle_encoding");
+            if (mask_rle_encoding == record.end() || !mask_rle_encoding->is_string() ||
+                mask_rle_encoding->get<std::string>() != kAnnotationMaskRleEncoding) {
+                fail("mask record is missing `mask_rle_encoding` value `" + std::string(kAnnotationMaskRleEncoding) +
+                     "`");
+            }
+            const std::vector<std::uint8_t> dense_mask =
+                decode_annotation_mask_rle(mask_rle->get<std::string>(), image_width, image_height);
+            object.shape = AnnotationMaskShape{
+                shape_capture_box_value,
+                AnnotationMaskRegion{
+                    static_cast<std::uint32_t>(shape_capture_box_value.x1),
+                    static_cast<std::uint32_t>(shape_capture_box_value.y1),
+                    static_cast<std::uint32_t>(std::max(0, shape_capture_box_value.x2 - shape_capture_box_value.x1)),
+                    static_cast<std::uint32_t>(std::max(0, shape_capture_box_value.y2 - shape_capture_box_value.y1)),
+                },
+                trim_dense_mask_to_bbox(dense_mask, image_width, shape_frame_box_value),
+                0U,
+                std::nullopt,
+            };
+            break;
         }
-        const std::optional<AnnotationBox> shape_frame_box =
-            annotation_box_from_json(*shape_box_xyxy);
-        if (!shape_frame_box.has_value()) {
-            fail("mask record has invalid `shape.box_xyxy`");
+        case AnnotationShapeType::Box: {
+            const json& shape_payload = required_shape_object();
+            const auto shape_box_xyxy = shape_payload.find("box_xyxy");
+            if (shape_box_xyxy == shape_payload.end()) {
+                fail("box record is missing `shape.box_xyxy`");
+            }
+            const std::optional<AnnotationBox> shape_frame_box = annotation_box_from_json(*shape_box_xyxy);
+            if (!shape_frame_box.has_value()) {
+                fail("box record has invalid `shape.box_xyxy`");
+            }
+            const AnnotationBox shape_frame_box_value = shape_frame_box.value_or(AnnotationBox{});
+            const std::optional<AnnotationBox> shape_capture_box =
+                frame_box_to_capture_box(shape_frame_box_value, view_x, view_y, capture_width, capture_height);
+            if (!shape_capture_box.has_value()) {
+                fail("box shape box falls outside the declared capture bounds");
+            }
+            const AnnotationBox shape_capture_box_value = shape_capture_box.value_or(AnnotationBox{});
+            object.shape = AnnotationBoxShape{shape_capture_box_value};
+            break;
         }
-        const AnnotationBox shape_frame_box_value =
-            shape_frame_box.value_or(AnnotationBox{});
-        const std::optional<AnnotationBox> shape_capture_box =
-            frame_box_to_capture_box(shape_frame_box_value, view_x, view_y, capture_width, capture_height);
-        if (!shape_capture_box.has_value()) {
-            fail("mask shape box falls outside the declared capture bounds");
-        }
-        const AnnotationBox shape_capture_box_value =
-            shape_capture_box.value_or(AnnotationBox{});
-        const auto mask_rle = record.find("mask_rle");
-        if (mask_rle == record.end() || !mask_rle->is_string()) {
-            fail("mask record is missing string `mask_rle`");
-        }
-        const auto mask_rle_encoding = record.find("mask_rle_encoding");
-        if (mask_rle_encoding == record.end() || !mask_rle_encoding->is_string() ||
-            mask_rle_encoding->get<std::string>() != kAnnotationMaskRleEncoding) {
-            fail("mask record is missing `mask_rle_encoding` value `" + std::string(kAnnotationMaskRleEncoding) + "`");
-        }
-        const std::vector<std::uint8_t> dense_mask =
-            decode_annotation_mask_rle(mask_rle->get<std::string>(), image_width, image_height);
-        object.shape = AnnotationMaskShape{
-            shape_capture_box_value,
-            AnnotationMaskRegion{
-                static_cast<std::uint32_t>(shape_capture_box_value.x1),
-                static_cast<std::uint32_t>(shape_capture_box_value.y1),
-                static_cast<std::uint32_t>(std::max(0, shape_capture_box_value.x2 - shape_capture_box_value.x1)),
-                static_cast<std::uint32_t>(std::max(0, shape_capture_box_value.y2 - shape_capture_box_value.y1)),
-            },
-            trim_dense_mask_to_bbox(dense_mask, image_width, shape_frame_box_value),
-            0U,
-            std::nullopt,
-        };
-        break;
-    }
-    case AnnotationShapeType::Box: {
-        const json& shape_payload = required_shape_object();
-        const auto shape_box_xyxy = shape_payload.find("box_xyxy");
-        if (shape_box_xyxy == shape_payload.end()) {
-            fail("box record is missing `shape.box_xyxy`");
-        }
-        const std::optional<AnnotationBox> shape_frame_box =
-            annotation_box_from_json(*shape_box_xyxy);
-        if (!shape_frame_box.has_value()) {
-            fail("box record has invalid `shape.box_xyxy`");
-        }
-        const AnnotationBox shape_frame_box_value =
-            shape_frame_box.value_or(AnnotationBox{});
-        const std::optional<AnnotationBox> shape_capture_box =
-            frame_box_to_capture_box(shape_frame_box_value, view_x, view_y, capture_width, capture_height);
-        if (!shape_capture_box.has_value()) {
-            fail("box shape box falls outside the declared capture bounds");
-        }
-        const AnnotationBox shape_capture_box_value =
-            shape_capture_box.value_or(AnnotationBox{});
-        object.shape = AnnotationBoxShape{shape_capture_box_value};
-        break;
-    }
     }
 
     return object;
@@ -546,7 +518,7 @@ std::string normalized_path_string(const std::filesystem::path& path) {
     }
 }
 
-} // namespace
+}  // namespace
 
 AnnotationCategories load_annotation_categories(const std::filesystem::path& output_root) {
     AnnotationCategories categories;
@@ -601,19 +573,17 @@ AnnotationCategories load_annotation_categories(const std::filesystem::path& out
 }
 
 std::size_t ensure_annotation_category(AnnotationCategories& categories, const std::string& class_name) {
-    const auto found = std::ranges::find_if(categories.items, [&](const AnnotationCategory& item) {
-        return item.name == class_name;
-    });
+    const auto found =
+        std::ranges::find_if(categories.items, [&](const AnnotationCategory& item) { return item.name == class_name; });
     if (found != categories.items.end()) {
         return static_cast<std::size_t>(std::distance(categories.items.begin(), found));
     }
     const int next_id = categories.items.empty() ? 1 : categories.items.back().id + 1;
-    categories.items.push_back(AnnotationCategory{next_id, class_name});
+    categories.items.emplace_back(next_id, class_name);
     return categories.items.size() - 1U;
 }
 
-void write_annotation_categories(const std::filesystem::path& output_root,
-                                 const AnnotationCategories& categories) {
+void write_annotation_categories(const std::filesystem::path& output_root, const AnnotationCategories& categories) {
     std::filesystem::create_directories(output_root);
     json payload;
     payload["meta"] = {
@@ -672,9 +642,7 @@ std::vector<AnnotationObject> load_annotation_scene_objects(const std::filesyste
 }
 
 std::optional<std::vector<AnnotationObject>> load_saved_annotation_scene_for_frame(
-    const std::filesystem::path& output_root,
-    const AnnotationFrame& frame,
-    AnnotationCategories* categories) {
+    const std::filesystem::path& output_root, const AnnotationFrame& frame, AnnotationCategories* categories) {
     const std::filesystem::path manifest_path = output_root / "manifests" / "scenes.jsonl";
     if (!std::filesystem::exists(manifest_path)) {
         return std::nullopt;
@@ -699,16 +667,14 @@ std::optional<std::vector<AnnotationObject>> load_saved_annotation_scene_for_fra
         if (frame_id != frame.frame_id) {
             continue;
         }
-        if (!target_source_path.empty() &&
-            normalized_path_string(source_path) != target_source_path) {
+        if (!target_source_path.empty() && normalized_path_string(source_path) != target_source_path) {
             continue;
         }
         const std::uint32_t scene_index = entry.value("scene_index", 0U);
         if (scene_index < best_scene_index) {
             continue;
         }
-        const std::filesystem::path relative_scene_jsonl =
-            entry.value("scene_jsonl", std::string{});
+        const std::filesystem::path relative_scene_jsonl = entry.value("scene_jsonl", std::string{});
         if (relative_scene_jsonl.empty()) {
             continue;
         }
@@ -722,11 +688,9 @@ std::optional<std::vector<AnnotationObject>> load_saved_annotation_scene_for_fra
     return load_annotation_scene_objects(best_scene_jsonl_path, categories);
 }
 
-AnnotationSaveResult save_annotation_scene(const AnnotationSaveConfig& config,
-                                           const AnnotationFrame& frame,
+AnnotationSaveResult save_annotation_scene(const AnnotationSaveConfig& config, const AnnotationFrame& frame,
                                            AnnotationCategories& categories,
-                                           const std::vector<AnnotationObject>& objects,
-                                           const bool live_mode,
+                                           const std::vector<AnnotationObject>& objects, const bool live_mode,
                                            const AnnotationProjectedScene* projected_scene) {
     if (config.output_root.empty()) {
         throw std::runtime_error("annotation output root must not be empty");
@@ -795,11 +759,8 @@ AnnotationSaveResult save_annotation_scene(const AnnotationSaveConfig& config,
             std::filesystem::create_directories(class_dir);
             const auto suffix = std::format("{:06}_{:03}.png", scene_index, index + 1U);
             const std::filesystem::path entity_path = class_dir / (config.split + "_" + suffix);
-            write_annotation_png(entity_path,
-                                 static_cast<int>(resolved.crop_width),
-                                 static_cast<int>(resolved.crop_height),
-                                 4,
-                                 resolved.crop_rgba.data(),
+            write_annotation_png(entity_path, static_cast<int>(resolved.crop_width),
+                                 static_cast<int>(resolved.crop_height), 4, resolved.crop_rgba.data(),
                                  static_cast<int>(resolved.crop_width * 4U));
             result.entity_paths.push_back(entity_path);
 
@@ -836,4 +797,4 @@ AnnotationSaveResult save_annotation_scene(const AnnotationSaveConfig& config,
     return result;
 }
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

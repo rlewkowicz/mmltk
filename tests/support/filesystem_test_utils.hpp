@@ -1,48 +1,45 @@
 #pragma once
 
-#include <dirent.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include "../../src/filesystem_utils.h"
 
+#include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace mmltk::testsupport {
 
-inline void remove_path_recursively_best_effort(const std::filesystem::path& path) {
-    namespace fs = std::filesystem;
+using mmltk::filesystem_utils::remove_path_recursively_best_effort;
 
-    std::error_code exists_error;
-    if (!fs::exists(path, exists_error) || exists_error) {
-        return;
-    }
-
-    const std::string native = path.string();
-    struct stat status {};
-    if (::lstat(native.c_str(), &status) != 0) {
-        return;
-    }
-    if (!S_ISDIR(status.st_mode) || S_ISLNK(status.st_mode)) {
-        (void)::unlink(native.c_str());
-        return;
-    }
-
-    DIR* directory = ::opendir(native.c_str());
-    if (directory == nullptr) {
-        (void)::rmdir(native.c_str());
-        return;
-    }
-
-    while (dirent* entry = ::readdir(directory)) {
-        const char* name = entry->d_name;
-        if (std::strcmp(name, ".") == 0 || std::strcmp(name, "..") == 0) {
-            continue;
+class ScopedTempDir {
+   public:
+    explicit ScopedTempDir(const char* name_prefix) {
+        std::string pattern =
+            (std::filesystem::temp_directory_path() / (std::string(name_prefix) + ".XXXXXX")).string();
+        std::vector<char> writable(pattern.begin(), pattern.end());
+        writable.push_back('\0');
+        const char* created = ::mkdtemp(writable.data());
+        if (created == nullptr) {
+            throw std::runtime_error(std::string("mkdtemp failed: ") + std::strerror(errno));
         }
-        remove_path_recursively_best_effort(path / name);
+        path_ = std::filesystem::path(created);
     }
-    (void)::closedir(directory);
-    (void)::rmdir(native.c_str());
-}
 
-} // namespace mmltk::testsupport
+    ~ScopedTempDir() {
+        if (!path_.empty()) {
+            remove_path_recursively_best_effort(path_);
+        }
+    }
+
+    [[nodiscard]] const std::filesystem::path& path() const {
+        return path_;
+    }
+
+   private:
+    std::filesystem::path path_;
+};
+
+}  // namespace mmltk::testsupport

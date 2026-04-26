@@ -3,6 +3,8 @@
 #include "gui/annotation/common.h"
 #include "gui/canvas_layers.h"
 
+#include <optional>
+
 namespace mmltk::gui {
 
 struct AnnotationCanvasState {
@@ -47,23 +49,26 @@ struct AnnotationCanvasLayout {
     CanvasViewport viewport{};
 };
 
-float clamp_annotation_canvas_pan_axis(float pan,
-                                       float image_extent,
-                                       float viewport_extent);
+struct AnnotationCanvasViewportCommit {
+    double center_x = 0.0;
+    double center_y = 0.0;
+    double zoom = 1.0;
+    std::optional<AnnotationBox> focus_frame_box;
+};
+
+float clamp_annotation_canvas_pan_axis(float pan, float image_extent, float viewport_extent);
 
 AnnotationCanvasLayout build_annotation_canvas_layout(const AnnotationFrame& frame,
                                                       const AnnotationCanvasLayoutInput& input);
 
 AnnotationCanvasState annotation_canvas_fit_state(const AnnotationCanvasLayout& layout);
 AnnotationCanvasState annotation_canvas_one_to_one_state() noexcept;
-AnnotationCanvasState annotation_canvas_zoom_around_point(const AnnotationCanvasLayout& layout,
-                                                          float new_scale,
-                                                          float anchor_screen_x,
-                                                          float anchor_screen_y);
-AnnotationCanvasState annotation_canvas_pan_by_delta(const AnnotationCanvasLayout& layout,
-                                                     float delta_x,
+AnnotationCanvasState annotation_canvas_zoom_around_point(const AnnotationCanvasLayout& layout, float new_scale,
+                                                          float anchor_screen_x, float anchor_screen_y);
+AnnotationCanvasState annotation_canvas_pan_by_delta(const AnnotationCanvasLayout& layout, float delta_x,
                                                      float delta_y);
-AnnotationCanvasState annotation_canvas_focus_box(const AnnotationCanvasLayout& layout,
-                                                  const AnnotationBox& frame_box);
+AnnotationCanvasState annotation_canvas_focus_box(const AnnotationCanvasLayout& layout, const AnnotationBox& frame_box);
+AnnotationCanvasState annotation_canvas_apply_viewport_commit(const AnnotationCanvasLayout& layout,
+                                                              const AnnotationCanvasViewportCommit& commit);
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

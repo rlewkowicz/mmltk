@@ -1,0 +1,81 @@
+@use "tokens" as *;
+@use "mixins" as *;
+
+@include emit-theme-vars;
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  background: var(--page-bg);
+  color: var(--text-0);
+}
+
+body {
+  min-height: 100vh;
+}
+
+button,
+input,
+select,
+pre,
+code {
+  font: inherit;
+}
+
+button {
+  @include control-surface($border: var(--control-accent-border));
+  @include surface-transition;
+
+  padding: 0.55rem 0.72rem;
+  cursor: pointer;
+
+  &:hover:not(:disabled) {
+    border-color: var(--control-hover-border);
+    background: var(--control-fill-hover);
+    box-shadow: var(--control-hover-shadow);
+  }
+
+  &:focus-visible {
+    outline: none;
+    @include focus-ring(primary);
+  }
+
+  &:disabled {
+    opacity: 0.46;
+    cursor: default;
+    border-color: var(--control-disabled-border);
+    background: var(--control-disabled-fill);
+    box-shadow: none;
+  }
+
+  &[data-active="true"] {
+    @include selected-surface(primary, lime);
+  }
+}
+
+input,
+select {
+  @include control-surface($fill: var(--control-fill));
+  @include surface-transition;
+
+  width: 100%;
+  padding: 0.55rem 0.65rem;
+  outline: none;
+
+  &:focus {
+    @include focus-ring(primary);
+  }
+}
+
+input[type="checkbox"] {
+  width: 1.05rem;
+  height: 1.05rem;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--accent-0);
+}

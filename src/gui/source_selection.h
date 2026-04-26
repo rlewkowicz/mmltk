@@ -43,12 +43,9 @@ struct SourceSelectionUiActions {
 const char* source_kind_label(SourceKind kind);
 ResolvedVideoCrop resolve_video_crop(const SourceSelectionState& state);
 std::string describe_source(const SourceSelectionState& state);
-SourceSelectionUiActions draw_source_selection(SourceSelectionState& state,
-                                               const char* id,
-                                               bool allow_compiled_dataset = true,
-                                               bool allow_single_image = false,
-                                               bool allow_image_folder = true,
-                                               bool allow_video_stream = true,
+SourceSelectionUiActions draw_source_selection(SourceSelectionState& state, const char* id,
+                                               bool allow_compiled_dataset = true, bool allow_single_image = false,
+                                               bool allow_image_folder = true, bool allow_video_stream = true,
                                                bool single_image_browse_busy = false);
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

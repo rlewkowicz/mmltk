@@ -7,14 +7,9 @@
 
 namespace mmltk::gui {
 
-inline constexpr std::string_view kDefaultGuiPresetName =
-    "rf-detr-seg-medium";
+inline constexpr std::string_view kDefaultGuiPresetName = "rf-detr-seg-medium";
 
-void apply_default_gui_state(std::string& selected_preset_name,
-                             TrainViewState& train,
-                             ValidateViewState& validate,
-                             PredictViewState& predict,
-                             AnnotateViewState& annotate,
-                             ExportViewState& export_state);
+void apply_default_gui_state(std::string& selected_preset_name, TrainViewState& train, ValidateViewState& validate,
+                             PredictViewState& predict, AnnotateViewState& annotate, ExportViewState& export_state);
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

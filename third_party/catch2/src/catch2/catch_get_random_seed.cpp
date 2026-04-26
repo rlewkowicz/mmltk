@@ -12,7 +12,7 @@
 #include <catch2/catch_config.hpp>
 
 namespace Catch {
-    std::uint32_t getSeed() {
-        return getCurrentContext().getConfig()->rngSeed();
-    }
+std::uint32_t getSeed() {
+    return getCurrentContext().getConfig()->rngSeed();
 }
+}  // namespace Catch

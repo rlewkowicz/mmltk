@@ -14,7 +14,6 @@
 #include <catch2/internal/catch_stringref.hpp>
 #include <catch2/internal/catch_unique_ptr.hpp>
 
-
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -26,117 +25,84 @@
 
 namespace Catch {
 
-    /**
-     * A **view** of a tag string that provides case insensitive comparisons
-     *
-     * Note that in Catch2 internals, the square brackets around tags are
-     * not a part of tag's representation, so e.g. "[cool-tag]" is represented
-     * as "cool-tag" internally.
-     */
-    struct Tag {
-        constexpr Tag(StringRef original_):
-            original(original_)
-        {}
-        StringRef original;
+struct Tag {
+    constexpr Tag(StringRef original_) : original(original_) {}
+    StringRef original;
 
-        friend bool operator< ( Tag const& lhs, Tag const& rhs );
-        friend bool operator==( Tag const& lhs, Tag const& rhs );
-    };
+    friend bool operator<(Tag const& lhs, Tag const& rhs);
+    friend bool operator==(Tag const& lhs, Tag const& rhs);
+};
 
-    class ITestInvoker;
-    struct NameAndTags;
+class ITestInvoker;
+struct NameAndTags;
 
-    enum class TestCaseProperties : uint8_t {
-        None = 0,
-        IsHidden = 1 << 1,
-        ShouldFail = 1 << 2,
-        MayFail = 1 << 3,
-        Throws = 1 << 4,
-        NonPortable = 1 << 5,
-        Benchmark = 1 << 6
-    };
+enum class TestCaseProperties : uint8_t {
+    None = 0,
+    IsHidden = 1 << 1,
+    ShouldFail = 1 << 2,
+    MayFail = 1 << 3,
+    Throws = 1 << 4,
+    NonPortable = 1 << 5,
+    Benchmark = 1 << 6
+};
 
-    /**
-     * Various metadata about the test case.
-     *
-     * A test case is uniquely identified by its (class)name and tags
-     * combination, with source location being ignored, and other properties
-     * being determined from tags.
-     *
-     * Tags are kept sorted.
-     */
-    struct TestCaseInfo : Detail::NonCopyable {
+struct TestCaseInfo : Detail::NonCopyable {
+    TestCaseInfo(StringRef _className, NameAndTags const& _nameAndTags, SourceLineInfo const& _lineInfo);
 
-        TestCaseInfo(StringRef _className,
-                     NameAndTags const& _nameAndTags,
-                     SourceLineInfo const& _lineInfo);
+    bool isHidden() const;
+    bool throws() const;
+    bool okToFail() const;
+    bool expectedToFail() const;
 
-        bool isHidden() const;
-        bool throws() const;
-        bool okToFail() const;
-        bool expectedToFail() const;
+    void addFilenameTag();
 
-        // Adds the tag(s) with test's filename (for the -# flag)
-        void addFilenameTag();
+    friend bool operator<(TestCaseInfo const& lhs, TestCaseInfo const& rhs);
 
-        //! Orders by name, classname and tags
-        friend bool operator<( TestCaseInfo const& lhs,
-                               TestCaseInfo const& rhs );
+    std::string tagsAsString() const;
 
+    std::string name;
+    StringRef className;
 
-        std::string tagsAsString() const;
+   private:
+    std::string backingTags;
+    void internalAppendTag(StringRef tagString);
 
-        std::string name;
-        StringRef className;
-    private:
-        std::string backingTags;
-        // Internally we copy tags to the backing storage and then add
-        // refs to this storage to the tags vector.
-        void internalAppendTag(StringRef tagString);
-    public:
-        std::vector<Tag> tags;
-        SourceLineInfo lineInfo;
-        TestCaseProperties properties = TestCaseProperties::None;
-    };
+   public:
+    std::vector<Tag> tags;
+    SourceLineInfo lineInfo;
+    TestCaseProperties properties = TestCaseProperties::None;
+};
 
-    /**
-     * Wrapper over the test case information and the test case invoker
-     *
-     * Does not own either, and is specifically made to be cheap
-     * to copy around.
-     */
-    class TestCaseHandle {
-        TestCaseInfo* m_info;
-        ITestInvoker* m_invoker;
-    public:
-        constexpr TestCaseHandle(TestCaseInfo* info, ITestInvoker* invoker) :
-            m_info(info), m_invoker(invoker) {}
+class TestCaseHandle {
+    TestCaseInfo* m_info;
+    ITestInvoker* m_invoker;
 
-        void prepareTestCase() const {
-            m_invoker->prepareTestCase();
-        }
+   public:
+    constexpr TestCaseHandle(TestCaseInfo* info, ITestInvoker* invoker) : m_info(info), m_invoker(invoker) {}
 
-        void tearDownTestCase() const {
-            m_invoker->tearDownTestCase();
-        }
+    void prepareTestCase() const {
+        m_invoker->prepareTestCase();
+    }
 
-        void invoke() const {
-            m_invoker->invoke();
-        }
+    void tearDownTestCase() const {
+        m_invoker->tearDownTestCase();
+    }
 
-        constexpr TestCaseInfo const& getTestCaseInfo() const {
-            return *m_info;
-        }
-    };
+    void invoke() const {
+        m_invoker->invoke();
+    }
 
-    Detail::unique_ptr<TestCaseInfo>
-    makeTestCaseInfo( StringRef className,
-                      NameAndTags const& nameAndTags,
-                      SourceLineInfo const& lineInfo );
-}
+    constexpr TestCaseInfo const& getTestCaseInfo() const {
+        return *m_info;
+    }
+};
+
+Detail::unique_ptr<TestCaseInfo> makeTestCaseInfo(StringRef className, NameAndTags const& nameAndTags,
+                                                  SourceLineInfo const& lineInfo);
+}  // namespace Catch
 
 #ifdef __clang__
 #pragma clang diagnostic pop
 #endif
 
-#endif // CATCH_TEST_CASE_INFO_HPP_INCLUDED
+#endif  // CATCH_TEST_CASE_INFO_HPP_INCLUDED

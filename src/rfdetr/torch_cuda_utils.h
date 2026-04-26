@@ -29,4 +29,4 @@ inline c10::cuda::CUDAStream get_high_priority_cuda_stream(int device_id) {
     return get_high_priority_cuda_stream(checked_device_index(device_id));
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

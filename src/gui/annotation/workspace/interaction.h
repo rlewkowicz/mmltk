@@ -38,16 +38,19 @@ struct AnnotationWorkspaceInteractionResult {
     AnnotationInteractionOverlayRequest overlay_request;
 };
 
-AnnotationWorkspaceInteractionResult process_annotation_workspace_interaction(
-    AnnotationDocument& document,
-    AnnotationSession& session,
-    AnnotationController& controller,
-    AnnotationCategories& categories,
-    const AnnotationFrame& frame,
-    SourceSelectionState& source,
-    const AnnotationWorkspaceViewModel& workspace_view,
-    const AnnotationCanvasLayout& canvas_layout,
-    const CanvasPointerState& canvas_pointer,
-    const AnnotationWorkspaceInteractionConfig& config);
+struct AnnotationWorkspaceInteractionRequest {
+    AnnotationDocument& document;
+    AnnotationSession& session;
+    AnnotationController& controller;
+    AnnotationCategories& categories;
+    const AnnotationFrame& frame;
+    SourceSelectionState& source;
+    const AnnotationWorkspaceViewModel& workspace_view;
+    const AnnotationCanvasLayout& canvas_layout;
+    const CanvasPointerState& canvas_pointer;
+};
 
-} // namespace mmltk::gui
+AnnotationWorkspaceInteractionResult process_annotation_workspace_interaction(
+    const AnnotationWorkspaceInteractionRequest& request, const AnnotationWorkspaceInteractionConfig& config);
+
+}  // namespace mmltk::gui

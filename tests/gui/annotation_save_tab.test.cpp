@@ -22,18 +22,30 @@ AnnotationQueuedSave make_queued_save(std::uint64_t frame_id) {
 }
 
 AnnotationSaveTabPlan make_live_save_plan(bool save_running, bool hold_save_active = true) {
-    return plan_annotation_save_tab(
-        AnnotationSaveTabState{
-            SourceKind::VideoStream,
-            true,
-            save_running,
-            hold_save_active,
-            false,
-            true,
-            true,
-            0U,
-            1U,
-        });
+    return plan_annotation_save_tab(AnnotationSaveTabState{
+        SourceKind::VideoStream,
+        true,
+        save_running,
+        hold_save_active,
+        false,
+        true,
+        true,
+        0U,
+        1U,
+    });
+}
+
+AnnotationHoldSaveDispatchPlan plan_busy_hold_save_dispatch(const bool current_frame_matches_queue) {
+    AnnotationSaveControllerState controller_state;
+    controller_state.hold_save = true;
+    controller_state.queued_save = make_queued_save(23U);
+    return plan_annotation_hold_save_dispatch(controller_state, AnnotationHoldSaveDispatchState{
+                                                                    make_live_save_plan(true),
+                                                                    true,
+                                                                    true,
+                                                                    false,
+                                                                    current_frame_matches_queue,
+                                                                });
 }
 
 void test_save_tab_ui_actions_stop_hold_save_and_clear_queue_for_non_live_sources() {
@@ -43,9 +55,7 @@ void test_save_tab_ui_actions_stop_hold_save_and_clear_queue_for_non_live_source
     controller_state.queued_save = make_queued_save(17U);
 
     const AnnotationSaveTabUiCommitResult result =
-        apply_annotation_save_tab_ui_actions(&controller_state,
-                                             false,
-                                             AnnotationSaveTabUiActions{});
+        apply_annotation_save_tab_ui_actions(&controller_state, false, AnnotationSaveTabUiActions{});
 
     assert(result.clear_queue);
     assert(!controller_state.hold_save);
@@ -58,15 +68,13 @@ void test_hold_save_planner_enqueues_newest_frame_while_writer_is_busy() {
     controller_state.hold_save = true;
 
     const AnnotationHoldSaveDispatchPlan plan =
-        plan_annotation_hold_save_dispatch(
-            controller_state,
-            AnnotationHoldSaveDispatchState{
-                make_live_save_plan(true),
-                true,
-                true,
-                false,
-                false,
-            });
+        plan_annotation_hold_save_dispatch(controller_state, AnnotationHoldSaveDispatchState{
+                                                                 make_live_save_plan(true),
+                                                                 true,
+                                                                 true,
+                                                                 false,
+                                                                 false,
+                                                             });
 
     assert(!plan.clear_queue);
     assert(plan.refresh_live_frame);
@@ -76,20 +84,7 @@ void test_hold_save_planner_enqueues_newest_frame_while_writer_is_busy() {
 }
 
 void test_hold_save_planner_skips_refresh_when_current_frame_already_matches_queue() {
-    AnnotationSaveControllerState controller_state;
-    controller_state.hold_save = true;
-    controller_state.queued_save = make_queued_save(23U);
-
-    const AnnotationHoldSaveDispatchPlan plan =
-        plan_annotation_hold_save_dispatch(
-            controller_state,
-            AnnotationHoldSaveDispatchState{
-                make_live_save_plan(true),
-                true,
-                true,
-                false,
-                true,
-            });
+    const AnnotationHoldSaveDispatchPlan plan = plan_busy_hold_save_dispatch(true);
 
     assert(!plan.clear_queue);
     assert(!plan.refresh_live_frame);
@@ -99,20 +94,7 @@ void test_hold_save_planner_skips_refresh_when_current_frame_already_matches_que
 }
 
 void test_hold_save_planner_blocks_when_writer_queue_would_overflow() {
-    AnnotationSaveControllerState controller_state;
-    controller_state.hold_save = true;
-    controller_state.queued_save = make_queued_save(23U);
-
-    const AnnotationHoldSaveDispatchPlan plan =
-        plan_annotation_hold_save_dispatch(
-            controller_state,
-            AnnotationHoldSaveDispatchState{
-                make_live_save_plan(true),
-                true,
-                true,
-                false,
-                false,
-            });
+    const AnnotationHoldSaveDispatchPlan plan = plan_busy_hold_save_dispatch(false);
 
     assert(plan.clear_queue);
     assert(!plan.refresh_live_frame);
@@ -126,8 +108,7 @@ void test_queued_save_dispatch_respects_hold_save_state() {
     dispatch_state.hold_save = true;
     dispatch_state.queued_save = make_queued_save(31U);
 
-    AnnotationQueuedSaveDispatchPlan plan =
-        plan_annotation_queued_save_dispatch(dispatch_state, false);
+    AnnotationQueuedSaveDispatchPlan plan = plan_annotation_queued_save_dispatch(dispatch_state, false);
     assert(!plan.clear_queue);
     assert(plan.dispatch_queued_save);
 
@@ -146,8 +127,7 @@ void test_annotation_workflow_setup_dispatch_plans_navigation_and_live_actions()
     actions.request_reload_frame = true;
     actions.request_next_frame = true;
 
-    const AnnotationWorkflowSetupDispatchPlan plan =
-        plan_annotation_workflow_setup_dispatch(actions, 1U, 3U);
+    const AnnotationWorkflowSetupDispatchPlan plan = plan_annotation_workflow_setup_dispatch(actions, 1U, 3U);
     assert(plan.browse_request == AnnotationSetupBrowseRequest::Onnx);
     assert(plan.prepare_source);
     assert(plan.reset_canvas_interactions);
@@ -170,8 +150,7 @@ void test_annotation_workflow_preview_runtime_tracks_dirty_ready_and_retry_state
     frame.frame_id = 41U;
 
     assert(annotation_workflow_preview_pending(runtime, &frame));
-    const std::uint64_t generation =
-        begin_annotation_workflow_preview(runtime);
+    const std::uint64_t generation = begin_annotation_workflow_preview(runtime);
     assert(annotation_workflow_preview_running(runtime));
     assert(annotation_workflow_preview_generation_matches(runtime, generation));
 
@@ -191,7 +170,7 @@ void test_annotation_workflow_preview_runtime_tracks_dirty_ready_and_retry_state
     assert(!annotation_workflow_preview_pending(runtime, &frame));
 }
 
-} // namespace
+}  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[gui][annotation_save_tab]",
                          test_save_tab_ui_actions_stop_hold_save_and_clear_queue_for_non_live_sources);
@@ -199,10 +178,8 @@ MMLTK_REGISTER_TEST_CASE("[gui][annotation_save_tab]",
                          test_hold_save_planner_enqueues_newest_frame_while_writer_is_busy);
 MMLTK_REGISTER_TEST_CASE("[gui][annotation_save_tab]",
                          test_hold_save_planner_skips_refresh_when_current_frame_already_matches_queue);
-MMLTK_REGISTER_TEST_CASE("[gui][annotation_save_tab]",
-                         test_hold_save_planner_blocks_when_writer_queue_would_overflow);
-MMLTK_REGISTER_TEST_CASE("[gui][annotation_save_tab]",
-                         test_queued_save_dispatch_respects_hold_save_state);
+MMLTK_REGISTER_TEST_CASE("[gui][annotation_save_tab]", test_hold_save_planner_blocks_when_writer_queue_would_overflow);
+MMLTK_REGISTER_TEST_CASE("[gui][annotation_save_tab]", test_queued_save_dispatch_respects_hold_save_state);
 MMLTK_REGISTER_TEST_CASE("[gui][annotation_save_tab]",
                          test_annotation_workflow_setup_dispatch_plans_navigation_and_live_actions);
 MMLTK_REGISTER_TEST_CASE("[gui][annotation_save_tab]",

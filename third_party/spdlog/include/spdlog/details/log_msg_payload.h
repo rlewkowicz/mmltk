@@ -12,10 +12,8 @@
 namespace spdlog {
 namespace details {
 
-inline string_view_t format_log_msg_payload(const bool enable_formatting,
-                                            formatter &sink_formatter,
-                                            const log_msg &msg,
-                                            memory_buf_t &formatted) {
+inline string_view_t format_log_msg_payload(const bool enable_formatting, formatter& sink_formatter, const log_msg& msg,
+                                            memory_buf_t& formatted) {
     if (!enable_formatting) {
         return msg.payload;
     }

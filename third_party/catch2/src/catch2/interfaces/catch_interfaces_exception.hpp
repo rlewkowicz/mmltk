@@ -14,23 +14,24 @@
 #include <vector>
 
 namespace Catch {
-    using exceptionTranslateFunction = std::string(*)();
+using exceptionTranslateFunction = std::string (*)();
 
-    class IExceptionTranslator;
-    using ExceptionTranslators = std::vector<Detail::unique_ptr<IExceptionTranslator const>>;
+class IExceptionTranslator;
+using ExceptionTranslators = std::vector<Detail::unique_ptr<IExceptionTranslator const>>;
 
-    class IExceptionTranslator {
-    public:
-        virtual ~IExceptionTranslator(); // = default
-        virtual std::string translate( ExceptionTranslators::const_iterator it, ExceptionTranslators::const_iterator itEnd ) const = 0;
-    };
+class IExceptionTranslator {
+   public:
+    virtual ~IExceptionTranslator();
+    virtual std::string translate(ExceptionTranslators::const_iterator it,
+                                  ExceptionTranslators::const_iterator itEnd) const = 0;
+};
 
-    class IExceptionTranslatorRegistry {
-    public:
-        virtual ~IExceptionTranslatorRegistry(); // = default
-        virtual std::string translateActiveException() const = 0;
-    };
+class IExceptionTranslatorRegistry {
+   public:
+    virtual ~IExceptionTranslatorRegistry();
+    virtual std::string translateActiveException() const = 0;
+};
 
-} // namespace Catch
+}  // namespace Catch
 
-#endif // CATCH_INTERFACES_EXCEPTION_HPP_INCLUDED
+#endif  // CATCH_INTERFACES_EXCEPTION_HPP_INCLUDED

@@ -74,14 +74,18 @@ def _checkpoint_arg_value(args_obj, name: str):
     return getattr(args_obj, name, None)
 
 
+def _is_bool_like(value) -> bool:
+    return isinstance(value, (bool, np.bool_))
+
+
 def _coerce_bool(value):
-    if isinstance(value, (bool, np.bool_)):
+    if _is_bool_like(value):
         return bool(value)
     return None
 
 
 def _coerce_int(value):
-    if isinstance(value, (bool, np.bool_)):
+    if _is_bool_like(value):
         return None
     if isinstance(value, (int, np.integer)):
         return int(value)
@@ -91,7 +95,7 @@ def _coerce_int(value):
 
 
 def _coerce_float(value):
-    if isinstance(value, (bool, np.bool_)):
+    if _is_bool_like(value):
         return None
     if isinstance(value, (int, float, np.integer, np.floating)):
         return float(value)

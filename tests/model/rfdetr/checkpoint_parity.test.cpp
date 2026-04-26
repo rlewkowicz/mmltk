@@ -5,16 +5,11 @@
 #include "support/catch2_compat.hpp"
 #include "support/filesystem_test_utils.hpp"
 
-#include <algorithm>
-#include <cerrno>
-#include <cstring>
-#include <cstdlib>
 #include <filesystem>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -33,33 +28,6 @@ using mmltk::rfdetr::testsupport::log_fixture_phase;
 using mmltk::rfdetr::testsupport::make_fixture_image;
 using mmltk::rfdetr::testsupport::parity_fixture_cases;
 using mmltk::rfdetr::testsupport::write_module_upstream_checkpoint;
-
-class ScopedTempDir {
-public:
-    explicit ScopedTempDir(const char* name_prefix) {
-        std::string pattern = (fs::temp_directory_path() / (std::string(name_prefix) + ".XXXXXX")).string();
-        std::vector<char> writable(pattern.begin(), pattern.end());
-        writable.push_back('\0');
-        const char* created = ::mkdtemp(writable.data());
-        if (created == nullptr) {
-            throw std::runtime_error(std::string("mkdtemp failed: ") + std::strerror(errno));
-        }
-        path_ = fs::path(created);
-    }
-
-    ~ScopedTempDir() {
-        if (!path_.empty()) {
-            mmltk::testsupport::remove_path_recursively_best_effort(path_);
-        }
-    }
-
-    [[nodiscard]] const fs::path& path() const {
-        return path_;
-    }
-
-private:
-    fs::path path_;
-};
 
 NativeRfDetrConfig config_for_fixture(const ParityFixtureCase& fixture) {
     const auto* preset = find_model_preset(fixture.preset_name);
@@ -101,36 +69,13 @@ void assert_clean_summary(const StateDictLoadSummary& summary, const std::string
     if (summary.missing_names.empty() && summary.unexpected_names.empty() && summary.incompatible_names.empty()) {
         return;
     }
-
-    std::ostringstream message;
-    message << label << " state_dict mismatch";
-    if (!summary.missing_names.empty()) {
-        message << " missing=" << summary.missing_names.front();
-        if (summary.missing_names.size() > 1) {
-            message << " +" << (summary.missing_names.size() - 1);
-        }
-    }
-    if (!summary.unexpected_names.empty()) {
-        message << " unexpected=" << summary.unexpected_names.front();
-        if (summary.unexpected_names.size() > 1) {
-            message << " +" << (summary.unexpected_names.size() - 1);
-        }
-    }
-    if (!summary.incompatible_names.empty()) {
-        message << " incompatible=" << summary.incompatible_names.front();
-        if (summary.incompatible_names.size() > 1) {
-            message << " +" << (summary.incompatible_names.size() - 1);
-        }
-    }
-    throw std::runtime_error(message.str());
+    throw std::runtime_error(label + " state_dict mismatch");
 }
 
-void assert_tensor_bitwise_equal(const torch::Tensor& actual,
-                                 const torch::Tensor& expected,
-                                 const std::string& label) {
+void assert_tensor_bitwise_equal(const torch::Tensor& actual, const torch::Tensor& expected, const std::string& label) {
     if (actual.sizes() != expected.sizes()) {
-        throw std::runtime_error(
-            label + " shape mismatch: actual=" + shape_string(actual) + " expected=" + shape_string(expected));
+        throw std::runtime_error(label + " shape mismatch: actual=" + shape_string(actual) +
+                                 " expected=" + shape_string(expected));
     }
 
     const auto actual_cpu = actual.detach().cpu().contiguous();
@@ -144,8 +89,7 @@ void assert_tensor_bitwise_equal(const torch::Tensor& actual,
     throw std::runtime_error(label + " differs at the bitwise level: max_abs=" + std::to_string(max_abs));
 }
 
-void assert_output_layer_bitwise_equal(const OutputLayer& actual,
-                                       const OutputLayer& expected,
+void assert_output_layer_bitwise_equal(const OutputLayer& actual, const OutputLayer& expected,
                                        const std::string& label) {
     assert_tensor_bitwise_equal(actual.pred_logits, expected.pred_logits, label + ".pred_logits");
     assert_tensor_bitwise_equal(actual.pred_boxes, expected.pred_boxes, label + ".pred_boxes");
@@ -157,30 +101,26 @@ void assert_output_layer_bitwise_equal(const OutputLayer& actual,
     }
 }
 
-void assert_outputs_bitwise_equal(const ModelOutputs& actual,
-                                  const ModelOutputs& expected,
-                                  const char* preset_name) {
+void assert_outputs_bitwise_equal(const ModelOutputs& actual, const ModelOutputs& expected, const char* preset_name) {
     assert_output_layer_bitwise_equal(actual.main, expected.main, std::string(preset_name) + ".main");
     if (actual.aux_outputs.size() != expected.aux_outputs.size()) {
         throw std::runtime_error(std::string(preset_name) + ".aux_outputs size mismatch");
     }
     for (size_t index = 0; index < actual.aux_outputs.size(); ++index) {
-        assert_output_layer_bitwise_equal(actual.aux_outputs[index],
-                                          expected.aux_outputs[index],
+        assert_output_layer_bitwise_equal(actual.aux_outputs[index], expected.aux_outputs[index],
                                           std::string(preset_name) + ".aux[" + std::to_string(index) + "]");
     }
     if (actual.enc_outputs.has_value() != expected.enc_outputs.has_value()) {
         throw std::runtime_error(std::string(preset_name) + ".enc_outputs presence mismatch");
     }
     if (actual.enc_outputs.has_value()) {
-        assert_output_layer_bitwise_equal(*actual.enc_outputs,
-                                          *expected.enc_outputs,
+        assert_output_layer_bitwise_equal(*actual.enc_outputs, *expected.enc_outputs,
                                           std::string(preset_name) + ".enc");
     }
 }
 
 void run_checkpoint_parity_case(const ParityFixtureCase& fixture, size_t index, size_t total) {
-    const ScopedTempDir temp_dir("mmltk_rfdetr_checkpoint_parity");
+    const mmltk::testsupport::ScopedTempDir temp_dir("mmltk_rfdetr_checkpoint_parity");
     const fs::path upstream_path = temp_dir.path() / "weights" / fixture.upstream_filename;
     const fs::path native_path = temp_dir.path() / "weights" / (std::string(fixture.preset_name) + ".native.pt");
 
@@ -217,15 +157,7 @@ void run_checkpoint_parity_case(const ParityFixtureCase& fixture, size_t index, 
     assert_outputs_bitwise_equal(upstream_outputs, native_outputs, fixture.preset_name);
 }
 
-const ParityFixtureCase* find_fixture_by_name(const std::string& preset_name) {
-    const auto& fixtures = parity_fixture_cases();
-    const auto it = std::find_if(fixtures.begin(), fixtures.end(), [&](const ParityFixtureCase& fixture) {
-        return preset_name == fixture.preset_name;
-    });
-    return it == fixtures.end() ? nullptr : &*it;
-}
-
-} // namespace
+}  // namespace
 
 void test_checkpoint_parity_matches_for_all_registered_fixtures() {
     const auto& fixtures = parity_fixture_cases();
@@ -234,4 +166,5 @@ void test_checkpoint_parity_matches_for_all_registered_fixtures() {
     }
 }
 
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][checkpoint_parity][integration]", test_checkpoint_parity_matches_for_all_registered_fixtures);
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][checkpoint_parity][integration]",
+                         test_checkpoint_parity_matches_for_all_registered_fixtures);

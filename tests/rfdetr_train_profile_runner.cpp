@@ -85,32 +85,14 @@ Options parse_options(int argc, char** argv) {
         throw std::runtime_error("RF-DETR train profile runner requires --weights-path");
     }
     if (options.width <= 0 || options.height <= 0 || options.num_images <= 0 || options.batch_size <= 0 ||
-        options.epochs <= 0 || options.device_id < 0 || options.workers < 0 || options.lanes < 0 || options.prefetch_factor <= 0 ||
-        options.repetitions <= 0 || options.warmup_runs < 0) {
+        options.epochs <= 0 || options.device_id < 0 || options.workers < 0 || options.lanes < 0 ||
+        options.prefetch_factor <= 0 || options.repetitions <= 0 || options.warmup_runs < 0) {
         throw std::runtime_error("numeric options must be positive except lanes and warmup-runs, which may be zero");
     }
     if (options.num_images < options.batch_size) {
         throw std::runtime_error("num-images must be at least batch-size for RF-DETR train profile");
     }
     return options;
-}
-
-void ensure_file_exists(const char* label, const std::string& path) {
-    if (!fs::exists(path)) {
-        throw std::runtime_error(std::string("missing ") + label + ": " + path);
-    }
-}
-
-std::string metric_name(const char* suffix) {
-    return std::string("benchmark.") + suffix;
-}
-
-void record_duration_metric(const char* suffix, std::uint64_t elapsed_ns) {
-    mmltk::profile_record_duration_ns(metric_name(suffix).c_str(), elapsed_ns);
-}
-
-void record_value_metric(const char* suffix, std::uint64_t value) {
-    mmltk::profile_add_value(metric_name(suffix).c_str(), value);
 }
 
 std::string compiled_path_for(const FixtureSpec& spec) {
@@ -130,9 +112,7 @@ void build_fixture(const Options& options, const FixtureSpec& fixture) {
     DatasetCompiler::compile(config);
 }
 
-TrainRun run_train_iteration(const Options& options,
-                             const std::string& compiled_path,
-                             const fs::path& output_dir) {
+TrainRun run_train_iteration(const Options& options, const std::string& compiled_path, const fs::path& output_dir) {
     fs::remove_all(output_dir);
 
     TrainOptions train_options;
@@ -169,8 +149,7 @@ TrainRun run_train_iteration(const Options& options,
 }
 
 void record_train_metrics(const TrainRun& run, const Options& options) {
-    const size_t profiled_train_images =
-        static_cast<size_t>(options.num_images) * static_cast<size_t>(options.epochs);
+    const size_t profiled_train_images = static_cast<size_t>(options.num_images) * static_cast<size_t>(options.epochs);
     record_duration_metric("rfdetr.train.total", run.elapsed_ns);
     record_value_metric("rfdetr.train.images", profiled_train_images);
     record_value_metric("rfdetr.train.img_per_sec_x100", img_per_sec_x100(run.elapsed_ns, profiled_train_images));
@@ -186,40 +165,25 @@ std::string iteration_label_for_run(int repetition) {
 }
 
 void print_iteration_line(const char* phase, int index, int total, const TrainRun& run) {
-    std::printf("%s=rfdetr.train %d/%d total=%.3fs train_loss=%.4f bbox=%.4f mask=%.4f\n",
-                phase,
-                index,
-                total,
-                static_cast<double>(run.elapsed_ns) / 1.0e9,
-                run.train_loss,
-                run.bbox_ap,
-                run.mask_ap);
+    std::printf("%s=rfdetr.train %d/%d total=%.3fs train_loss=%.4f bbox=%.4f mask=%.4f\n", phase, index, total,
+                static_cast<double>(run.elapsed_ns) / 1.0e9, run.train_loss, run.bbox_ap, run.mask_ap);
     std::fflush(stdout);
 }
 
-} // namespace
+}  // namespace
 
 int main(int argc, char** argv) {
     MMLTK_PROFILE_PROCESS_LABEL("profile.rfdetr.train");
     MMLTK_PROFILE_RUN_LABEL("rfdetr.train");
 
     try {
-        const mmltk::ExecutionPolicySnapshot execution_snapshot =
-            mmltk::apply_process_execution_policy();
-        mmltk::log_process_execution_policy(
-            "mmltk_rfdetr_train_profile_runner",
-            execution_snapshot,
-            false,
-            true);
+        const mmltk::ExecutionPolicySnapshot execution_snapshot = mmltk::apply_process_execution_policy();
+        mmltk::log_process_execution_policy("mmltk_rfdetr_train_profile_runner", execution_snapshot, false, true);
         const Options options = parse_options(argc, argv);
         ensure_file_exists("weights checkpoint", options.weights_path);
 
         const FixtureSpec fixture{
-            options.test_dir,
-            "train",
-            options.width,
-            options.height,
-            options.num_images,
+            options.test_dir, "train", options.width, options.height, options.num_images,
         };
         build_fixture(options, fixture);
         const std::string compiled_path = compiled_path_for(fixture);
@@ -249,8 +213,8 @@ int main(int argc, char** argv) {
             print_iteration_line("warmup", warmup + 1, options.warmup_runs, warmup_runs[static_cast<size_t>(warmup)]);
         }
         for (int repetition = 0; repetition < options.repetitions; ++repetition) {
-            print_iteration_line(
-                "repetition", repetition + 1, options.repetitions, repetition_runs[static_cast<size_t>(repetition)]);
+            print_iteration_line("repetition", repetition + 1, options.repetitions,
+                                 repetition_runs[static_cast<size_t>(repetition)]);
         }
 
         mmltk::profile_flush();

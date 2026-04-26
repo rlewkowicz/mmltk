@@ -1,0 +1,180 @@
+@use "sass:map";
+@use "tokens" as *;
+@use "mixins" as *;
+
+.pill {
+  @include row-center(0.55rem);
+  @include control-surface($fill: var(--primary-fill), $radius: radius-token(sm));
+
+  align-items: baseline;
+  padding: 0.45rem 0.65rem;
+  color: var(--text-1);
+
+  strong {
+    color: var(--text-0);
+  }
+
+  &.accent {
+    border-color: var(--selected-border);
+    background: var(--selected-fill);
+  }
+}
+
+.section-copy {
+  @include copy-block($line-height: 1.5);
+
+  margin: 0.9rem 0 0;
+}
+
+.action-stack,
+.action-row,
+.tool-selector {
+  display: flex;
+  flex-wrap: wrap;
+  margin-top: 0.9rem;
+}
+
+.tool-selector button {
+  padding-inline: 0.9rem;
+}
+
+.remote-query-panel,
+.annotate-object-card,
+.annotate-detail-panel,
+.annotate-mask-range-panel,
+.remote-offer-card,
+.local-gpu-card,
+.slot-card {
+  @include inset-surface;
+}
+
+.remote-query-toolbar,
+.remote-offer-header,
+.annotate-object-header {
+  @include row-between(space-token(md));
+}
+
+.remote-query-toolbar {
+  flex-wrap: wrap;
+}
+
+.remote-query-status {
+  margin-top: 0.7rem;
+}
+
+.remote-query-armed {
+  @include tone-surface(info);
+
+  margin-top: 0.8rem;
+  padding: 0.8rem 0.9rem;
+  border-radius: radius-token(md);
+  line-height: 1.5;
+}
+
+.remote-offer-list,
+.annotate-object-list,
+.local-gpu-list {
+  gap: space-token(md);
+  margin-top: 0.9rem;
+}
+
+.annotate-action-row {
+  margin-top: 0.8rem;
+}
+
+.annotate-object-card[data-selected="true"],
+.local-gpu-card[data-selected="true"] {
+  @include selected-surface(primary, lime);
+}
+
+.annotate-object-header strong,
+.local-gpu-card-copy strong,
+.remote-offer-card strong,
+.slot-card strong,
+.statusbar strong {
+  color: var(--accent-2);
+}
+
+.annotate-object-copy,
+.remote-offer-copy {
+  @include copy-block;
+
+  margin: 0.65rem 0 0;
+}
+
+.annotate-detail-panel {
+  margin-top: 0.9rem;
+
+  h3 {
+    @include uppercase-label($size: 0.9rem, $color: var(--accent-2));
+
+    margin: 0;
+  }
+}
+
+.local-gpu-card {
+  display: flex;
+  gap: space-token(md);
+  align-items: flex-start;
+}
+
+.local-gpu-card-copy {
+  min-width: 0;
+
+  p {
+    @include copy-block;
+
+    margin: 0.4rem 0 0;
+  }
+}
+
+.status-copy {
+  @include copy-block($line-height: 1.4);
+
+  margin: 0;
+}
+
+@each $tone, $tone-map in $status-tones {
+  .status-copy[data-tone="#{$tone}"] {
+    color: map.get($tone-map, text);
+  }
+}
+
+.annotate-mask-grid {
+  @include grid(repeat(2, minmax(0, 1fr)), 0.85rem);
+
+  margin-top: 0.9rem;
+}
+
+.annotate-mask-range-panel {
+  background: var(--panel-fill-muted);
+
+  h4 {
+    @include uppercase-label($size: 0.78rem, $color: var(--text-1));
+
+    margin: 0;
+  }
+
+  .form-grid {
+    margin-top: 0.8rem;
+  }
+}
+
+.slot-list {
+  display: grid;
+}
+
+.workflow-actions .action-row {
+  margin-top: 0;
+}
+
+.workflow-sidebar {
+  .detail-grid,
+  .form-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.button-compact {
+  padding: 0.45rem 0.6rem;
+}

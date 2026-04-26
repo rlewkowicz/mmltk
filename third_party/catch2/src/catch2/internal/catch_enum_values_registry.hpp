@@ -16,21 +16,21 @@
 
 namespace Catch {
 
-    namespace Detail {
+namespace Detail {
 
-        Catch::Detail::unique_ptr<EnumInfo> makeEnumInfo( StringRef enumName, StringRef allValueNames, std::vector<int> const& values );
+Catch::Detail::unique_ptr<EnumInfo> makeEnumInfo(StringRef enumName, StringRef allValueNames,
+                                                 std::vector<int> const& values);
 
-        class EnumValuesRegistry : public IMutableEnumValuesRegistry {
+class EnumValuesRegistry : public IMutableEnumValuesRegistry {
+    std::vector<Catch::Detail::unique_ptr<EnumInfo>> m_enumInfos;
 
-            std::vector<Catch::Detail::unique_ptr<EnumInfo>> m_enumInfos;
+    EnumInfo const& registerEnum(StringRef enumName, StringRef allValueNames, std::vector<int> const& values) override;
+};
 
-            EnumInfo const& registerEnum( StringRef enumName, StringRef allValueNames, std::vector<int> const& values) override;
-        };
+std::vector<StringRef> parseEnums(StringRef enums);
 
-        std::vector<StringRef> parseEnums( StringRef enums );
+}  // namespace Detail
 
-    } // Detail
+}  // namespace Catch
 
-} // Catch
-
-#endif // CATCH_ENUM_VALUES_REGISTRY_HPP_INCLUDED
+#endif  // CATCH_ENUM_VALUES_REGISTRY_HPP_INCLUDED

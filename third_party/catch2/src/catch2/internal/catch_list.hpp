@@ -13,31 +13,29 @@
 #include <set>
 #include <string>
 
-
 namespace Catch {
 
-    class IEventListener;
-    class Config;
+class IEventListener;
+class Config;
 
+struct ReporterDescription {
+    std::string name, description;
+};
+struct ListenerDescription {
+    StringRef name;
+    std::string description;
+};
 
-    struct ReporterDescription {
-        std::string name, description;
-    };
-    struct ListenerDescription {
-        StringRef name;
-        std::string description;
-    };
+struct TagInfo {
+    void add(StringRef spelling);
+    std::string all() const;
 
-    struct TagInfo {
-        void add(StringRef spelling);
-        std::string all() const;
+    std::set<StringRef> spellings;
+    std::size_t count = 0;
+};
 
-        std::set<StringRef> spellings;
-        std::size_t count = 0;
-    };
+bool list(IEventListener& reporter, Config const& config);
 
-    bool list( IEventListener& reporter, Config const& config );
+}  // namespace Catch
 
-} // end namespace Catch
-
-#endif // CATCH_LIST_HPP_INCLUDED
+#endif  // CATCH_LIST_HPP_INCLUDED

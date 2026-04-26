@@ -19,9 +19,8 @@ namespace mmltk {
 namespace {
 
 class CompileProgressReporter {
-public:
-    CompileProgressReporter(size_t num_images,
-                            const std::function<void(const CompileProgress&)>& progress_cb,
+   public:
+    CompileProgressReporter(size_t num_images, const std::function<void(const CompileProgress&)>& progress_cb,
                             compiler_internal::DroppedAnnotationTracker* dropped_annotations)
         : num_images_(num_images),
           total_steps_(num_images * 2 + 1),
@@ -79,7 +78,7 @@ public:
         rethrow_if_failed();
     }
 
-private:
+   private:
     static constexpr auto kHeartbeatInterval = std::chrono::milliseconds(100);
 
     void wait_for_startup() {
@@ -158,26 +157,20 @@ private:
         const size_t done = label_d + pixel_d;
         const size_t active = pixel_done_.active_load();
         const size_t dropped_annotations = dropped_annotations_ != nullptr ? dropped_annotations_->load() : 0;
-        // Prefer an explicit pixel phase while pixel workers are active so
-        // progress remains stable even when labels finish very quickly.
         CompileProgressPhase phase;
         if (pixel_d >= num_images_) {
             phase = CompileProgressPhase::kLabels;
         } else if (active > 0 || label_d >= num_images_) {
             phase = CompileProgressPhase::kPixels;
         } else {
-            phase = (label_d <= pixel_d) ? CompileProgressPhase::kLabels
-                                         : CompileProgressPhase::kPixels;
+            phase = (label_d <= pixel_d) ? CompileProgressPhase::kLabels : CompileProgressPhase::kPixels;
         }
         return CompileProgress{done, total_steps_, phase, active, dropped_annotations};
     }
 
     static bool snapshot_changed(const CompileProgress& left, const CompileProgress& right) noexcept {
-        return left.done != right.done ||
-               left.phase != right.phase ||
-               left.active != right.active ||
-               left.dropped_annotations != right.dropped_annotations ||
-               left.total != right.total;
+        return left.done != right.done || left.phase != right.phase || left.active != right.active ||
+               left.dropped_annotations != right.dropped_annotations || left.total != right.total;
     }
 
     void wake() noexcept {
@@ -211,7 +204,7 @@ private:
     std::exception_ptr error_;
 };
 
-} // namespace
+}  // namespace
 
 void DatasetCompiler::compile(const CompilerConfig& config,
                               const std::function<void(const CompileProgress&)>& progress_cb) {
@@ -246,28 +239,19 @@ void DatasetCompiler::compile(const CompilerConfig& config,
     CompileProgressReporter progress_reporter(num_images, progress_cb, &dropped_annotations);
 
     MMLTK_DEBUG_LOG("[compile] %s: %u images, %d workers (%d pixel + %d label), target %ux%u, stride=%zu bytes/img",
-                    config.split.c_str(),
-                    num_images,
-                    num_workers,
-                    pixel_workers,
-                    label_workers,
-                    width,
-                    height,
+                    config.split.c_str(), num_images, num_workers, pixel_workers, label_workers, width, height,
                     image_stride);
 
-    // Phase 1: compute pixel layout (known upfront — only needs num_images + stride)
     compiler_internal::FileLayout layout;
     {
         MMLTK_PROFILE_SCOPE("compiler.compute_pixel_layout");
         layout = compiler_internal::compute_pixel_layout(num_images, image_stride);
     }
 
-    MMLTK_DEBUG_LOG("[compile] Pixel layout: pixel_offset=%zu (%.1f MB aligned), pixels=%.2f GB",
-                    layout.pixel_offset,
+    MMLTK_DEBUG_LOG("[compile] Pixel layout: pixel_offset=%zu (%.1f MB aligned), pixels=%.2f GB", layout.pixel_offset,
                     static_cast<double>(layout.pixel_offset) / (1024.0 * 1024.0),
                     static_cast<double>(layout.pixel_blob_size) / (1024.0 * 1024.0 * 1024.0));
 
-    // Create output file sized for header+index+padding+pixels (will extend later for labels/rle)
     const std::string out_path = (out_dir / (config.split + ".bin")).string();
     FileHandle fd;
     {
@@ -275,37 +259,32 @@ void DatasetCompiler::compile(const CompilerConfig& config,
         fd = FileHandle::create_output(out_path, layout.pixel_offset + layout.pixel_blob_size);
     }
 
-    // Run labels and pixels concurrently
     compiler_internal::LabelBlocks label_blocks;
     std::exception_ptr pixel_error;
     std::exception_ptr label_error;
 
     std::thread pixel_thread([&] {
         try {
-            compiler_internal::write_pixel_blob(fd,
-                                                split_dir,
-                                                num_images,
-                                                width,
-                                                height,
-                                                image_stride,
-                                                pixel_workers,
-                                                /*any_resize=*/true,
-                                                /*any_downscale=*/true,
-                                                progress_reporter.pixel_counter(),
-                                                layout.pixel_offset);
+            compiler_internal::write_pixel_blob(fd, compiler_internal::PixelBlobWriteRequest{
+                                                        split_dir,
+                                                        num_images,
+                                                        width,
+                                                        height,
+                                                        image_stride,
+                                                        pixel_workers,
+                                                        true,
+                                                        true,
+                                                        progress_reporter.pixel_counter(),
+                                                        layout.pixel_offset,
+                                                    });
         } catch (...) {
             pixel_error = std::current_exception();
         }
     });
 
     try {
-        label_blocks = compiler_internal::build_label_blocks(split_dir,
-                                                             num_images,
-                                                             config,
-                                                             class_map,
-                                                             label_workers,
-                                                             progress_reporter.label_counter(),
-                                                             &dropped_annotations);
+        label_blocks = compiler_internal::build_label_blocks(split_dir, num_images, config, class_map, label_workers,
+                                                             progress_reporter.label_counter(), &dropped_annotations);
     } catch (...) {
         label_error = std::current_exception();
     }
@@ -320,14 +299,12 @@ void DatasetCompiler::compile(const CompilerConfig& config,
     }
     MMLTK_DEBUG_LOG("[compile] Labels and pixels complete");
 
-    // Phase 2: finalize layout with actual label/rle counts
     {
         MMLTK_PROFILE_SCOPE("compiler.finalize_layout");
-        compiler_internal::finalize_layout(layout,
-                                           compiler_internal::LayoutFinalizeInputs{
-                                               label_blocks.labels.size(),
-                                               label_blocks.rle_pairs.size(),
-                                           });
+        compiler_internal::finalize_layout(layout, compiler_internal::LayoutFinalizeInputs{
+                                                       label_blocks.labels.size(),
+                                                       label_blocks.rle_pairs.size(),
+                                                   });
     }
 
     compiler_internal::assign_pixel_offsets(label_blocks.index, layout.pixel_offset, image_stride);
@@ -335,7 +312,6 @@ void DatasetCompiler::compile(const CompilerConfig& config,
     MMLTK_DEBUG_LOG("[compile] Layout: total=%.2f GB",
                     static_cast<double>(layout.total_size) / (1024.0 * 1024.0 * 1024.0));
 
-    // Extend file to final size for labels + rle
     fd.preallocate(layout.total_size);
 
     const FileHeader header = compiler_internal::make_file_header(
@@ -346,8 +322,7 @@ void DatasetCompiler::compile(const CompilerConfig& config,
             channels,
             image_stride,
         },
-        class_map,
-        layout);
+        class_map, layout);
     compiler_internal::write_metadata_blocks(fd, layout, header, label_blocks);
     progress_reporter.enter_syncing();
     fd.sync_data();
@@ -355,22 +330,20 @@ void DatasetCompiler::compile(const CompilerConfig& config,
 
     if (label_blocks.dropped_annotations > 0) {
         mmltk::logging::logger("compile")->warn(
-            "compile {}: dropped {} annotations whose masks fully vanished during resize",
-            config.split,
+            "compile {}: dropped {} annotations whose masks fully vanished during resize", config.split,
             label_blocks.dropped_annotations);
         for (const std::string& sample : label_blocks.dropped_annotation_examples) {
             mmltk::logging::logger("compile")->warn("  sample: {}", sample);
         }
         if (label_blocks.dropped_annotations > label_blocks.dropped_annotation_examples.size()) {
-            mmltk::logging::logger("compile")->warn("  ... {} more omitted",
-                                                   label_blocks.dropped_annotations -
-                                                       label_blocks.dropped_annotation_examples.size());
+            mmltk::logging::logger("compile")->warn(
+                "  ... {} more omitted",
+                label_blocks.dropped_annotations - label_blocks.dropped_annotation_examples.size());
         }
     }
 
-    MMLTK_DEBUG_LOG("[compile] Written %s (%.2f GB)",
-                    out_path.c_str(),
+    MMLTK_DEBUG_LOG("[compile] Written %s (%.2f GB)", out_path.c_str(),
                     static_cast<double>(layout.total_size) / (1024.0 * 1024.0 * 1024.0));
 }
 
-} // namespace mmltk
+}  // namespace mmltk

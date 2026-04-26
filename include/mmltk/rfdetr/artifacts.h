@@ -54,4 +54,4 @@ struct ResolvedModelArtifacts : mmltk::model::ResolvedModelArtifacts {
 ResolvedModelArtifacts resolve_model_artifacts(const ModelArtifactRequest& request);
 ResolvedModelArtifacts resolve_upstream_weight_artifacts(const std::filesystem::path& weights_path);
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

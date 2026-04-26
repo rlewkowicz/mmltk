@@ -37,9 +37,7 @@ void rgb_to_bgr_in_place(std::vector<std::uint8_t>& pixels) {
     }
 }
 
-void decode_encoded_mask_to_linear(const mmltk::rfdetr::EncodedMask& mask,
-                                   std::uint32_t width,
-                                   std::uint32_t height,
+void decode_encoded_mask_to_linear(const mmltk::rfdetr::EncodedMask& mask, std::uint32_t width, std::uint32_t height,
                                    std::uint8_t* destination) {
     if (destination == nullptr) {
         throw std::runtime_error("decode_encoded_mask_to_linear requires a destination buffer");
@@ -57,13 +55,11 @@ void decode_encoded_mask_to_linear(const mmltk::rfdetr::EncodedMask& mask,
     }
 }
 
-} // namespace
+}  // namespace
 
-StillImagePreview render_single_image_prediction_preview(
-    const mmltk::rfdetr::PredictImageInput& input,
-    const mmltk::rfdetr::PredictionRecord& record,
-    int num_classes,
-    int device_id) {
+StillImagePreview render_single_image_prediction_preview(const mmltk::rfdetr::PredictImageInput& input,
+                                                         const mmltk::rfdetr::PredictionRecord& record, int num_classes,
+                                                         int device_id) {
     int raw_width = 0;
     int raw_height = 0;
     int raw_channels = 0;
@@ -80,8 +76,7 @@ StillImagePreview render_single_image_prediction_preview(
     preview.source_name = record.source_name.empty() ? input.image_path.string() : record.source_name;
     preview.width = static_cast<std::uint32_t>(raw_width);
     preview.height = static_cast<std::uint32_t>(raw_height);
-    const std::size_t image_bytes =
-        static_cast<std::size_t>(raw_width) * static_cast<std::size_t>(raw_height) * 3U;
+    const std::size_t image_bytes = static_cast<std::size_t>(raw_width) * static_cast<std::size_t>(raw_height) * 3U;
     preview.pixels_bgr.assign(raw_pixels, raw_pixels + image_bytes);
     stbi_image_free(raw_pixels);
     rgb_to_bgr_in_place(preview.pixels_bgr);
@@ -122,28 +117,22 @@ StillImagePreview render_single_image_prediction_preview(
         return preview;
     }
 
-    const std::size_t pixels_per_mask =
-        static_cast<std::size_t>(raw_width) * static_cast<std::size_t>(raw_height);
+    const std::size_t pixels_per_mask = static_cast<std::size_t>(raw_width) * static_cast<std::size_t>(raw_height);
     if (has_any_masks) {
         masks_host.assign(labels_host.size() * pixels_per_mask, 0U);
         for (std::size_t kept_index = 0; kept_index < kept_detections.size(); ++kept_index) {
             const auto& detection = *kept_detections[kept_index];
             if (detection.has_mask) {
-                decode_encoded_mask_to_linear(
-                    detection.mask,
-                    static_cast<std::uint32_t>(raw_width),
-                    static_cast<std::uint32_t>(raw_height),
-                    masks_host.data() + kept_index * pixels_per_mask);
+                decode_encoded_mask_to_linear(detection.mask, static_cast<std::uint32_t>(raw_width),
+                                              static_cast<std::uint32_t>(raw_height),
+                                              masks_host.data() + kept_index * pixels_per_mask);
             }
         }
     }
 
     std::vector<std::uint8_t> colors_host;
-    mmltk::rfdetr::build_instance_colors_from_zero_based_labels(
-        labels_host.data(),
-        labels_host.size(),
-        num_classes,
-        &colors_host);
+    mmltk::rfdetr::build_instance_colors_from_zero_based_labels(labels_host.data(), labels_host.size(), num_classes,
+                                                                &colors_host);
 
     const torch::Device device(torch::kCUDA, static_cast<torch::DeviceIndex>(device_id));
     c10::cuda::CUDAGuard guard(device);
@@ -156,69 +145,42 @@ StillImagePreview render_single_image_prediction_preview(
     bool* masks_device = nullptr;
     {
         c10::cuda::CUDAStreamGuard stream_guard(stream);
-        image_device = torch::empty(
-            {raw_height, raw_width, 3},
-            torch::TensorOptions().dtype(torch::kUInt8).device(device));
-        require_cuda_ok(cudaMemcpyAsync(image_device.data_ptr<std::uint8_t>(),
-                                        preview.pixels_bgr.data(),
-                                        image_bytes,
-                                        cudaMemcpyHostToDevice,
-                                        stream.stream()),
+        image_device =
+            torch::empty({raw_height, raw_width, 3}, torch::TensorOptions().dtype(torch::kUInt8).device(device));
+        require_cuda_ok(cudaMemcpyAsync(image_device.data_ptr<std::uint8_t>(), preview.pixels_bgr.data(), image_bytes,
+                                        cudaMemcpyHostToDevice, stream.stream()),
                         "cudaMemcpyAsync preview image host->device");
 
-        boxes_device = torch::tensor(
-            boxes_host,
-            torch::TensorOptions().dtype(torch::kFloat32).device(device));
-        colors_device = torch::tensor(
-            colors_host,
-            torch::TensorOptions().dtype(torch::kUInt8).device(device));
-        labels_device = torch::tensor(
-            labels_host,
-            torch::TensorOptions().dtype(torch::kInt32).device(device));
+        boxes_device = torch::tensor(boxes_host, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+        colors_device = torch::tensor(colors_host, torch::TensorOptions().dtype(torch::kUInt8).device(device));
+        labels_device = torch::tensor(labels_host, torch::TensorOptions().dtype(torch::kInt32).device(device));
         if (!masks_host.empty()) {
-            require_cuda_ok(cudaMalloc(reinterpret_cast<void**>(&masks_device),
-                                       masks_host.size() * sizeof(bool)),
+            require_cuda_ok(cudaMalloc(reinterpret_cast<void**>(&masks_device), masks_host.size() * sizeof(bool)),
                             "cudaMalloc preview masks_device");
-            require_cuda_ok(cudaMemcpyAsync(masks_device,
-                                            masks_host.data(),
-                                            masks_host.size() * sizeof(bool),
-                                            cudaMemcpyHostToDevice,
-                                            stream.stream()),
+            require_cuda_ok(cudaMemcpyAsync(masks_device, masks_host.data(), masks_host.size() * sizeof(bool),
+                                            cudaMemcpyHostToDevice, stream.stream()),
                             "cudaMemcpyAsync preview masks host->device");
             mmltk::rfdetr::launch_draw_masks_boxes_labels_bgr_pitched(
-                image_device.data_ptr<std::uint8_t>(),
-                static_cast<std::size_t>(raw_width) * 3U,
-                raw_width,
-                raw_height,
-                masks_device,
-                boxes_device.data_ptr<float>(),
-                colors_device.data_ptr<std::uint8_t>(),
-                labels_device.data_ptr<int>(),
-                static_cast<int>(labels_host.size()),
-                0.45f,
-                2,
-                stream.stream());
+                image_device.data_ptr<std::uint8_t>(), static_cast<std::size_t>(raw_width) * 3U,
+                mmltk::rfdetr::draw_launch::MaskBoxLabelArgs{
+                    raw_width,
+                    raw_height,
+                    {masks_device, boxes_device.data_ptr<float>(), colors_device.data_ptr<std::uint8_t>(),
+                     labels_device.data_ptr<int>(), static_cast<int>(labels_host.size())},
+                    0.45f,
+                    2,
+                    stream.stream()});
             require_cuda_ok(cudaPeekAtLastError(), "launch_draw_masks_boxes_labels_bgr_pitched");
         } else {
             mmltk::rfdetr::launch_draw_boxes_labels_bgr_pitched(
-                image_device.data_ptr<std::uint8_t>(),
-                static_cast<std::size_t>(raw_width) * 3U,
-                raw_width,
-                raw_height,
-                boxes_device.data_ptr<float>(),
-                colors_device.data_ptr<std::uint8_t>(),
-                labels_device.data_ptr<int>(),
-                static_cast<int>(labels_host.size()),
-                2,
-                stream.stream());
+                image_device.data_ptr<std::uint8_t>(), static_cast<std::size_t>(raw_width) * 3U, raw_width, raw_height,
+                boxes_device.data_ptr<float>(), colors_device.data_ptr<std::uint8_t>(), labels_device.data_ptr<int>(),
+                static_cast<int>(labels_host.size()), 2, stream.stream());
             require_cuda_ok(cudaPeekAtLastError(), "launch_draw_boxes_labels_bgr_pitched");
         }
 
-        require_cuda_ok(cudaMemcpyAsync(preview.pixels_bgr.data(),
-                                        image_device.data_ptr<std::uint8_t>(),
-                                        image_bytes,
-                                        cudaMemcpyDeviceToHost,
-                                        stream.stream()),
+        require_cuda_ok(cudaMemcpyAsync(preview.pixels_bgr.data(), image_device.data_ptr<std::uint8_t>(), image_bytes,
+                                        cudaMemcpyDeviceToHost, stream.stream()),
                         "cudaMemcpyAsync preview image device->host");
     }
     require_cuda_ok(cudaStreamSynchronize(stream.stream()), "cudaStreamSynchronize preview draw");
@@ -228,4 +190,4 @@ StillImagePreview render_single_image_prediction_preview(
     return preview;
 }
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

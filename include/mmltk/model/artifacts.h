@@ -21,8 +21,7 @@ struct ModelArtifactRequest {
     std::string preset_name;
 
     [[nodiscard]] size_t selected_input_count() const noexcept {
-        return static_cast<size_t>(!weights_path.empty()) +
-               static_cast<size_t>(!onnx_path.empty()) +
+        return static_cast<size_t>(!weights_path.empty()) + static_cast<size_t>(!onnx_path.empty()) +
                static_cast<size_t>(!tensorrt_path.empty());
     }
 
@@ -53,16 +52,16 @@ struct ResolvedModelArtifacts {
 
 [[nodiscard]] inline const char* to_string(const ModelArtifactInputKind kind) noexcept {
     switch (kind) {
-    case ModelArtifactInputKind::None:
-        return "none";
-    case ModelArtifactInputKind::Weights:
-        return "weights";
-    case ModelArtifactInputKind::Onnx:
-        return "onnx";
-    case ModelArtifactInputKind::TensorRt:
-        return "tensorrt";
+        case ModelArtifactInputKind::None:
+            return "none";
+        case ModelArtifactInputKind::Weights:
+            return "weights";
+        case ModelArtifactInputKind::Onnx:
+            return "onnx";
+        case ModelArtifactInputKind::TensorRt:
+            return "tensorrt";
     }
     return "unknown";
 }
 
-} // namespace mmltk::model
+}  // namespace mmltk::model

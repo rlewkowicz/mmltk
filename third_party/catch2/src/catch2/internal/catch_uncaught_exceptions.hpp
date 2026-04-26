@@ -9,7 +9,7 @@
 #define CATCH_UNCAUGHT_EXCEPTIONS_HPP_INCLUDED
 
 namespace Catch {
-    bool uncaught_exceptions();
-} // end namespace Catch
+bool uncaught_exceptions();
+}
 
-#endif // CATCH_UNCAUGHT_EXCEPTIONS_HPP_INCLUDED
+#endif  // CATCH_UNCAUGHT_EXCEPTIONS_HPP_INCLUDED

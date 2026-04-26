@@ -18,68 +18,48 @@
 
 namespace Catch {
 
-    enum class ColourMode : std::uint8_t;
+enum class ColourMode : std::uint8_t;
 
-    namespace Detail {
-        //! Splits the reporter spec into reporter name and kv-pair options
-        std::vector<std::string> splitReporterSpec( StringRef reporterSpec );
+namespace Detail {
+std::vector<std::string> splitReporterSpec(StringRef reporterSpec);
 
-        Optional<ColourMode> stringToColourMode( StringRef colourMode );
+Optional<ColourMode> stringToColourMode(StringRef colourMode);
+}  // namespace Detail
+
+class ReporterSpec {
+    std::string m_name;
+    Optional<std::string> m_outputFileName;
+    Optional<ColourMode> m_colourMode;
+    std::map<std::string, std::string> m_customOptions;
+
+    friend bool operator==(ReporterSpec const& lhs, ReporterSpec const& rhs);
+    friend bool operator!=(ReporterSpec const& lhs, ReporterSpec const& rhs) {
+        return !(lhs == rhs);
     }
 
-    /**
-     * Structured reporter spec that a reporter can be created from
-     *
-     * Parsing has been validated, but semantics have not. This means e.g.
-     * that the colour mode is known to Catch2, but it might not be
-     * compiled into the binary, and the output filename might not be
-     * openable.
-     */
-    class ReporterSpec {
-        std::string m_name;
-        Optional<std::string> m_outputFileName;
-        Optional<ColourMode> m_colourMode;
-        std::map<std::string, std::string> m_customOptions;
+   public:
+    ReporterSpec(std::string name, Optional<std::string> outputFileName, Optional<ColourMode> colourMode,
+                 std::map<std::string, std::string> customOptions);
 
-        friend bool operator==( ReporterSpec const& lhs,
-                                ReporterSpec const& rhs );
-        friend bool operator!=( ReporterSpec const& lhs,
-                                ReporterSpec const& rhs ) {
-            return !( lhs == rhs );
-        }
+    std::string const& name() const {
+        return m_name;
+    }
 
-    public:
-        ReporterSpec(
-            std::string name,
-            Optional<std::string> outputFileName,
-            Optional<ColourMode> colourMode,
-            std::map<std::string, std::string> customOptions );
+    Optional<std::string> const& outputFile() const {
+        return m_outputFileName;
+    }
 
-        std::string const& name() const { return m_name; }
+    Optional<ColourMode> const& colourMode() const {
+        return m_colourMode;
+    }
 
-        Optional<std::string> const& outputFile() const {
-            return m_outputFileName;
-        }
+    std::map<std::string, std::string> const& customOptions() const {
+        return m_customOptions;
+    }
+};
 
-        Optional<ColourMode> const& colourMode() const { return m_colourMode; }
+Optional<ReporterSpec> parseReporterSpec(StringRef reporterSpec);
 
-        std::map<std::string, std::string> const& customOptions() const {
-            return m_customOptions;
-        }
-    };
+}  // namespace Catch
 
-    /**
-     * Parses provided reporter spec string into
-     *
-     * Returns empty optional on errors, e.g.
-     *  * field that is not first and not a key+value pair
-     *  * duplicated keys in kv pair
-     *  * unknown catch reporter option
-     *  * empty key/value in an custom kv pair
-     *  * ...
-     */
-    Optional<ReporterSpec> parseReporterSpec( StringRef reporterSpec );
-
-}
-
-#endif // CATCH_REPORTER_SPEC_PARSER_HPP_INCLUDED
+#endif  // CATCH_REPORTER_SPEC_PARSER_HPP_INCLUDED

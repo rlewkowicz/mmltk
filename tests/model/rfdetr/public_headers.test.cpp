@@ -152,7 +152,7 @@ void test_backend_selection_helpers_choose_available_artifacts() {
     assert(unsupported_backend_rejected);
 }
 
-} // namespace
+}  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][public_headers]", test_public_header_types_are_constructible);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][public_headers]", test_backend_selection_helpers_choose_available_artifacts);

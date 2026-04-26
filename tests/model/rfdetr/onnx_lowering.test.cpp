@@ -27,7 +27,6 @@
 
 namespace {
 
-// Avoid Torch/JIT symbol registration before main in release/LTO test bundles.
 #define MMLTK_TEST_JIT_SYMBOL(name) (::c10::Symbol::fromQualString(name))
 #define MMLTK_TEST_JIT_ATTR(name) (::c10::Symbol::attr(name))
 
@@ -83,30 +82,21 @@ namespace {
 #define kAttrGroup MMLTK_TEST_JIT_ATTR("group")
 #define kAttrAxis MMLTK_TEST_JIT_ATTR("axis")
 
-std::shared_ptr<torch::jit::Graph> trace_unary_graph(
-    const torch::Tensor& input,
-    const std::function<torch::Tensor(const torch::Tensor&)>& fn) {
+std::shared_ptr<torch::jit::Graph> trace_unary_graph(const torch::Tensor& input,
+                                                     const std::function<torch::Tensor(const torch::Tensor&)>& fn) {
     auto cu = std::make_shared<torch::jit::CompilationUnit>();
     auto cls = torch::jit::ClassType::create("__torch__.TestOnnxLowering", cu, true);
     torch::jit::Module module(cu, cls);
 
     auto trace_res = torch::jit::tracer::trace(
-        {input},
-        [&](torch::jit::Stack args) -> torch::jit::Stack {
-            return {fn(args[0].toTensor())};
-        },
-        [](const torch::autograd::Variable&) { return ""; },
-        false,
-        false,
-        &module);
+        {input}, [&](torch::jit::Stack args) -> torch::jit::Stack { return {fn(args[0].toTensor())}; },
+        [](const torch::autograd::Variable&) { return ""; }, false, false, &module);
 
     return trace_res.first->graph;
 }
 
-std::pair<std::shared_ptr<torch::jit::Graph>, mmltk::rfdetr::OnnxInitializerMap>
-trace_unary_graph_with_parameters(
-    const torch::Tensor& input,
-    const std::vector<std::pair<std::string, torch::Tensor>>& parameters,
+std::pair<std::shared_ptr<torch::jit::Graph>, mmltk::rfdetr::OnnxInitializerMap> trace_unary_graph_with_parameters(
+    const torch::Tensor& input, const std::vector<std::pair<std::string, torch::Tensor>>& parameters,
     const std::function<torch::Tensor(torch::jit::Module&, const torch::Tensor&)>& fn) {
     auto cu = std::make_shared<torch::jit::CompilationUnit>();
     auto cls = torch::jit::ClassType::create("__torch__.TestOnnxLoweringWithParameters", cu, true);
@@ -118,26 +108,18 @@ trace_unary_graph_with_parameters(
     }
 
     auto trace_res = torch::jit::tracer::trace(
-        {input},
-        [&](torch::jit::Stack args) -> torch::jit::Stack {
-            return {fn(module, args[0].toTensor())};
-        },
-        [](const torch::autograd::Variable&) { return ""; },
-        false,
-        false,
-        &module);
+        {input}, [&](torch::jit::Stack args) -> torch::jit::Stack { return {fn(module, args[0].toTensor())}; },
+        [](const torch::autograd::Variable&) { return ""; }, false, false, &module);
 
     return {trace_res.first->graph, std::move(initializers)};
 }
 
-std::pair<std::shared_ptr<torch::jit::Graph>, mmltk::rfdetr::OnnxInitializerMap>
-trace_unary_graph_with_bias_attr(const torch::Tensor& input, const torch::Tensor& bias) {
-    return trace_unary_graph_with_parameters(
-        input,
-        {{"bias", bias}},
-        [](torch::jit::Module& module, const torch::Tensor& traced_input) {
-            return traced_input + module.attr("bias").toTensor();
-        });
+std::pair<std::shared_ptr<torch::jit::Graph>, mmltk::rfdetr::OnnxInitializerMap> trace_unary_graph_with_bias_attr(
+    const torch::Tensor& input, const torch::Tensor& bias) {
+    return trace_unary_graph_with_parameters(input, {{"bias", bias}},
+                                             [](torch::jit::Module& module, const torch::Tensor& traced_input) {
+                                                 return traced_input + module.attr("bias").toTensor();
+                                             });
 }
 
 bool block_contains_kind(const torch::jit::Block* block, c10::Symbol kind) {
@@ -192,11 +174,8 @@ void test_dtype_mapping() {
 }
 
 void test_lower_to_emits_onnx_cast() {
-    auto graph = trace_unary_graph(
-        torch::randn({2, 3}),
-        [](const torch::Tensor& input) {
-            return input.to(torch::kBool);
-        });
+    auto graph =
+        trace_unary_graph(torch::randn({2, 3}), [](const torch::Tensor& input) { return input.to(torch::kBool); });
     assert(block_contains_kind(graph->block(), kAtenTo));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -208,11 +187,9 @@ void test_lower_to_emits_onnx_cast() {
 }
 
 void test_lower_type_as_emits_onnx_cast() {
-    auto graph = trace_unary_graph(
-        torch::randn({2, 3}),
-        [](const torch::Tensor& input) {
-            return input.type_as(torch::ones({1}, torch::TensorOptions().dtype(torch::kFloat16)));
-        });
+    auto graph = trace_unary_graph(torch::randn({2, 3}), [](const torch::Tensor& input) {
+        return input.type_as(torch::ones({1}, torch::TensorOptions().dtype(torch::kFloat16)));
+    });
     assert(block_contains_kind(graph->block(), kAtenTypeAs));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -224,11 +201,8 @@ void test_lower_type_as_emits_onnx_cast() {
 }
 
 void test_lower_noop_to_removes_redundant_cast() {
-    auto graph = trace_unary_graph(
-        torch::randn({2, 3}),
-        [](const torch::Tensor& input) {
-            return input.to(torch::kFloat32);
-        });
+    auto graph =
+        trace_unary_graph(torch::randn({2, 3}), [](const torch::Tensor& input) { return input.to(torch::kFloat32); });
     assert(block_contains_kind(graph->block(), kAtenTo));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -238,14 +212,10 @@ void test_lower_noop_to_removes_redundant_cast() {
 }
 
 void test_lower_six_input_to_emits_onnx_cast() {
-    auto graph = trace_unary_graph(
-        torch::randn({2, 3}),
-        [](const torch::Tensor& input) {
-            auto source = torch::ones(
-                {2, 3},
-                torch::TensorOptions().dtype(torch::kInt64).device(input.device()));
-            return source.to(input.device(), input.dtype(), false, false);
-        });
+    auto graph = trace_unary_graph(torch::randn({2, 3}), [](const torch::Tensor& input) {
+        auto source = torch::ones({2, 3}, torch::TensorOptions().dtype(torch::kInt64).device(input.device()));
+        return source.to(input.device(), input.dtype(), false, false);
+    });
     assert(block_contains_kind(graph->block(), kAtenTo));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -259,14 +229,12 @@ void test_lower_six_input_to_emits_onnx_cast() {
 void test_lower_convolution_emits_onnx_conv() {
     auto weight = torch::randn({8, 3, 3, 3});
     auto bias = torch::randn({8});
-    auto graph = trace_unary_graph(
-        torch::randn({1, 3, 16, 16}),
-        [weight, bias](const torch::Tensor& input) {
-            const std::vector<int64_t> stride{2, 2};
-            const std::vector<int64_t> padding{1, 1};
-            const std::vector<int64_t> dilation{1, 1};
-            return torch::conv2d(input, weight, bias, stride, padding, dilation, 1);
-        });
+    auto graph = trace_unary_graph(torch::randn({1, 3, 16, 16}), [weight, bias](const torch::Tensor& input) {
+        const std::vector<int64_t> stride{2, 2};
+        const std::vector<int64_t> padding{1, 1};
+        const std::vector<int64_t> dilation{1, 1};
+        return torch::conv2d(input, weight, bias, stride, padding, dilation, 1);
+    });
     assert(block_contains_kind(graph->block(), kAtenConvolution));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -282,11 +250,8 @@ void test_lower_convolution_emits_onnx_conv() {
 }
 
 void test_lower_flatten_emits_onnx_reshape() {
-    auto graph = trace_unary_graph(
-        torch::randn({2, 3, 4, 5}),
-        [](const torch::Tensor& input) {
-            return input.flatten(2);
-        });
+    auto graph =
+        trace_unary_graph(torch::randn({2, 3, 4, 5}), [](const torch::Tensor& input) { return input.flatten(2); });
     assert(block_contains_kind(graph->block(), kAtenFlatten));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -297,11 +262,7 @@ void test_lower_flatten_emits_onnx_reshape() {
 }
 
 void test_lower_t_emits_onnx_transpose() {
-    auto graph = trace_unary_graph(
-        torch::randn({3, 4}),
-        [](const torch::Tensor& input) {
-            return at::t(input);
-        });
+    auto graph = trace_unary_graph(torch::randn({3, 4}), [](const torch::Tensor& input) { return at::t(input); });
     assert(block_contains_kind(graph->block(), kAtenT));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -311,11 +272,8 @@ void test_lower_t_emits_onnx_transpose() {
 }
 
 void test_lower_transpose_emits_onnx_transpose() {
-    auto graph = trace_unary_graph(
-        torch::randn({2, 3, 4}),
-        [](const torch::Tensor& input) {
-            return input.transpose(1, 2);
-        });
+    auto graph =
+        trace_unary_graph(torch::randn({2, 3, 4}), [](const torch::Tensor& input) { return input.transpose(1, 2); });
     assert(block_contains_kind(graph->block(), kAtenTranspose));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -325,11 +283,8 @@ void test_lower_transpose_emits_onnx_transpose() {
 }
 
 void test_lower_view_emits_onnx_reshape() {
-    auto graph = trace_unary_graph(
-        torch::randn({2, 3, 4}),
-        [](const torch::Tensor& input) {
-            return input.view({2, 12});
-        });
+    auto graph =
+        trace_unary_graph(torch::randn({2, 3, 4}), [](const torch::Tensor& input) { return input.view({2, 12}); });
     assert(block_contains_kind(graph->block(), kAtenView));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -339,11 +294,8 @@ void test_lower_view_emits_onnx_reshape() {
 }
 
 void test_lower_cat_emits_onnx_concat() {
-    auto graph = trace_unary_graph(
-        torch::randn({2, 3, 4}),
-        [](const torch::Tensor& input) {
-            return torch::cat({input, input}, 1);
-        });
+    auto graph = trace_unary_graph(torch::randn({2, 3, 4}),
+                                   [](const torch::Tensor& input) { return torch::cat({input, input}, 1); });
     assert(block_contains_kind(graph->block(), kAtenCat));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -355,11 +307,8 @@ void test_lower_cat_emits_onnx_concat() {
 }
 
 void test_lower_stack_emits_concat_path() {
-    auto graph = trace_unary_graph(
-        torch::randn({2, 3, 4}),
-        [](const torch::Tensor& input) {
-            return torch::stack({input, input}, 1);
-        });
+    auto graph = trace_unary_graph(torch::randn({2, 3, 4}),
+                                   [](const torch::Tensor& input) { return torch::stack({input, input}, 1); });
     assert(block_contains_kind(graph->block(), kAtenStack));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -369,11 +318,8 @@ void test_lower_stack_emits_concat_path() {
 }
 
 void test_lower_repeat_emits_onnx_tile() {
-    auto graph = trace_unary_graph(
-        torch::randn({1, 3, 4}),
-        [](const torch::Tensor& input) {
-            return input.repeat({2, 1, 1});
-        });
+    auto graph =
+        trace_unary_graph(torch::randn({1, 3, 4}), [](const torch::Tensor& input) { return input.repeat({2, 1, 1}); });
     assert(block_contains_kind(graph->block(), kAtenRepeat));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -383,11 +329,9 @@ void test_lower_repeat_emits_onnx_tile() {
 }
 
 void test_lower_slice_and_select_emit_onnx_slice_path() {
-    auto graph = trace_unary_graph(
-        torch::randn({2, 3, 4}),
-        [](const torch::Tensor& input) {
-            return input.index({torch::indexing::Slice(), 0, torch::indexing::Slice()});
-        });
+    auto graph = trace_unary_graph(torch::randn({2, 3, 4}), [](const torch::Tensor& input) {
+        return input.index({torch::indexing::Slice(), 0, torch::indexing::Slice()});
+    });
     assert(block_contains_kind(graph->block(), kAtenSlice) || block_contains_kind(graph->block(), kAtenSelect));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -398,11 +342,8 @@ void test_lower_slice_and_select_emit_onnx_slice_path() {
 }
 
 void test_lower_slice_with_negative_axis_and_step_emits_onnx_slice() {
-    auto graph = trace_unary_graph(
-        torch::randn({2, 3, 8}),
-        [](const torch::Tensor& input) {
-            return input.slice(-1, 0, c10::nullopt, 2);
-        });
+    auto graph = trace_unary_graph(torch::randn({2, 3, 8}),
+                                   [](const torch::Tensor& input) { return input.slice(-1, 0, c10::nullopt, 2); });
     assert(block_contains_kind(graph->block(), kAtenSlice));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -412,11 +353,8 @@ void test_lower_slice_with_negative_axis_and_step_emits_onnx_slice() {
 }
 
 void test_lower_inference_dropout_removes_dropout_node() {
-    auto graph = trace_unary_graph(
-        torch::randn({2, 3, 8}),
-        [](const torch::Tensor& input) {
-            return torch::dropout(input, 0.1, false);
-        });
+    auto graph = trace_unary_graph(torch::randn({2, 3, 8}),
+                                   [](const torch::Tensor& input) { return torch::dropout(input, 0.1, false); });
     assert(block_contains_kind(graph->block(), kAtenDropout));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -425,11 +363,7 @@ void test_lower_inference_dropout_removes_dropout_node() {
 }
 
 void test_lower_detach_removes_detach_node() {
-    auto graph = trace_unary_graph(
-        torch::randn({2, 3, 8}),
-        [](const torch::Tensor& input) {
-            return input.detach();
-        });
+    auto graph = trace_unary_graph(torch::randn({2, 3, 8}), [](const torch::Tensor& input) { return input.detach(); });
     assert(block_contains_kind(graph->block(), kAtenDetach));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -438,11 +372,8 @@ void test_lower_detach_removes_detach_node() {
 }
 
 void test_lower_alias_removes_alias_node() {
-    auto graph = trace_unary_graph(
-        torch::randn({2, 3, 8}),
-        [](const torch::Tensor& input) {
-            return at::alias(input);
-        });
+    auto graph =
+        trace_unary_graph(torch::randn({2, 3, 8}), [](const torch::Tensor& input) { return at::alias(input); });
     assert(block_contains_kind(graph->block(), kAtenAlias));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -453,20 +384,16 @@ void test_lower_alias_removes_alias_node() {
 void test_lower_layer_norm_emits_onnx_layer_normalization() {
     const auto weight = torch::randn({8});
     const auto bias = torch::randn({8});
-    auto [graph, initializers] = trace_unary_graph_with_parameters(
-        torch::randn({2, 3, 8}),
-        {
-            {"weight", weight},
-            {"bias", bias},
-        },
-        [](torch::jit::Module& module, const torch::Tensor& input) {
-            return torch::layer_norm(input,
-                                     {8},
-                                     module.attr("weight").toTensor(),
-                                     module.attr("bias").toTensor(),
-                                     1.0e-5,
-                                     false);
-        });
+    auto [graph, initializers] =
+        trace_unary_graph_with_parameters(torch::randn({2, 3, 8}),
+                                          {
+                                              {"weight", weight},
+                                              {"bias", bias},
+                                          },
+                                          [](torch::jit::Module& module, const torch::Tensor& input) {
+                                              return torch::layer_norm(input, {8}, module.attr("weight").toTensor(),
+                                                                       module.attr("bias").toTensor(), 1.0e-5, false);
+                                          });
     assert(block_contains_kind(graph->block(), kAtenLayerNorm));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph, &initializers);
@@ -476,12 +403,10 @@ void test_lower_layer_norm_emits_onnx_layer_normalization() {
 }
 
 void test_lower_add_inplace_emits_onnx_add() {
-    auto graph = trace_unary_graph(
-        torch::randn({2, 3, 8}),
-        [](const torch::Tensor& input) {
-            auto out = input + 1.0;
-            return out.add_(input);
-        });
+    auto graph = trace_unary_graph(torch::randn({2, 3, 8}), [](const torch::Tensor& input) {
+        auto out = input + 1.0;
+        return out.add_(input);
+    });
     assert(block_contains_kind(graph->block(), kAtenAddInplace));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -491,11 +416,9 @@ void test_lower_add_inplace_emits_onnx_add() {
 }
 
 void test_lower_arange_emits_onnx_range() {
-    auto graph = trace_unary_graph(
-        torch::randn({2, 3, 8}),
-        [](const torch::Tensor& input) {
-            return at::arange(input.size(2), input.options().dtype(torch::kFloat32));
-        });
+    auto graph = trace_unary_graph(torch::randn({2, 3, 8}), [](const torch::Tensor& input) {
+        return at::arange(input.size(2), input.options().dtype(torch::kFloat32));
+    });
     assert(block_contains_kind(graph->block(), kAtenArange));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -505,11 +428,8 @@ void test_lower_arange_emits_onnx_range() {
 }
 
 void test_lower_narrow_with_static_size_arithmetic_emits_onnx_slice() {
-    auto graph = trace_unary_graph(
-        torch::randn({2, 5, 4}),
-        [](const torch::Tensor& input) {
-            return input.narrow(1, 1, input.size(1) - 1);
-        });
+    auto graph = trace_unary_graph(torch::randn({2, 5, 4}),
+                                   [](const torch::Tensor& input) { return input.narrow(1, 1, input.size(1) - 1); });
     assert(block_contains_kind(graph->block(), kAtenNarrow));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -519,11 +439,8 @@ void test_lower_narrow_with_static_size_arithmetic_emits_onnx_slice() {
 }
 
 void test_lower_softmax_emits_onnx_softmax() {
-    auto graph = trace_unary_graph(
-        torch::randn({2, 3, 4}),
-        [](const torch::Tensor& input) {
-            return input.softmax(-1, c10::nullopt);
-        });
+    auto graph = trace_unary_graph(torch::randn({2, 3, 4}),
+                                   [](const torch::Tensor& input) { return input.softmax(-1, c10::nullopt); });
     assert(block_contains_kind(graph->block(), kAtenSoftmax));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -534,10 +451,7 @@ void test_lower_softmax_emits_onnx_softmax() {
 
 void test_lower_topk_emits_onnx_topk() {
     auto graph = trace_unary_graph(
-        torch::randn({2, 4, 4}),
-        [](const torch::Tensor& input) {
-            return std::get<1>(input.topk(2, 1, true, true));
-        });
+        torch::randn({2, 4, 4}), [](const torch::Tensor& input) { return std::get<1>(input.topk(2, 1, true, true)); });
     assert(block_contains_kind(graph->block(), kAtenTopk));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -547,11 +461,8 @@ void test_lower_topk_emits_onnx_topk() {
 }
 
 void test_lower_ones_like_emits_constant_of_shape() {
-    auto graph = trace_unary_graph(
-        torch::randn({2, 3, 4}),
-        [](const torch::Tensor& input) {
-            return torch::ones_like(input);
-        });
+    auto graph =
+        trace_unary_graph(torch::randn({2, 3, 4}), [](const torch::Tensor& input) { return torch::ones_like(input); });
     assert(block_contains_kind(graph->block(), kAtenOnesLike));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -562,11 +473,9 @@ void test_lower_ones_like_emits_constant_of_shape() {
 
 void test_lower_einsum_emits_onnx_einsum() {
     const auto query = torch::randn({2, 7, 3});
-    auto graph = trace_unary_graph(
-        torch::randn({2, 3, 4, 5}),
-        [query](const torch::Tensor& input) {
-            return at::einsum("bchw,bnc->bnhw", {input, query});
-        });
+    auto graph = trace_unary_graph(torch::randn({2, 3, 4, 5}), [query](const torch::Tensor& input) {
+        return at::einsum("bchw,bnc->bnhw", {input, query});
+    });
     assert(block_contains_kind(graph->block(), kAtenEinsum));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -577,11 +486,8 @@ void test_lower_einsum_emits_onnx_einsum() {
 }
 
 void test_lower_split_list_unpack_emits_onnx_split() {
-    auto graph = trace_unary_graph(
-        torch::randn({2, 4, 4}),
-        [](const torch::Tensor& input) {
-            return input.split(1, 1)[0];
-        });
+    auto graph =
+        trace_unary_graph(torch::randn({2, 4, 4}), [](const torch::Tensor& input) { return input.split(1, 1)[0]; });
     assert(block_contains_kind(graph->block(), kAtenSplit));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -591,11 +497,8 @@ void test_lower_split_list_unpack_emits_onnx_split() {
 }
 
 void test_lower_unbind_list_unpack_emits_onnx_split() {
-    auto graph = trace_unary_graph(
-        torch::randn({2, 4, 4}),
-        [](const torch::Tensor& input) {
-            return at::unbind(input, 1)[0];
-        });
+    auto graph =
+        trace_unary_graph(torch::randn({2, 4, 4}), [](const torch::Tensor& input) { return at::unbind(input, 1)[0]; });
     assert(block_contains_kind(graph->block(), kAtenUnbind));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -618,10 +521,7 @@ void test_lower_add_with_bias_attr_emits_onnx_add() {
 
 void test_lower_bool_bitwise_and_emits_onnx_and() {
     auto graph = trace_unary_graph(
-        torch::randn({2, 3, 4}),
-        [](const torch::Tensor& input) {
-            return at::bitwise_and(input > 0.0, input < 1.0);
-        });
+        torch::randn({2, 3, 4}), [](const torch::Tensor& input) { return at::bitwise_and(input > 0.0, input < 1.0); });
     assert(block_contains_kind(graph->block(), kAtenBitwiseAnd));
 
     mmltk::rfdetr::lower_graph_for_onnx_export(graph);
@@ -631,11 +531,8 @@ void test_lower_bool_bitwise_and_emits_onnx_and() {
 }
 
 void test_lower_integer_bitwise_and_fails_loudly() {
-    auto graph = trace_unary_graph(
-        torch::randint(0, 8, {2, 3}, torch::TensorOptions().dtype(torch::kInt64)),
-        [](const torch::Tensor& input) {
-            return at::bitwise_and(input, 1);
-        });
+    auto graph = trace_unary_graph(torch::randint(0, 8, {2, 3}, torch::TensorOptions().dtype(torch::kInt64)),
+                                   [](const torch::Tensor& input) { return at::bitwise_and(input, 1); });
     assert(block_contains_kind(graph->block(), kAtenBitwiseAnd));
 
     bool threw = false;
@@ -648,7 +545,7 @@ void test_lower_integer_bitwise_and_fails_loudly() {
     assert(threw);
 }
 
-} // namespace
+}  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][onnx_lowering]", test_supported_opset_validation);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][onnx_lowering]", test_dtype_mapping);
@@ -665,14 +562,16 @@ MMLTK_REGISTER_TEST_CASE("[model][rfdetr][onnx_lowering]", test_lower_cat_emits_
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][onnx_lowering]", test_lower_stack_emits_concat_path);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][onnx_lowering]", test_lower_repeat_emits_onnx_tile);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][onnx_lowering]", test_lower_slice_and_select_emit_onnx_slice_path);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][onnx_lowering]", test_lower_slice_with_negative_axis_and_step_emits_onnx_slice);
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][onnx_lowering]",
+                         test_lower_slice_with_negative_axis_and_step_emits_onnx_slice);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][onnx_lowering]", test_lower_inference_dropout_removes_dropout_node);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][onnx_lowering]", test_lower_detach_removes_detach_node);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][onnx_lowering]", test_lower_alias_removes_alias_node);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][onnx_lowering]", test_lower_layer_norm_emits_onnx_layer_normalization);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][onnx_lowering]", test_lower_add_inplace_emits_onnx_add);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][onnx_lowering]", test_lower_arange_emits_onnx_range);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][onnx_lowering]", test_lower_narrow_with_static_size_arithmetic_emits_onnx_slice);
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][onnx_lowering]",
+                         test_lower_narrow_with_static_size_arithmetic_emits_onnx_slice);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][onnx_lowering]", test_lower_softmax_emits_onnx_softmax);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][onnx_lowering]", test_lower_topk_emits_onnx_topk);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][onnx_lowering]", test_lower_ones_like_emits_constant_of_shape);

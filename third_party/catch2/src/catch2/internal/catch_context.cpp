@@ -10,15 +10,15 @@
 
 namespace Catch {
 
-    Context Context::currentContext;
+Context Context::currentContext;
 
-    Context& getCurrentMutableContext() {
-        return Context::currentContext;
-    }
-
-    SimplePcg32& sharedRng() {
-        static SimplePcg32 s_rng;
-        return s_rng;
-    }
-
+Context& getCurrentMutableContext() {
+    return Context::currentContext;
 }
+
+SimplePcg32& sharedRng() {
+    static SimplePcg32 s_rng;
+    return s_rng;
+}
+
+}  // namespace Catch

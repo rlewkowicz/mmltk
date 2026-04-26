@@ -1,7 +1,8 @@
 #include "gui/annotation/document/document.h"
 #include "gui/annotation/session.h"
-#include "gui/annotation/workflow_live.h"
-#include "gui/cuda_gl_interop_utils.h"
+#include "gui/annotation/workflow_live_overlay.h"
+#include "gui/cuda_gl_interop_error.h"
+#include "gui/preview_interaction_overlay_types.h"
 #include "mmltk/live/manual_overlay_document.h"
 #include "overlay_compare_utils.h"
 #include "live/live_helpers.h"
@@ -164,10 +165,9 @@ void test_manual_overlay_document_suppresses_identical_replays() {
 
 void test_gui_interop_helpers_report_invalid_graphics_context_errors() {
     const std::string error_message =
-        cuda_gl_interop_error_message(cudaErrorInvalidGraphicsContext,
-                                      "cudaGraphicsGLRegisterBuffer");
+        cuda_gl_interop_error_message(cudaErrorInvalidGraphicsContext, "cudaGraphicsGLRegisterBuffer");
     assert(error_message.find("cudaGraphicsGLRegisterBuffer failed:") != std::string::npos);
-    assert(error_message.find("valid hardware OpenGL context") != std::string::npos);
+    assert(error_message.find("valid hardware OpenGL or EGL context") != std::string::npos);
     assert(is_invalid_graphics_context_error(error_message));
     assert(!is_invalid_graphics_context_error("some unrelated error"));
 }
@@ -179,56 +179,68 @@ void test_live_slot_helpers_prefer_latest_published_slot_and_fall_back() {
     slots[2]->state.store(to_slot_state_value(SlotState::kPublished), std::memory_order_release);
 
     int acquired_value = 0;
-    const bool acquired_latest =
-        try_acquire_latest_published_slot(slots,
-                                          latest_index,
-                                          &acquired_value,
-                                          [](TestSlot& slot) { return slot.value; });
+    const bool acquired_latest = try_acquire_latest_published_slot(slots, latest_index, &acquired_value,
+                                                                   [](TestSlot& slot) { return slot.value; });
     assert(acquired_latest);
     assert(acquired_value == 3);
-    assert(slots[2]->state.load(std::memory_order_acquire) ==
-           to_slot_state_value(SlotState::kAcquired));
+    assert(slots[2]->state.load(std::memory_order_acquire) == to_slot_state_value(SlotState::kAcquired));
 
     release_acquired_slot(*slots[2], "test latest slot release");
     slots[2]->state.store(to_slot_state_value(SlotState::kWriting), std::memory_order_release);
     acquired_value = 0;
 
-    const bool acquired_fallback =
-        try_acquire_latest_published_slot(slots,
-                                          latest_index,
-                                          &acquired_value,
-                                          [](TestSlot& slot) { return slot.value; });
+    const bool acquired_fallback = try_acquire_latest_published_slot(slots, latest_index, &acquired_value,
+                                                                     [](TestSlot& slot) { return slot.value; });
     assert(acquired_fallback);
     assert(acquired_value == 2);
-    assert(slots[1]->state.load(std::memory_order_acquire) ==
-           to_slot_state_value(SlotState::kAcquired));
+    assert(slots[1]->state.load(std::memory_order_acquire) == to_slot_state_value(SlotState::kAcquired));
 }
 
-void test_live_slot_helpers_reuse_ready_published_slot_and_reset_latest_index() {
-    auto slots = make_slots(2U);
-    std::atomic<int> latest_index{1};
-    slots[0]->state.store(to_slot_state_value(SlotState::kAcquired), std::memory_order_release);
-    slots[1]->state.store(to_slot_state_value(SlotState::kPublished), std::memory_order_release);
-    slots[1]->generation = 9U;
+void test_live_slot_helpers_reuse_ready_stale_published_slot_only() {
+    auto latest_only_slots = make_slots(2U);
+    std::atomic<int> latest_only_index{1};
+    latest_only_slots[0]->state.store(to_slot_state_value(SlotState::kAcquired), std::memory_order_release);
+    latest_only_slots[1]->state.store(to_slot_state_value(SlotState::kPublished), std::memory_order_release);
+    latest_only_slots[1]->generation = 7U;
 
     int reset_count = 0;
-    TestSlot* slot = reserve_writable_slot(
-        slots,
-        latest_index,
+    TestSlot* latest_slot = reserve_writable_slot(
+        latest_only_slots, latest_only_index,
         [&reset_count](TestSlot& current) {
             ++reset_count;
             current.generation = 0U;
         },
-        [](const TestSlot& current) { return current.ready_event; },
-        "test published slot reuse");
+        [](const TestSlot& current) { return current.ready_event; }, "test latest published slot reuse");
+
+    assert(latest_slot == nullptr);
+    assert(reset_count == 0);
+    assert(latest_only_slots[1]->generation == 7U);
+    assert(latest_only_index.load(std::memory_order_acquire) == 1);
+    assert(latest_only_slots[1]->state.load(std::memory_order_acquire) == to_slot_state_value(SlotState::kPublished));
+
+    auto slots = make_slots(3U);
+    std::atomic<int> latest_index{2};
+    slots[0]->state.store(to_slot_state_value(SlotState::kAcquired), std::memory_order_release);
+    slots[1]->state.store(to_slot_state_value(SlotState::kPublished), std::memory_order_release);
+    slots[2]->state.store(to_slot_state_value(SlotState::kPublished), std::memory_order_release);
+    slots[1]->generation = 9U;
+    slots[2]->generation = 10U;
+
+    TestSlot* slot = reserve_writable_slot(
+        slots, latest_index,
+        [&reset_count](TestSlot& current) {
+            ++reset_count;
+            current.generation = 0U;
+        },
+        [](const TestSlot& current) { return current.ready_event; }, "test published slot reuse");
 
     assert(slot != nullptr);
     assert(slot->slot_index == 1U);
     assert(reset_count == 1);
     assert(slot->generation == 0U);
-    assert(latest_index.load(std::memory_order_acquire) == -1);
-    assert(slot->state.load(std::memory_order_acquire) ==
-           to_slot_state_value(SlotState::kWriting));
+    assert(latest_index.load(std::memory_order_acquire) == 2);
+    assert(slots[2]->state.load(std::memory_order_acquire) == to_slot_state_value(SlotState::kPublished));
+    assert(slot->state.load(std::memory_order_acquire) == to_slot_state_value(SlotState::kWriting));
 }
 
 void test_annotation_workflow_live_overlay_state_tracks_boundary_changes() {
@@ -241,8 +253,7 @@ void test_annotation_workflow_live_overlay_state_tracks_boundary_changes() {
     frame.capture_width = 640U;
     frame.capture_height = 360U;
 
-    const auto request =
-        make_annotation_workflow_live_overlay_request(&document, &session, &frame);
+    const auto request = make_annotation_workflow_live_overlay_request(&document, &session, &frame);
     assert(annotation_workflow_live_overlay_needs_publish(runtime.live_overlay, request));
 
     note_annotation_workflow_live_overlay_published(runtime, document, session, frame);
@@ -254,8 +265,7 @@ void test_annotation_workflow_live_overlay_state_tracks_boundary_changes() {
 
     frame.capture_width = 800U;
     assert(annotation_workflow_live_overlay_needs_publish(
-        runtime.live_overlay,
-        make_annotation_workflow_live_overlay_request(&document, &session, &frame)));
+        runtime.live_overlay, make_annotation_workflow_live_overlay_request(&document, &session, &frame)));
 }
 
 void test_live_pitched_buffers_fit_bgr_and_rgba_pixel_rows() {
@@ -279,37 +289,30 @@ void test_live_pitched_buffers_fit_bgr_and_rgba_pixel_rows() {
     assert(bgr_buffer.pitch_bytes() >= bgr_row_bytes);
 
     std::vector<std::uint8_t> bgr_input(bgr_row_bytes * static_cast<std::size_t>(height), 0x5AU);
-    CUDA_ASSERT_OK(cudaMemcpy2DAsync(device_ptr_as_void(bgr_buffer.data()),
-                                     bgr_buffer.pitch_bytes(),
-                                     bgr_input.data(),
-                                     bgr_row_bytes,
-                                     bgr_row_bytes,
-                                     height,
-                                     cudaMemcpyHostToDevice,
-                                     stream));
+    CUDA_ASSERT_OK(cudaMemcpy2DAsync(device_ptr_as_void(bgr_buffer.data()), bgr_buffer.pitch_bytes(), bgr_input.data(),
+                                     bgr_row_bytes, bgr_row_bytes, height, cudaMemcpyHostToDevice, stream));
 
     RgbaPitchedDeviceBuffer rgba_buffer;
     rgba_buffer.ensure_dimensions(width, height, "cudaMallocPitch for RGBA pitched live buffer test");
     assert(rgba_buffer.width() == width);
     assert(rgba_buffer.height() == height);
     assert(rgba_buffer.pitch_bytes() >= rgba_row_bytes);
-    CUDA_ASSERT_OK(cudaMemset2DAsync(device_ptr_as_void(rgba_buffer.data()),
-                                     rgba_buffer.pitch_bytes(),
-                                     0,
-                                     rgba_row_bytes,
-                                     height,
-                                     stream));
+    CUDA_ASSERT_OK(cudaMemset2DAsync(device_ptr_as_void(rgba_buffer.data()), rgba_buffer.pitch_bytes(), 0,
+                                     rgba_row_bytes, height, stream));
 
     CUDA_ASSERT_OK(cudaStreamSynchronize(stream));
     CUDA_ASSERT_OK(cudaStreamDestroy(stream));
 }
 
-} // namespace
+}  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[gui][live_overlay_runtime]", test_overlay_compare_helpers_detect_boundary_changes);
 MMLTK_REGISTER_TEST_CASE("[gui][live_overlay_runtime]", test_manual_overlay_document_suppresses_identical_replays);
-MMLTK_REGISTER_TEST_CASE("[gui][live_overlay_runtime]", test_gui_interop_helpers_report_invalid_graphics_context_errors);
-MMLTK_REGISTER_TEST_CASE("[gui][live_overlay_runtime]", test_live_slot_helpers_prefer_latest_published_slot_and_fall_back);
-MMLTK_REGISTER_TEST_CASE("[gui][live_overlay_runtime]", test_live_slot_helpers_reuse_ready_published_slot_and_reset_latest_index);
-MMLTK_REGISTER_TEST_CASE("[gui][live_overlay_runtime]", test_annotation_workflow_live_overlay_state_tracks_boundary_changes);
+MMLTK_REGISTER_TEST_CASE("[gui][live_overlay_runtime]",
+                         test_gui_interop_helpers_report_invalid_graphics_context_errors);
+MMLTK_REGISTER_TEST_CASE("[gui][live_overlay_runtime]",
+                         test_live_slot_helpers_prefer_latest_published_slot_and_fall_back);
+MMLTK_REGISTER_TEST_CASE("[gui][live_overlay_runtime]", test_live_slot_helpers_reuse_ready_stale_published_slot_only);
+MMLTK_REGISTER_TEST_CASE("[gui][live_overlay_runtime]",
+                         test_annotation_workflow_live_overlay_state_tracks_boundary_changes);
 MMLTK_REGISTER_TEST_CASE("[gui][live_overlay_runtime][cuda]", test_live_pitched_buffers_fit_bgr_and_rgba_pixel_rows);

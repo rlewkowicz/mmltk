@@ -12,36 +12,40 @@
 
 namespace Catch {
 
-    class IResultCapture;
-    class IConfig;
+class IResultCapture;
+class IConfig;
 
-    class Context {
-        IConfig const* m_config = nullptr;
-        IResultCapture* m_resultCapture = nullptr;
+class Context {
+    IConfig const* m_config = nullptr;
+    IResultCapture* m_resultCapture = nullptr;
 
-        CATCH_EXPORT static Context currentContext;
-        friend Context& getCurrentMutableContext();
-        friend Context const& getCurrentContext();
+    CATCH_EXPORT static Context currentContext;
+    friend Context& getCurrentMutableContext();
+    friend Context const& getCurrentContext();
 
-    public:
-        constexpr IResultCapture* getResultCapture() const {
-            return m_resultCapture;
-        }
-        constexpr IConfig const* getConfig() const { return m_config; }
-        constexpr void setResultCapture( IResultCapture* resultCapture ) {
-            m_resultCapture = resultCapture;
-        }
-        constexpr void setConfig( IConfig const* config ) { m_config = config; }
-    };
-
-    Context& getCurrentMutableContext();
-
-    inline Context const& getCurrentContext() {
-        return Context::currentContext;
+   public:
+    constexpr IResultCapture* getResultCapture() const {
+        return m_resultCapture;
     }
+    constexpr IConfig const* getConfig() const {
+        return m_config;
+    }
+    constexpr void setResultCapture(IResultCapture* resultCapture) {
+        m_resultCapture = resultCapture;
+    }
+    constexpr void setConfig(IConfig const* config) {
+        m_config = config;
+    }
+};
 
-    class SimplePcg32;
-    SimplePcg32& sharedRng();
+Context& getCurrentMutableContext();
+
+inline Context const& getCurrentContext() {
+    return Context::currentContext;
 }
 
-#endif // CATCH_CONTEXT_HPP_INCLUDED
+class SimplePcg32;
+SimplePcg32& sharedRng();
+}  // namespace Catch
+
+#endif  // CATCH_CONTEXT_HPP_INCLUDED

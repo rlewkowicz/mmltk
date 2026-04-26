@@ -10,18 +10,15 @@
 
 namespace Catch {
 
-    //! Simple RAII class that stores the value of `errno`
-    //! at construction and restores it at destruction.
-    class ErrnoGuard {
-    public:
-        // Keep these outlined to avoid dragging in macros from <cerrno>
+class ErrnoGuard {
+   public:
+    ErrnoGuard();
+    ~ErrnoGuard();
 
-        ErrnoGuard();
-        ~ErrnoGuard();
-    private:
-        int m_oldErrno;
-    };
+   private:
+    int m_oldErrno;
+};
 
-}
+}  // namespace Catch
 
-#endif // CATCH_ERRNO_GUARD_HPP_INCLUDED
+#endif  // CATCH_ERRNO_GUARD_HPP_INCLUDED

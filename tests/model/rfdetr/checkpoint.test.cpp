@@ -40,8 +40,7 @@ fs::path native_golden_fixture_path(const ParityFixtureCase& fixture) {
     return fixture_root() / "golden" / (std::string(fixture.preset_name) + ".golden.native.pt");
 }
 
-const mmltk::rfdetr::StateDictEntry* find_entry(const mmltk::rfdetr::NativeCheckpoint& checkpoint,
-                                                     const char* name) {
+const mmltk::rfdetr::StateDictEntry* find_entry(const mmltk::rfdetr::NativeCheckpoint& checkpoint, const char* name) {
     for (const auto& entry : checkpoint.state_dict) {
         if (entry.name == name) {
             return &entry;
@@ -74,9 +73,7 @@ void write_legacy_native_checkpoint(const fs::path& output_path) {
 
     torch::serialize::OutputArchive entry_archive;
     write_archive_string(entry_archive, "name", "class_embed.bias");
-    entry_archive.write(
-        "tensor",
-        torch::arange(7, torch::TensorOptions().dtype(torch::kFloat32)).contiguous());
+    entry_archive.write("tensor", torch::arange(7, torch::TensorOptions().dtype(torch::kFloat32)).contiguous());
     state_archive.write("entry_000000", entry_archive);
 
     archive.write("state", state_archive);
@@ -96,8 +93,7 @@ void test_upstream_checkpoint_parse(const ParityFixtureCase& fixture, const fs::
     for (const auto& entry : checkpoint.state_dict) {
         if (entry.name == "query_feat.weight") {
             found_query_feat = true;
-            assert(entry.tensor.sizes() ==
-                   torch::IntArrayRef({fixture.query_rows, kParityFixtureHiddenDim}));
+            assert(entry.tensor.sizes() == torch::IntArrayRef({fixture.query_rows, kParityFixtureHiddenDim}));
         }
         if (entry.name == "refpoint_embed.weight") {
             found_refpoint = true;
@@ -106,8 +102,7 @@ void test_upstream_checkpoint_parse(const ParityFixtureCase& fixture, const fs::
         if (entry.name == "class_embed.bias") {
             found_cls_bias = true;
             assert(entry.tensor.sizes() == torch::IntArrayRef({kParityFixtureNumClasses}));
-            assert(entry.tensor.index({0}).item<float>() ==
-                   make_fixture_class_bias(fixture).index({0}).item<float>());
+            assert(entry.tensor.index({0}).item<float>() == make_fixture_class_bias(fixture).index({0}).item<float>());
         }
     }
     assert(found_query_feat);
@@ -166,15 +161,15 @@ void test_native_checkpoint_tensor_preparation() {
     checkpoint.metadata.source_path = output_path.string();
     checkpoint.metadata.num_classes = 1;
 
-    const auto cpu_contiguous =
-        torch::arange(12, torch::TensorOptions().dtype(torch::kFloat32)).view({3, 4}).clone();
+    const auto cpu_contiguous = torch::arange(12, torch::TensorOptions().dtype(torch::kFloat32)).view({3, 4}).clone();
     const auto cpu_non_contiguous = cpu_contiguous.transpose(0, 1);
     checkpoint.state_dict.push_back({"cpu_contiguous", cpu_contiguous});
     checkpoint.state_dict.push_back({"cpu_non_contiguous", cpu_non_contiguous});
     const bool has_cuda = torch::cuda::is_available();
     if (has_cuda) {
         checkpoint.state_dict.push_back(
-            {"cuda_tensor", torch::arange(6, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA)).view({2, 3})});
+            {"cuda_tensor",
+             torch::arange(6, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA)).view({2, 3})});
     }
 
     mmltk::rfdetr::save_native_checkpoint(output_path, checkpoint);
@@ -195,8 +190,7 @@ void test_native_checkpoint_tensor_preparation() {
     const auto* loaded_cuda = find_entry(loaded, "cuda_tensor");
     assert((loaded_cuda != nullptr) == has_cuda);
     if (loaded_cuda != nullptr) {
-        const auto expected =
-            checkpoint.state_dict.back().tensor.detach().to(torch::Device(torch::kCPU)).contiguous();
+        const auto expected = checkpoint.state_dict.back().tensor.detach().to(torch::Device(torch::kCPU)).contiguous();
         assert(loaded_cuda->tensor.device().is_cpu());
         assert(loaded_cuda->tensor.is_contiguous());
         assert(torch::equal(loaded_cuda->tensor, expected));
@@ -210,13 +204,10 @@ void test_upstream_checkpoint_scalar_type_bridge() {
         {
             {"query_feat.weight",
              torch::ones({4, kParityFixtureHiddenDim}, torch::TensorOptions().dtype(torch::kFloat16))},
-            {"refpoint_embed.weight",
-             torch::zeros({4, 4}, torch::TensorOptions().dtype(torch::kFloat32))},
-            {"class_embed.weight",
-             torch::ones({kParityFixtureNumClasses, kParityFixtureHiddenDim},
-                         torch::TensorOptions().dtype(torch::kFloat32))},
-            {"class_embed.bias",
-             torch::arange(kParityFixtureNumClasses, torch::TensorOptions().dtype(torch::kInt64))},
+            {"refpoint_embed.weight", torch::zeros({4, 4}, torch::TensorOptions().dtype(torch::kFloat32))},
+            {"class_embed.weight", torch::ones({kParityFixtureNumClasses, kParityFixtureHiddenDim},
+                                               torch::TensorOptions().dtype(torch::kFloat32))},
+            {"class_embed.bias", torch::arange(kParityFixtureNumClasses, torch::TensorOptions().dtype(torch::kInt64))},
         });
 
     const auto checkpoint = mmltk::rfdetr::load_checkpoint(upstream_path);
@@ -241,12 +232,10 @@ void test_legacy_native_checkpoint_format_support() {
 
     const auto* class_bias = find_entry(checkpoint, "class_embed.bias");
     assert(class_bias != nullptr);
-    assert(torch::equal(
-        class_bias->tensor,
-        torch::arange(7, torch::TensorOptions().dtype(torch::kFloat32))));
+    assert(torch::equal(class_bias->tensor, torch::arange(7, torch::TensorOptions().dtype(torch::kFloat32))));
 }
 
-} // namespace
+}  // namespace
 
 void test_checkpoint_roundtrip_and_fixture_loading() {
     mmltk::testsupport::remove_path_recursively_best_effort(fixture_root());

@@ -18,12 +18,7 @@ namespace {
 
 [[noreturn]] void throw_cuda_error(cudaError_t err, const char* file, int line) {
     std::array<char, 256> msg{};
-    std::snprintf(msg.data(),
-                  msg.size(),
-                  "CUDA error at %s:%d: %s",
-                  file,
-                  line,
-                  cudaGetErrorString(err));
+    std::snprintf(msg.data(), msg.size(), "CUDA error at %s:%d: %s", file, line, cudaGetErrorString(err));
     throw std::runtime_error(msg.data());
 }
 
@@ -43,10 +38,8 @@ struct PoolKey {
     int device_id = 0;
 
     bool operator==(const PoolKey& other) const {
-        return batch_capacity == other.batch_capacity &&
-               image_stride == other.image_stride &&
-               num_buffers == other.num_buffers &&
-               enable_gather_buffers == other.enable_gather_buffers &&
+        return batch_capacity == other.batch_capacity && image_stride == other.image_stride &&
+               num_buffers == other.num_buffers && enable_gather_buffers == other.enable_gather_buffers &&
                device_id == other.device_id;
     }
 };
@@ -66,10 +59,11 @@ struct HostSlot {
     float* gather = nullptr;
 };
 
+#if MMLTK_ENABLE_PROFILING
 std::uint64_t elapsed_ms_to_ns(float elapsed_ms) {
-    return static_cast<std::uint64_t>(
-        std::llround(static_cast<double>(elapsed_ms) * 1.0e6));
+    return static_cast<std::uint64_t>(std::llround(static_cast<double>(elapsed_ms) * 1.0e6));
 }
+#endif
 
 [[noreturn]] void throw_cuda_query_error(cudaError_t err) {
     throw_cuda_error(err, __FILE__, __LINE__);
@@ -105,8 +99,7 @@ struct SlotPool {
 #if MMLTK_ENABLE_PROFILING
         float elapsed_ms = 0.0f;
         CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, slot.transfer_start, slot.transfer_done));
-        MMLTK_PROFILE_RECORD_DURATION_NS("cuda.async_h2d.gpu_active",
-                                              elapsed_ms_to_ns(elapsed_ms));
+        MMLTK_PROFILE_RECORD_DURATION_NS("cuda.async_h2d.gpu_active", elapsed_ms_to_ns(elapsed_ms));
 #endif
         slot.transfer_pending = false;
     }
@@ -178,9 +171,7 @@ std::unique_ptr<SlotPool> create_pool(const PoolKey& key) {
 
     if (key.enable_gather_buffers) {
         for (auto& slot : pool->host_slots) {
-            CUDA_CHECK(cudaHostAlloc(&slot.gather,
-                                     pool->buf_bytes,
-                                     cudaHostAllocDefault));
+            CUDA_CHECK(cudaHostAlloc(&slot.gather, pool->buf_bytes, cudaHostAllocDefault));
         }
     }
 
@@ -188,7 +179,7 @@ std::unique_ptr<SlotPool> create_pool(const PoolKey& key) {
 }
 
 class SlotPoolCache {
-public:
+   public:
     ~SlotPoolCache() {
         for (auto& pool : pools_) {
             destroy_pool(*pool);
@@ -218,7 +209,7 @@ public:
         pool->leased = false;
     }
 
-private:
+   private:
     std::mutex mutex_;
     std::vector<std::unique_ptr<SlotPool>> pools_;
 };
@@ -228,7 +219,7 @@ SlotPoolCache& slot_pool_cache() {
     return cache;
 }
 
-} // namespace
+}  // namespace
 
 struct CudaStreamManager::Impl {
     SlotPool* pool = nullptr;
@@ -241,11 +232,7 @@ CudaStreamManager::CudaStreamManager(CudaStreamManagerConfig config)
 
     impl_ = new Impl();
     const PoolKey key{
-        config.batch_capacity,
-        config.image_stride,
-        slot_count_,
-        config.enable_gather_buffers,
-        config.device_id,
+        config.batch_capacity, config.image_stride, slot_count_, config.enable_gather_buffers, config.device_id,
     };
 
     bool hit = false;
@@ -300,9 +287,7 @@ void CudaStreamManager::async_h2d(int buf_idx, const void* host_src, size_t byte
 #if MMLTK_ENABLE_PROFILING
     CUDA_CHECK(cudaEventRecord(slot.transfer_start, impl_->pool->copy_stream));
 #endif
-    CUDA_CHECK(cudaMemcpyAsync(
-        slot.device, host_src, bytes,
-        cudaMemcpyHostToDevice, impl_->pool->copy_stream));
+    CUDA_CHECK(cudaMemcpyAsync(slot.device, host_src, bytes, cudaMemcpyHostToDevice, impl_->pool->copy_stream));
     CUDA_CHECK(cudaEventRecord(slot.transfer_done, impl_->pool->copy_stream));
     slot.transfer_pending = true;
 }
@@ -354,4 +339,4 @@ void* CudaStreamManager::copy_stream() const {
     return impl_->pool->copy_stream;
 }
 
-} // namespace mmltk
+}  // namespace mmltk

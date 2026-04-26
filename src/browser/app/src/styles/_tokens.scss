@@ -1,0 +1,202 @@
+@use "sass:color";
+@use "sass:map";
+
+$font-sans: "Avenir Next", "Trebuchet MS", "Segoe UI Variable", sans-serif;
+$font-display: "Avenir Next Condensed", "Franklin Gothic Medium", sans-serif;
+$font-mono: "IBM Plex Mono", "SFMono-Regular", monospace;
+
+$colors: (
+  primary: #042aff,
+  primary-soft: #155dfc,
+  primary-dark: #111f68,
+  cyan: #09dbf0,
+  lime: #e1ff25,
+  success: #26c000,
+  warning: #f99c00,
+  error: #e40014,
+  black: #000000,
+  white: #ffffff,
+);
+
+$space: (
+  2xs: 0.3rem,
+  xs: 0.42rem,
+  sm: 0.55rem,
+  md: 0.75rem,
+  lg: 0.9rem,
+  xl: 1rem,
+);
+
+$radii: (
+  sm: 6px,
+  md: 8px,
+);
+
+$shadows: (
+  focus: 0 0 0 3px rgba(#042aff, 0.22),
+);
+
+$breakpoints: (
+  shell: 1100px,
+  mobile: 720px,
+);
+
+$theme-vars-light: (
+  page-bg: #f7f7f9,
+  bg-0: #f7f7f9,
+  bg-1: #ffffff,
+  panel-border: #e5e7eb,
+  panel-border-strong: #d8dce5,
+  panel-fill: rgba(#ffffff, 0.98),
+  panel-fill-muted: #f7f7f9,
+  inset-fill: #f1f2f6,
+  control-fill: #ffffff,
+  control-fill-hover: #e9eaec,
+  control-border: #d8dce5,
+  control-accent-border: rgba(#042aff, 0.22),
+  control-hover-border: rgba(#042aff, 0.42),
+  control-disabled-border: #eceff5,
+  control-disabled-fill: #f7f7f9,
+  control-hover-shadow: 0 0 0 1px rgba(#042aff, 0.06),
+  text-0: #0b0b0f,
+  text-1: #374151,
+  text-2: #6b7280,
+  text-3: #9ca3af,
+  accent-0: #042aff,
+  accent-1: #e1ff25,
+  accent-2: #155dfc,
+  accent-cyan: #09dbf0,
+  primary-fill: rgba(#042aff, 0.08),
+  selected-fill: rgba(#042aff, 0.1),
+  selected-border: rgba(#042aff, 0.42),
+  success: #26c000,
+  warning: #f99c00,
+  error: #e40014,
+  shadow: 0 18px 50px rgba(#020617, 0.08),
+  workspace-frame-bg: (linear-gradient(180deg, rgba(#042aff, 0.06), rgba(#f1f2f6, 0.88)), #ffffff),
+  console-fill: rgba(#0b0b0f, 0.05),
+  modal-backdrop: rgba(#0b0b0f, 0.28),
+);
+
+$theme-vars-dark: (
+  page-bg: #0a0a0a,
+  bg-0: #0a0a0a,
+  bg-1: #111111,
+  panel-border: rgba(#ffffff, 0.1),
+  panel-border-strong: rgba(#ffffff, 0.18),
+  panel-fill: rgba(#171717, 0.96),
+  panel-fill-muted: rgba(#131318, 0.92),
+  inset-fill: rgba(#ffffff, 0.035),
+  control-fill: #202024,
+  control-fill-hover: #2a2b30,
+  control-border: rgba(#ffffff, 0.14),
+  control-accent-border: rgba(#3080ff, 0.32),
+  control-hover-border: rgba(#3080ff, 0.58),
+  control-disabled-border: rgba(#ffffff, 0.1),
+  control-disabled-fill: rgba(#ffffff, 0.04),
+  control-hover-shadow: 0 0 0 1px rgba(#ffffff, 0.03),
+  text-0: #fafafa,
+  text-1: #d4d4d8,
+  text-2: #a1a1aa,
+  text-3: #71717a,
+  accent-0: #1447e6,
+  accent-1: #e1ff25,
+  accent-2: #3080ff,
+  accent-cyan: #09dbf0,
+  primary-fill: rgba(#3080ff, 0.1),
+  selected-fill: rgba(#1447e6, 0.14),
+  selected-border: rgba(#e1ff25, 0.42),
+  success: #7bf1a8,
+  warning: #fcbb00,
+  error: #ff6568,
+  shadow: 0 18px 50px rgba(#000000, 0.34),
+  workspace-frame-bg: (linear-gradient(180deg, rgba(#1447e6, 0.12), rgba(#000000, 0.24)), #131318),
+  console-fill: rgba(#000000, 0.3),
+  modal-backdrop: rgba(#000000, 0.62),
+);
+
+$themes: (
+  light: (
+    scheme: light,
+    vars: $theme-vars-light,
+  ),
+  dark: (
+    scheme: dark,
+    vars: $theme-vars-dark,
+  ),
+);
+
+$status-tones: (
+  info: (
+    text: map.get($colors, primary-soft),
+    border: rgba(map.get($colors, primary-soft), 0.3),
+    fill: rgba(map.get($colors, primary-soft), 0.1),
+  ),
+  success: (
+    text: map.get($colors, success),
+    border: rgba(map.get($colors, success), 0.28),
+    fill: rgba(map.get($colors, success), 0.1),
+  ),
+  warning: (
+    text: map.get($colors, warning),
+    border: rgba(map.get($colors, warning), 0.28),
+    fill: rgba(map.get($colors, warning), 0.1),
+  ),
+  error: (
+    text: map.get($colors, error),
+    border: rgba(map.get($colors, error), 0.3),
+    fill: rgba(map.get($colors, error), 0.1),
+  ),
+);
+
+@function color-token($key) {
+  @if not map.has-key($colors, $key) {
+    @error "Unknown color token `#{$key}`.";
+  }
+
+  @return map.get($colors, $key);
+}
+
+@function space-token($key) {
+  @if not map.has-key($space, $key) {
+    @error "Unknown spacing token `#{$key}`.";
+  }
+
+  @return map.get($space, $key);
+}
+
+@function radius-token($key) {
+  @if not map.has-key($radii, $key) {
+    @error "Unknown radius token `#{$key}`.";
+  }
+
+  @return map.get($radii, $key);
+}
+
+@function shadow-token($key) {
+  @if not map.has-key($shadows, $key) {
+    @error "Unknown shadow token `#{$key}`.";
+  }
+
+  @return map.get($shadows, $key);
+}
+
+@function breakpoint-token($key) {
+  @if not map.has-key($breakpoints, $key) {
+    @error "Unknown breakpoint token `#{$key}`.";
+  }
+
+  @return map.get($breakpoints, $key);
+}
+
+@function alpha-token($key, $opacity) {
+  @return rgba(color-token($key), $opacity);
+}
+
+@function tint-token($key, $weight) {
+  @return color.mix(color-token(white), color-token($key), $weight);
+}
+
+@function shade-token($key, $weight) {
+  @return color.mix(color-token(black), color-token($key), $weight);
+}

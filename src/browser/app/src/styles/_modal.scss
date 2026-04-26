@@ -1,0 +1,55 @@
+@use "tokens" as *;
+@use "mixins" as *;
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: var(--modal-backdrop);
+}
+
+.settings-modal {
+  @include panel-surface($padding: 1rem);
+
+  position: relative;
+  inset: auto;
+  width: min(760px, calc(100vw - 2rem));
+  max-height: min(820px, calc(100vh - 2rem));
+  margin: 0;
+  overflow: auto;
+  color: var(--text-0);
+  box-shadow: var(--shadow);
+  justify-self: center;
+  align-self: center;
+}
+
+.settings-modal__header {
+  h2 {
+    margin: 0 0 0 auto;
+    text-align: right;
+  }
+}
+
+.settings-modal__section {
+  margin-top: 1rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid var(--panel-border);
+
+  h3 {
+    @include uppercase-label($size: 0.86rem, $color: var(--accent-2));
+
+    margin: 0;
+  }
+}
+
+.statusbar {
+  justify-content: space-between;
+  gap: 1rem;
+  margin-top: 1rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--panel-border);
+  font-size: 0.88rem;
+}

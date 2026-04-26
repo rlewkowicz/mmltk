@@ -11,22 +11,20 @@
 
 namespace Catch {
 
-    IGeneratorTracker::~IGeneratorTracker() = default;
+IGeneratorTracker::~IGeneratorTracker() = default;
 
 namespace Generators {
 
-    GeneratorUntypedBase::~GeneratorUntypedBase() = default;
+GeneratorUntypedBase::~GeneratorUntypedBase() = default;
 
-    IGeneratorTracker* acquireGeneratorTracker(StringRef generatorName, SourceLineInfo const& lineInfo ) {
-        return getResultCapture().acquireGeneratorTracker( generatorName, lineInfo );
-    }
+IGeneratorTracker* acquireGeneratorTracker(StringRef generatorName, SourceLineInfo const& lineInfo) {
+    return getResultCapture().acquireGeneratorTracker(generatorName, lineInfo);
+}
 
-    IGeneratorTracker* createGeneratorTracker( StringRef generatorName,
-                                 SourceLineInfo lineInfo,
-                                 GeneratorBasePtr&& generator ) {
-        return getResultCapture().createGeneratorTracker(
-            generatorName, lineInfo, CATCH_MOVE( generator ) );
-    }
+IGeneratorTracker* createGeneratorTracker(StringRef generatorName, SourceLineInfo lineInfo,
+                                          GeneratorBasePtr&& generator) {
+    return getResultCapture().createGeneratorTracker(generatorName, lineInfo, CATCH_MOVE(generator));
+}
 
-} // namespace Generators
-} // namespace Catch
+}  // namespace Generators
+}  // namespace Catch

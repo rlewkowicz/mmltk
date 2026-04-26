@@ -10,11 +10,11 @@
 #include <catch2/internal/catch_enforce.hpp>
 
 namespace Catch {
-    namespace Detail {
-        void missingCaptureInstance() {
-            CATCH_INTERNAL_ERROR( "No result capture instance" );
-        }
-    } // namespace Detail
+namespace Detail {
+void missingCaptureInstance() {
+    CATCH_INTERNAL_ERROR("No result capture instance");
+}
+}  // namespace Detail
 
-    IResultCapture::~IResultCapture() = default;
-} // namespace Catch
+IResultCapture::~IResultCapture() = default;
+}  // namespace Catch

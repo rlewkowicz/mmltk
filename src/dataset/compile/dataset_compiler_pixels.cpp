@@ -23,18 +23,13 @@ namespace {
 #endif
 
 class WritablePixelRange {
-public:
-    // mmap uses byte offset plus byte length as its native contract.
+   public:
     // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     WritablePixelRange(const FileHandle& fd, size_t offset, size_t bytes) : bytes_(bytes) {
         if (bytes_ == 0) {
             return;
         }
-        void* ptr = mmap(nullptr,
-                         bytes_,
-                         PROT_READ | PROT_WRITE,
-                         MAP_SHARED,
-                         fd.get(),
+        void* ptr = mmap(nullptr, bytes_, PROT_READ | PROT_WRITE, MAP_SHARED, fd.get(),
                          checked_cast<off_t>(offset, "pixel mmap offset overflow"));
         if (ptr == MAP_FAILED) {
             throw errno_error("mmap failed");
@@ -45,8 +40,7 @@ public:
     WritablePixelRange(const WritablePixelRange&) = delete;
     WritablePixelRange& operator=(const WritablePixelRange&) = delete;
 
-    WritablePixelRange(WritablePixelRange&& other) noexcept
-        : data_(other.data_), bytes_(other.bytes_) {
+    WritablePixelRange(WritablePixelRange&& other) noexcept : data_(other.data_), bytes_(other.bytes_) {
         other.data_ = nullptr;
         other.bytes_ = 0;
     }
@@ -63,16 +57,17 @@ public:
         return *this;
     }
 
-    ~WritablePixelRange() { reset(); }
+    ~WritablePixelRange() {
+        reset();
+    }
 
-    // Image ordinal plus stride are distinct dataset layout coordinates here.
     // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
     [[nodiscard]] float* image(uint32_t image_index, size_t image_stride) const {
         const size_t image_floats = image_stride / sizeof(float);
         return data_ + static_cast<size_t>(image_index) * image_floats;
     }
 
-private:
+   private:
     void reset() noexcept {
         if (data_) {
             munmap(data_, bytes_);
@@ -85,71 +80,48 @@ private:
     size_t bytes_ = 0;
 };
 
-// SSSE3 deinterleave + AVX2 uint8→float conversion, 16 pixels per iteration.
-// Input: interleaved RGB uint8 (48 bytes per 16 pixels).
-// Output: 3 planar float32 channels scaled to [0,1].
-void hwc_uint8_to_nchw_float_avx2(const uint8_t* MMLTK_RESTRICT src,
-                                   float* MMLTK_RESTRICT dst,
-                                   int height,
-                                   int width) {
+void hwc_uint8_to_nchw_float_avx2(const uint8_t* MMLTK_RESTRICT src, float* MMLTK_RESTRICT dst, int height, int width) {
     const int hw = height * width;
     const __m256 scale = _mm256_set1_ps(1.0f / 255.0f);
     float* MMLTK_RESTRICT dst_r = dst;
     float* MMLTK_RESTRICT dst_g = dst + hw;
     float* MMLTK_RESTRICT dst_b = dst + static_cast<ptrdiff_t>(hw) * 2;
 
-    // SSSE3 shuffle masks for 3-channel deinterleave of 16 pixels from 48 bytes.
-    // Input layout across three 16-byte registers a, b, c:
-    //   a = [R0 G0 B0 R1 G1 B1 R2 G2 B2 R3 G3 B3 R4 G4 B4 R5]
-    //   b = [G5 B5 R6 G6 B6 R7 G7 B7 R8 G8 B8 R9 G9 B9 R10 G10]
-    //   c = [B10 R11 G11 B11 R12 G12 B12 R13 G13 B13 R14 G14 B14 R15 G15 B15]
-    //
-    // Extract R channel: bytes at positions 0,3,6,9,12,15 from a, 2,5,8,11,14 from b, 1,4,7,10,13 from c
-    // We use pshufb to select wanted bytes within each register (0x80 = zero),
-    // then OR the results.
-    static const __m128i shuf_r_a = _mm_setr_epi8( 0, 3, 6, 9,12,15,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1);
-    static const __m128i shuf_r_b = _mm_setr_epi8(-1,-1,-1,-1,-1,-1, 2, 5, 8,11,14,-1,-1,-1,-1,-1);
-    static const __m128i shuf_r_c = _mm_setr_epi8(-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 1, 4, 7,10,13);
+    static const __m128i shuf_r_a = _mm_setr_epi8(0, 3, 6, 9, 12, 15, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    static const __m128i shuf_r_b = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, 2, 5, 8, 11, 14, -1, -1, -1, -1, -1);
+    static const __m128i shuf_r_c = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 1, 4, 7, 10, 13);
 
-    static const __m128i shuf_g_a = _mm_setr_epi8( 1, 4, 7,10,13,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1);
-    static const __m128i shuf_g_b = _mm_setr_epi8(-1,-1,-1,-1,-1, 0, 3, 6, 9,12,15,-1,-1,-1,-1,-1);
-    static const __m128i shuf_g_c = _mm_setr_epi8(-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 2, 5, 8,11,14);
+    static const __m128i shuf_g_a = _mm_setr_epi8(1, 4, 7, 10, 13, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    static const __m128i shuf_g_b = _mm_setr_epi8(-1, -1, -1, -1, -1, 0, 3, 6, 9, 12, 15, -1, -1, -1, -1, -1);
+    static const __m128i shuf_g_c = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 2, 5, 8, 11, 14);
 
-    static const __m128i shuf_b_a = _mm_setr_epi8( 2, 5, 8,11,14,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1);
-    static const __m128i shuf_b_b = _mm_setr_epi8(-1,-1,-1,-1,-1, 1, 4, 7,10,13,-1,-1,-1,-1,-1,-1);
-    static const __m128i shuf_b_c = _mm_setr_epi8(-1,-1,-1,-1,-1,-1,-1,-1,-1,-1, 0, 3, 6, 9,12,15);
+    static const __m128i shuf_b_a = _mm_setr_epi8(2, 5, 8, 11, 14, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1);
+    static const __m128i shuf_b_b = _mm_setr_epi8(-1, -1, -1, -1, -1, 1, 4, 7, 10, 13, -1, -1, -1, -1, -1, -1);
+    static const __m128i shuf_b_c = _mm_setr_epi8(-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 3, 6, 9, 12, 15);
 
     int i = 0;
     for (; i + 15 < hw; i += 16) {
-        // Load 48 bytes (16 RGB pixels) as three 128-bit registers
         const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src));
         const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 16));
         const __m128i c = _mm_loadu_si128(reinterpret_cast<const __m128i*>(src + 32));
 
-        // Deinterleave: collect R, G, B bytes from a, b, c using pshufb + OR
         const __m128i r16 = _mm_or_si128(_mm_shuffle_epi8(a, shuf_r_a),
-                            _mm_or_si128(_mm_shuffle_epi8(b, shuf_r_b),
-                                         _mm_shuffle_epi8(c, shuf_r_c)));
+                                         _mm_or_si128(_mm_shuffle_epi8(b, shuf_r_b), _mm_shuffle_epi8(c, shuf_r_c)));
         const __m128i g16 = _mm_or_si128(_mm_shuffle_epi8(a, shuf_g_a),
-                            _mm_or_si128(_mm_shuffle_epi8(b, shuf_g_b),
-                                         _mm_shuffle_epi8(c, shuf_g_c)));
+                                         _mm_or_si128(_mm_shuffle_epi8(b, shuf_g_b), _mm_shuffle_epi8(c, shuf_g_c)));
         const __m128i b16 = _mm_or_si128(_mm_shuffle_epi8(a, shuf_b_a),
-                            _mm_or_si128(_mm_shuffle_epi8(b, shuf_b_b),
-                                         _mm_shuffle_epi8(c, shuf_b_c)));
+                                         _mm_or_si128(_mm_shuffle_epi8(b, shuf_b_b), _mm_shuffle_epi8(c, shuf_b_c)));
 
-        // Convert R channel: 16 bytes → 2×8 floats
         const __m256 r_lo = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(r16)), scale);
         const __m256 r_hi = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(r16, 8))), scale);
         _mm256_storeu_ps(dst_r, r_lo);
         _mm256_storeu_ps(dst_r + 8, r_hi);
 
-        // Convert G channel
         const __m256 g_lo = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(g16)), scale);
         const __m256 g_hi = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(g16, 8))), scale);
         _mm256_storeu_ps(dst_g, g_lo);
         _mm256_storeu_ps(dst_g + 8, g_hi);
 
-        // Convert B channel
         const __m256 b_lo = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(b16)), scale);
         const __m256 b_hi = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(b16, 8))), scale);
         _mm256_storeu_ps(dst_b, b_lo);
@@ -160,7 +132,6 @@ void hwc_uint8_to_nchw_float_avx2(const uint8_t* MMLTK_RESTRICT src,
         dst_g += 16;
         dst_b += 16;
     }
-    // Scalar tail
     for (; i < hw; ++i) {
         *dst_r++ = static_cast<float>(src[0]) * (1.0f / 255.0f);
         *dst_g++ = static_cast<float>(src[1]) * (1.0f / 255.0f);
@@ -174,16 +145,10 @@ void hwc_uint8_to_nchw_float(const uint8_t* src, float* dst, int height, int wid
     hwc_uint8_to_nchw_float_avx2(src, dst, height, width);
 }
 
-// Image ordinal plus target geometry stay ordered to mirror the dataset scan.
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
-void decode_pixel_image(const std::filesystem::path& split_dir,
-                        const WritablePixelRange& pixel_blob,
-                        uint32_t image_index,
-                        uint32_t target_width,
-                        uint32_t target_height,
-                        RgbImageResizer& image_resizer,
-                        size_t image_stride,
-                        std::vector<uint8_t>& resize_scratch) {
+void decode_pixel_image(const std::filesystem::path& split_dir, const WritablePixelRange& pixel_blob,
+                        uint32_t image_index, uint32_t target_width, uint32_t target_height,
+                        RgbImageResizer& image_resizer, size_t image_stride, std::vector<uint8_t>& resize_scratch) {
     const int width = checked_cast<int>(target_width, "image width too large");
     const int height = checked_cast<int>(target_height, "image height too large");
 
@@ -203,8 +168,7 @@ void decode_pixel_image(const std::filesystem::path& split_dir,
     }
 
     const uint8_t* src_pixels = raw_pixels;
-    if (static_cast<uint32_t>(raw_width) != target_width ||
-        static_cast<uint32_t>(raw_height) != target_height) {
+    if (static_cast<uint32_t>(raw_width) != target_width || static_cast<uint32_t>(raw_height) != target_height) {
         const size_t resized_bytes = static_cast<size_t>(target_width) * target_height * 3;
         if (resize_scratch.capacity() < resized_bytes) {
             MMLTK_PROFILE_ADD("compiler.pixels.resize_scratch_grows", 1);
@@ -213,34 +177,22 @@ void decode_pixel_image(const std::filesystem::path& split_dir,
         {
             MMLTK_PROFILE_SCOPE("compiler.pixels.resize");
             resize_scratch.resize(resized_bytes);
-            image_resizer.resize(raw_pixels,
-                                 raw_width,
-                                 raw_height,
-                                 resize_scratch.data(),
-                                 width,
-                                 height);
+            image_resizer.resize(raw_pixels, raw_width, raw_height, resize_scratch.data(), width, height);
         }
         MMLTK_PROFILE_ADD("compiler.pixels.resize_count", 1);
         src_pixels = resize_scratch.data();
     }
 
-    MMLTK_PROFILE_ADD("compiler.pixels.convert_bytes",
-                           static_cast<size_t>(width) * height * 3);
+    MMLTK_PROFILE_ADD("compiler.pixels.convert_bytes", static_cast<size_t>(width) * height * 3);
     hwc_uint8_to_nchw_float(src_pixels, dst, height, width);
     stbi_image_free(raw_pixels);
 }
 // NOLINTEND(bugprone-easily-swappable-parameters)
 
-// The worker signature mirrors the decode pipeline inputs in submission order.
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
-void decode_pixel_worker(const std::filesystem::path& split_dir,
-                         const WritablePixelRange& pixel_blob,
-                         std::atomic<uint32_t>& next_image,
-                         uint32_t num_images,
-                         uint32_t target_width,
-                         uint32_t target_height,
-                         size_t image_stride,
-                         int resize_threads_per_image,
+void decode_pixel_worker(const std::filesystem::path& split_dir, const WritablePixelRange& pixel_blob,
+                         std::atomic<uint32_t>& next_image, uint32_t num_images, uint32_t target_width,
+                         uint32_t target_height, size_t image_stride, int resize_threads_per_image,
                          ProgressCounter* completed_images) {
     MMLTK_PROFILE_SCOPE("compiler.pixels.decode_worker");
     RgbImageResizer image_resizer(resize_threads_per_image);
@@ -254,14 +206,8 @@ void decode_pixel_worker(const std::filesystem::path& split_dir,
             completed_images->begin_work();
         }
         try {
-            decode_pixel_image(split_dir,
-                               pixel_blob,
-                               image_index,
-                               target_width,
-                               target_height,
-                               image_resizer,
-                               image_stride,
-                               resize_scratch);
+            decode_pixel_image(split_dir, pixel_blob, image_index, target_width, target_height, image_resizer,
+                               image_stride, resize_scratch);
             if (completed_images != nullptr) {
                 completed_images->finish_work();
             }
@@ -277,49 +223,31 @@ void decode_pixel_worker(const std::filesystem::path& split_dir,
 
 #undef MMLTK_RESTRICT
 
-} // namespace
+}  // namespace
 
-// Pixel writer arguments intentionally match the compile layout and worker plan order.
-// NOLINTBEGIN(bugprone-easily-swappable-parameters)
-void write_pixel_blob(const FileHandle& fd,
-                      const std::filesystem::path& split_dir,
-                      uint32_t num_images,
-                      uint32_t width,
-                      uint32_t height,
-                      size_t image_stride,
-                      int num_workers,
-                      bool any_resize,
-                      bool any_downscale,
-                      ProgressCounter* completed_images,
-                      size_t pixel_offset) {
+void write_pixel_blob(const FileHandle& fd, const PixelBlobWriteRequest& request) {
     MMLTK_PROFILE_SCOPE("compiler.pixels.write_blob");
-    const size_t pixel_bytes = static_cast<size_t>(num_images) * image_stride;
+    const size_t pixel_bytes = static_cast<size_t>(request.num_images) * request.image_stride;
     MMLTK_PROFILE_SET("compiler.pixels.total_bytes", pixel_bytes);
-    WritablePixelRange pixel_blob(fd, pixel_offset, pixel_bytes);
+    WritablePixelRange pixel_blob(fd, request.pixel_offset, pixel_bytes);
 
-    if (num_images == 0) {
+    if (request.num_images == 0) {
         return;
     }
 
-    const ResizeWorkerPlan resize_plan = plan_rgb_resize_workers(num_workers, any_resize, any_downscale);
+    const ResizeWorkerPlan resize_plan =
+        plan_rgb_resize_workers(request.num_workers, request.any_resize, request.any_downscale);
     MMLTK_PROFILE_SET("compiler.pixels.worker.count", static_cast<size_t>(resize_plan.image_workers));
     MMLTK_PROFILE_SET("compiler.pixels.image_workers", static_cast<size_t>(resize_plan.image_workers));
     MMLTK_PROFILE_SET("compiler.pixels.resize_threads_per_image",
-                           static_cast<size_t>(resize_plan.resize_threads_per_image));
+                      static_cast<size_t>(resize_plan.resize_threads_per_image));
     std::atomic<uint32_t> next_image{0};
 
     parallel_for_range_indexed<int>(0, resize_plan.image_workers, resize_plan.image_workers, [&](int, int, int) {
-        decode_pixel_worker(split_dir,
-                            pixel_blob,
-                            next_image,
-                            num_images,
-                            width,
-                            height,
-                            image_stride,
-                            resize_plan.resize_threads_per_image,
-                            completed_images);
+        decode_pixel_worker(request.split_dir, pixel_blob, next_image, request.num_images, request.width,
+                            request.height, request.image_stride, resize_plan.resize_threads_per_image,
+                            request.completed_images);
     });
 }
-// NOLINTEND(bugprone-easily-swappable-parameters)
 
-} // namespace mmltk::compiler_internal
+}  // namespace mmltk::compiler_internal

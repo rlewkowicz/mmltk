@@ -35,7 +35,7 @@ void write_png_stub(const std::string& path, int width, int height) {
     stbi_write_png(path.c_str(), width, height, 3, pixels.data(), width * 3);
 }
 
-} // namespace
+}  // namespace
 
 std::string dataset_dir(const FixtureSpec& spec) {
     return spec.root_dir + "/dataset";
@@ -62,31 +62,22 @@ void create_synthetic_dataset(const FixtureSpec& spec) {
         std::ofstream f(data_dir + "/categories.json");
         f << "{\n"
           << R"(  "meta": {"dataset_name":"test","version":"1.0","image_format":"png",
-)"
-          << R"(           "image_size_wh":[)" << spec.width << "," << spec.height
-          << R"(],"bbox_format":"xyxy_absolute_pixels",
-)"
-          << R"(           "mask_format":"rle_row_major_start_length",
-)"
-          << R"(           "background_annotation_policy":"empty_jsonl_file"},
-)"
-          << R"(  "classes": [
-)"
-          << R"(    {"id":)" << spec.first_class_id << R"(,"name":"person"},)"
-          << R"({"id":)" << spec.first_class_id + 1 << R"(,"name":"ret"},)"
-          << R"({"id":)" << spec.first_class_id + 2 << R"(,"name":"scope"},
-)"
-          << R"(    {"id":)" << spec.first_class_id + 3 << R"(,"name":"iron_sight"},)"
-          << R"({"id":)" << spec.first_class_id + 4 << R"(,"name":"anchor_dot"},)"
-          << R"({"id":)" << spec.first_class_id + 5 << R"(,"name":"glint"}
-)"
-          << R"(  ],
-)"
-          << R"json(  "splits": {")json" << spec.split << R"json(":{"total":)json" << spec.num_images
-          << R"(,"background":)" << background_images
+)" << R"(           "image_size_wh":[)"
+          << spec.width << "," << spec.height << R"(],"bbox_format":"xyxy_absolute_pixels",
+)" << R"(           "mask_format":"rle_row_major_start_length",
+)" << R"(           "background_annotation_policy":"empty_jsonl_file"},
+)" << R"(  "classes": [
+)" << R"(    {"id":)"
+          << spec.first_class_id << R"(,"name":"person"},)" << R"({"id":)" << spec.first_class_id + 1
+          << R"(,"name":"ret"},)" << R"({"id":)" << spec.first_class_id + 2 << R"(,"name":"scope"},
+)" << R"(    {"id":)"
+          << spec.first_class_id + 3 << R"(,"name":"iron_sight"},)" << R"({"id":)" << spec.first_class_id + 4
+          << R"(,"name":"anchor_dot"},)" << R"({"id":)" << spec.first_class_id + 5 << R"(,"name":"glint"}
+)" << R"(  ],
+)" << R"json(  "splits": {")json"
+          << spec.split << R"json(":{"total":)json" << spec.num_images << R"(,"background":)" << background_images
           << R"(,"annotated":)" << annotated_images << R"(}}
-)"
-          << "}";
+)" << "}";
     }
 
     constexpr std::array<const char*, 6> class_names{
@@ -114,10 +105,9 @@ void create_synthetic_dataset(const FixtureSpec& spec) {
                 }
                 rle += std::to_string(start) + ":" + std::to_string(len);
             }
-            f << R"({"class":")" << class_names[cls]
-              << R"(","bbox_xyxy":[)" << x1 << "," << y1 << "," << x2 << "," << y2
-              << R"(],"mask_rle_encoding":"row_major_start_length","mask_rle":")"
-              << rle << R"(","image_size_wh":[)" << spec.width << "," << spec.height << R"(]})" << "\n";
+            f << R"({"class":")" << class_names[cls] << R"(","bbox_xyxy":[)" << x1 << "," << y1 << "," << x2 << ","
+              << y2 << R"(],"mask_rle_encoding":"row_major_start_length","mask_rle":")" << rle
+              << R"(","image_size_wh":[)" << spec.width << "," << spec.height << R"(]})" << "\n";
         }
     }
 }
@@ -146,4 +136,4 @@ void assert_image_matches(const float* actual, const std::vector<float>& expecte
     }
 }
 
-} // namespace mmltk::testsupport
+}  // namespace mmltk::testsupport

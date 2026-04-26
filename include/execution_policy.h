@@ -28,21 +28,11 @@ struct ExecutionPolicySnapshot {
 [[nodiscard]] ExecutionPolicySnapshot apply_worker_execution_policy(const ExecutionPolicyRequest& request);
 [[nodiscard]] ExecutionPolicySnapshot capture_execution_policy_snapshot();
 
-// Worker budget inputs mirror the scheduling knobs the callers already hold.
 // NOLINTNEXTLINE(bugprone-easily-swappable-parameters)
-int clamp_worker_count_to_cpus(int requested_workers,
-                               size_t cpu_count,
-                               int reserved_cpus = 0,
-                               int minimum_workers = 1);
-void log_worker_budget_clamp(const char* subsystem,
-                             int requested_workers,
-                             int applied_workers,
-                             const std::vector<int>& cpus,
-                             int reserved_cpus = 0,
-                             int minimum_workers = 1);
-void log_process_execution_policy(const char* process_label,
-                                  const ExecutionPolicySnapshot& snapshot,
-                                  bool expect_realtime_scheduler,
-                                  bool expect_realtime_io);
+int clamp_worker_count_to_cpus(int requested_workers, size_t cpu_count, int reserved_cpus = 0, int minimum_workers = 1);
+void log_worker_budget_clamp(const char* subsystem, int requested_workers, int applied_workers,
+                             const std::vector<int>& cpus, int reserved_cpus = 0, int minimum_workers = 1);
+void log_process_execution_policy(const char* process_label, const ExecutionPolicySnapshot& snapshot,
+                                  bool expect_realtime_scheduler, bool expect_realtime_io);
 
-} // namespace mmltk
+}  // namespace mmltk

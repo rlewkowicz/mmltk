@@ -9,7 +9,7 @@
 namespace {
 
 class FakeModule final : public mmltk::runtime::ModelModule {
-public:
+   public:
     [[nodiscard]] std::string_view module_id() const override {
         return "fake";
     }
@@ -29,7 +29,8 @@ public:
         return preset_name == "preset-a" || preset_name == "preset-b";
     }
 
-    [[nodiscard]] std::string infer_preset_from_artifact_path(const std::filesystem::path& artifact_path) const override {
+    [[nodiscard]] std::string infer_preset_from_artifact_path(
+        const std::filesystem::path& artifact_path) const override {
         if (artifact_path.extension() == ".fakept") {
             return "preset-a";
         }
@@ -56,6 +57,6 @@ void test_registry_resolves_modules_and_presets() {
     assert(presets[1].preset_name == "preset-b");
 }
 
-} // namespace
+}  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[core][model_registry]", test_registry_resolves_modules_and_presets);

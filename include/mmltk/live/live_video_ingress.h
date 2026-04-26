@@ -14,7 +14,7 @@
 namespace mmltk::live {
 
 class LiveVideoIngress {
-public:
+   public:
     explicit LiveVideoIngress(frameshow::CaptureConfig config);
     ~LiveVideoIngress();
 
@@ -26,6 +26,8 @@ public:
 
     [[nodiscard]] bool running() const noexcept;
     [[nodiscard]] bool try_acquire_latest_source(SourceFrameView* out);
+    [[nodiscard]] bool wait_acquire_latest_source(SourceFrameView* out, const std::atomic<bool>& stop_requested);
+    void notify_source_waiters() noexcept;
     void release_source(std::uint32_t buffer_index);
 
     void set_capture_region(const LiveCaptureRegion& region);
@@ -37,7 +39,7 @@ public:
     [[nodiscard]] std::uint32_t max_inflight_sources() const noexcept;
     [[nodiscard]] std::uint64_t session_nonce() const noexcept;
 
-private:
+   private:
     frameshow::CaptureConfig config_{};
     std::unique_ptr<frameshow::CaptureSession> session_;
     std::atomic<bool> running_{false};
@@ -45,4 +47,4 @@ private:
     mutable std::mutex lifecycle_mutex_;
 };
 
-} // namespace mmltk::live
+}  // namespace mmltk::live

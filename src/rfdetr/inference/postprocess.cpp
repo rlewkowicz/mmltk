@@ -25,20 +25,16 @@ torch::Tensor box_cxcywh_to_xyxy(const torch::Tensor& value) {
             x_c + 0.5 * w,
             y_c + 0.5 * h,
         },
-        -1
-    );
+        -1);
 }
 
-static std::vector<TensorMap> postprocess_outputs_impl(
-    const OutputTensors& outputs,
-    const torch::Tensor* target_sizes,
-    std::optional<std::pair<int64_t, int64_t>> fixed_size,
-    int64_t num_select) {
+static std::vector<TensorMap> postprocess_outputs_impl(const OutputTensors& outputs, const torch::Tensor* target_sizes,
+                                                       std::optional<std::pair<int64_t, int64_t>> fixed_size,
+                                                       int64_t num_select) {
     MMLTK_PROFILE_SCOPE("rfdetr.native.postprocess.total");
     const auto& out_logits = outputs.pred_logits;
     const auto& out_bbox = outputs.pred_boxes;
-    if (target_sizes != nullptr &&
-        (out_logits.size(0) != target_sizes->size(0) || target_sizes->size(1) != 2)) {
+    if (target_sizes != nullptr && (out_logits.size(0) != target_sizes->size(0) || target_sizes->size(1) != 2)) {
         throw std::runtime_error("target_sizes must be [batch,2] and aligned with RF-DETR outputs");
     }
     if (!fixed_size.has_value() && target_sizes == nullptr) {
@@ -93,8 +89,7 @@ static std::vector<TensorMap> postprocess_outputs_impl(
             result["labels"] = labels[batch];
             result["boxes"] = boxes[batch];
             const auto gather_index = topk_boxes[batch].unsqueeze(-1).unsqueeze(-1).expand(
-                {topk_boxes.size(1), out_masks.size(-2), out_masks.size(-1)}
-            );
+                {topk_boxes.size(1), out_masks.size(-2), out_masks.size(-1)});
             auto masks = out_masks[batch].gather(0, gather_index);
             int64_t height = 0;
             int64_t width = 0;
@@ -126,20 +121,15 @@ static std::vector<TensorMap> postprocess_outputs_impl(
     return results;
 }
 
-std::vector<TensorMap> postprocess_outputs(const OutputTensors& outputs,
-                                           const torch::Tensor& target_sizes,
+std::vector<TensorMap> postprocess_outputs(const OutputTensors& outputs, const torch::Tensor& target_sizes,
                                            int64_t num_select) {
     return postprocess_outputs_impl(outputs, &target_sizes, std::nullopt, num_select);
 }
 
-std::vector<TensorMap> postprocess_outputs_fixed_size(const OutputTensors& outputs,
-                                                      int64_t target_height,
-                                                      int64_t target_width,
-                                                      int64_t num_select) {
-    return postprocess_outputs_impl(outputs,
-                                    nullptr,
-                                    std::make_optional(std::make_pair(target_height, target_width)),
+std::vector<TensorMap> postprocess_outputs_fixed_size(const OutputTensors& outputs, int64_t target_height,
+                                                      int64_t target_width, int64_t num_select) {
+    return postprocess_outputs_impl(outputs, nullptr, std::make_optional(std::make_pair(target_height, target_width)),
                                     num_select);
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

@@ -1,4 +1,5 @@
 .claude
+.docker-cache/
 
 # Build outputs
 /build/
@@ -6,6 +7,7 @@
 /profiles/
 /artifacts/
 .mmltk-data/logs/
+.mmltk-data/time-trace/
 
 *synth*
 
@@ -19,6 +21,12 @@ __pycache__/
 *.out
 *.err
 *.tmp
+*.bt
+*.dmp
+*.stackdump
+*.trace
+core
+core.*
 
 # Large dataset and model artifacts
 *.bin
@@ -45,3 +53,15 @@ pytorch
 Deformable-DETR
 grid_sample1d
 engines
+
+**node_modules**
+
+# Angular app generated artifacts and local scratch state
+src/browser/app/.angular/
+src/browser/app/.test-dist/
+src/browser/app/.test-dist-debug/
+src/browser/app/.test-dist-debug*/
+src/browser/app/.tmp-helper-test/
+src/browser/app/dist/
+
+actionplan.md

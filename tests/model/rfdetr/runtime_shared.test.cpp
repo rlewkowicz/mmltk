@@ -59,8 +59,7 @@ void test_live_split_helpers_clamp_counts_and_preserve_regions() {
 }
 
 void test_live_runtime_helpers_format_context_and_clamp_large_frame_ids() {
-    const std::string context =
-        format_live_split_context(77U, 2U, 4096U, 320U, 180U, 256U, 256U);
+    const std::string context = format_live_split_context(77U, 2U, 4096U, 320U, 180U, 256U, 256U);
     assert(context.find("frame_id=77") != std::string::npos);
     assert(context.find("split_index=2") != std::string::npos);
     assert(context.find("src=320x180") != std::string::npos);
@@ -79,11 +78,8 @@ void test_make_live_runner_state_allocates_single_frame_cuda_state() {
     ResolvedModelArtifacts artifacts;
     artifacts.config.resolution = 16;
 
-    LiveRunnerState state = make_live_runner_state(
-        artifacts,
-        0,
-        get_high_priority_cuda_stream(0),
-        "cudaEventCreateWithFlags for shared live runner state");
+    LiveRunnerState state = make_live_runner_state(artifacts, 0, get_high_priority_cuda_stream(0),
+                                                   "cudaEventCreateWithFlags for shared live runner state");
 
     assert(state.mean.defined());
     assert(state.std.defined());
@@ -113,17 +109,14 @@ void test_make_raw_image_batch_workspace_reuses_batch_tensors() {
     assert(workspace.resize_scratch_slots.size() == 3U);
 }
 
-} // namespace
+}  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][runtime_shared]",
                          test_prediction_lane_slot_count_scales_with_runtime_pressure);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][runtime_shared]",
-                         test_effective_lane_count_prefers_explicit_lane_override);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][runtime_shared]",
-                         test_live_split_helpers_clamp_counts_and_preserve_regions);
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][runtime_shared]", test_effective_lane_count_prefers_explicit_lane_override);
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][runtime_shared]", test_live_split_helpers_clamp_counts_and_preserve_regions);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][runtime_shared]",
                          test_live_runtime_helpers_format_context_and_clamp_large_frame_ids);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][runtime_shared]",
                          test_make_live_runner_state_allocates_single_frame_cuda_state);
-MMLTK_REGISTER_TEST_CASE("[model][rfdetr][runtime_shared]",
-                         test_make_raw_image_batch_workspace_reuses_batch_tensors);
+MMLTK_REGISTER_TEST_CASE("[model][rfdetr][runtime_shared]", test_make_raw_image_batch_workspace_reuses_batch_tensors);

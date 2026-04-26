@@ -25,7 +25,7 @@ std::string worker_name_for_index(const std::string& prefix, size_t index) {
     return name;
 }
 
-} // namespace
+}  // namespace
 
 struct WorkerPool::Impl {
     std::mutex mutex;
@@ -58,9 +58,7 @@ struct WorkerPool::Impl {
 
     void wait_for_startup(size_t worker_count) {
         std::unique_lock<std::mutex> lock(mutex);
-        startup_cv.wait(lock, [&] {
-            return started_workers == worker_count || startup_error != nullptr;
-        });
+        startup_cv.wait(lock, [&] { return started_workers == worker_count || startup_error != nullptr; });
         if (startup_error != nullptr) {
             std::rethrow_exception(startup_error);
         }
@@ -85,9 +83,7 @@ struct WorkerPool::Impl {
     }
 };
 
-WorkerPool::WorkerPool(size_t worker_count,
-                       std::vector<int> cpu_affinity,
-                       std::string thread_name_prefix)
+WorkerPool::WorkerPool(size_t worker_count, std::vector<int> cpu_affinity, std::string thread_name_prefix)
     : impl_(std::make_unique<Impl>()) {
     if (worker_count == 0) {
         throw std::runtime_error("worker_count must be greater than zero");
@@ -96,15 +92,13 @@ WorkerPool::WorkerPool(size_t worker_count,
     impl_->thread_name_prefix = std::move(thread_name_prefix);
     const auto actual_worker_count = static_cast<size_t>(
         clamp_worker_count_to_cpus(static_cast<int>(worker_count), impl_->cpu_affinity.size(), 0, 1));
-    log_worker_budget_clamp("worker_pool",
-                            static_cast<int>(worker_count),
-                            static_cast<int>(actual_worker_count),
+    log_worker_budget_clamp("worker_pool", static_cast<int>(worker_count), static_cast<int>(actual_worker_count),
                             impl_->cpu_affinity);
     impl_->workers.reserve(actual_worker_count);
     for (size_t worker_index = 0; worker_index < actual_worker_count; ++worker_index) {
         impl_->workers.emplace_back([this, worker_index] {
             try {
-                apply_worker_execution_policy(ExecutionPolicyRequest{
+                (void)apply_worker_execution_policy(ExecutionPolicyRequest{
                     impl_->cpu_affinity,
                     worker_name_for_index(impl_->thread_name_prefix, worker_index),
                     worker_index,
@@ -133,9 +127,7 @@ WorkerPool::WorkerPool(size_t worker_count,
                 std::function<void()> task;
                 {
                     std::unique_lock<std::mutex> lock(impl_->mutex);
-                    impl_->work_cv.wait(lock, [this] {
-                        return impl_->shutdown || !impl_->tasks.empty();
-                    });
+                    impl_->work_cv.wait(lock, [this] { return impl_->shutdown || !impl_->tasks.empty(); });
                     if (impl_->shutdown && impl_->tasks.empty()) {
                         g_current_worker_pool = nullptr;
                         return;
@@ -203,9 +195,7 @@ void WorkerPool::wait_idle() {
         return;
     }
     std::unique_lock<std::mutex> lock(impl_->mutex);
-    impl_->idle_cv.wait(lock, [this] {
-        return impl_->pending_tasks == 0 || impl_->startup_error != nullptr;
-    });
+    impl_->idle_cv.wait(lock, [this] { return impl_->pending_tasks == 0 || impl_->startup_error != nullptr; });
     if (impl_->startup_error != nullptr) {
         std::rethrow_exception(impl_->startup_error);
     }
@@ -219,4 +209,4 @@ bool WorkerPool::running_on_worker_thread() const noexcept {
     return impl_ && g_current_worker_pool == impl_.get();
 }
 
-} // namespace mmltk
+}  // namespace mmltk

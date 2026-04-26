@@ -37,18 +37,15 @@ struct AnnotationScreenPoint {
     float y = 0.0f;
 };
 
-} // namespace
+}  // namespace
 
-AnnotationPoint clamp_capture_point_to_bounds(const AnnotationFrame& frame,
-                                              const AnnotationPoint& point) {
-    const float max_x =
-        annotation_frame_capture_width(frame) == 0U
-            ? 0.0f
-            : static_cast<float>(annotation_frame_capture_width(frame) - 1U);
-    const float max_y =
-        annotation_frame_capture_height(frame) == 0U
-            ? 0.0f
-            : static_cast<float>(annotation_frame_capture_height(frame) - 1U);
+AnnotationPoint clamp_capture_point_to_bounds(const AnnotationFrame& frame, const AnnotationPoint& point) {
+    const float max_x = annotation_frame_capture_width(frame) == 0U
+                            ? 0.0f
+                            : static_cast<float>(annotation_frame_capture_width(frame) - 1U);
+    const float max_y = annotation_frame_capture_height(frame) == 0U
+                            ? 0.0f
+                            : static_cast<float>(annotation_frame_capture_height(frame) - 1U);
     return AnnotationPoint{
         std::clamp(point.x, 0.0f, max_x),
         std::clamp(point.y, 0.0f, max_y),
@@ -57,18 +54,14 @@ AnnotationPoint clamp_capture_point_to_bounds(const AnnotationFrame& frame,
 
 std::optional<AnnotationPoint> default_spline_handle_capture_point(const AnnotationFrame& frame,
                                                                    const AnnotationSplineShape& spline,
-                                                                   std::size_t knot_index,
-                                                                   AnnotationHandleRole role) {
-    if ((role != AnnotationHandleRole::SplineInHandle &&
-         role != AnnotationHandleRole::SplineOutHandle) ||
-        knot_index >= spline.knots.size() ||
-        spline.knots.size() < 2U) {
+                                                                   std::size_t knot_index, AnnotationHandleRole role) {
+    if ((role != AnnotationHandleRole::SplineInHandle && role != AnnotationHandleRole::SplineOutHandle) ||
+        knot_index >= spline.knots.size() || spline.knots.size() < 2U) {
         return std::nullopt;
     }
 
     const AnnotationSplineKnot& knot = spline.knots[knot_index];
-    const auto mirrored_from_handle = [&](const AnnotationSplineHandle& opposite)
-        -> std::optional<AnnotationPoint> {
+    const auto mirrored_from_handle = [&](const AnnotationSplineHandle& opposite) -> std::optional<AnnotationPoint> {
         if (!opposite.enabled) {
             return std::nullopt;
         }
@@ -77,12 +70,10 @@ std::optional<AnnotationPoint> default_spline_handle_capture_point(const Annotat
         if (std::abs(vx) <= 0.001f && std::abs(vy) <= 0.001f) {
             return std::nullopt;
         }
-        return clamp_capture_point_to_bounds(
-            frame,
-            AnnotationPoint{
-                knot.position.x - vx,
-                knot.position.y - vy,
-            });
+        return clamp_capture_point_to_bounds(frame, AnnotationPoint{
+                                                        knot.position.x - vx,
+                                                        knot.position.y - vy,
+                                                    });
     };
 
     if (role == AnnotationHandleRole::SplineInHandle) {
@@ -97,14 +88,13 @@ std::optional<AnnotationPoint> default_spline_handle_capture_point(const Annotat
         }
     }
 
-    const std::optional<std::size_t> prev_index =
-        knot_index > 0U ? std::optional<std::size_t>{knot_index - 1U}
-        : spline.closed ? std::optional<std::size_t>{spline.knots.size() - 1U}
-                        : std::nullopt;
-    const std::optional<std::size_t> next_index =
-        knot_index + 1U < spline.knots.size() ? std::optional<std::size_t>{knot_index + 1U}
-        : spline.closed ? std::optional<std::size_t>{0U}
-                        : std::nullopt;
+    const std::optional<std::size_t> prev_index = knot_index > 0U ? std::optional<std::size_t>{knot_index - 1U}
+                                                  : spline.closed ? std::optional<std::size_t>{spline.knots.size() - 1U}
+                                                                  : std::nullopt;
+    const std::optional<std::size_t> next_index = knot_index + 1U < spline.knots.size()
+                                                      ? std::optional<std::size_t>{knot_index + 1U}
+                                                  : spline.closed ? std::optional<std::size_t>{0U}
+                                                                  : std::nullopt;
 
     if (role == AnnotationHandleRole::SplineInHandle && !prev_index.has_value()) {
         return std::nullopt;
@@ -144,35 +134,24 @@ std::optional<AnnotationPoint> default_spline_handle_capture_point(const Annotat
     const float direction = role == AnnotationHandleRole::SplineInHandle ? -1.0f : 1.0f;
     const float normalized_x = tangent_x / tangent_length;
     const float normalized_y = tangent_y / tangent_length;
-    return clamp_capture_point_to_bounds(
-        frame,
-        AnnotationPoint{
-            knot.position.x + normalized_x * handle_length * direction,
-            knot.position.y + normalized_y * handle_length * direction,
-        });
+    return clamp_capture_point_to_bounds(frame, AnnotationPoint{
+                                                    knot.position.x + normalized_x * handle_length * direction,
+                                                    knot.position.y + normalized_y * handle_length * direction,
+                                                });
 }
 
 namespace {
 
 bool boxes_equal(const AnnotationBox& lhs, const AnnotationBox& rhs) {
-    return lhs.x1 == rhs.x1 &&
-           lhs.y1 == rhs.y1 &&
-           lhs.x2 == rhs.x2 &&
-           lhs.y2 == rhs.y2;
+    return lhs.x1 == rhs.x1 && lhs.y1 == rhs.y1 && lhs.x2 == rhs.x2 && lhs.y2 == rhs.y2;
 }
 
-void push_handle(AnnotationProjectedScene* scene,
-                 const std::optional<std::size_t>& selected_object_index,
-                 std::size_t index,
-                 AnnotationHandleRole role,
-                 std::size_t category_index,
-                 const AnnotationPoint& capture_point,
-                 const AnnotationPoint& frame_point,
-                 const AnnotationPoint& tether_frame_point = {},
-                 bool has_tether = false,
-                 bool materialized = true) {
+void push_handle(AnnotationProjectedScene* scene, std::size_t selected_object_index, std::size_t index,
+                 AnnotationHandleRole role, std::size_t category_index, const AnnotationPoint& capture_point,
+                 const AnnotationPoint& frame_point, const AnnotationPoint& tether_frame_point = {},
+                 bool has_tether = false, bool materialized = true) {
     scene->editable_handles.push_back(AnnotationEditableHandle{
-        AnnotationHandleId{*selected_object_index, index, role},
+        AnnotationHandleId{selected_object_index, index, role},
         category_index,
         capture_point,
         frame_point,
@@ -183,9 +162,7 @@ void push_handle(AnnotationProjectedScene* scene,
 }
 
 bool box_contains_point(const AnnotationBox& box, const int x, const int y) {
-    return annotation_box_has_area(box) &&
-           x >= box.x1 && x < box.x2 &&
-           y >= box.y1 && y < box.y2;
+    return annotation_box_has_area(box) && x >= box.x1 && x < box.x2 && y >= box.y1 && y < box.y2;
 }
 
 std::array<std::uint8_t, 3> category_color(const std::size_t index) {
@@ -202,8 +179,7 @@ std::array<std::uint8_t, 3> category_color(const std::size_t index) {
     return palette[index % palette.size()];
 }
 
-std::array<std::uint8_t, 3> interaction_color(const bool selected,
-                                              const bool hovered,
+std::array<std::uint8_t, 3> interaction_color(const bool selected, const bool hovered,
                                               const std::size_t category_index) {
     if (selected) {
         return {kSelectedR, kSelectedG, kSelectedB};
@@ -214,14 +190,9 @@ std::array<std::uint8_t, 3> interaction_color(const bool selected,
     return category_color(category_index);
 }
 
-void append_overlay_box(PreviewInteractionOverlaySnapshot& snapshot,
-                        const AnnotationBox& box,
-                        const std::uint8_t r,
-                        const std::uint8_t g,
-                        const std::uint8_t b,
-                        const int thickness,
-                        const bool draw_handles = false,
-                        const int handle_radius = 4) {
+void append_overlay_box(PreviewInteractionOverlaySnapshot& snapshot, const AnnotationBox& box, const std::uint8_t r,
+                        const std::uint8_t g, const std::uint8_t b, const int thickness,
+                        const bool draw_handles = false, const int handle_radius = 4) {
     if (!annotation_box_has_area(box)) {
         return;
     }
@@ -236,8 +207,7 @@ void append_overlay_box(PreviewInteractionOverlaySnapshot& snapshot,
     });
 }
 
-AnnotationPoint capture_point_to_frame_unclipped(const AnnotationFrame& frame,
-                                                 const AnnotationPoint& point) {
+AnnotationPoint capture_point_to_frame_unclipped(const AnnotationFrame& frame, const AnnotationPoint& point) {
     return AnnotationPoint{
         point.x - static_cast<float>(frame.view_x),
         point.y - static_cast<float>(frame.view_y),
@@ -252,7 +222,7 @@ PreviewInteractionOverlayPoint to_preview_overlay_point(const AnnotationPoint& p
 }
 
 PreviewInteractionOverlayPoint capture_point_to_preview_overlay_point(const AnnotationFrame& frame,
-                                                                     const AnnotationPoint& point) {
+                                                                      const AnnotationPoint& point) {
     return to_preview_overlay_point(capture_point_to_frame_unclipped(frame, point));
 }
 
@@ -263,8 +233,7 @@ mmltk::live::ManualOverlayPoint to_overlay_point(const AnnotationPoint& point) {
     };
 }
 
-std::vector<mmltk::live::ManualOverlayPoint> to_overlay_points(
-    const std::vector<AnnotationPoint>& points) {
+std::vector<mmltk::live::ManualOverlayPoint> to_overlay_points(const std::vector<AnnotationPoint>& points) {
     std::vector<mmltk::live::ManualOverlayPoint> overlay_points;
     overlay_points.reserve(points.size());
     for (const AnnotationPoint& point : points) {
@@ -273,9 +242,8 @@ std::vector<mmltk::live::ManualOverlayPoint> to_overlay_points(
     return overlay_points;
 }
 
-std::vector<AnnotationPoint> capture_points_to_frame_unclipped(
-    const AnnotationFrame& frame,
-    const std::vector<AnnotationPoint>& points) {
+std::vector<AnnotationPoint> capture_points_to_frame_unclipped(const AnnotationFrame& frame,
+                                                               const std::vector<AnnotationPoint>& points) {
     std::vector<AnnotationPoint> frame_points;
     frame_points.reserve(points.size());
     for (const AnnotationPoint& point : points) {
@@ -294,8 +262,7 @@ std::vector<PreviewInteractionOverlayPoint> frame_points_to_preview_overlay_poin
     return overlay_points;
 }
 
-std::vector<PreviewInteractionOverlayEdge> to_preview_overlay_edges(
-    const std::vector<AnnotationSkeletonEdge>& edges) {
+std::vector<PreviewInteractionOverlayEdge> to_preview_overlay_edges(const std::vector<AnnotationSkeletonEdge>& edges) {
     std::vector<PreviewInteractionOverlayEdge> overlay_edges;
     overlay_edges.reserve(edges.size());
     for (const AnnotationSkeletonEdge& edge : edges) {
@@ -307,8 +274,7 @@ std::vector<PreviewInteractionOverlayEdge> to_preview_overlay_edges(
     return overlay_edges;
 }
 
-std::vector<mmltk::live::ManualOverlayEdge> to_overlay_edges(
-    const std::vector<AnnotationSkeletonEdge>& edges) {
+std::vector<mmltk::live::ManualOverlayEdge> to_overlay_edges(const std::vector<AnnotationSkeletonEdge>& edges) {
     std::vector<mmltk::live::ManualOverlayEdge> overlay_edges;
     overlay_edges.reserve(edges.size());
     for (const AnnotationSkeletonEdge& edge : edges) {
@@ -320,8 +286,7 @@ std::vector<mmltk::live::ManualOverlayEdge> to_overlay_edges(
     return overlay_edges;
 }
 
-AnnotationVisibleGeometry build_visible_geometry(const AnnotationFrame& frame,
-                                                 const AnnotationObject& object) {
+AnnotationVisibleGeometry build_visible_geometry(const AnnotationFrame& frame, const AnnotationObject& object) {
     AnnotationVisibleGeometry geometry;
     std::visit(
         [&](const auto& shape) {
@@ -332,8 +297,7 @@ AnnotationVisibleGeometry build_visible_geometry(const AnnotationFrame& frame,
             } else if constexpr (std::is_same_v<T, AnnotationSplineShape>) {
                 geometry.closed = shape.closed;
                 geometry.capture_points = sample_annotation_spline_points(shape);
-                geometry.frame_points =
-                    capture_points_to_frame_unclipped(frame, geometry.capture_points);
+                geometry.frame_points = capture_points_to_frame_unclipped(frame, geometry.capture_points);
                 geometry.control_preview_points.reserve(shape.knots.size());
                 geometry.handle_preview_points.reserve(shape.knots.size() * 2U);
                 geometry.latent_handle_preview_points.reserve(shape.knots.size() * 2U);
@@ -345,28 +309,23 @@ AnnotationVisibleGeometry build_visible_geometry(const AnnotationFrame& frame,
                         capture_point_to_preview_overlay_point(frame, knot.position);
                     geometry.control_preview_points.push_back(knot_point);
 
-                    const auto append_materialized_handle =
-                        [&](const AnnotationSplineHandle& handle) {
-                            const PreviewInteractionOverlayPoint handle_point =
-                                capture_point_to_preview_overlay_point(frame, handle.position);
-                            geometry.handle_preview_points.push_back(handle_point);
-                            geometry.handle_preview_segments.emplace_back(knot_point, handle_point);
-                        };
-                    const auto append_latent_handle =
-                        [&](const AnnotationHandleRole role) {
-                            const std::optional<AnnotationPoint> latent_handle =
-                                default_spline_handle_capture_point(frame,
-                                                                    shape,
-                                                                    knot_index,
-                                                                    role);
-                            if (!latent_handle.has_value()) {
-                                return;
-                            }
-                            const PreviewInteractionOverlayPoint handle_point =
-                                capture_point_to_preview_overlay_point(frame, *latent_handle);
-                            geometry.latent_handle_preview_points.push_back(handle_point);
-                            geometry.latent_handle_preview_segments.emplace_back(knot_point, handle_point);
-                        };
+                    const auto append_materialized_handle = [&](const AnnotationSplineHandle& handle) {
+                        const PreviewInteractionOverlayPoint handle_point =
+                            capture_point_to_preview_overlay_point(frame, handle.position);
+                        geometry.handle_preview_points.push_back(handle_point);
+                        geometry.handle_preview_segments.emplace_back(knot_point, handle_point);
+                    };
+                    const auto append_latent_handle = [&](const AnnotationHandleRole role) {
+                        const std::optional<AnnotationPoint> latent_handle =
+                            default_spline_handle_capture_point(frame, shape, knot_index, role);
+                        if (!latent_handle.has_value()) {
+                            return;
+                        }
+                        const PreviewInteractionOverlayPoint handle_point =
+                            capture_point_to_preview_overlay_point(frame, *latent_handle);
+                        geometry.latent_handle_preview_points.push_back(handle_point);
+                        geometry.latent_handle_preview_segments.emplace_back(knot_point, handle_point);
+                    };
 
                     if (knot.in_handle.enabled) {
                         append_materialized_handle(knot.in_handle);
@@ -394,8 +353,7 @@ AnnotationVisibleGeometry build_visible_geometry(const AnnotationFrame& frame,
                 }
                 geometry.edges.reserve(shape.edges.size());
                 for (const AnnotationSkeletonEdge& edge : shape.edges) {
-                    if (edge.source_index >= node_remap.size() ||
-                        edge.target_index >= node_remap.size()) {
+                    if (edge.source_index >= node_remap.size() || edge.target_index >= node_remap.size()) {
                         continue;
                     }
                     const std::optional<std::size_t>& source_index = node_remap[edge.source_index];
@@ -412,8 +370,7 @@ AnnotationVisibleGeometry build_visible_geometry(const AnnotationFrame& frame,
         },
         object.shape);
     if (!geometry.frame_points.empty()) {
-        geometry.preview_points =
-            frame_points_to_preview_overlay_points(geometry.frame_points);
+        geometry.preview_points = frame_points_to_preview_overlay_points(geometry.frame_points);
     }
     if (!geometry.capture_points.empty()) {
         geometry.manual_points = to_overlay_points(geometry.capture_points);
@@ -425,10 +382,9 @@ AnnotationVisibleGeometry build_visible_geometry(const AnnotationFrame& frame,
     return geometry;
 }
 
-void append_selected_object_editable_handles(const AnnotationFrame& frame,
-                                            const AnnotationDocument& document,
-                                            const std::optional<std::size_t> selected_object_index,
-                                            AnnotationProjectedScene* scene) {
+void append_selected_object_editable_handles(const AnnotationFrame& frame, const AnnotationDocument& document,
+                                             const std::optional<std::size_t> selected_object_index,
+                                             AnnotationProjectedScene* scene) {
     if (scene == nullptr || !selected_object_index.has_value()) {
         if (scene != nullptr) {
             scene->editable_handles.clear();
@@ -441,46 +397,41 @@ void append_selected_object_editable_handles(const AnnotationFrame& frame,
         scene->selected_object_index.reset();
         return;
     }
+    const std::size_t selected_index = *selected_object_index;
     std::visit(
         [&](const auto& shape) {
             using T = std::decay_t<decltype(shape)>;
             if constexpr (std::is_same_v<T, AnnotationPointShape>) {
-                push_handle(scene, selected_object_index, 0U, AnnotationHandleRole::Point, object->category_index,
-                            shape.point, capture_point_to_frame_unclipped(frame, shape.point));
+                push_handle(scene, selected_index, 0U, AnnotationHandleRole::Point, object->category_index, shape.point,
+                            capture_point_to_frame_unclipped(frame, shape.point));
             } else if constexpr (std::is_same_v<T, AnnotationSplineShape>) {
                 scene->editable_handles.reserve(shape.knots.size() * 5U);
                 for (std::size_t index = 0; index < shape.knots.size(); ++index) {
                     const AnnotationSplineKnot& knot = shape.knots[index];
-                    push_handle(scene, selected_object_index, index, AnnotationHandleRole::SplineKnot,
-                                object->category_index, knot.position, capture_point_to_frame_unclipped(frame, knot.position));
+                    push_handle(scene, selected_index, index, AnnotationHandleRole::SplineKnot, object->category_index,
+                                knot.position, capture_point_to_frame_unclipped(frame, knot.position));
                     if (knot.in_handle.enabled) {
-                        push_handle(scene, selected_object_index, index, AnnotationHandleRole::SplineInHandle,
+                        push_handle(scene, selected_index, index, AnnotationHandleRole::SplineInHandle,
                                     object->category_index, knot.in_handle.position,
                                     capture_point_to_frame_unclipped(frame, knot.in_handle.position),
                                     capture_point_to_frame_unclipped(frame, knot.position), true);
-                    } else if (const std::optional<AnnotationPoint> latent_handle =
-                                   default_spline_handle_capture_point(frame,
-                                                                       shape,
-                                                                       index,
-                                                                       AnnotationHandleRole::SplineInHandle);
+                    } else if (const std::optional<AnnotationPoint> latent_handle = default_spline_handle_capture_point(
+                                   frame, shape, index, AnnotationHandleRole::SplineInHandle);
                                latent_handle.has_value()) {
-                        push_handle(scene, selected_object_index, index, AnnotationHandleRole::SplineInHandle,
+                        push_handle(scene, selected_index, index, AnnotationHandleRole::SplineInHandle,
                                     object->category_index, *latent_handle,
                                     capture_point_to_frame_unclipped(frame, *latent_handle),
                                     capture_point_to_frame_unclipped(frame, knot.position), true, false);
                     }
                     if (knot.out_handle.enabled) {
-                        push_handle(scene, selected_object_index, index, AnnotationHandleRole::SplineOutHandle,
+                        push_handle(scene, selected_index, index, AnnotationHandleRole::SplineOutHandle,
                                     object->category_index, knot.out_handle.position,
                                     capture_point_to_frame_unclipped(frame, knot.out_handle.position),
                                     capture_point_to_frame_unclipped(frame, knot.position), true);
-                    } else if (const std::optional<AnnotationPoint> latent_handle =
-                                   default_spline_handle_capture_point(frame,
-                                                                       shape,
-                                                                       index,
-                                                                       AnnotationHandleRole::SplineOutHandle);
+                    } else if (const std::optional<AnnotationPoint> latent_handle = default_spline_handle_capture_point(
+                                   frame, shape, index, AnnotationHandleRole::SplineOutHandle);
                                latent_handle.has_value()) {
-                        push_handle(scene, selected_object_index, index, AnnotationHandleRole::SplineOutHandle,
+                        push_handle(scene, selected_index, index, AnnotationHandleRole::SplineOutHandle,
                                     object->category_index, *latent_handle,
                                     capture_point_to_frame_unclipped(frame, *latent_handle),
                                     capture_point_to_frame_unclipped(frame, knot.position), true, false);
@@ -493,19 +444,19 @@ void append_selected_object_editable_handles(const AnnotationFrame& frame,
                     if (!node.visible) {
                         continue;
                     }
-                    push_handle(scene, selected_object_index, index, AnnotationHandleRole::SkeletonNode,
-                                object->category_index, node.point, capture_point_to_frame_unclipped(frame, node.point));
+                    push_handle(scene, selected_index, index, AnnotationHandleRole::SkeletonNode,
+                                object->category_index, node.point,
+                                capture_point_to_frame_unclipped(frame, node.point));
                 }
             }
         },
         object->shape);
 }
 
-AnnotationProjectedScene rebuild_projected_scene_selection(
-    const AnnotationFrame& frame,
-    const AnnotationDocument& document,
-    AnnotationProjectedScene scene,
-    std::optional<std::size_t> selected_object_index) {
+AnnotationProjectedScene rebuild_projected_scene_selection(const AnnotationFrame& frame,
+                                                           const AnnotationDocument& document,
+                                                           AnnotationProjectedScene scene,
+                                                           std::optional<std::size_t> selected_object_index) {
     if (selected_object_index.has_value() && *selected_object_index >= document.size()) {
         selected_object_index.reset();
     }
@@ -515,8 +466,7 @@ AnnotationProjectedScene rebuild_projected_scene_selection(
     return scene;
 }
 
-AnnotationScreenPoint frame_point_to_screen_point(const CanvasViewport& viewport,
-                                                  const AnnotationPoint& point) {
+AnnotationScreenPoint frame_point_to_screen_point(const CanvasViewport& viewport, const AnnotationPoint& point) {
     const float scale_x =
         viewport.image_width == 0U ? 1.0f : viewport.screen_width / static_cast<float>(viewport.image_width);
     const float scale_y =
@@ -536,15 +486,13 @@ float object_hit_radius_px(const CanvasViewport& viewport) {
     return std::clamp(scale * 4.0f, kMinObjectHitRadiusPx, kMaxObjectHitRadiusPx);
 }
 
-float squared_distance(const AnnotationScreenPoint& lhs,
-                       const AnnotationScreenPoint& rhs) {
+float squared_distance(const AnnotationScreenPoint& lhs, const AnnotationScreenPoint& rhs) {
     const float dx = lhs.x - rhs.x;
     const float dy = lhs.y - rhs.y;
     return dx * dx + dy * dy;
 }
 
-float squared_distance_to_segment(const AnnotationScreenPoint& point,
-                                  const AnnotationScreenPoint& start,
+float squared_distance_to_segment(const AnnotationScreenPoint& point, const AnnotationScreenPoint& start,
                                   const AnnotationScreenPoint& end) {
     const float segment_dx = end.x - start.x;
     const float segment_dy = end.y - start.y;
@@ -553,10 +501,8 @@ float squared_distance_to_segment(const AnnotationScreenPoint& point,
         return squared_distance(point, start);
     }
 
-    const float t = std::clamp(((point.x - start.x) * segment_dx + (point.y - start.y) * segment_dy) /
-                                   segment_length_sq,
-                               0.0f,
-                               1.0f);
+    const float t = std::clamp(
+        ((point.x - start.x) * segment_dx + (point.y - start.y) * segment_dy) / segment_length_sq, 0.0f, 1.0f);
     const AnnotationScreenPoint projection{
         start.x + segment_dx * t,
         start.y + segment_dy * t,
@@ -564,27 +510,20 @@ float squared_distance_to_segment(const AnnotationScreenPoint& point,
     return squared_distance(point, projection);
 }
 
-bool point_cloud_hit_test(const std::vector<AnnotationPoint>& frame_points,
-                          const CanvasViewport& viewport,
-                          const CanvasPointerState& pointer,
-                          const float hit_radius_px) {
+bool point_cloud_hit_test(const std::vector<AnnotationPoint>& frame_points, const CanvasViewport& viewport,
+                          const CanvasPointerState& pointer, const float hit_radius_px) {
     if (frame_points.empty()) {
         return false;
     }
     const AnnotationScreenPoint pointer_point{pointer.screen_x, pointer.screen_y};
     const float hit_radius_sq = hit_radius_px * hit_radius_px;
-    return std::ranges::any_of(frame_points,
-                       [&](const AnnotationPoint& frame_point) {
-                           return squared_distance(pointer_point,
-                                                   frame_point_to_screen_point(viewport, frame_point)) <= hit_radius_sq;
-                       });
+    return std::ranges::any_of(frame_points, [&](const AnnotationPoint& frame_point) {
+        return squared_distance(pointer_point, frame_point_to_screen_point(viewport, frame_point)) <= hit_radius_sq;
+    });
 }
 
-bool polyline_hit_test(const std::vector<AnnotationPoint>& frame_points,
-                       const bool closed,
-                       const CanvasViewport& viewport,
-                       const CanvasPointerState& pointer,
-                       const float hit_radius_px) {
+bool polyline_hit_test(const std::vector<AnnotationPoint>& frame_points, const bool closed,
+                       const CanvasViewport& viewport, const CanvasPointerState& pointer, const float hit_radius_px) {
     if (frame_points.empty()) {
         return false;
     }
@@ -594,11 +533,9 @@ bool polyline_hit_test(const std::vector<AnnotationPoint>& frame_points,
 
     const AnnotationScreenPoint pointer_point{pointer.screen_x, pointer.screen_y};
     const float hit_radius_sq = hit_radius_px * hit_radius_px;
-    const std::size_t segment_count =
-        closed ? frame_points.size() : frame_points.size() - 1U;
+    const std::size_t segment_count = closed ? frame_points.size() : frame_points.size() - 1U;
     for (std::size_t index = 0; index < segment_count; ++index) {
-        const AnnotationScreenPoint segment_start =
-            frame_point_to_screen_point(viewport, frame_points[index]);
+        const AnnotationScreenPoint segment_start = frame_point_to_screen_point(viewport, frame_points[index]);
         const AnnotationScreenPoint segment_end =
             frame_point_to_screen_point(viewport, frame_points[(index + 1U) % frame_points.size()]);
         if (squared_distance_to_segment(pointer_point, segment_start, segment_end) <= hit_radius_sq) {
@@ -608,10 +545,8 @@ bool polyline_hit_test(const std::vector<AnnotationPoint>& frame_points,
     return false;
 }
 
-bool skeleton_hit_test(const AnnotationVisibleGeometry& geometry,
-                       const CanvasViewport& viewport,
-                       const CanvasPointerState& pointer,
-                       const float hit_radius_px) {
+bool skeleton_hit_test(const AnnotationVisibleGeometry& geometry, const CanvasViewport& viewport,
+                       const CanvasPointerState& pointer, const float hit_radius_px) {
     if (point_cloud_hit_test(geometry.frame_points, viewport, pointer, hit_radius_px)) {
         return true;
     }
@@ -622,8 +557,7 @@ bool skeleton_hit_test(const AnnotationVisibleGeometry& geometry,
     const AnnotationScreenPoint pointer_point{pointer.screen_x, pointer.screen_y};
     const float hit_radius_sq = hit_radius_px * hit_radius_px;
     for (const AnnotationSkeletonEdge& edge : geometry.edges) {
-        if (edge.source_index >= geometry.frame_points.size() ||
-            edge.target_index >= geometry.frame_points.size()) {
+        if (edge.source_index >= geometry.frame_points.size() || edge.target_index >= geometry.frame_points.size()) {
             continue;
         }
         const AnnotationScreenPoint segment_start =
@@ -638,188 +572,165 @@ bool skeleton_hit_test(const AnnotationVisibleGeometry& geometry,
 }
 
 bool is_resize_drag_kind(const RectDragKind drag_kind) {
-    return drag_kind == RectDragKind::ResizeTopLeft ||
-           drag_kind == RectDragKind::ResizeTopRight ||
-           drag_kind == RectDragKind::ResizeBottomLeft ||
-           drag_kind == RectDragKind::ResizeBottomRight;
+    return drag_kind == RectDragKind::ResizeTopLeft || drag_kind == RectDragKind::ResizeTopRight ||
+           drag_kind == RectDragKind::ResizeBottomLeft || drag_kind == RectDragKind::ResizeBottomRight;
 }
 
-bool geometry_hit_test(const AnnotationVisibleObject& object,
-                       const CanvasViewport& viewport,
-                       const CanvasPointerState& pointer,
-                       const int image_x,
-                       const int image_y) {
+bool geometry_hit_test(const AnnotationVisibleObject& object, const CanvasViewport& viewport,
+                       const CanvasPointerState& pointer, const int image_x, const int image_y) {
     const float hit_radius_px = object_hit_radius_px(viewport);
     switch (object.shape_type) {
-    case AnnotationShapeType::Box:
-    case AnnotationShapeType::Mask:
-        return box_contains_point(object.frame_box, image_x, image_y);
-    case AnnotationShapeType::Point:
-        return point_cloud_hit_test(object.geometry.frame_points,
-                                    viewport,
-                                    pointer,
-                                    hit_radius_px);
-    case AnnotationShapeType::Spline:
-        return polyline_hit_test(object.geometry.frame_points,
-                                 object.geometry.closed,
-                                 viewport,
-                                 pointer,
-                                 hit_radius_px);
-    case AnnotationShapeType::Skeleton:
-        return skeleton_hit_test(object.geometry,
-                                 viewport,
-                                 pointer,
-                                 hit_radius_px);
+        case AnnotationShapeType::Box:
+        case AnnotationShapeType::Mask:
+            return box_contains_point(object.frame_box, image_x, image_y);
+        case AnnotationShapeType::Point:
+            return point_cloud_hit_test(object.geometry.frame_points, viewport, pointer, hit_radius_px);
+        case AnnotationShapeType::Spline:
+            return polyline_hit_test(object.geometry.frame_points, object.geometry.closed, viewport, pointer,
+                                     hit_radius_px);
+        case AnnotationShapeType::Skeleton:
+            return skeleton_hit_test(object.geometry, viewport, pointer, hit_radius_px);
     }
     return false;
 }
 
-const AnnotationEditableHandle* find_editable_handle(
-    const std::vector<AnnotationEditableHandle>& handles,
-    const AnnotationHandleId& id) {
-    const auto it = std::ranges::find_if(handles,
-                                 [&](const AnnotationEditableHandle& handle) {
-                                     return handle.id == id;
-                                 });
+const AnnotationEditableHandle* find_editable_handle(const std::vector<AnnotationEditableHandle>& handles,
+                                                     const AnnotationHandleId& id) {
+    const auto it =
+        std::ranges::find_if(handles, [&](const AnnotationEditableHandle& handle) { return handle.id == id; });
     return it != handles.end() ? &(*it) : nullptr;
 }
 
 void append_annotation_shape_overlay_primitives(AnnotationInteractionOverlayRequest* request,
                                                 const AnnotationVisibleObject& object,
-                                                const AnnotationVisibleGeometry& geometry,
-                                                const bool selected,
+                                                const AnnotationVisibleGeometry& geometry, const bool selected,
                                                 const bool hovered) {
     if (request == nullptr) {
         return;
     }
-    const std::array<std::uint8_t, 3> color =
-        interaction_color(selected, hovered, object.category_index);
+    const std::array<std::uint8_t, 3> color = interaction_color(selected, hovered, object.category_index);
 
     switch (object.shape_type) {
-    case AnnotationShapeType::Box:
-    case AnnotationShapeType::Mask:
-        return;
-    case AnnotationShapeType::Spline:
-        if (geometry.preview_points.size() >= 2U) {
-            request->polylines.push_back(PreviewInteractionOverlayPolyline{
-                geometry.preview_points,
-                geometry.closed,
-                color[0],
-                color[1],
-                color[2],
-                selected ? 3 : 2,
-            });
-        }
-        if (!geometry.control_preview_points.empty()) {
-            request->marker_sets.push_back(PreviewInteractionOverlayMarkerSet{
-                geometry.control_preview_points,
-                selected ? 4 : 3,
-                color[0],
-                color[1],
-                color[2],
-                static_cast<std::uint8_t>(240U),
-            });
-        }
-        if (!selected) {
+        case AnnotationShapeType::Box:
+        case AnnotationShapeType::Mask:
             return;
-        }
-        for (const auto& segment : geometry.handle_preview_segments) {
-            request->polylines.push_back(PreviewInteractionOverlayPolyline{
-                {
-                    segment.first,
-                    segment.second,
-                },
-                false,
-                color[0],
-                color[1],
-                color[2],
-                1,
-            });
-        }
-        for (const auto& segment : geometry.latent_handle_preview_segments) {
-            request->polylines.push_back(PreviewInteractionOverlayPolyline{
-                {
-                    segment.first,
-                    segment.second,
-                },
-                false,
-                kLatentHandleR,
-                kLatentHandleG,
-                kLatentHandleB,
-                1,
-            });
-        }
-        if (!geometry.handle_preview_points.empty()) {
-            request->marker_sets.push_back(PreviewInteractionOverlayMarkerSet{
-                geometry.handle_preview_points,
-                3,
-                color[0],
-                color[1],
-                color[2],
-                static_cast<std::uint8_t>(220U),
-            });
-        }
-        if (!geometry.latent_handle_preview_points.empty()) {
-            request->marker_sets.push_back(PreviewInteractionOverlayMarkerSet{
-                geometry.latent_handle_preview_points,
-                3,
-                kLatentHandleR,
-                kLatentHandleG,
-                kLatentHandleB,
-                static_cast<std::uint8_t>(176U),
-            });
-        }
-        return;
-    case AnnotationShapeType::Point:
-        if (geometry.preview_points.empty()) {
+        case AnnotationShapeType::Spline:
+            if (geometry.preview_points.size() >= 2U) {
+                request->polylines.push_back(PreviewInteractionOverlayPolyline{
+                    geometry.preview_points,
+                    geometry.closed,
+                    color[0],
+                    color[1],
+                    color[2],
+                    selected ? 3 : 2,
+                });
+            }
+            if (!geometry.control_preview_points.empty()) {
+                request->marker_sets.push_back(PreviewInteractionOverlayMarkerSet{
+                    geometry.control_preview_points,
+                    selected ? 4 : 3,
+                    color[0],
+                    color[1],
+                    color[2],
+                    static_cast<std::uint8_t>(240U),
+                });
+            }
+            if (!selected) {
+                return;
+            }
+            for (const auto& segment : geometry.handle_preview_segments) {
+                request->polylines.push_back(PreviewInteractionOverlayPolyline{
+                    {
+                        segment.first,
+                        segment.second,
+                    },
+                    false,
+                    color[0],
+                    color[1],
+                    color[2],
+                    1,
+                });
+            }
+            for (const auto& segment : geometry.latent_handle_preview_segments) {
+                request->polylines.push_back(PreviewInteractionOverlayPolyline{
+                    {
+                        segment.first,
+                        segment.second,
+                    },
+                    false,
+                    kLatentHandleR,
+                    kLatentHandleG,
+                    kLatentHandleB,
+                    1,
+                });
+            }
+            if (!geometry.handle_preview_points.empty()) {
+                request->marker_sets.push_back(PreviewInteractionOverlayMarkerSet{
+                    geometry.handle_preview_points,
+                    3,
+                    color[0],
+                    color[1],
+                    color[2],
+                    static_cast<std::uint8_t>(220U),
+                });
+            }
+            if (!geometry.latent_handle_preview_points.empty()) {
+                request->marker_sets.push_back(PreviewInteractionOverlayMarkerSet{
+                    geometry.latent_handle_preview_points,
+                    3,
+                    kLatentHandleR,
+                    kLatentHandleG,
+                    kLatentHandleB,
+                    static_cast<std::uint8_t>(176U),
+                });
+            }
             return;
-        }
-        request->marker_sets.push_back(PreviewInteractionOverlayMarkerSet{
-            {geometry.preview_points.front()},
-            selected ? 5 : 4,
-            color[0],
-            color[1],
-            color[2],
-            static_cast<std::uint8_t>(255U),
-        });
-        return;
-    case AnnotationShapeType::Skeleton:
-        if (!geometry.preview_points.empty() && !geometry.preview_edges.empty()) {
-            request->skeletons.push_back(PreviewInteractionOverlaySkeleton{
-                geometry.preview_points,
-                geometry.preview_edges,
-                color[0],
-                color[1],
-                color[2],
-                selected ? 3 : 2,
-            });
-        }
-        if (!geometry.preview_points.empty()) {
+        case AnnotationShapeType::Point:
+            if (geometry.preview_points.empty()) {
+                return;
+            }
             request->marker_sets.push_back(PreviewInteractionOverlayMarkerSet{
-                geometry.preview_points,
-                selected ? 4 : 3,
+                {geometry.preview_points.front()},
+                selected ? 5 : 4,
                 color[0],
                 color[1],
                 color[2],
-                static_cast<std::uint8_t>(240U),
+                static_cast<std::uint8_t>(255U),
             });
-        }
-        return;
+            return;
+        case AnnotationShapeType::Skeleton:
+            if (!geometry.preview_points.empty() && !geometry.preview_edges.empty()) {
+                request->skeletons.push_back(PreviewInteractionOverlaySkeleton{
+                    geometry.preview_points,
+                    geometry.preview_edges,
+                    color[0],
+                    color[1],
+                    color[2],
+                    selected ? 3 : 2,
+                });
+            }
+            if (!geometry.preview_points.empty()) {
+                request->marker_sets.push_back(PreviewInteractionOverlayMarkerSet{
+                    geometry.preview_points,
+                    selected ? 4 : 3,
+                    color[0],
+                    color[1],
+                    color[2],
+                    static_cast<std::uint8_t>(240U),
+                });
+            }
+            return;
     }
 }
 
 void append_handle_highlight(AnnotationInteractionOverlayRequest* request,
                              const std::vector<AnnotationEditableHandle>& handles,
-                             const std::optional<AnnotationHandleId>& handle,
-                             const int radius,
-                             const std::uint8_t r,
-                             const std::uint8_t g,
-                             const std::uint8_t b) {
+                             const std::optional<AnnotationHandleId>& handle, const int radius, const std::uint8_t r,
+                             const std::uint8_t g, const std::uint8_t b) {
     if (request == nullptr || !handle.has_value()) {
         return;
     }
-    const AnnotationEditableHandle* editable_handle =
-        find_editable_handle(handles, *handle);
+    const AnnotationEditableHandle* editable_handle = find_editable_handle(handles, *handle);
     if (editable_handle == nullptr) {
         return;
     }
@@ -853,9 +764,8 @@ mmltk::live::ManualOverlayInstance to_overlay_instance(const AnnotationObject& o
         overlay_object.box = to_overlay_box(*bbox);
     }
 
-    if (const AnnotationMaskShape* mask_shape = annotation_object_mask_shape(object); mask_shape != nullptr &&
-        mask_shape->region.width > 0 &&
-        mask_shape->region.height > 0 &&
+    if (const AnnotationMaskShape* mask_shape = annotation_object_mask_shape(object);
+        mask_shape != nullptr && mask_shape->region.width > 0 && mask_shape->region.height > 0 &&
         mask_shape->mask.size() ==
             static_cast<std::size_t>(mask_shape->region.width) * static_cast<std::size_t>(mask_shape->region.height)) {
         overlay_object.mask_region = mmltk::live::ManualOverlayMaskRegion{
@@ -874,8 +784,7 @@ mmltk::live::ManualOverlayInstance to_overlay_instance(const AnnotationObject& o
                 if (geometry != nullptr && !geometry->manual_points.empty()) {
                     overlay_object.polyline_points = geometry->manual_points;
                 } else {
-                    overlay_object.polyline_points =
-                        to_overlay_points(sample_annotation_spline_points(shape));
+                    overlay_object.polyline_points = to_overlay_points(sample_annotation_spline_points(shape));
                 }
                 overlay_object.polyline_closed = shape.closed;
                 overlay_object.points.reserve(shape.knots.size());
@@ -883,10 +792,9 @@ mmltk::live::ManualOverlayInstance to_overlay_instance(const AnnotationObject& o
                     overlay_object.points.push_back(to_overlay_point(knot.position));
                 }
             } else if constexpr (std::is_same_v<T, AnnotationPointShape>) {
-                overlay_object.points.push_back(
-                    geometry != nullptr && !geometry->manual_points.empty()
-                        ? geometry->manual_points.front()
-                        : to_overlay_point(shape.point));
+                overlay_object.points.push_back(geometry != nullptr && !geometry->manual_points.empty()
+                                                    ? geometry->manual_points.front()
+                                                    : to_overlay_point(shape.point));
             } else if constexpr (std::is_same_v<T, AnnotationSkeletonShape>) {
                 if (geometry != nullptr && !geometry->manual_points.empty()) {
                     overlay_object.points = geometry->manual_points;
@@ -904,22 +812,18 @@ mmltk::live::ManualOverlayInstance to_overlay_instance(const AnnotationObject& o
                 }
                 overlay_object.skeleton_edges.reserve(shape.edges.size());
                 for (const AnnotationSkeletonEdge& edge : shape.edges) {
-                    if (edge.source_index >= node_remap.size() ||
-                        edge.target_index >= node_remap.size()) {
+                    if (edge.source_index >= node_remap.size() || edge.target_index >= node_remap.size()) {
                         continue;
                     }
-                    const std::optional<std::size_t>& source_index =
-                        node_remap[edge.source_index];
-                    const std::optional<std::size_t>& target_index =
-                        node_remap[edge.target_index];
+                    const std::optional<std::size_t>& source_index = node_remap[edge.source_index];
+                    const std::optional<std::size_t>& target_index = node_remap[edge.target_index];
                     if (!source_index.has_value() || !target_index.has_value()) {
                         continue;
                     }
-                    overlay_object.skeleton_edges.push_back(
-                        mmltk::live::ManualOverlayEdge{
-                            static_cast<std::uint32_t>(*source_index),
-                            static_cast<std::uint32_t>(*target_index),
-                        });
+                    overlay_object.skeleton_edges.push_back(mmltk::live::ManualOverlayEdge{
+                        static_cast<std::uint32_t>(*source_index),
+                        static_cast<std::uint32_t>(*target_index),
+                    });
                 }
             }
         },
@@ -928,14 +832,12 @@ mmltk::live::ManualOverlayInstance to_overlay_instance(const AnnotationObject& o
     return overlay_object;
 }
 
-} // namespace
+}  // namespace
 
-AnnotationProjectedScene AnnotationRenderer::build_projected_scene(
-    const AnnotationFrame& frame,
-    const AnnotationDocument& document,
-    std::optional<std::size_t> selected_object_index) {
-    if (selected_object_index.has_value() &&
-        *selected_object_index >= document.size()) {
+AnnotationProjectedScene AnnotationRenderer::build_projected_scene(const AnnotationFrame& frame,
+                                                                   const AnnotationDocument& document,
+                                                                   std::optional<std::size_t> selected_object_index) {
+    if (selected_object_index.has_value() && *selected_object_index >= document.size()) {
         selected_object_index.reset();
     }
 
@@ -957,8 +859,7 @@ AnnotationProjectedScene AnnotationRenderer::build_projected_scene(
             continue;
         }
 
-        const AnnotationBox normalized_box =
-            normalize_annotation_box(*object_box, capture_width, capture_height);
+        const AnnotationBox normalized_box = normalize_annotation_box(*object_box, capture_width, capture_height);
         if (!annotation_box_has_area(normalized_box)) {
             continue;
         }
@@ -979,37 +880,26 @@ AnnotationProjectedScene AnnotationRenderer::build_projected_scene(
         });
     }
 
-    append_selected_object_editable_handles(frame,
-                                            document,
-                                            scene.selected_object_index,
-                                            &scene);
+    append_selected_object_editable_handles(frame, document, scene.selected_object_index, &scene);
     return scene;
 }
 
 std::vector<AnnotationEditableHandle> AnnotationRenderer::build_editable_handles(
-    const AnnotationFrame& frame,
-    const AnnotationDocument& document,
+    const AnnotationFrame& frame, const AnnotationDocument& document,
     std::optional<std::size_t> selected_object_index) {
     return build_projected_scene(frame, document, selected_object_index).editable_handles;
 }
 
 AnnotationProjectedScene AnnotationRenderer::refresh_projected_scene_selection(
-    const AnnotationFrame& frame,
-    const AnnotationDocument& document,
-    AnnotationProjectedScene scene,
+    const AnnotationFrame& frame, const AnnotationDocument& document, AnnotationProjectedScene scene,
     const std::optional<std::size_t> selected_object_index) {
-    return rebuild_projected_scene_selection(frame,
-                                             document,
-                                             std::move(scene),
-                                             selected_object_index);
+    return rebuild_projected_scene_selection(frame, document, std::move(scene), selected_object_index);
 }
 
 AnnotationProjectedBox AnnotationRenderer::project_capture_box(const AnnotationFrame& frame,
                                                                const AnnotationBox& capture_box) {
-    const AnnotationBox normalized_box =
-        normalize_annotation_box(capture_box,
-                                 annotation_frame_capture_width(frame),
-                                 annotation_frame_capture_height(frame));
+    const AnnotationBox normalized_box = normalize_annotation_box(capture_box, annotation_frame_capture_width(frame),
+                                                                  annotation_frame_capture_height(frame));
     const AnnotationBox frame_box = annotation_box_to_frame(frame, normalized_box);
     if (!annotation_box_has_area(frame_box)) {
         return {};
@@ -1022,22 +912,15 @@ AnnotationProjectedBox AnnotationRenderer::project_capture_box(const AnnotationF
 }
 
 std::optional<AnnotationVisibleObjectHit> AnnotationRenderer::hit_test_visible_objects(
-    const std::vector<AnnotationVisibleObject>& objects,
-    const CanvasViewport& viewport,
-    const CanvasPointerState& pointer,
-    const int image_x,
-    const int image_y,
-    const bool direct_drag_mode) {
+    const std::vector<AnnotationVisibleObject>& objects, const CanvasViewport& viewport,
+    const CanvasPointerState& pointer, const int image_x, const int image_y, const bool direct_drag_mode) {
     for (std::size_t index = objects.size(); index-- > 0;) {
         const auto& object = objects[index];
-        const RectDragKind hover_kind =
-            rectangle_hover_kind(pointer, viewport, object.frame_box);
-        const bool geometry_hit =
-            geometry_hit_test(object, viewport, pointer, image_x, image_y);
+        const RectDragKind hover_kind = rectangle_hover_kind(pointer, viewport, object.frame_box);
+        const bool geometry_hit = geometry_hit_test(object, viewport, pointer, image_x, image_y);
         if (direct_drag_mode) {
             const bool box_like =
-                object.shape_type == AnnotationShapeType::Box ||
-                object.shape_type == AnnotationShapeType::Mask;
+                object.shape_type == AnnotationShapeType::Box || object.shape_type == AnnotationShapeType::Mask;
             if (box_like && hover_kind != RectDragKind::None) {
                 return AnnotationVisibleObjectHit{
                     object,
@@ -1067,16 +950,10 @@ std::optional<AnnotationVisibleObjectHit> AnnotationRenderer::hit_test_visible_o
 }
 
 AnnotationInteractionOverlayRequest AnnotationRenderer::build_interaction_overlay_request(
-    const AnnotationFrame& frame,
-    const int cuda_device_index,
-    const AnnotationProjectedScene& scene,
-    const std::optional<std::size_t> hovered_object_index,
-    const std::optional<std::size_t> replaced_object_index,
-    std::optional<AnnotationBox> crop_box,
-    const int crop_handle_radius,
-    std::optional<AnnotationBox> drag_box,
-    std::optional<AnnotationBox> create_box,
-    const std::optional<AnnotationHandleId> hovered_handle,
+    const AnnotationFrame& frame, const int cuda_device_index, const AnnotationProjectedScene& scene,
+    const std::optional<std::size_t> hovered_object_index, const std::optional<std::size_t> replaced_object_index,
+    std::optional<AnnotationBox> crop_box, const int crop_handle_radius, std::optional<AnnotationBox> drag_box,
+    std::optional<AnnotationBox> create_box, const std::optional<AnnotationHandleId> hovered_handle,
     const std::optional<AnnotationHandleId> active_handle) {
     AnnotationInteractionOverlayRequest request;
     request.width = frame.width;
@@ -1096,15 +973,10 @@ AnnotationInteractionOverlayRequest AnnotationRenderer::build_interaction_overla
         if (replaced_object_index.has_value() && *replaced_object_index == object.index) {
             continue;
         }
-        const bool selected =
-            scene.selected_object_index.has_value() && *scene.selected_object_index == object.index;
-        const bool hovered =
-            hovered_object_index.has_value() && *hovered_object_index == object.index;
-        const bool show_box =
-            object.shape_type == AnnotationShapeType::Box ||
-            object.shape_type == AnnotationShapeType::Mask ||
-            selected ||
-            hovered;
+        const bool selected = scene.selected_object_index.has_value() && *scene.selected_object_index == object.index;
+        const bool hovered = hovered_object_index.has_value() && *hovered_object_index == object.index;
+        const bool show_box = object.shape_type == AnnotationShapeType::Box ||
+                              object.shape_type == AnnotationShapeType::Mask || selected || hovered;
         if (show_box) {
             request.objects.push_back(AnnotationInteractionOverlayObject{
                 object.index,
@@ -1115,11 +987,7 @@ AnnotationInteractionOverlayRequest AnnotationRenderer::build_interaction_overla
                 hovered,
             });
         }
-        append_annotation_shape_overlay_primitives(&request,
-                                                   object,
-                                                   object.geometry,
-                                                   selected,
-                                                   hovered);
+        append_annotation_shape_overlay_primitives(&request, object, object.geometry, selected, hovered);
     }
 
     if (drag_box.has_value()) {
@@ -1130,22 +998,11 @@ AnnotationInteractionOverlayRequest AnnotationRenderer::build_interaction_overla
     }
 
     if (active_handle.has_value()) {
-        append_handle_highlight(&request,
-                                scene.editable_handles,
-                                active_handle,
-                                6,
-                                kActiveHandleR,
-                                kActiveHandleG,
+        append_handle_highlight(&request, scene.editable_handles, active_handle, 6, kActiveHandleR, kActiveHandleG,
                                 kActiveHandleB);
     }
-    if (hovered_handle.has_value() &&
-        (!active_handle.has_value() || !(*hovered_handle == *active_handle))) {
-        append_handle_highlight(&request,
-                                scene.editable_handles,
-                                hovered_handle,
-                                5,
-                                kHoveredHandleR,
-                                kHoveredHandleG,
+    if (hovered_handle.has_value() && (!active_handle.has_value() || !(*hovered_handle == *active_handle))) {
+        append_handle_highlight(&request, scene.editable_handles, hovered_handle, 5, kHoveredHandleR, kHoveredHandleG,
                                 kHoveredHandleB);
     }
 
@@ -1161,19 +1018,11 @@ PreviewInteractionOverlaySnapshot AnnotationRenderer::build_interaction_overlay_
     snapshot.polylines = request.polylines;
     snapshot.marker_sets = request.marker_sets;
     snapshot.skeletons = request.skeletons;
-    snapshot.boxes.reserve(request.objects.size() +
-                           (request.crop_box.has_value() ? 1U : 0U) +
-                           (request.drag_box.has_value() ? 1U : 0U) +
-                           (request.create_box.has_value() ? 1U : 0U));
+    snapshot.boxes.reserve(request.objects.size() + (request.crop_box.has_value() ? 1U : 0U) +
+                           (request.drag_box.has_value() ? 1U : 0U) + (request.create_box.has_value() ? 1U : 0U));
 
     if (request.crop_box.has_value()) {
-        append_overlay_box(snapshot,
-                           *request.crop_box,
-                           255U,
-                           255U,
-                           255U,
-                           kInteractionCropStrokeWidth,
-                           true,
+        append_overlay_box(snapshot, *request.crop_box, 255U, 255U, 255U, kInteractionCropStrokeWidth, true,
                            request.crop_handle_radius);
     }
 
@@ -1181,27 +1030,11 @@ PreviewInteractionOverlaySnapshot AnnotationRenderer::build_interaction_overlay_
         const std::array<std::uint8_t, 3> color =
             interaction_color(object.selected, object.hovered, object.category_index);
         if (object.selected) {
-            append_overlay_box(snapshot,
-                               object.frame_box,
-                               color[0],
-                               color[1],
-                               color[2],
-                               3,
-                               true);
+            append_overlay_box(snapshot, object.frame_box, color[0], color[1], color[2], 3, true);
         } else if (object.hovered) {
-            append_overlay_box(snapshot,
-                               object.frame_box,
-                               color[0],
-                               color[1],
-                               color[2],
-                               2);
+            append_overlay_box(snapshot, object.frame_box, color[0], color[1], color[2], 2);
         } else {
-            append_overlay_box(snapshot,
-                               object.frame_box,
-                               color[0],
-                               color[1],
-                               color[2],
-                               1);
+            append_overlay_box(snapshot, object.frame_box, color[0], color[1], color[2], 1);
         }
     }
 
@@ -1216,18 +1049,13 @@ PreviewInteractionOverlaySnapshot AnnotationRenderer::build_interaction_overlay_
 }
 
 mmltk::live::ManualOverlayDocumentSnapshot AnnotationRenderer::build_manual_overlay_snapshot(
-    const AnnotationFrame& frame,
-    const AnnotationDocument& document,
-    const AnnotationSession& session) {
-    const AnnotationProjectedScene scene =
-        build_projected_scene(frame, document, session.selected_object_index());
+    const AnnotationFrame& frame, const AnnotationDocument& document, const AnnotationSession& session) {
+    const AnnotationProjectedScene scene = build_projected_scene(frame, document, session.selected_object_index());
     return build_manual_overlay_snapshot(frame, document, session, scene);
 }
 
 mmltk::live::ManualOverlayDocumentSnapshot AnnotationRenderer::build_manual_overlay_snapshot(
-    const AnnotationFrame& frame,
-    const AnnotationDocument& document,
-    const AnnotationSession& session,
+    const AnnotationFrame& frame, const AnnotationDocument& document, const AnnotationSession& session,
     const AnnotationProjectedScene& scene) {
     mmltk::live::ManualOverlayDocumentSnapshot snapshot;
     snapshot.capture_width = annotation_frame_capture_width(frame);
@@ -1249,4 +1077,4 @@ mmltk::live::ManualOverlayDocumentSnapshot AnnotationRenderer::build_manual_over
     return snapshot;
 }
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

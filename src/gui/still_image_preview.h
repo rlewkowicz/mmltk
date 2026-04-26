@@ -7,7 +7,7 @@
 namespace mmltk::rfdetr {
 struct PredictImageInput;
 struct PredictionRecord;
-}
+}  // namespace mmltk::rfdetr
 
 namespace mmltk::gui {
 
@@ -18,10 +18,8 @@ struct StillImagePreview {
     std::vector<std::uint8_t> pixels_bgr;
 };
 
-StillImagePreview render_single_image_prediction_preview(
-    const mmltk::rfdetr::PredictImageInput& input,
-    const mmltk::rfdetr::PredictionRecord& record,
-    int num_classes,
-    int device_id);
+StillImagePreview render_single_image_prediction_preview(const mmltk::rfdetr::PredictImageInput& input,
+                                                         const mmltk::rfdetr::PredictionRecord& record, int num_classes,
+                                                         int device_id);
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

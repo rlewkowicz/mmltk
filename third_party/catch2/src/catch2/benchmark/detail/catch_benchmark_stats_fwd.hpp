@@ -12,12 +12,9 @@
 
 namespace Catch {
 
-    // We cannot forward declare the type with default template argument
-    // multiple times, so it is split out into a separate header so that
-    // we can prevent multiple declarations in dependencies
-    template <typename Duration = Benchmark::FDuration>
-    struct BenchmarkStats;
+template <typename Duration = Benchmark::FDuration>
+struct BenchmarkStats;
 
-} // end namespace Catch
+}
 
-#endif // CATCH_BENCHMARK_STATS_FWD_HPP_INCLUDED
+#endif  // CATCH_BENCHMARK_STATS_FWD_HPP_INCLUDED

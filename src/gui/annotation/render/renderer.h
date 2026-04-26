@@ -3,7 +3,7 @@
 #include "gui/canvas_layers.h"
 #include "gui/annotation/document/document.h"
 #include "gui/annotation/session.h"
-#include "gui/preview_interaction_overlay.h"
+#include "gui/preview_interaction_overlay_types.h"
 #include "mmltk/live/manual_overlay_document.h"
 
 #include <optional>
@@ -20,8 +20,7 @@ struct AnnotationVisibleGeometry {
     std::vector<PreviewInteractionOverlayPoint> control_preview_points;
     std::vector<PreviewInteractionOverlayPoint> handle_preview_points;
     std::vector<PreviewInteractionOverlayPoint> latent_handle_preview_points;
-    std::vector<std::pair<PreviewInteractionOverlayPoint, PreviewInteractionOverlayPoint>>
-        handle_preview_segments;
+    std::vector<std::pair<PreviewInteractionOverlayPoint, PreviewInteractionOverlayPoint>> handle_preview_segments;
     std::vector<std::pair<PreviewInteractionOverlayPoint, PreviewInteractionOverlayPoint>>
         latent_handle_preview_segments;
     std::vector<mmltk::live::ManualOverlayPoint> manual_points;
@@ -91,58 +90,41 @@ struct AnnotationProjectedScene {
 };
 
 class AnnotationRenderer {
-public:
-    static AnnotationProjectedScene build_projected_scene(
-        const AnnotationFrame& frame,
-        const AnnotationDocument& document,
-        std::optional<std::size_t> selected_object_index);
+   public:
+    static AnnotationProjectedScene build_projected_scene(const AnnotationFrame& frame,
+                                                          const AnnotationDocument& document,
+                                                          std::optional<std::size_t> selected_object_index);
     static std::vector<AnnotationEditableHandle> build_editable_handles(
-        const AnnotationFrame& frame,
-        const AnnotationDocument& document,
+        const AnnotationFrame& frame, const AnnotationDocument& document,
         std::optional<std::size_t> selected_object_index);
-    static AnnotationProjectedScene refresh_projected_scene_selection(
-        const AnnotationFrame& frame,
-        const AnnotationDocument& document,
-        AnnotationProjectedScene scene,
-        std::optional<std::size_t> selected_object_index);
+    static AnnotationProjectedScene refresh_projected_scene_selection(const AnnotationFrame& frame,
+                                                                      const AnnotationDocument& document,
+                                                                      AnnotationProjectedScene scene,
+                                                                      std::optional<std::size_t> selected_object_index);
 
-    static AnnotationProjectedBox project_capture_box(const AnnotationFrame& frame,
-                                                      const AnnotationBox& capture_box);
+    static AnnotationProjectedBox project_capture_box(const AnnotationFrame& frame, const AnnotationBox& capture_box);
 
     static std::optional<AnnotationVisibleObjectHit> hit_test_visible_objects(
-        const std::vector<AnnotationVisibleObject>& objects,
-        const CanvasViewport& viewport,
-        const CanvasPointerState& pointer,
-        int image_x,
-        int image_y,
-        bool direct_drag_mode);
+        const std::vector<AnnotationVisibleObject>& objects, const CanvasViewport& viewport,
+        const CanvasPointerState& pointer, int image_x, int image_y, bool direct_drag_mode);
 
     static AnnotationInteractionOverlayRequest build_interaction_overlay_request(
-        const AnnotationFrame& frame,
-        int cuda_device_index,
-        const AnnotationProjectedScene& scene,
-        std::optional<std::size_t> hovered_object_index,
-        std::optional<std::size_t> replaced_object_index,
-        std::optional<AnnotationBox> crop_box,
-        int crop_handle_radius,
-        std::optional<AnnotationBox> drag_box,
-        std::optional<AnnotationBox> create_box,
-        std::optional<AnnotationHandleId> hovered_handle,
+        const AnnotationFrame& frame, int cuda_device_index, const AnnotationProjectedScene& scene,
+        std::optional<std::size_t> hovered_object_index, std::optional<std::size_t> replaced_object_index,
+        std::optional<AnnotationBox> crop_box, int crop_handle_radius, std::optional<AnnotationBox> drag_box,
+        std::optional<AnnotationBox> create_box, std::optional<AnnotationHandleId> hovered_handle,
         std::optional<AnnotationHandleId> active_handle);
 
     static PreviewInteractionOverlaySnapshot build_interaction_overlay_snapshot(
         const AnnotationInteractionOverlayRequest& request);
 
-    static mmltk::live::ManualOverlayDocumentSnapshot build_manual_overlay_snapshot(
-        const AnnotationFrame& frame,
-        const AnnotationDocument& document,
-        const AnnotationSession& session);
+    static mmltk::live::ManualOverlayDocumentSnapshot build_manual_overlay_snapshot(const AnnotationFrame& frame,
+                                                                                    const AnnotationDocument& document,
+                                                                                    const AnnotationSession& session);
 
     static mmltk::live::ManualOverlayDocumentSnapshot build_manual_overlay_snapshot(
-        const AnnotationFrame& frame,
-        const AnnotationDocument& document,
-        const AnnotationSession& session,
+        const AnnotationFrame& frame, const AnnotationDocument& document, const AnnotationSession& session,
         const AnnotationProjectedScene& scene);
 };
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

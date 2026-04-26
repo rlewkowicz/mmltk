@@ -3,6 +3,7 @@
 #include "live_session_utils.h"
 #include "rfdetr_workflows.h"
 
+#include "mmltk/live/frame_analyzer.h"
 #include "mmltk/rfdetr/live_predict.h"
 
 #if MMLTK_RFDETR_LIVE_CAPTURE
@@ -19,8 +20,7 @@ namespace mmltk::gui {
 namespace {
 
 #if MMLTK_RFDETR_LIVE_CAPTURE
-mmltk::live::LiveSessionConfig
-make_predict_live_session_config(const mmltk::rfdetr::LivePredictOptions& options) {
+mmltk::live::LiveSessionConfig make_predict_live_session_config(const mmltk::rfdetr::LivePredictOptions& options) {
     mmltk::live::LiveSessionConfig config;
     config.capture.device_path = options.source.device_path;
     config.capture.cuda_device_index = options.device_id;
@@ -36,14 +36,13 @@ make_predict_live_session_config(const mmltk::rfdetr::LivePredictOptions& option
         options.source.height,
     };
     config.detect_slot_count = 2U;
-    config.output_slot_count =
-        std::max<std::uint32_t>(2U, options.source.preview_buffer_count);
+    config.output_slot_count = std::max<std::uint32_t>(2U, options.source.preview_buffer_count);
     config.cuda_device_index = options.device_id;
     return config;
 }
 #endif
 
-} // namespace
+}  // namespace
 
 void LivePredictController::poll_status() {
     if (controller_ == nullptr) {
@@ -64,13 +63,11 @@ void LivePredictController::clear_start_error() {
     start_error_.clear();
 }
 
-void LivePredictController::launch(
-    mmltk::runtime::BackgroundExecutor& background_executor,
-    mmltk::runtime::UiCallbackQueue& ui_callbacks,
-    const PredictViewState& state,
-    const std::string& preset_name,
-    std::function<void(int)> on_started,
-    std::function<void(const std::string&)> on_error) {
+void LivePredictController::launch(mmltk::runtime::BackgroundExecutor& background_executor,
+                                   mmltk::runtime::UiCallbackQueue& ui_callbacks, const PredictViewState& state,
+                                   const std::string& preset_name, std::function<void()> on_workspace_ready,
+                                   std::function<void(int)> on_started,
+                                   std::function<void(const std::string&)> on_error) {
     if (running()) {
         return;
     }
@@ -78,24 +75,20 @@ void LivePredictController::launch(
     clear_errors();
     starting_ = true;
     start_task_ = mmltk::runtime::submit_background_task(
-        background_executor,
-        ui_callbacks,
-        [state, preset_name]() {
+        background_executor, ui_callbacks,
+        [state, preset_name, on_workspace_ready = std::move(on_workspace_ready)]() {
             StartOutcome outcome;
             const mmltk::rfdetr::LivePredictOptions options =
                 rfdetr_workflows::build_live_predict_options(state, preset_name);
             outcome.device_id = options.device_id;
 #if !MMLTK_RFDETR_LIVE_CAPTURE
-            throw std::runtime_error(
-                "live prediction requires live capture support in this build");
+            throw std::runtime_error("live prediction requires live capture support in this build");
 #else
             outcome.controller =
-                std::make_unique<mmltk::live::LiveSessionController>(
-                    make_predict_live_session_config(options));
-            seed_runtime_crop_from_source(outcome.controller->ui_crop_state(),
-                                          state.source);
-            outcome.controller->attach_analyzer(
-                make_live_rfdetr_frame_analyzer(options));
+                std::make_unique<mmltk::live::LiveSessionController>(make_predict_live_session_config(options));
+            outcome.controller->set_workspace_ready_callback(on_workspace_ready);
+            seed_runtime_crop_from_source(outcome.controller->ui_crop_state(), state.source);
+            outcome.controller->attach_analyzer(make_live_rfdetr_frame_analyzer(options));
             outcome.controller->start();
             outcome.status = outcome.controller->snapshot_status();
 #endif
@@ -104,8 +97,7 @@ void LivePredictController::launch(
         [this, on_started = std::move(on_started)](StartOutcome outcome) mutable {
             starting_ = false;
             controller_ = std::move(outcome.controller);
-            status_ = std::make_unique<mmltk::live::LiveSessionStatus>(
-                std::move(outcome.status));
+            status_ = std::make_unique<mmltk::live::LiveSessionStatus>(std::move(outcome.status));
             clear_errors();
             if (on_started) {
                 on_started(outcome.device_id);
@@ -120,13 +112,10 @@ void LivePredictController::launch(
         });
 }
 
-void LivePredictController::stop(
-    mmltk::runtime::BackgroundExecutor& background_executor,
-    mmltk::runtime::UiCallbackQueue& ui_callbacks,
-    SourceSelectionState* source,
-    const std::function<void()>& before_async_stop,
-    std::function<void()> on_stopped,
-    std::function<void(const std::string&)> on_error) {
+void LivePredictController::stop(mmltk::runtime::BackgroundExecutor& background_executor,
+                                 mmltk::runtime::UiCallbackQueue& ui_callbacks, SourceSelectionState* source,
+                                 const std::function<void()>& before_async_stop, std::function<void()> on_stopped,
+                                 std::function<void(const std::string&)> on_error) {
     if (starting_) {
         start_task_.cancel();
         starting_ = false;
@@ -156,8 +145,7 @@ void LivePredictController::stop(
         before_async_stop();
     }
     mmltk::runtime::submit_background_task(
-        background_executor,
-        ui_callbacks,
+        background_executor, ui_callbacks,
         [controller = std::move(controller)]() mutable {
             if (controller) {
                 controller->stop();
@@ -188,9 +176,7 @@ bool LivePredictController::active() const noexcept {
     if (starting_ || stopping_ || status_ == nullptr) {
         return starting_ || stopping_;
     }
-    return status_->running ||
-           status_->analyzer.running ||
-           status_->analyzer.model_hot;
+    return status_->running || status_->analyzer.running || status_->analyzer.model_hot;
 }
 
 bool LivePredictController::starting() const noexcept {
@@ -221,4 +207,4 @@ const std::string& LivePredictController::action_error() const noexcept {
     return action_error_;
 }
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

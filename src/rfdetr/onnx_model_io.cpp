@@ -34,4 +34,4 @@ void write_onnx_model(const ONNX_NAMESPACE::ModelProto& model, const std::filesy
     }
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

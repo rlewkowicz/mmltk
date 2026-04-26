@@ -152,12 +152,17 @@ void test_annotation_save_matching_prefers_canonical_live_frame_identity() {
     assert(mmltk::gui::annotation_frame_matches_saved_identity(plain, 17U, std::nullopt));
 }
 
-} // namespace
+}  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[gui][live_session_utils]", test_seed_runtime_crop_from_source_uses_persisted_crop);
 MMLTK_REGISTER_TEST_CASE("[gui][live_session_utils]", test_seed_runtime_crop_from_source_clears_full_capture);
-MMLTK_REGISTER_TEST_CASE("[gui][live_session_utils]", test_runtime_crop_mirror_round_trips_partial_crop_and_clears_full_capture);
-MMLTK_REGISTER_TEST_CASE("[gui][live_session_utils]", test_persist_crop_box_to_source_round_trips_partial_crop_and_clamps_out_of_bounds);
-MMLTK_REGISTER_TEST_CASE("[gui][live_session_utils]", test_preview_region_for_source_returns_crop_when_full_frame_is_off);
-MMLTK_REGISTER_TEST_CASE("[gui][live_session_utils]", test_runtime_crop_box_for_ui_state_defaults_to_full_capture_and_clamps_runtime_state);
-MMLTK_REGISTER_TEST_CASE("[gui][live_session_utils]", test_annotation_save_matching_prefers_canonical_live_frame_identity);
+MMLTK_REGISTER_TEST_CASE("[gui][live_session_utils]",
+                         test_runtime_crop_mirror_round_trips_partial_crop_and_clears_full_capture);
+MMLTK_REGISTER_TEST_CASE("[gui][live_session_utils]",
+                         test_persist_crop_box_to_source_round_trips_partial_crop_and_clamps_out_of_bounds);
+MMLTK_REGISTER_TEST_CASE("[gui][live_session_utils]",
+                         test_preview_region_for_source_returns_crop_when_full_frame_is_off);
+MMLTK_REGISTER_TEST_CASE("[gui][live_session_utils]",
+                         test_runtime_crop_box_for_ui_state_defaults_to_full_capture_and_clamps_runtime_state);
+MMLTK_REGISTER_TEST_CASE("[gui][live_session_utils]",
+                         test_annotation_save_matching_prefers_canonical_live_frame_identity);

@@ -11,10 +11,9 @@
 namespace Catch {
 namespace Detail {
 
-    //! Wrapper over `std::getenv` that compiles on UWP (and always returns nullptr there)
-    char const* getEnv(char const* varName);
+char const* getEnv(char const* varName);
 
 }
-}
+}  // namespace Catch
 
-#endif // CATCH_GETENV_HPP_INCLUDED
+#endif  // CATCH_GETENV_HPP_INCLUDED

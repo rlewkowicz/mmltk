@@ -17,11 +17,7 @@ CanvasViewport make_viewport() {
 
 CanvasPointerState make_pointer(float x, float y, bool hovered, bool clicked, bool down) {
     return CanvasPointerState{
-        x,
-        y,
-        hovered,
-        clicked,
-        down,
+        x, y, hovered, clicked, down,
     };
 }
 
@@ -33,8 +29,8 @@ void test_hover_prefers_higher_priority_layer() {
     }};
 
     RectLayerState state{};
-    const RectLayerFrameResult frame =
-        update_rect_layers(state, layers.data(), layers.size(), viewport, make_pointer(12.0f, 12.0f, true, false, false));
+    const RectLayerFrameResult frame = update_rect_layers(state, layers.data(), layers.size(), viewport,
+                                                          make_pointer(12.0f, 12.0f, true, false, false));
     assert(frame.hovered_layer_id == kCropLayerId);
     assert(frame.hovered_kind == RectDragKind::ResizeTopLeft);
     assert(state.active_layer_id == 0);
@@ -54,14 +50,16 @@ void test_active_layer_keeps_pointer_capture_until_release() {
     assert(frame.active_layer_id == kCropLayerId);
     assert(!frame.commit);
 
-    frame = update_rect_layers(state, layers.data(), layers.size(), viewport, make_pointer(80.0f, 80.0f, false, false, true));
+    frame = update_rect_layers(state, layers.data(), layers.size(), viewport,
+                               make_pointer(80.0f, 80.0f, false, false, true));
     assert(frame.active_layer_id == kCropLayerId);
     assert(frame.dragging);
     assert(frame.changed);
     assert(!frame.commit);
     assert(state.active_layer_id == kCropLayerId);
 
-    frame = update_rect_layers(state, layers.data(), layers.size(), viewport, make_pointer(80.0f, 80.0f, false, false, false));
+    frame = update_rect_layers(state, layers.data(), layers.size(), viewport,
+                               make_pointer(80.0f, 80.0f, false, false, false));
     assert(frame.active_layer_id == kCropLayerId);
     assert(frame.commit);
     assert(frame.changed);
@@ -71,13 +69,7 @@ void test_active_layer_keeps_pointer_capture_until_release() {
 void test_commit_on_release_uses_explicit_crop_box() {
     const CanvasViewport viewport = make_viewport();
     const RectLayerSpec layer{
-        kCropLayerId,
-        AnnotationBox{34, 24, 66, 56},
-        100U,
-        100U,
-        10,
-        1,
-        true,
+        kCropLayerId, AnnotationBox{34, 24, 66, 56}, 100U, 100U, 10, 1, true,
     };
 
     RectLayerState state{};
@@ -114,14 +106,7 @@ void test_commit_on_release_uses_explicit_crop_box() {
 void test_edge_only_move_requires_hitting_crop_outline() {
     const CanvasViewport viewport = make_viewport();
     const RectLayerSpec crop_layer{
-        kCropLayerId,
-        AnnotationBox{10, 10, 40, 40},
-        100U,
-        100U,
-        10,
-        1,
-        true,
-        true,
+        kCropLayerId, AnnotationBox{10, 10, 40, 40}, 100U, 100U, 10, 1, true, true,
     };
 
     RectLayerState state{};
@@ -141,29 +126,16 @@ void test_custom_white_crop_hit_metrics_support_larger_edges_and_corners() {
     const float edge_hit_half_width = 8.0f;
     const float corner_hit_size = 20.0f;
 
-    RectDragKind hover =
-        rectangle_hover_kind_with_options(make_pointer(50.0f, 27.0f, true, false, false),
-                                          viewport,
-                                          box,
-                                          true,
-                                          edge_hit_half_width,
-                                          corner_hit_size);
+    RectDragKind hover = rectangle_hover_kind_with_options(make_pointer(50.0f, 27.0f, true, false, false), viewport,
+                                                           box, true, edge_hit_half_width, corner_hit_size);
     assert(hover == RectDragKind::Move);
 
-    hover = rectangle_hover_kind_with_options(make_pointer(50.0f, 29.0f, true, false, false),
-                                              viewport,
-                                              box,
-                                              true,
-                                              edge_hit_half_width,
-                                              corner_hit_size);
+    hover = rectangle_hover_kind_with_options(make_pointer(50.0f, 29.0f, true, false, false), viewport, box, true,
+                                              edge_hit_half_width, corner_hit_size);
     assert(hover == RectDragKind::None);
 
-    hover = rectangle_hover_kind_with_options(make_pointer(27.0f, 27.0f, true, false, false),
-                                              viewport,
-                                              box,
-                                              true,
-                                              edge_hit_half_width,
-                                              corner_hit_size);
+    hover = rectangle_hover_kind_with_options(make_pointer(27.0f, 27.0f, true, false, false), viewport, box, true,
+                                              edge_hit_half_width, corner_hit_size);
     assert(hover == RectDragKind::ResizeTopLeft);
 }
 
@@ -190,7 +162,7 @@ void test_resolved_centered_crop_commits_to_explicit_coordinates() {
     assert(source.crop_height == 432);
 }
 
-} // namespace
+}  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[gui][canvas_layers]", test_hover_prefers_higher_priority_layer);
 MMLTK_REGISTER_TEST_CASE("[gui][canvas_layers]", test_active_layer_keeps_pointer_capture_until_release);

@@ -18,12 +18,11 @@ namespace mmltk::gui {
 using LocalGpuEnumerator = std::function<std::vector<LocalGpuInfo>(std::string*)>;
 
 class LocalTrainController {
-public:
+   public:
     LocalTrainController(mmltk::runtime::BackgroundExecutor& background_executor,
                          mmltk::runtime::UiCallbackQueue& ui_callbacks);
     LocalTrainController(mmltk::runtime::BackgroundExecutor& background_executor,
-                         mmltk::runtime::UiCallbackQueue& ui_callbacks,
-                         LocalGpuEnumerator gpu_enumerator);
+                         mmltk::runtime::UiCallbackQueue& ui_callbacks, LocalGpuEnumerator gpu_enumerator);
 
     LocalTrainController(const LocalTrainController&) = delete;
     LocalTrainController& operator=(const LocalTrainController&) = delete;
@@ -32,6 +31,7 @@ public:
     void poll();
     void refresh_visible_gpus(const std::vector<int>& preferred_device_ids);
     void set_device_selected(std::size_t index, bool selected);
+    void set_selected_device_ids(const std::vector<int>& device_ids);
     void start(const TrainViewState& state, std::string_view preset_name);
     void request_stop(bool force);
     void shutdown();
@@ -44,7 +44,7 @@ public:
     [[nodiscard]] const std::string& gpu_error() const noexcept;
     [[nodiscard]] std::vector<int> selected_device_ids() const;
 
-private:
+   private:
     mmltk::runtime::BackgroundExecutor& background_executor_;
     mmltk::runtime::UiCallbackQueue& ui_callbacks_;
     LocalGpuEnumerator gpu_enumerator_;
@@ -56,4 +56,4 @@ private:
     std::unique_ptr<LocalTrainSession> session_;
 };
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

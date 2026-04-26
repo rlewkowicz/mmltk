@@ -49,8 +49,7 @@
 
 #include <spdlog/fmt/fmt.h>
 
-#if !defined(SPDLOG_USE_STD_FORMAT) && \
-    FMT_VERSION >= 80000  // backward compatibility with fmt versions older than 8
+#if !defined(SPDLOG_USE_STD_FORMAT) && FMT_VERSION >= 80000
 #define SPDLOG_FMT_RUNTIME(format_string) fmt::runtime(format_string)
 #define SPDLOG_FMT_STRING(format_string) FMT_STRING(format_string)
 #if defined(SPDLOG_WCHAR_FILENAMES) || defined(SPDLOG_WCHAR_TO_UTF8_SUPPORT)
@@ -61,7 +60,6 @@
 #define SPDLOG_FMT_STRING(format_string) format_string
 #endif
 
-// visual studio up to 2013 does not support noexcept nor constexpr
 #if defined(_MSC_VER) && (_MSC_VER < 1900)
 #define SPDLOG_NOEXCEPT _NOEXCEPT
 #define SPDLOG_CONSTEXPR
@@ -70,11 +68,6 @@
 #define SPDLOG_CONSTEXPR constexpr
 #endif
 
-// If building with std::format, can just use constexpr, otherwise if building with fmt
-// SPDLOG_CONSTEXPR_FUNC needs to be set the same as FMT_CONSTEXPR to avoid situations where
-// a constexpr function in spdlog could end up calling a non-constexpr function in fmt
-// depending on the compiler
-// If fmt determines it can't use constexpr, we should inline the function instead
 #ifdef SPDLOG_USE_STD_FORMAT
 #define SPDLOG_CONSTEXPR_FUNC constexpr
 #else  // Being built with fmt
@@ -93,7 +86,6 @@
 #define SPDLOG_DEPRECATED
 #endif
 
-// disable thread local on msvc 2013
 #ifndef SPDLOG_NO_TLS
 #if (defined(_MSC_VER) && (_MSC_VER < 1900)) || defined(__cplusplus_winrt)
 #define SPDLOG_NO_TLS 1
@@ -101,7 +93,7 @@
 #endif
 
 #ifndef SPDLOG_FUNCTION
-#define SPDLOG_FUNCTION static_cast<const char *>(__FUNCTION__)
+#define SPDLOG_FUNCTION static_cast<const char*>(__FUNCTION__)
 #endif
 
 #ifdef SPDLOG_NO_EXCEPTIONS
@@ -115,8 +107,8 @@
 #else
 #define SPDLOG_TRY try
 #define SPDLOG_THROW(ex) throw(ex)
-#define SPDLOG_CATCH_STD             \
-    catch (const std::exception &) { \
+#define SPDLOG_CATCH_STD            \
+    catch (const std::exception&) { \
     }
 #endif
 
@@ -130,7 +122,6 @@ class sink;
 
 #if defined(_WIN32) && defined(SPDLOG_WCHAR_FILENAMES)
 using filename_t = std::wstring;
-// allow macro expansion to occur in SPDLOG_FILENAME_T
 #define SPDLOG_FILENAME_T_INNER(s) L##s
 #define SPDLOG_FILENAME_T(s) SPDLOG_FILENAME_T_INNER(s)
 #else
@@ -141,7 +132,7 @@ using filename_t = std::string;
 using log_clock = std::chrono::system_clock;
 using sink_ptr = std::shared_ptr<sinks::sink>;
 using sinks_init_list = std::initializer_list<sink_ptr>;
-using err_handler = std::function<void(const std::string &err_msg)>;
+using err_handler = std::function<void(const std::string& err_msg)>;
 #ifdef SPDLOG_USE_STD_FORMAT
 namespace fmt_lib = std;
 
@@ -190,15 +181,10 @@ using fmt_runtime_string = fmt::runtime_format_string<Char>;
 using fmt_runtime_string = fmt::basic_runtime<Char>;
 #endif
 
-// clang doesn't like SFINAE disabled constructor in std::is_convertible<> so have to repeat the
-// condition from basic_format_string here, in addition, fmt::basic_runtime<Char> is only
-// convertible to basic_format_string<Char> but not basic_string_view<Char>
 template <class T, class Char = char>
 struct is_convertible_to_basic_format_string
-    : std::integral_constant<bool,
-                             std::is_convertible<T, fmt::basic_string_view<Char>>::value ||
-                                 std::is_same<remove_cvref_t<T>, fmt_runtime_string<Char>>::value> {
-};
+    : std::integral_constant<bool, std::is_convertible<T, fmt::basic_string_view<Char>>::value ||
+                                       std::is_same<remove_cvref_t<T>, fmt_runtime_string<Char>>::value> {};
 
 #if defined(SPDLOG_WCHAR_FILENAMES) || defined(SPDLOG_WCHAR_TO_UTF8_SUPPORT)
 using wstring_view_t = fmt::basic_string_view<wchar_t>;
@@ -218,9 +204,8 @@ using wformat_string_t = fmt::wformat_string<Args...>;
 
 template <class T>
 struct is_convertible_to_any_format_string
-    : std::integral_constant<bool,
-                             is_convertible_to_basic_format_string<T, char>::value ||
-                                 is_convertible_to_basic_format_string<T, wchar_t>::value> {};
+    : std::integral_constant<bool, is_convertible_to_basic_format_string<T, char>::value ||
+                                       is_convertible_to_basic_format_string<T, wchar_t>::value> {};
 
 #if defined(SPDLOG_NO_ATOMIC_LEVELS)
 using level_t = details::null_atomic_int;
@@ -240,7 +225,6 @@ using level_t = std::atomic<int>;
 #define SPDLOG_ACTIVE_LEVEL SPDLOG_LEVEL_INFO
 #endif
 
-// Log level enum
 namespace level {
 enum level_enum : int {
     trace = SPDLOG_LEVEL_TRACE,
@@ -262,11 +246,10 @@ enum level_enum : int {
 #define SPDLOG_LEVEL_NAME_OFF spdlog::string_view_t("off", 3)
 
 #if !defined(SPDLOG_LEVEL_NAMES)
-#define SPDLOG_LEVEL_NAMES                                                                  \
-    {                                                                                       \
-        SPDLOG_LEVEL_NAME_TRACE, SPDLOG_LEVEL_NAME_DEBUG, SPDLOG_LEVEL_NAME_INFO,           \
-            SPDLOG_LEVEL_NAME_WARNING, SPDLOG_LEVEL_NAME_ERROR, SPDLOG_LEVEL_NAME_CRITICAL, \
-            SPDLOG_LEVEL_NAME_OFF                                                           \
+#define SPDLOG_LEVEL_NAMES                                                                                   \
+    {                                                                                                        \
+        SPDLOG_LEVEL_NAME_TRACE, SPDLOG_LEVEL_NAME_DEBUG, SPDLOG_LEVEL_NAME_INFO, SPDLOG_LEVEL_NAME_WARNING, \
+            SPDLOG_LEVEL_NAME_ERROR, SPDLOG_LEVEL_NAME_CRITICAL, SPDLOG_LEVEL_NAME_OFF                       \
     }
 #endif
 
@@ -276,71 +259,60 @@ enum level_enum : int {
     { "T", "D", "I", "W", "E", "C", "O" }
 #endif
 
-SPDLOG_API const string_view_t &to_string_view(spdlog::level::level_enum l) SPDLOG_NOEXCEPT;
-SPDLOG_API const char *to_short_c_str(spdlog::level::level_enum l) SPDLOG_NOEXCEPT;
-SPDLOG_API spdlog::level::level_enum from_str(const std::string &name) SPDLOG_NOEXCEPT;
+SPDLOG_API const string_view_t& to_string_view(spdlog::level::level_enum l) SPDLOG_NOEXCEPT;
+SPDLOG_API const char* to_short_c_str(spdlog::level::level_enum l) SPDLOG_NOEXCEPT;
+SPDLOG_API spdlog::level::level_enum from_str(const std::string& name) SPDLOG_NOEXCEPT;
 
 }  // namespace level
 
-//
-// Color mode used by sinks with color support.
-//
-enum class color_mode { always, automatic, never };
-
-//
-// Pattern time - specific time getting to use for pattern_formatter.
-// local time by default
-//
-enum class pattern_time_type {
-    local,  // log localtime
-    utc     // log utc
+enum class color_mode {
+    always,
+    automatic,
+    never
 };
 
-//
-// Log exception
-//
-class SPDLOG_API spdlog_ex : public std::exception {
-public:
-    explicit spdlog_ex(std::string msg);
-    spdlog_ex(const std::string &msg, int last_errno);
-    const char *what() const SPDLOG_NOEXCEPT override;
+enum class pattern_time_type {
+    local,
+    utc
+};
 
-private:
+class SPDLOG_API spdlog_ex : public std::exception {
+   public:
+    explicit spdlog_ex(std::string msg);
+    spdlog_ex(const std::string& msg, int last_errno);
+    const char* what() const SPDLOG_NOEXCEPT override;
+
+   private:
     std::string msg_;
 };
 
-[[noreturn]] SPDLOG_API void throw_spdlog_ex(const std::string &msg, int last_errno);
+[[noreturn]] SPDLOG_API void throw_spdlog_ex(const std::string& msg, int last_errno);
 [[noreturn]] SPDLOG_API void throw_spdlog_ex(std::string msg);
 
 struct source_loc {
     SPDLOG_CONSTEXPR source_loc() = default;
-    SPDLOG_CONSTEXPR source_loc(const char *filename_in, int line_in, const char *funcname_in)
-        : filename{filename_in},
-          line{line_in},
-          funcname{funcname_in} {}
+    SPDLOG_CONSTEXPR source_loc(const char* filename_in, int line_in, const char* funcname_in)
+        : filename{filename_in}, line{line_in}, funcname{funcname_in} {}
 
-    SPDLOG_CONSTEXPR bool empty() const SPDLOG_NOEXCEPT { return line <= 0; }
-    const char *filename{nullptr};
+    SPDLOG_CONSTEXPR bool empty() const SPDLOG_NOEXCEPT {
+        return line <= 0;
+    }
+    const char* filename{nullptr};
     int line{0};
-    const char *funcname{nullptr};
+    const char* funcname{nullptr};
 };
 
 struct file_event_handlers {
-    file_event_handlers()
-        : before_open(nullptr),
-          after_open(nullptr),
-          before_close(nullptr),
-          after_close(nullptr) {}
+    file_event_handlers() : before_open(nullptr), after_open(nullptr), before_close(nullptr), after_close(nullptr) {}
 
-    std::function<void(const filename_t &filename)> before_open;
-    std::function<void(const filename_t &filename, std::FILE *file_stream)> after_open;
-    std::function<void(const filename_t &filename, std::FILE *file_stream)> before_close;
-    std::function<void(const filename_t &filename)> after_close;
+    std::function<void(const filename_t& filename)> before_open;
+    std::function<void(const filename_t& filename, std::FILE* file_stream)> after_open;
+    std::function<void(const filename_t& filename, std::FILE* file_stream)> before_close;
+    std::function<void(const filename_t& filename)> after_close;
 };
 
 namespace details {
 
-// make_unique support for pre c++14
 #if __cplusplus >= 201402L  // C++14 and beyond
 using std::enable_if_t;
 using std::make_unique;
@@ -349,13 +321,12 @@ template <bool B, class T = void>
 using enable_if_t = typename std::enable_if<B, T>::type;
 
 template <typename T, typename... Args>
-std::unique_ptr<T> make_unique(Args &&...args) {
+std::unique_ptr<T> make_unique(Args&&... args) {
     static_assert(!std::is_array<T>::value, "arrays not supported");
     return std::unique_ptr<T>(new T(std::forward<Args>(args)...));
 }
 #endif
 
-// to avoid useless casts (see https://github.com/nlohmann/json/issues/2893#issuecomment-889152324)
 template <typename T, typename U, enable_if_t<!std::is_same<T, U>::value, int> = 0>
 constexpr T conditional_static_cast(U value) {
     return static_cast<T>(value);

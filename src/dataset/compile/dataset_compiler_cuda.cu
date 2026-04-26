@@ -22,15 +22,10 @@ inline void ensure_cuda_ok(cudaError_t status, const char* context) {
     throw std::runtime_error(std::string(context) + ": " + cudaGetErrorString(status));
 }
 
-__global__ void resize_binary_masks_kernel(const uint8_t* input_masks,
-                                           uint8_t* output_masks,
-                                           const uint32_t* source_widths,
-                                           const uint32_t* source_heights,
-                                           const uint64_t* source_offsets,
-                                           uint32_t target_width,
-                                           uint32_t target_height,
-                                           uint32_t batch_size,
-                                           uint64_t target_pixels) {
+__global__ void resize_binary_masks_kernel(const uint8_t* input_masks, uint8_t* output_masks,
+                                           const uint32_t* source_widths, const uint32_t* source_heights,
+                                           const uint64_t* source_offsets, uint32_t target_width,
+                                           uint32_t target_height, uint32_t batch_size, uint64_t target_pixels) {
     const uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
     const uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
     const uint32_t mask_index = blockIdx.z;
@@ -40,25 +35,20 @@ __global__ void resize_binary_masks_kernel(const uint8_t* input_masks,
 
     const uint32_t source_width = source_widths[mask_index];
     const uint32_t source_height = source_heights[mask_index];
-    const uint32_t source_y = min(
-        source_height - 1,
-        static_cast<uint32_t>(((static_cast<uint64_t>(2) * y + 1) * source_height) /
-                              (static_cast<uint64_t>(2) * target_height)));
-    const uint32_t source_x = min(
-        source_width - 1,
-        static_cast<uint32_t>(((static_cast<uint64_t>(2) * x + 1) * source_width) /
-                              (static_cast<uint64_t>(2) * target_width)));
+    const uint32_t source_y =
+        min(source_height - 1, static_cast<uint32_t>(((static_cast<uint64_t>(2) * y + 1) * source_height) /
+                                                     (static_cast<uint64_t>(2) * target_height)));
+    const uint32_t source_x =
+        min(source_width - 1, static_cast<uint32_t>(((static_cast<uint64_t>(2) * x + 1) * source_width) /
+                                                    (static_cast<uint64_t>(2) * target_width)));
     const uint64_t source_offset = source_offsets[mask_index];
-    const uint64_t source_index =
-        source_offset + static_cast<uint64_t>(source_y) * source_width + source_x;
+    const uint64_t source_index = source_offset + static_cast<uint64_t>(source_y) * source_width + source_x;
     const uint64_t output_index =
-        static_cast<uint64_t>(mask_index) * target_pixels +
-        static_cast<uint64_t>(y) * target_width +
-        x;
+        static_cast<uint64_t>(mask_index) * target_pixels + static_cast<uint64_t>(y) * target_width + x;
     output_masks[output_index] = input_masks[source_index] == 0 ? uint8_t{0} : uint8_t{1};
 }
 
-} // namespace
+}  // namespace
 
 struct CudaBinaryMaskResizer::Impl {
     explicit Impl(int requested_device_id) : device_id(requested_device_id) {}
@@ -137,8 +127,7 @@ bool CudaBinaryMaskResizer::available() noexcept {
     return cudaGetDeviceCount(&device_count) == cudaSuccess && device_count > 0;
 }
 
-CudaBinaryMaskResizer::CudaBinaryMaskResizer(int device_id)
-    : impl_(new Impl(device_id)) {
+CudaBinaryMaskResizer::CudaBinaryMaskResizer(int device_id) : impl_(new Impl(device_id)) {
     int device_count = 0;
     ensure_cuda_ok(cudaGetDeviceCount(&device_count), "cudaGetDeviceCount for mask resize");
     if (device_count <= 0) {
@@ -149,17 +138,15 @@ CudaBinaryMaskResizer::CudaBinaryMaskResizer(int device_id)
     }
 
     ensure_cuda_ok(cudaSetDevice(device_id), "cudaSetDevice for mask resize");
-    ensure_cuda_ok(
-        mmltk::cuda_stream_create_with_highest_priority(&impl_->stream, cudaStreamNonBlocking),
-        "cudaStreamCreateWithPriority for mask resize");
+    ensure_cuda_ok(mmltk::cuda_stream_create_with_highest_priority(&impl_->stream, cudaStreamNonBlocking),
+                   "cudaStreamCreateWithPriority for mask resize");
 }
 
 CudaBinaryMaskResizer::~CudaBinaryMaskResizer() {
     reset();
 }
 
-CudaBinaryMaskResizer::CudaBinaryMaskResizer(CudaBinaryMaskResizer&& other) noexcept
-    : impl_(other.impl_) {
+CudaBinaryMaskResizer::CudaBinaryMaskResizer(CudaBinaryMaskResizer&& other) noexcept : impl_(other.impl_) {
     other.impl_ = nullptr;
 }
 
@@ -176,10 +163,8 @@ CudaBinaryMaskResizer& CudaBinaryMaskResizer::operator=(CudaBinaryMaskResizer&& 
 void CudaBinaryMaskResizer::resize_batch(const std::vector<uint8_t>& source_masks,
                                          const std::vector<uint32_t>& source_widths,
                                          const std::vector<uint32_t>& source_heights,
-                                         const std::vector<size_t>& source_offsets,
-                                         uint32_t target_width,
-                                         uint32_t target_height,
-                                         std::vector<uint8_t>& output_masks) {
+                                         const std::vector<size_t>& source_offsets, uint32_t target_width,
+                                         uint32_t target_height, std::vector<uint8_t>& output_masks) {
     if (impl_ == nullptr) {
         throw std::runtime_error("CUDA mask resizer is not initialized");
     }
@@ -251,47 +236,27 @@ void CudaBinaryMaskResizer::resize_batch(const std::vector<uint8_t>& source_mask
         capacity = required;
     };
 
-    ensure_host_buffer(reinterpret_cast<void**>(&impl_->host_input),
-                       impl_->host_input_capacity,
-                       source_masks.size(),
+    ensure_host_buffer(reinterpret_cast<void**>(&impl_->host_input), impl_->host_input_capacity, source_masks.size(),
                        "cudaMallocHost for mask resize input");
-    ensure_host_buffer(reinterpret_cast<void**>(&impl_->host_output),
-                       impl_->host_output_capacity,
-                       output_bytes,
+    ensure_host_buffer(reinterpret_cast<void**>(&impl_->host_output), impl_->host_output_capacity, output_bytes,
                        "cudaMallocHost for mask resize output");
-    ensure_host_buffer(reinterpret_cast<void**>(&impl_->host_widths),
-                       impl_->host_widths_capacity,
-                       batch_size * sizeof(uint32_t),
-                       "cudaMallocHost for mask resize widths");
-    ensure_host_buffer(reinterpret_cast<void**>(&impl_->host_heights),
-                       impl_->host_heights_capacity,
-                       batch_size * sizeof(uint32_t),
-                       "cudaMallocHost for mask resize heights");
-    ensure_host_buffer(reinterpret_cast<void**>(&impl_->host_offsets),
-                       impl_->host_offsets_capacity,
-                       batch_size * sizeof(uint64_t),
-                       "cudaMallocHost for mask resize offsets");
+    ensure_host_buffer(reinterpret_cast<void**>(&impl_->host_widths), impl_->host_widths_capacity,
+                       batch_size * sizeof(uint32_t), "cudaMallocHost for mask resize widths");
+    ensure_host_buffer(reinterpret_cast<void**>(&impl_->host_heights), impl_->host_heights_capacity,
+                       batch_size * sizeof(uint32_t), "cudaMallocHost for mask resize heights");
+    ensure_host_buffer(reinterpret_cast<void**>(&impl_->host_offsets), impl_->host_offsets_capacity,
+                       batch_size * sizeof(uint64_t), "cudaMallocHost for mask resize offsets");
 
-    ensure_device_buffer(reinterpret_cast<void**>(&impl_->device_input),
-                         impl_->device_input_capacity,
-                         source_masks.size(),
-                         "cudaMalloc for mask resize input");
-    ensure_device_buffer(reinterpret_cast<void**>(&impl_->device_output),
-                         impl_->device_output_capacity,
-                         output_bytes,
+    ensure_device_buffer(reinterpret_cast<void**>(&impl_->device_input), impl_->device_input_capacity,
+                         source_masks.size(), "cudaMalloc for mask resize input");
+    ensure_device_buffer(reinterpret_cast<void**>(&impl_->device_output), impl_->device_output_capacity, output_bytes,
                          "cudaMalloc for mask resize output");
-    ensure_device_buffer(reinterpret_cast<void**>(&impl_->device_widths),
-                         impl_->device_widths_capacity,
-                         batch_size * sizeof(uint32_t),
-                         "cudaMalloc for mask resize widths");
-    ensure_device_buffer(reinterpret_cast<void**>(&impl_->device_heights),
-                         impl_->device_heights_capacity,
-                         batch_size * sizeof(uint32_t),
-                         "cudaMalloc for mask resize heights");
-    ensure_device_buffer(reinterpret_cast<void**>(&impl_->device_offsets),
-                         impl_->device_offsets_capacity,
-                         batch_size * sizeof(uint64_t),
-                         "cudaMalloc for mask resize offsets");
+    ensure_device_buffer(reinterpret_cast<void**>(&impl_->device_widths), impl_->device_widths_capacity,
+                         batch_size * sizeof(uint32_t), "cudaMalloc for mask resize widths");
+    ensure_device_buffer(reinterpret_cast<void**>(&impl_->device_heights), impl_->device_heights_capacity,
+                         batch_size * sizeof(uint32_t), "cudaMalloc for mask resize heights");
+    ensure_device_buffer(reinterpret_cast<void**>(&impl_->device_offsets), impl_->device_offsets_capacity,
+                         batch_size * sizeof(uint64_t), "cudaMalloc for mask resize offsets");
 
     std::memcpy(impl_->host_input, source_masks.data(), source_masks.size());
     std::memcpy(impl_->host_widths, source_widths.data(), batch_size * sizeof(uint32_t));
@@ -300,57 +265,34 @@ void CudaBinaryMaskResizer::resize_batch(const std::vector<uint8_t>& source_mask
         impl_->host_offsets[index] = static_cast<uint64_t>(source_offsets[index]);
     }
 
-    ensure_cuda_ok(cudaMemcpyAsync(impl_->device_input,
-                                   impl_->host_input,
-                                   source_masks.size(),
-                                   cudaMemcpyHostToDevice,
+    ensure_cuda_ok(cudaMemcpyAsync(impl_->device_input, impl_->host_input, source_masks.size(), cudaMemcpyHostToDevice,
                                    impl_->stream),
                    "cudaMemcpyAsync H2D mask resize input");
-    ensure_cuda_ok(cudaMemcpyAsync(impl_->device_widths,
-                                   impl_->host_widths,
-                                   batch_size * sizeof(uint32_t),
-                                   cudaMemcpyHostToDevice,
-                                   impl_->stream),
+    ensure_cuda_ok(cudaMemcpyAsync(impl_->device_widths, impl_->host_widths, batch_size * sizeof(uint32_t),
+                                   cudaMemcpyHostToDevice, impl_->stream),
                    "cudaMemcpyAsync H2D mask resize widths");
-    ensure_cuda_ok(cudaMemcpyAsync(impl_->device_heights,
-                                   impl_->host_heights,
-                                   batch_size * sizeof(uint32_t),
-                                   cudaMemcpyHostToDevice,
-                                   impl_->stream),
+    ensure_cuda_ok(cudaMemcpyAsync(impl_->device_heights, impl_->host_heights, batch_size * sizeof(uint32_t),
+                                   cudaMemcpyHostToDevice, impl_->stream),
                    "cudaMemcpyAsync H2D mask resize heights");
-    ensure_cuda_ok(cudaMemcpyAsync(impl_->device_offsets,
-                                   impl_->host_offsets,
-                                   batch_size * sizeof(uint64_t),
-                                   cudaMemcpyHostToDevice,
-                                   impl_->stream),
+    ensure_cuda_ok(cudaMemcpyAsync(impl_->device_offsets, impl_->host_offsets, batch_size * sizeof(uint64_t),
+                                   cudaMemcpyHostToDevice, impl_->stream),
                    "cudaMemcpyAsync H2D mask resize offsets");
 
     const dim3 block(16, 16, 1);
-    const dim3 grid((target_width + block.x - 1) / block.x,
-                    (target_height + block.y - 1) / block.y,
+    const dim3 grid((target_width + block.x - 1) / block.x, (target_height + block.y - 1) / block.y,
                     static_cast<unsigned int>(batch_size));
     resize_binary_masks_kernel<<<grid, block, 0, impl_->stream>>>(
-        impl_->device_input,
-        impl_->device_output,
-        impl_->device_widths,
-        impl_->device_heights,
-        impl_->device_offsets,
-        target_width,
-        target_height,
-        static_cast<uint32_t>(batch_size),
-        static_cast<uint64_t>(target_pixels));
+        impl_->device_input, impl_->device_output, impl_->device_widths, impl_->device_heights, impl_->device_offsets,
+        target_width, target_height, static_cast<uint32_t>(batch_size), static_cast<uint64_t>(target_pixels));
     ensure_cuda_ok(cudaGetLastError(), "resize_binary_masks_kernel launch");
 
-    ensure_cuda_ok(cudaMemcpyAsync(impl_->host_output,
-                                   impl_->device_output,
-                                   output_bytes,
-                                   cudaMemcpyDeviceToHost,
-                                   impl_->stream),
-                   "cudaMemcpyAsync D2H mask resize output");
+    ensure_cuda_ok(
+        cudaMemcpyAsync(impl_->host_output, impl_->device_output, output_bytes, cudaMemcpyDeviceToHost, impl_->stream),
+        "cudaMemcpyAsync D2H mask resize output");
     ensure_cuda_ok(cudaStreamSynchronize(impl_->stream), "cudaStreamSynchronize for mask resize batch");
 
     output_masks.resize(output_bytes);
     std::memcpy(output_masks.data(), impl_->host_output, output_bytes);
 }
 
-} // namespace mmltk::compiler_internal
+}  // namespace mmltk::compiler_internal

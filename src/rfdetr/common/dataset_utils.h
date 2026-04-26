@@ -24,4 +24,4 @@ inline int64_t image_id_for_dataset_index(const std::vector<int>& image_ids, int
     return dataset_index + 1;
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

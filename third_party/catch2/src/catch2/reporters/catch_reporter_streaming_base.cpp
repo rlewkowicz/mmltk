@@ -9,15 +9,14 @@
 
 namespace Catch {
 
-    StreamingReporterBase::~StreamingReporterBase() = default;
+StreamingReporterBase::~StreamingReporterBase() = default;
 
-    void
-    StreamingReporterBase::testRunStarting( TestRunInfo const& _testRunInfo ) {
-        currentTestRunInfo = _testRunInfo;
-    }
+void StreamingReporterBase::testRunStarting(TestRunInfo const& _testRunInfo) {
+    currentTestRunInfo = _testRunInfo;
+}
 
-    void StreamingReporterBase::testRunEnded( TestRunStats const& ) {
-        currentTestCaseInfo = nullptr;
-    }
+void StreamingReporterBase::testRunEnded(TestRunStats const&) {
+    currentTestCaseInfo = nullptr;
+}
 
-} // end namespace Catch
+}  // namespace Catch

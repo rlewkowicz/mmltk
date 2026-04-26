@@ -14,15 +14,13 @@
 
 namespace Catch {
 
-    struct AssertionInfo {
-        // AssertionInfo() = delete;
+struct AssertionInfo {
+    StringRef macroName;
+    SourceLineInfo lineInfo;
+    StringRef capturedExpression;
+    ResultDisposition::Flags resultDisposition;
+};
 
-        StringRef macroName;
-        SourceLineInfo lineInfo;
-        StringRef capturedExpression;
-        ResultDisposition::Flags resultDisposition;
-    };
+}  // namespace Catch
 
-} // end namespace Catch
-
-#endif // CATCH_ASSERTION_INFO_HPP_INCLUDED
+#endif  // CATCH_ASSERTION_INFO_HPP_INCLUDED

@@ -89,4 +89,4 @@ struct DetectionConfig {
 
 void populate_default_detection_weight_dict(DetectionConfig& config);
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

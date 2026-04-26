@@ -21,99 +21,64 @@ namespace mmltk::rfdetr {
 
 namespace {
 
-template <typename Fn>
-void for_each_ms_deform_attn_batch(const int batch, const int im2col_step, Fn&& fn) {
-    const int chunk_count = batch / im2col_step;
-    for (int chunk_index = 0; chunk_index < chunk_count; ++chunk_index) {
-        fn(chunk_index);
-    }
+template <typename BatchArgs, typename LaunchFn>
+void launch_with_common_ms_deform_args(const cudaStream_t stream, const BatchArgs& args,
+                                       const ms_deform_attn_launch::LaunchPlan& plan, LaunchFn&& launch_fn) {
+    launch_fn(stream, args.value, args.spatial_shapes, args.level_start_index, args.sampling_loc, args.attn_weight,
+              plan.batch_n, plan.spatial_size, plan.num_heads, plan.channels, plan.num_levels, plan.num_query,
+              plan.num_point);
 }
 
-} // namespace
+template <typename Launch>
+[[nodiscard]] ms_deform_attn_launch::LaunchPlan make_plan_for_launch(const Launch& launch) {
+    return ms_deform_attn_launch::make_launch_plan(launch.batch, launch.spatial_size, launch.num_heads, launch.channels,
+                                                   launch.num_levels, launch.num_query, launch.num_point,
+                                                   launch.im2col_step);
+}
 
-void launch_ms_deform_attn_cuda_forward(const float* value,
-                                        const int64_t* spatial_shapes,
-                                        const int64_t* level_start_index,
-                                        const float* sampling_loc,
-                                        const float* attn_weight,
-                                        int batch,
-                                        int spatial_size,
-                                        int num_heads,
-                                        int channels,
-                                        int num_levels,
-                                        int num_query,
-                                        int num_point,
-                                        int im2col_step,
-                                        float* output,
-                                        cudaStream_t stream) {
-    const int batch_n = im2col_step;
-    const auto per_value_size = spatial_size * num_heads * channels;
-    const auto per_sample_loc_size = num_query * num_heads * num_levels * num_point * 2;
-    const auto per_attn_weight_size = num_query * num_heads * num_levels * num_point;
-    for_each_ms_deform_attn_batch(batch, im2col_step, [&](const int n) {
-        ms_deformable_im2col_cuda(
-            stream,
-            value + n * im2col_step * per_value_size,
-            spatial_shapes,
-            level_start_index,
-            sampling_loc + n * im2col_step * per_sample_loc_size,
-            attn_weight + n * im2col_step * per_attn_weight_size,
-            batch_n,
-            spatial_size,
-            num_heads,
-            channels,
-            num_levels,
-            num_query,
-            num_point,
-            output + static_cast<int64_t>(n) * batch_n * num_query * num_heads * channels);
-        ensure_cuda_ok(cudaGetLastError(), "ms_deform_attn forward launch");
+template <typename Launch, typename MakeBatchArgsFn, typename LaunchBatchFn>
+void launch_ms_deform_attn_batches(const Launch& launch, MakeBatchArgsFn&& make_batch_args,
+                                   LaunchBatchFn&& launch_batch, const char* error_context) {
+    const auto plan = make_plan_for_launch(launch);
+    ms_deform_attn_launch::for_each_batch(plan, [&](const int n) {
+        const auto args = make_batch_args(plan, n);
+        launch_with_common_ms_deform_args(launch.stream, args, plan,
+                                          [&](const auto... common_args) { launch_batch(args, common_args...); });
+        ensure_cuda_ok(cudaGetLastError(), error_context);
     });
 }
 
-void launch_ms_deform_attn_cuda_backward(const float* value,
-                                         const int64_t* spatial_shapes,
-                                         const int64_t* level_start_index,
-                                         const float* sampling_loc,
-                                         const float* attn_weight,
-                                         const float* grad_output,
-                                         int batch,
-                                         int spatial_size,
-                                         int num_heads,
-                                         int channels,
-                                         int num_levels,
-                                         int num_query,
-                                         int num_point,
-                                         int im2col_step,
-                                         float* grad_value,
-                                         float* grad_sampling_loc,
-                                         float* grad_attn_weight,
-                                         cudaStream_t stream) {
-    const int batch_n = im2col_step;
-    const auto per_value_size = spatial_size * num_heads * channels;
-    const auto per_sample_loc_size = num_query * num_heads * num_levels * num_point * 2;
-    const auto per_attn_weight_size = num_query * num_heads * num_levels * num_point;
-    const auto per_grad_output_size = static_cast<int64_t>(batch_n) * num_query * num_heads * channels;
-    for_each_ms_deform_attn_batch(batch, im2col_step, [&](const int n) {
-        ms_deformable_col2im_cuda(
-            stream,
-            grad_output + static_cast<int64_t>(n) * per_grad_output_size,
-            value + n * im2col_step * per_value_size,
-            spatial_shapes,
-            level_start_index,
-            sampling_loc + n * im2col_step * per_sample_loc_size,
-            attn_weight + n * im2col_step * per_attn_weight_size,
-            batch_n,
-            spatial_size,
-            num_heads,
-            channels,
-            num_levels,
-            num_query,
-            num_point,
-            grad_value + n * im2col_step * per_value_size,
-            grad_sampling_loc + n * im2col_step * per_sample_loc_size,
-            grad_attn_weight + n * im2col_step * per_attn_weight_size);
-        ensure_cuda_ok(cudaGetLastError(), "ms_deform_attn backward launch");
-    });
+}  // namespace
+
+void launch_ms_deform_attn_cuda_forward(const ms_deform_attn_launch::ForwardLaunch& launch) {
+    launch_ms_deform_attn_batches(
+        launch,
+        [&](const auto& plan, const int n) {
+            return ms_deform_attn_launch::make_forward_batch_args(launch.value, launch.spatial_shapes,
+                                                                  launch.level_start_index, launch.sampling_loc,
+                                                                  launch.attn_weight, launch.output, plan, n);
+        },
+        [](const auto& args, const auto... common_args) { ms_deformable_im2col_cuda(common_args..., args.output); },
+        "ms_deform_attn forward launch");
 }
 
-} // namespace mmltk::rfdetr
+void launch_ms_deform_attn_cuda_backward(const ms_deform_attn_launch::BackwardLaunch& launch) {
+    launch_ms_deform_attn_batches(
+        launch,
+        [&](const auto& plan, const int n) {
+            return ms_deform_attn_launch::make_backward_batch_args(
+                launch.value, launch.spatial_shapes, launch.level_start_index, launch.sampling_loc, launch.attn_weight,
+                launch.grad_output, launch.grad_value, launch.grad_sampling_loc, launch.grad_attn_weight, plan, n);
+        },
+        [](const auto& args, const auto stream, const auto value, const auto spatial_shapes,
+           const auto level_start_index, const auto sampling_loc, const auto attn_weight, const auto batch_n,
+           const auto spatial_size, const auto num_heads, const auto channels, const auto num_levels,
+           const auto num_query, const auto num_point) {
+            ms_deformable_col2im_cuda(stream, args.grad_output, value, spatial_shapes, level_start_index, sampling_loc,
+                                      attn_weight, batch_n, spatial_size, num_heads, channels, num_levels, num_query,
+                                      num_point, args.grad_value, args.grad_sampling_loc, args.grad_attn_weight);
+        },
+        "ms_deform_attn backward launch");
+}
+
+}  // namespace mmltk::rfdetr

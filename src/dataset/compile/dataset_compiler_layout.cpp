@@ -14,12 +14,8 @@ int resolve_num_workers(int configured_workers) {
     if (configured_workers > 0) {
         try {
             allowed = allowed_cpu_set();
-            const int clamped =
-                clamp_worker_count_to_cpus(configured_workers, allowed.size(), 0, 1);
-            log_worker_budget_clamp("compile",
-                                    configured_workers,
-                                    clamped,
-                                    allowed);
+            const int clamped = clamp_worker_count_to_cpus(configured_workers, allowed.size(), 0, 1);
+            log_worker_budget_clamp("compile", configured_workers, clamped, allowed);
             return clamped;
         } catch (...) {
             return configured_workers;
@@ -57,8 +53,7 @@ void assign_pixel_offsets(std::vector<ImageEntry>& index, size_t pixel_offset, s
     }
 }
 
-FileHeader make_file_header(const FileHeaderInputs& inputs,
-                            const std::unordered_map<std::string, uint8_t>& class_map,
+FileHeader make_file_header(const FileHeaderInputs& inputs, const std::unordered_map<std::string, uint8_t>& class_map,
                             const FileLayout& layout) {
     FileHeader header{};
     header.magic = MAGIC;
@@ -75,16 +70,12 @@ FileHeader make_file_header(const FileHeaderInputs& inputs,
     header.total_file_size = layout.total_size;
     header.image_stride = inputs.image_stride;
     for (const auto& [name, id] : class_map) {
-        std::strncpy(header.class_names[id].data(),
-                     name.c_str(),
-                     header.class_names[id].size() - 1);
+        std::strncpy(header.class_names[id].data(), name.c_str(), header.class_names[id].size() - 1);
     }
     return header;
 }
 
-void write_metadata_blocks(const FileHandle& fd,
-                           const FileLayout& layout,
-                           const FileHeader& header,
+void write_metadata_blocks(const FileHandle& fd, const FileLayout& layout, const FileHeader& header,
                            const LabelBlocks& label_blocks) {
     {
         MMLTK_PROFILE_SCOPE("compiler.write_header");
@@ -104,4 +95,4 @@ void write_metadata_blocks(const FileHandle& fd,
     }
 }
 
-} // namespace mmltk::compiler_internal
+}  // namespace mmltk::compiler_internal

@@ -3,6 +3,7 @@
 
 #include "dataset_compiler.h"
 #include "dataset_loader.h"
+#include "rfdetr/onnx_tool_shared.h"
 #include "rfdetr/torch_cuda_utils.h"
 #include "rfdetr/postprocess.h"
 #include "spdmon/spdmon.hpp"
@@ -74,23 +75,9 @@ std::vector<std::string> split_csv(const std::string& value) {
     return items;
 }
 
-std::string shape_to_string(const std::vector<int64_t>& shape) {
-    std::ostringstream stream;
-    stream << "[";
-    for (size_t index = 0; index < shape.size(); ++index) {
-        if (index > 0) {
-            stream << ", ";
-        }
-        stream << shape[index];
-    }
-    stream << "]";
-    return stream.str();
-}
-
 void compile_dataset(const ValidationOptions& options) {
-    log_line(options,
-             "dataset: compiling " + options.source_dir.string() + "/" + options.split + " -> " +
-                 options.compiled_path.parent_path().string());
+    log_line(options, "dataset: compiling " + options.source_dir.string() + "/" + options.split + " -> " +
+                          options.compiled_path.parent_path().string());
 
     size_t last_done = 0;
     size_t total = 0;
@@ -110,19 +97,17 @@ void compile_dataset(const ValidationOptions& options) {
     config.cuda_device_id = options.compile_cuda_device_id;
     if (bar) {
         size_t progress_pulse = 0;
-        DatasetCompiler::compile(
-            config,
-            [&bar, &last_done, &total, &progress_pulse](const CompileProgress& progress) {
-                if (progress.total != total) {
-                    total = progress.total;
-                    bar->set_total(total);
-                }
-                if (progress.done > last_done) {
-                    bar->add(progress.done - last_done);
-                    last_done = progress.done;
-                }
-                bar->set_postfix(spdmon::format_compile_postfix(progress, progress_pulse++));
-            });
+        DatasetCompiler::compile(config, [&bar, &last_done, &total, &progress_pulse](const CompileProgress& progress) {
+            if (progress.total != total) {
+                total = progress.total;
+                bar->set_total(total);
+            }
+            if (progress.done > last_done) {
+                bar->add(progress.done - last_done);
+                last_done = progress.done;
+            }
+            bar->set_postfix(spdmon::format_compile_postfix(progress, progress_pulse++));
+        });
         bar->close();
         return;
     }
@@ -151,20 +136,17 @@ void validate_loader_shape(const ValidationOptions& options) {
     }
 }
 
-void print_model_metadata_impl(const ModelInfo& info,
-                               size_t images,
-                               size_t categories,
-                               ValidationLogMode log_mode) {
+void print_model_metadata_impl(const ModelInfo& info, size_t images, size_t categories, ValidationLogMode log_mode) {
     if (log_mode != ValidationLogMode::Interactive) {
         return;
     }
     spdmon::ProgressBar::log(
         "model[" + info.backend + "]: path=" + info.model_path + " input=" + info.input.name + " " +
-        shape_to_string(info.input.shape) + " outputs=" + std::to_string(info.outputs.size()) +
+        format_shape(info.input.shape) + " outputs=" + std::to_string(info.outputs.size()) +
         " queries=" + std::to_string(info.num_queries) + " classes=" + std::to_string(info.num_classes) +
         " dataset_images=" + std::to_string(images) + " dataset_classes=" + std::to_string(categories));
     for (const TensorInfo& output : info.outputs) {
-        spdmon::ProgressBar::log("  output: " + output.name + " " + shape_to_string(output.shape) + " " + output.dtype);
+        spdmon::ProgressBar::log("  output: " + output.name + " " + format_shape(output.shape) + " " + output.dtype);
     }
 }
 
@@ -174,42 +156,31 @@ AlignmentStats merge_alignment(const AlignmentStats& lhs, const AlignmentStats& 
     if (out.images_compared == 0) {
         return out;
     }
-    const auto weighted_mean = [total = out.images_compared](double lhs_value,
-                                                             size_t lhs_count,
-                                                             double rhs_value,
+    const auto weighted_mean = [total = out.images_compared](double lhs_value, size_t lhs_count, double rhs_value,
                                                              size_t rhs_count) {
-        return ((lhs_value * static_cast<double>(lhs_count)) +
-                (rhs_value * static_cast<double>(rhs_count))) /
+        return ((lhs_value * static_cast<double>(lhs_count)) + (rhs_value * static_cast<double>(rhs_count))) /
                static_cast<double>(total);
     };
-    out.top1_score_abs_diff_mean = weighted_mean(lhs.top1_score_abs_diff_mean,
-                                                 lhs.images_compared,
-                                                 rhs.top1_score_abs_diff_mean,
-                                                 rhs.images_compared);
-    out.top1_box_abs_diff_px_mean = weighted_mean(lhs.top1_box_abs_diff_px_mean,
-                                                  lhs.images_compared,
-                                                  rhs.top1_box_abs_diff_px_mean,
-                                                  rhs.images_compared);
-    out.top1_mask_xor_pixels_mean = weighted_mean(lhs.top1_mask_xor_pixels_mean,
-                                                  lhs.images_compared,
-                                                  rhs.top1_mask_xor_pixels_mean,
-                                                  rhs.images_compared);
+    out.top1_score_abs_diff_mean = weighted_mean(lhs.top1_score_abs_diff_mean, lhs.images_compared,
+                                                 rhs.top1_score_abs_diff_mean, rhs.images_compared);
+    out.top1_box_abs_diff_px_mean = weighted_mean(lhs.top1_box_abs_diff_px_mean, lhs.images_compared,
+                                                  rhs.top1_box_abs_diff_px_mean, rhs.images_compared);
+    out.top1_mask_xor_pixels_mean = weighted_mean(lhs.top1_mask_xor_pixels_mean, lhs.images_compared,
+                                                  rhs.top1_mask_xor_pixels_mean, rhs.images_compared);
     out.top1_score_abs_diff_max = std::max(lhs.top1_score_abs_diff_max, rhs.top1_score_abs_diff_max);
     out.top1_box_abs_diff_px_max = std::max(lhs.top1_box_abs_diff_px_max, rhs.top1_box_abs_diff_px_max);
     out.top1_mask_xor_pixels_max = std::max(lhs.top1_mask_xor_pixels_max, rhs.top1_mask_xor_pixels_max);
     return out;
 }
 
-AlignmentStats run_alignment(const ValidationOptions& options,
-                             CocoDataset& dataset,
-                             InferenceBackend& lhs_backend,
-                             InferenceBackend& rhs_backend,
-                             const torch::Tensor& mean,
-                             const torch::Tensor& std) {
-    const RuntimeContext runtime(resolve_runtime_config(
-        options.workers,
-        static_cast<int>(options.batch_size),
-        options.cpu_affinity));
+RuntimeContext make_validation_runtime_context(const ValidationOptions& options) {
+    return RuntimeContext(
+        resolve_runtime_config(options.workers, static_cast<int>(options.batch_size), options.cpu_affinity));
+}
+
+AlignmentStats run_alignment(const ValidationOptions& options, CocoDataset& dataset, InferenceBackend& lhs_backend,
+                             InferenceBackend& rhs_backend, const torch::Tensor& mean, const torch::Tensor& std) {
+    const RuntimeContext runtime = make_validation_runtime_context(options);
     DatasetLoader loader(make_loader_config(options, runtime));
 
     const size_t target_images = std::min(options.alignment_images, dataset.num_images());
@@ -233,8 +204,7 @@ AlignmentStats run_alignment(const ValidationOptions& options,
                 normalize_batch(batch, options.device_id, loader.image_height(), loader.image_width(), mean, std)
                     .contiguous();
             lhs_results = postprocess_outputs_fixed_size(
-                lhs_backend.run(normalized),
-                static_cast<int64_t>(loader.image_height()),
+                lhs_backend.run(normalized), static_cast<int64_t>(loader.image_height()),
                 static_cast<int64_t>(loader.image_width()),
                 lhs_backend.info().num_queries > 0 ? lhs_backend.info().num_queries : 300);
         }
@@ -245,19 +215,15 @@ AlignmentStats run_alignment(const ValidationOptions& options,
                 normalize_batch(batch, options.device_id, loader.image_height(), loader.image_width(), mean, std)
                     .contiguous();
             rhs_results = postprocess_outputs_fixed_size(
-                rhs_backend.run(normalized),
-                static_cast<int64_t>(loader.image_height()),
+                rhs_backend.run(normalized), static_cast<int64_t>(loader.image_height()),
                 static_cast<int64_t>(loader.image_width()),
                 rhs_backend.info().num_queries > 0 ? rhs_backend.info().num_queries : 300);
         }
-        ensure_cuda_ok(
-            cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(lhs_backend.stream())),
-            "cudaStreamSynchronize for alignment lhs backend");
-        ensure_cuda_ok(
-            cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(rhs_backend.stream())),
-            "cudaStreamSynchronize for alignment rhs backend");
-        const AlignmentStats sample =
-            compare_top1(lhs_results.front(), rhs_results.front(), dataset.num_categories());
+        ensure_cuda_ok(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(lhs_backend.stream())),
+                       "cudaStreamSynchronize for alignment lhs backend");
+        ensure_cuda_ok(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(rhs_backend.stream())),
+                       "cudaStreamSynchronize for alignment rhs backend");
+        const AlignmentStats sample = compare_top1(lhs_results.front(), rhs_results.front(), dataset.num_categories());
         total_stats = merge_alignment(total_stats, sample);
         if (bar && total_stats.images_compared > 0) {
             std::ostringstream postfix;
@@ -280,15 +246,10 @@ AlignmentStats run_alignment(const ValidationOptions& options,
     return total_stats;
 }
 
-ValidationBackendResult run_backend_eval_impl(const ValidationOptions& options,
-                                              const CocoDataset& source_dataset,
-                                              InferenceBackend& backend,
-                                              const torch::Tensor& mean,
+ValidationBackendResult run_backend_eval_impl(const ValidationOptions& options, const CocoDataset& source_dataset,
+                                              InferenceBackend& backend, const torch::Tensor& mean,
                                               const torch::Tensor& std) {
-    const RuntimeContext runtime(resolve_runtime_config(
-        options.workers,
-        static_cast<int>(options.batch_size),
-        options.cpu_affinity));
+    const RuntimeContext runtime = make_validation_runtime_context(options);
     DatasetLoader loader(make_loader_config(options, runtime));
     CocoDataset dataset = source_dataset;
 
@@ -316,11 +277,10 @@ ValidationBackendResult run_backend_eval_impl(const ValidationOptions& options,
         auto normalized =
             normalize_batch(batch, options.device_id, loader.image_height(), loader.image_width(), mean, std)
                 .contiguous();
-        auto results = postprocess_outputs_fixed_size(
-            backend.run(normalized),
-            static_cast<int64_t>(loader.image_height()),
-            static_cast<int64_t>(loader.image_width()),
-            backend.info().num_queries > 0 ? backend.info().num_queries : 300);
+        auto results =
+            postprocess_outputs_fixed_size(backend.run(normalized), static_cast<int64_t>(loader.image_height()),
+                                           static_cast<int64_t>(loader.image_width()),
+                                           backend.info().num_queries > 0 ? backend.info().num_queries : 300);
         const int image_id = static_cast<int>(batch.image_indices[0]) + 1;
         if (dataset.has_image(image_id)) {
             auto predictions =
@@ -393,7 +353,7 @@ json result_to_json(const ValidationOptions& options, const ValidationRunResult&
     return report;
 }
 
-} // namespace
+}  // namespace
 
 void print_model_metadata(const ModelInfo& info, size_t images, size_t categories, ValidationLogMode log_mode) {
     print_model_metadata_impl(info, images, categories, log_mode);
@@ -418,12 +378,8 @@ ValidationRunResult run_validation(const ValidationOptions& options) {
 
     c10::cuda::CUDAGuard device_guard(checked_device_index(options.device_id));
     auto [mean, std] = make_normalization_tensors(options.device_id);
-    InferenceBackendFactory backend_factory(
-        options.onnx_path,
-        options.tensorrt_path,
-        options.device_id,
-        options.allow_fp16,
-        options.save_engine_path);
+    InferenceBackendFactory backend_factory(options.onnx_path, options.tensorrt_path, options.device_id,
+                                            options.allow_fp16, options.save_engine_path);
 
     std::unordered_map<std::string, std::unique_ptr<InferenceBackend>> backends;
     if (!options.onnx_path.empty()) {
@@ -447,36 +403,26 @@ ValidationRunResult run_validation(const ValidationOptions& options) {
         if (found == backends.end()) {
             throw std::runtime_error("eval order references unavailable backend: " + backend_name);
         }
-        print_model_metadata_impl(found->second->info(),
-                                  dataset.num_images(),
-                                  dataset.num_categories(),
+        print_model_metadata_impl(found->second->info(), dataset.num_images(), dataset.num_categories(),
                                   options.log_mode);
     }
 
-    log_line(options,
-             "eval: split=" + options.split + " images=" + std::to_string(dataset.num_images()) +
-                 " eval_max_dets=" + std::to_string(options.eval_max_dets) +
-                 " batch_size=" + std::to_string(options.batch_size));
+    log_line(options, "eval: split=" + options.split + " images=" + std::to_string(dataset.num_images()) +
+                          " eval_max_dets=" + std::to_string(options.eval_max_dets) +
+                          " batch_size=" + std::to_string(options.batch_size));
 
     if (options.profile && backends.size() >= 2 && options.alignment_images > 0) {
-        result.alignment_probe =
-            run_alignment(options, dataset, *backends.at(result.eval_order[0]), *backends.at(result.eval_order[1]), mean, std);
+        result.alignment_probe = run_alignment(options, dataset, *backends.at(result.eval_order[0]),
+                                               *backends.at(result.eval_order[1]), mean, std);
     }
 
     for (const std::string& backend_name : result.eval_order) {
         if (options.batch_size > 1) {
             result.backends.emplace(
-                backend_name,
-                run_backend_eval_parallel_impl(
-                    options,
-                    dataset,
-                    *backends.at(backend_name),
-                    mean,
-                    std));
+                backend_name, run_backend_eval_parallel_impl(options, dataset, *backends.at(backend_name), mean, std));
         } else {
-            result.backends.emplace(
-                backend_name,
-                run_backend_eval_impl(options, dataset, *backends.at(backend_name), mean, std));
+            result.backends.emplace(backend_name,
+                                    run_backend_eval_impl(options, dataset, *backends.at(backend_name), mean, std));
         }
     }
 
@@ -495,19 +441,13 @@ ValidationRunResult run_validation(const ValidationOptions& options) {
     return result;
 }
 
-ValidationBackendResult run_validation_backend(const ValidationOptions& options,
-                                               const CocoDataset& source_dataset,
+ValidationBackendResult run_validation_backend(const ValidationOptions& options, const CocoDataset& source_dataset,
                                                InferenceBackend& backend) {
     validate_loader_shape(options);
     c10::cuda::CUDAGuard device_guard(checked_device_index(options.device_id));
     auto [mean, std] = make_normalization_tensors(options.device_id);
     if (options.batch_size > 1) {
-        return run_backend_eval_parallel_impl(
-            options,
-            source_dataset,
-            backend,
-            mean,
-            std);
+        return run_backend_eval_parallel_impl(options, source_dataset, backend, mean, std);
     }
     return run_backend_eval_impl(options, source_dataset, backend, mean, std);
 }
@@ -547,4 +487,4 @@ void print_validation_run_summary(const ValidationOptions& options, const Valida
     }
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

@@ -14,16 +14,19 @@
 
 namespace Catch {
 
-    struct RegistrarForTagAliases {
-        RegistrarForTagAliases( char const* alias, char const* tag, SourceLineInfo const& lineInfo );
-    };
+struct RegistrarForTagAliases {
+    RegistrarForTagAliases(char const* alias, char const* tag, SourceLineInfo const& lineInfo);
+};
 
-} // end namespace Catch
+}  // namespace Catch
 
-#define CATCH_REGISTER_TAG_ALIAS( alias, spec ) \
-    CATCH_INTERNAL_START_WARNINGS_SUPPRESSION \
-    CATCH_INTERNAL_SUPPRESS_GLOBALS_WARNINGS \
-    namespace{ const Catch::RegistrarForTagAliases INTERNAL_CATCH_UNIQUE_NAME( AutoRegisterTagAlias )( alias, spec, CATCH_INTERNAL_LINEINFO ); } \
+#define CATCH_REGISTER_TAG_ALIAS(alias, spec)                                                                      \
+    CATCH_INTERNAL_START_WARNINGS_SUPPRESSION                                                                      \
+    CATCH_INTERNAL_SUPPRESS_GLOBALS_WARNINGS                                                                       \
+    namespace {                                                                                                    \
+    const Catch::RegistrarForTagAliases INTERNAL_CATCH_UNIQUE_NAME(AutoRegisterTagAlias)(alias, spec,              \
+                                                                                         CATCH_INTERNAL_LINEINFO); \
+    }                                                                                                              \
     CATCH_INTERNAL_STOP_WARNINGS_SUPPRESSION
 
-#endif // CATCH_TAG_ALIAS_AUTOREGISTRAR_HPP_INCLUDED
+#endif  // CATCH_TAG_ALIAS_AUTOREGISTRAR_HPP_INCLUDED

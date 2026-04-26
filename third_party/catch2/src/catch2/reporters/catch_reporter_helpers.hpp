@@ -20,124 +20,73 @@
 
 namespace Catch {
 
-    class IConfig;
-    class TestCaseHandle;
-    class ColourImpl;
+class IConfig;
+class TestCaseHandle;
+class ColourImpl;
 
-    // Returns double formatted as %.3f (format expected on output)
-    std::string getFormattedDuration( double duration );
+std::string getFormattedDuration(double duration);
 
-    //! Should the reporter show duration of test given current configuration?
-    bool shouldShowDuration( IConfig const& config, double duration );
+bool shouldShowDuration(IConfig const& config, double duration);
 
-    std::string serializeFilters( std::vector<std::string> const& filters );
+std::string serializeFilters(std::vector<std::string> const& filters);
 
-    enum class XmlAssertionBodyStyle {
-        TextFlowIndented,
-        PlainIndented,
-    };
+enum class XmlAssertionBodyStyle {
+    TextFlowIndented,
+    PlainIndented,
+};
 
-    bool shouldReportXmlAssertion( AssertionResult const& result );
+bool shouldReportXmlAssertion(AssertionResult const& result);
 
-    StringRef xmlAssertionElementName( ResultWas::OfType resultType,
-                                       bool okToFailOverride = false );
+StringRef xmlAssertionElementName(ResultWas::OfType resultType, bool okToFailOverride = false);
 
-    std::string formatXmlAssertionBody( AssertionStats const& stats,
-                                        XmlAssertionBodyStyle style );
+std::string formatXmlAssertionBody(AssertionStats const& stats, XmlAssertionBodyStyle style);
 
-    struct lineOfChars {
-        char c;
-        constexpr lineOfChars( char c_ ): c( c_ ) {}
+struct lineOfChars {
+    char c;
+    constexpr lineOfChars(char c_) : c(c_) {}
 
-        friend std::ostream& operator<<( std::ostream& out, lineOfChars value );
-    };
+    friend std::ostream& operator<<(std::ostream& out, lineOfChars value);
+};
 
-    namespace Detail {
+namespace Detail {
 
-        class SharedAssertionPrinter {
-        protected:
-            SharedAssertionPrinter(std::ostream& stream,
-                                   AssertionStats const& stats,
-                                   bool printInfoMessages,
-                                   ColourImpl* colourImpl,
-                                   Colour::Code dimColour);
+class SharedAssertionPrinter {
+   protected:
+    SharedAssertionPrinter(std::ostream& stream, AssertionStats const& stats, bool printInfoMessages,
+                           ColourImpl* colourImpl, Colour::Code dimColour);
 
-            void resetMessages();
-            void printExpressionWas();
-            void printOriginalExpression() const;
-            void printReconstructedExpression() const;
-            void printReconstructedExpressionOneLine() const;
-            void printMessage();
-            void printRemainingMessages(Colour::Code colour);
+    void resetMessages();
+    void printExpressionWas();
+    void printOriginalExpression() const;
+    void printReconstructedExpression() const;
+    void printReconstructedExpressionOneLine() const;
+    void printExpressionAndMessages(bool reconstructedOnOneLine, Colour::Code expressionlessColour,
+                                    Colour::Code remainingColour);
+    void printMessage();
+    void printRemainingMessages(Colour::Code colour);
 
-            std::ostream& stream;
-            AssertionResult const& result;
-            std::vector<MessageInfo> const& messages;
-            std::vector<MessageInfo>::const_iterator itMessage;
-            bool printInfoMessages;
-            ColourImpl* colourImpl;
-            Colour::Code dimColour;
-        };
+    std::ostream& stream;
+    AssertionResult const& result;
+    std::vector<MessageInfo> const& messages;
+    std::vector<MessageInfo>::const_iterator itMessage;
+    bool printInfoMessages;
+    ColourImpl* colourImpl;
+    Colour::Code dimColour;
+};
 
-    } // namespace Detail
+}  // namespace Detail
 
-    /**
-     * Lists reporter descriptions to the provided stream in user-friendly
-     * format
-     *
-     * Used as the default listing implementation by the first party reporter
-     * bases. The output should be backwards compatible with the output of
-     * Catch2 v2 binaries.
-     */
-    void
-    defaultListReporters( std::ostream& out,
-                          std::vector<ReporterDescription> const& descriptions,
-                          Verbosity verbosity );
+void defaultListReporters(std::ostream& out, std::vector<ReporterDescription> const& descriptions, Verbosity verbosity);
 
-    /**
-     * Lists listeners descriptions to the provided stream in user-friendly
-     * format
-     */
-    void defaultListListeners( std::ostream& out,
-                               std::vector<ListenerDescription> const& descriptions,
-                               Verbosity verbosity );
+void defaultListListeners(std::ostream& out, std::vector<ListenerDescription> const& descriptions, Verbosity verbosity);
 
-    /**
-     * Lists tag information to the provided stream in user-friendly format
-     *
-     * Used as the default listing implementation by the first party reporter
-     * bases. The output should be backwards compatible with the output of
-     * Catch2 v2 binaries.
-     */
-    void defaultListTags( std::ostream& out,
-                          std::vector<TagInfo> const& tags,
-                          bool isFiltered,
-                          Verbosity verbosity );
+void defaultListTags(std::ostream& out, std::vector<TagInfo> const& tags, bool isFiltered, Verbosity verbosity);
 
-    /**
-     * Lists test case information to the provided stream in user-friendly
-     * format
-     *
-     * Used as the default listing implementation by the first party reporter
-     * bases. The output is backwards compatible with the output of Catch2
-     * v2 binaries, and also supports the format specific to the old
-     * `--list-test-names-only` option, for people who used it in integrations.
-     */
-    void defaultListTests( std::ostream& out,
-                           ColourImpl* streamColour,
-                           std::vector<TestCaseHandle> const& tests,
-                           bool isFiltered,
-                           Verbosity verbosity );
+void defaultListTests(std::ostream& out, ColourImpl* streamColour, std::vector<TestCaseHandle> const& tests,
+                      bool isFiltered, Verbosity verbosity);
 
-    /**
-     * Prints test run totals to the provided stream in user-friendly format
-     *
-     * Used by the console and compact reporters.
-     */
-    void printTestRunTotals( std::ostream& stream,
-                      ColourImpl& streamColour,
-                      Totals const& totals );
+void printTestRunTotals(std::ostream& stream, ColourImpl& streamColour, Totals const& totals);
 
-} // end namespace Catch
+}  // namespace Catch
 
-#endif // CATCH_REPORTER_HELPERS_HPP_INCLUDED
+#endif  // CATCH_REPORTER_HELPERS_HPP_INCLUDED

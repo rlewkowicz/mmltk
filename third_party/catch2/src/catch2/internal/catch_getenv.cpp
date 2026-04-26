@@ -14,24 +14,26 @@
 #include <cstdlib>
 
 namespace Catch {
-    namespace Detail {
+namespace Detail {
 
-#if !defined (CATCH_CONFIG_GETENV)
-        char const* getEnv( char const* ) { return nullptr; }
+#if !defined(CATCH_CONFIG_GETENV)
+char const* getEnv(char const*) {
+    return nullptr;
+}
 #else
 
-        char const* getEnv( char const* varName ) {
-#    if defined( _MSC_VER )
-#        pragma warning( push )
-#        pragma warning( disable : 4996 ) // use getenv_s instead of getenv
-#    endif
-
-            return std::getenv( varName );
-
-#    if defined( _MSC_VER )
-#        pragma warning( pop )
-#    endif
-        }
+char const* getEnv(char const* varName) {
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)  // use getenv_s instead of getenv
 #endif
-} // namespace Detail
-} // namespace Catch
+
+    return std::getenv(varName);
+
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+}
+#endif
+}  // namespace Detail
+}  // namespace Catch

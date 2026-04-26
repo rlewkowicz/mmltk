@@ -17,6 +17,7 @@
         "MMLTK_CUDA_VERSION": "13.0",
         "MMLTK_CUDA_TOOLKIT_ROOT": "/usr/local/cuda-13.0",
         "MMLTK_CUDA_ARCHITECTURES": "86;87;89;90;100;103;110;120;121",
+        "MMLTK_BROWSER_RUNTIME_BACKEND": "webkitgtk",
         "MMLTK_TORCH_ROOT": "/opt/pytorch",
         "MMLTK_ONNX_ROOT": "/opt/onnx",
         "MMLTK_ONNXRUNTIME_ROOT": "/opt/onnxruntime",
@@ -34,7 +35,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "BUILD_TESTS": "OFF",
-        "BUILD_MMLTK_GUI": "ON",
+        "BUILD_MMLTK_BROWSER_HOST": "ON",
         "BUILD_RFDETR_NATIVE": "ON",
         "BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER": "ON"
       }
@@ -46,7 +47,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Dev",
         "BUILD_TESTS": "ON",
-        "BUILD_MMLTK_GUI": "ON",
+        "BUILD_MMLTK_BROWSER_HOST": "ON",
         "BUILD_RFDETR_NATIVE": "ON",
         "BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER": "ON"
       }
@@ -70,7 +71,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "BUILD_TESTS": "OFF",
-        "BUILD_MMLTK_GUI": "ON",
+        "BUILD_MMLTK_BROWSER_HOST": "ON",
         "BUILD_RFDETR_NATIVE": "ON",
         "BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER": "ON"
       }
@@ -82,7 +83,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Dev",
         "BUILD_TESTS": "ON",
-        "BUILD_MMLTK_GUI": "ON",
+        "BUILD_MMLTK_BROWSER_HOST": "ON",
         "BUILD_RFDETR_NATIVE": "ON",
         "BUILD_RFDETR_PYTHON_CHECKPOINT_LOADER": "ON"
       }

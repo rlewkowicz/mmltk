@@ -5,19 +5,6 @@
 //        https://www.boost.org/LICENSE_1_0.txt)
 
 // SPDX-License-Identifier: BSL-1.0
-/** \file
- * This is a convenience header for Catch2's interfaces. It includes
- * **all** of Catch2 headers related to interfaces.
- *
- * Generally the Catch2 users should use specific includes they need,
- * but this header can be used instead for ease-of-experimentation, or
- * just plain convenience, at the cost of somewhat increased compilation
- * times.
- *
- * When a new header is added to either the `interfaces` folder, or to
- * the corresponding internal subfolder, it should be added here.
- */
-
 
 #ifndef CATCH_INTERFACES_ALL_HPP_INCLUDED
 #define CATCH_INTERFACES_ALL_HPP_INCLUDED
@@ -34,4 +21,4 @@
 #include <catch2/interfaces/catch_interfaces_test_invoker.hpp>
 #include <catch2/interfaces/catch_interfaces_testcase.hpp>
 
-#endif // CATCH_INTERFACES_ALL_HPP_INCLUDED
+#endif  // CATCH_INTERFACES_ALL_HPP_INCLUDED

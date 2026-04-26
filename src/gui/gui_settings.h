@@ -1,7 +1,5 @@
 #pragma once
 
-#include "view_state.h"
-
 #include <cstdint>
 #include <chrono>
 #include <condition_variable>
@@ -14,6 +12,16 @@
 #include <nlohmann/json.hpp>
 
 namespace mmltk::gui {
+
+enum class View : std::uint8_t;
+
+struct SourceSelectionState;
+struct TrainViewState;
+struct ValidateViewState;
+struct PredictViewState;
+struct UiSettingsState;
+struct AnnotateViewState;
+struct ExportViewState;
 
 inline constexpr std::uint32_t kGuiSettingsSchemaVersion = 3U;
 
@@ -48,34 +56,27 @@ struct WorkflowSettingsSnapshot {
     ExportViewState* export_state = nullptr;
 };
 
+[[nodiscard]] nlohmann::json snapshot_workflows(const WorkflowSettingsSnapshot& workflows);
+
 struct GuiSettingsSnapshot {
-    View current_view = View::Train;
+    View current_view{};
     std::string selected_preset;
     UiSettingsState* ui_settings = nullptr;
     WorkflowSettingsSnapshot workflows{};
 
     GuiSettingsSnapshot() = default;
 
-    GuiSettingsSnapshot(View current_view_,
-                        std::string selected_preset_,
-                        UiSettingsState* ui_settings_,
+    GuiSettingsSnapshot(View current_view_, std::string selected_preset_, UiSettingsState* ui_settings_,
                         const WorkflowSettingsSnapshot& workflows_)
         : current_view(current_view_),
           selected_preset(std::move(selected_preset_)),
           ui_settings(ui_settings_),
           workflows(workflows_) {}
 
-    GuiSettingsSnapshot(View current_view_,
-                        std::string selected_preset_,
-                        UiSettingsState* ui_settings_,
-                        TrainViewState* train_,
-                        ValidateViewState* validate_,
-                        PredictViewState* predict_,
-                        AnnotateViewState* annotate_,
-                        ExportViewState* export_state_)
-        : GuiSettingsSnapshot(current_view_,
-                              std::move(selected_preset_),
-                              ui_settings_,
+    GuiSettingsSnapshot(View current_view_, std::string selected_preset_, UiSettingsState* ui_settings_,
+                        TrainViewState* train_, ValidateViewState* validate_, PredictViewState* predict_,
+                        AnnotateViewState* annotate_, ExportViewState* export_state_)
+        : GuiSettingsSnapshot(current_view_, std::move(selected_preset_), ui_settings_,
                               WorkflowSettingsSnapshot{train_, validate_, predict_, annotate_, export_state_}) {}
 };
 
@@ -83,7 +84,7 @@ nlohmann::json snapshot_gui_settings(const GuiSettingsSnapshot& snap);
 void apply_gui_settings(const nlohmann::json& j, GuiSettingsSnapshot& snap);
 
 class GuiSettingsPersistence {
-public:
+   public:
     explicit GuiSettingsPersistence(std::string path);
     ~GuiSettingsPersistence();
 
@@ -91,7 +92,7 @@ public:
     void notify_frame(const GuiSettingsSnapshot& snap);
     void flush();
 
-private:
+   private:
     void enqueue_save(nlohmann::json j);
     void writer_main();
     void save_to_disk(const nlohmann::json& j);
@@ -109,4 +110,4 @@ private:
     static constexpr std::chrono::milliseconds kSaveDelay{200};
 };
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

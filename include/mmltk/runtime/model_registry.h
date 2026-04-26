@@ -9,4 +9,4 @@ using ModelModuleCapabilities = mmltk::model::ModelModuleCapabilities;
 using ModelModule = mmltk::model::ModelModule;
 using ModelRegistry = mmltk::model::ModelRegistry;
 
-} // namespace mmltk::runtime
+}  // namespace mmltk::runtime

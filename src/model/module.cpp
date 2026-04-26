@@ -5,6 +5,21 @@
 
 namespace mmltk::model {
 
+namespace {
+
+template <typename Predicate>
+const ModelModule* find_module_if(const std::vector<std::shared_ptr<const ModelModule>>& modules,
+                                  Predicate&& predicate) {
+    for (const auto& module : modules) {
+        if (predicate(*module)) {
+            return module.get();
+        }
+    }
+    return nullptr;
+}
+
+}  // namespace
+
 std::string ModelModule::infer_preset_from_artifact_path(const std::filesystem::path&) const {
     return {};
 }
@@ -24,38 +39,25 @@ void ModelRegistry::register_module(std::shared_ptr<const ModelModule> module) {
 }
 
 const ModelModule* ModelRegistry::find_module(std::string_view module_id) const {
-    for (const auto& module : modules_) {
-        if (module->module_id() == module_id) {
-            return module.get();
-        }
-    }
-    return nullptr;
+    return find_module_if(modules_, [module_id](const ModelModule& module) { return module.module_id() == module_id; });
 }
 
 const ModelModule* ModelRegistry::find_module_for_preset(std::string_view preset_name) const {
-    for (const auto& module : modules_) {
-        if (module->owns_preset(preset_name)) {
-            return module.get();
-        }
-    }
-    return nullptr;
+    return find_module_if(modules_,
+                          [preset_name](const ModelModule& module) { return module.owns_preset(preset_name); });
 }
 
 const ModelModule* ModelRegistry::find_module_for_artifact_path(const std::filesystem::path& artifact_path) const {
-    for (const auto& module : modules_) {
-        if (!module->infer_preset_from_artifact_path(artifact_path).empty()) {
-            return module.get();
-        }
-    }
-    return nullptr;
+    return find_module_if(modules_, [&artifact_path](const ModelModule& module) {
+        return !module.infer_preset_from_artifact_path(artifact_path).empty();
+    });
 }
 
 std::vector<ModelPresetDescriptor> ModelRegistry::presets() const {
     std::vector<ModelPresetDescriptor> descriptors;
     for (const auto& module : modules_) {
         std::vector<ModelPresetDescriptor> module_presets = module->presets();
-        descriptors.insert(descriptors.end(),
-                           std::make_move_iterator(module_presets.begin()),
+        descriptors.insert(descriptors.end(), std::make_move_iterator(module_presets.begin()),
                            std::make_move_iterator(module_presets.end()));
     }
     return descriptors;
@@ -65,4 +67,4 @@ bool ModelRegistry::empty() const noexcept {
     return modules_.empty();
 }
 
-} // namespace mmltk::model
+}  // namespace mmltk::model

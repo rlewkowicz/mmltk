@@ -21,8 +21,7 @@ inline bool is_supported_native_checkpoint_format(std::string_view format) {
 }
 
 torch::Tensor prepare_tensor_for_checkpoint_write(const torch::Tensor& tensor);
-void write_state_archive(torch::serialize::OutputArchive& archive,
-                         const char* key,
+void write_state_archive(torch::serialize::OutputArchive& archive, const char* key,
                          const std::vector<StateDictEntry>& state_dict);
 
-} // namespace mmltk::rfdetr::detail
+}  // namespace mmltk::rfdetr::detail

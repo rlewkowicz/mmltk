@@ -1,0 +1,114 @@
+@use "tokens" as *;
+@use "mixins" as *;
+
+.shell {
+  @include panel-surface(
+    $padding: 0.8rem,
+    $fill: var(--bg-1),
+    $radius: radius-token(md)
+  );
+
+  width: min(1740px, calc(100vw - 1rem));
+  margin: 0.5rem auto;
+  box-shadow: var(--shadow);
+}
+
+.topbar,
+.workflow-bar,
+.statusbar,
+.section-header,
+.workspace-header,
+.topbar-meta,
+.workspace-status {
+  @include row-center;
+}
+
+.topbar,
+.section-header,
+.workspace-header {
+  justify-content: space-between;
+}
+
+.brand-block h1,
+.workspace-header h2,
+.panel-section h2 {
+  margin: 0;
+}
+
+.brand-block h1,
+.workspace-header h2 {
+  font-family: $font-display;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+.eyebrow {
+  @include uppercase-label($color: var(--accent-1));
+
+  margin: 0 0 space-token(2xs);
+}
+
+.topbar-meta,
+.workflow-bar,
+.workspace-status,
+.action-stack,
+.slot-list,
+.action-row,
+.tool-selector {
+  gap: space-token(md);
+}
+
+.workflow-bar {
+  flex-wrap: wrap;
+  margin: 0.8rem 0;
+}
+
+.shell-grid {
+  @include grid(minmax(0, 3fr) minmax(280px, 1fr), space-token(md));
+}
+
+.shell-grid--workflow,
+app-workflow-main,
+app-workflow-sidebar,
+app-workflow-actions-section,
+app-workspace-host,
+.workflow-main,
+.workflow-sidebar,
+.panel,
+.workspace {
+  min-width: 0;
+}
+
+.workflow-main,
+.workflow-sidebar {
+  @include stack(space-token(md));
+}
+
+.workflow-main-grid {
+  @include grid(repeat(2, minmax(0, 1fr)), space-token(md));
+}
+
+.workflow-main-grid--live {
+  align-items: start;
+}
+
+.workflow-span {
+  grid-column: 1 / -1;
+}
+
+.panel {
+  @include stack(space-token(md));
+}
+
+.panel-section,
+.workspace {
+  @include panel-surface;
+}
+
+.panel-section--compact {
+  padding: space-token(md);
+}
+
+.panel-section h2 {
+  @include uppercase-label($size: 0.88rem, $color: var(--accent-2));
+}

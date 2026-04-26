@@ -57,16 +57,16 @@ struct LabelWorkerStats {
     std::uint64_t rle_pairs = 0;
 };
 
+#if MMLTK_ENABLE_PROFILING
 std::uint64_t compute_skew_x1000(std::uint64_t total, std::uint64_t peak, std::uint64_t count) {
     if (count == 0 || total == 0) {
         return 0;
     }
     return (peak * 1000ULL * count) / total;
 }
+#endif
 
-std::filesystem::path numbered_path(const std::filesystem::path& dir,
-                                    uint32_t one_based_index,
-                                    const char* extension) {
+std::filesystem::path numbered_path(const std::filesystem::path& dir, uint32_t one_based_index, const char* extension) {
     return dir / std::format("{:06}{}", one_based_index, extension);
 }
 
@@ -137,8 +137,7 @@ ImageDimensions load_image_dimensions(const std::filesystem::path& image_file) {
     };
 }
 
-void validate_record_image_dimensions(const json& record,
-                                      const std::filesystem::path& annotation_file,
+void validate_record_image_dimensions(const json& record, const std::filesystem::path& annotation_file,
                                       const ImageDimensions& source_dims) {
     if (!record.contains("image_size_wh")) {
         return;
@@ -148,8 +147,7 @@ void validate_record_image_dimensions(const json& record,
     }
     const int record_width = record["image_size_wh"][0].get<int>();
     const int record_height = record["image_size_wh"][1].get<int>();
-    if (record_width != static_cast<int>(source_dims.width) ||
-        record_height != static_cast<int>(source_dims.height)) {
+    if (record_width != static_cast<int>(source_dims.width) || record_height != static_cast<int>(source_dims.height)) {
         throw std::runtime_error("annotation image_size_wh does not match PNG dimensions in " +
                                  annotation_file.string());
     }
@@ -167,11 +165,9 @@ int16_t scale_box_min(int16_t coord, uint32_t source_extent, uint32_t target_ext
     if (coord < 0) {
         throw std::runtime_error("negative bbox coordinate is not supported");
     }
-    const double scaled =
-        std::floor((static_cast<double>(coord) * static_cast<double>(target_extent)) /
-                   static_cast<double>(source_extent));
-    const uint32_t clamped =
-        clamp_coord_to_extent(static_cast<std::int64_t>(scaled), target_extent);
+    const double scaled = std::floor((static_cast<double>(coord) * static_cast<double>(target_extent)) /
+                                     static_cast<double>(source_extent));
+    const uint32_t clamped = clamp_coord_to_extent(static_cast<std::int64_t>(scaled), target_extent);
     return checked_cast<int16_t>(clamped, "scaled bbox minimum overflow");
 }
 
@@ -179,17 +175,13 @@ int16_t scale_box_max(int16_t coord, uint32_t source_extent, uint32_t target_ext
     if (coord < 0) {
         throw std::runtime_error("negative bbox coordinate is not supported");
     }
-    const double scaled =
-        std::ceil((static_cast<double>(coord) * static_cast<double>(target_extent)) /
-                  static_cast<double>(source_extent));
-    const uint32_t clamped =
-        clamp_coord_to_extent(static_cast<std::int64_t>(scaled), target_extent);
+    const double scaled = std::ceil((static_cast<double>(coord) * static_cast<double>(target_extent)) /
+                                    static_cast<double>(source_extent));
+    const uint32_t clamped = clamp_coord_to_extent(static_cast<std::int64_t>(scaled), target_extent);
     return checked_cast<int16_t>(clamped, "scaled bbox maximum overflow");
 }
 
-void scale_bbox_in_place(ParsedInstance& instance,
-                         const ImageDimensions& source_dims,
-                         uint32_t target_width,
+void scale_bbox_in_place(ParsedInstance& instance, const ImageDimensions& source_dims, uint32_t target_width,
                          uint32_t target_height) {
     instance.bbox[0] = scale_box_min(instance.bbox[0], source_dims.width, target_width);
     instance.bbox[1] = scale_box_min(instance.bbox[1], source_dims.height, target_height);
@@ -197,8 +189,7 @@ void scale_bbox_in_place(ParsedInstance& instance,
     instance.bbox[3] = scale_box_max(instance.bbox[3], source_dims.height, target_height);
 }
 
-void materialize_mask_row_major(const std::vector<RLEPair>& input_pairs,
-                                const ImageDimensions& source_dims,
+void materialize_mask_row_major(const std::vector<RLEPair>& input_pairs, const ImageDimensions& source_dims,
                                 std::vector<uint8_t>& source_mask_scratch) {
     const size_t source_pixels = static_cast<size_t>(source_dims.width) * source_dims.height;
     if (source_mask_scratch.size() != source_pixels) {
@@ -216,16 +207,13 @@ void materialize_mask_row_major(const std::vector<RLEPair>& input_pairs,
     }
 }
 
-ResizedMask encode_dense_mask_row_major(const uint8_t* dense_mask,
-                                        uint32_t target_width,
-                                        uint32_t target_height) {
+ResizedMask encode_dense_mask_row_major(const uint8_t* dense_mask, uint32_t target_width, uint32_t target_height) {
     ResizedMask resized;
     const size_t target_pixels = static_cast<size_t>(target_width) * target_height;
     if (target_pixels == 0 || dense_mask == nullptr) {
         return resized;
     }
 
-    // Fused single-pass: RLE encode + bounding box using AVX2-accelerated scanning.
     const __m256i zero = _mm256_setzero_si256();
     uint32_t min_x = target_width;
     uint32_t min_y = target_height;
@@ -234,7 +222,6 @@ ResizedMask encode_dense_mask_row_major(const uint8_t* dense_mask,
 
     size_t cursor = 0;
     while (cursor < target_pixels) {
-        // Skip zeros: scan 32 bytes at a time
         while (cursor + 32 <= target_pixels) {
             const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dense_mask + cursor));
             const auto nonzero_mask = static_cast<uint32_t>(~_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, zero)));
@@ -254,7 +241,6 @@ ResizedMask encode_dense_mask_row_major(const uint8_t* dense_mask,
     found_start:;
         const size_t run_start = cursor;
 
-        // Scan nonzeros: 32 bytes at a time
         while (cursor + 32 <= target_pixels) {
             const __m256i v = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(dense_mask + cursor));
             const auto zero_mask = static_cast<uint32_t>(_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, zero)));
@@ -274,7 +260,6 @@ ResizedMask encode_dense_mask_row_major(const uint8_t* dense_mask,
             checked_cast<uint32_t>(cursor - run_start, "resized mask run length overflow"),
         });
 
-        // Derive bounding box from this run
         resized.has_foreground = true;
         const auto start_y = static_cast<uint32_t>(run_start / target_width);
         const auto start_x = static_cast<uint32_t>(run_start % target_width);
@@ -287,7 +272,6 @@ ResizedMask encode_dense_mask_row_major(const uint8_t* dense_mask,
             min_x = std::min(min_x, start_x);
             max_x = std::max(max_x, end_x + 1);
         } else {
-            // Run spans multiple rows — x covers full width
             min_x = 0;
             max_x = target_width;
         }
@@ -302,10 +286,8 @@ ResizedMask encode_dense_mask_row_major(const uint8_t* dense_mask,
     return resized;
 }
 
-ResizedMask resize_mask_row_major(const std::vector<RLEPair>& input_pairs,
-                                  const ImageDimensions& source_dims,
-                                  uint32_t target_width,
-                                  uint32_t target_height,
+ResizedMask resize_mask_row_major(const std::vector<RLEPair>& input_pairs, const ImageDimensions& source_dims,
+                                  uint32_t target_width, uint32_t target_height,
                                   std::vector<uint8_t>& source_mask_scratch,
                                   std::vector<uint8_t>& target_mask_scratch) {
     ResizedMask resized;
@@ -319,7 +301,6 @@ ResizedMask resize_mask_row_major(const std::vector<RLEPair>& input_pairs,
         target_mask_scratch.resize(target_pixels);
     }
 
-    // Precompute src_x LUT — hoists the 64-bit divide out of the row loop.
     std::vector<uint32_t> src_x_lut(target_width);
     const std::uint64_t tw2 = static_cast<std::uint64_t>(2) * target_width;
     for (uint32_t x = 0; x < target_width; ++x) {
@@ -330,11 +311,11 @@ ResizedMask resize_mask_row_major(const std::vector<RLEPair>& input_pairs,
     }
 
     for (uint32_t y = 0; y < target_height; ++y) {
-        const uint32_t src_y = std::min<uint32_t>(
-            source_dims.height - 1,
-            checked_cast<uint32_t>(((static_cast<std::uint64_t>(2) * y + 1) * source_dims.height) /
-                                       (static_cast<std::uint64_t>(2) * target_height),
-                                   "scaled mask y overflow"));
+        const uint32_t src_y =
+            std::min<uint32_t>(source_dims.height - 1,
+                               checked_cast<uint32_t>(((static_cast<std::uint64_t>(2) * y + 1) * source_dims.height) /
+                                                          (static_cast<std::uint64_t>(2) * target_height),
+                                                      "scaled mask y overflow"));
         const uint8_t* src_row = source_mask_scratch.data() + static_cast<size_t>(src_y) * source_dims.width;
         uint8_t* dst_row = target_mask_scratch.data() + static_cast<size_t>(y) * target_width;
         for (uint32_t x = 0; x < target_width; ++x) {
@@ -345,17 +326,12 @@ ResizedMask resize_mask_row_major(const std::vector<RLEPair>& input_pairs,
     return encode_dense_mask_row_major(target_mask_scratch.data(), target_width, target_height);
 }
 
-// Annotation and image paths are paired inputs for one dataset item.
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
-std::vector<ParsedInstance> parse_jsonl(const std::filesystem::path& annotation_file,
-                                        const std::filesystem::path& image_file,
-                                        const std::unordered_map<std::string, uint8_t>& class_map,
-                                        uint32_t target_width,
-                                        uint32_t target_height,
-                                        ResizeObservation* resize_observation,
-                                        DroppedAnnotationTracker* dropped_annotations,
-                                        std::vector<uint8_t>& source_mask_scratch,
-                                        std::vector<uint8_t>& target_mask_scratch) {
+std::vector<ParsedInstance> parse_jsonl(
+    const std::filesystem::path& annotation_file, const std::filesystem::path& image_file,
+    const std::unordered_map<std::string, uint8_t>& class_map, uint32_t target_width, uint32_t target_height,
+    ResizeObservation* resize_observation, DroppedAnnotationTracker* dropped_annotations,
+    std::vector<uint8_t>& source_mask_scratch, std::vector<uint8_t>& target_mask_scratch) {
     MMLTK_PROFILE_SCOPE("compiler.labels.parse_jsonl");
     std::vector<ParsedInstance> instances;
     std::ifstream file(annotation_file);
@@ -380,19 +356,16 @@ std::vector<ParsedInstance> parse_jsonl(const std::filesystem::path& annotation_
 
         json record = json::parse(line, nullptr, false);
         if (record.is_discarded()) {
-            throw std::runtime_error("invalid JSON annotation record in " +
-                                     annotation_file.string() +
-                                     " at line " + std::to_string(line_number));
+            throw std::runtime_error("invalid JSON annotation record in " + annotation_file.string() + " at line " +
+                                     std::to_string(line_number));
         }
         validate_record_image_dimensions(record, annotation_file, source_dims);
 
         const std::string class_name = record["class"].get<std::string>();
         auto class_it = class_map.find(class_name);
         if (class_it == class_map.end()) {
-            throw std::runtime_error("annotation class '" + class_name +
-                                     "' is not declared in categories.json: " +
-                                     annotation_file.string() +
-                                     " at line " + std::to_string(line_number));
+            throw std::runtime_error("annotation class '" + class_name + "' is not declared in categories.json: " +
+                                     annotation_file.string() + " at line " + std::to_string(line_number));
         }
 
         ParsedInstance instance{};
@@ -405,21 +378,14 @@ std::vector<ParsedInstance> parse_jsonl(const std::filesystem::path& annotation_
         instance.rle_pairs = parse_rle(record["mask_rle"].get<std::string>());
         if (needs_resize) {
             if (!instance.rle_pairs.empty()) {
-                ResizedMask resized = resize_mask_row_major(instance.rle_pairs,
-                                                            source_dims,
-                                                            target_width,
-                                                            target_height,
-                                                            source_mask_scratch,
-                                                            target_mask_scratch);
+                ResizedMask resized = resize_mask_row_major(instance.rle_pairs, source_dims, target_width,
+                                                            target_height, source_mask_scratch, target_mask_scratch);
                 if (!resized.has_foreground) {
                     if (dropped_annotations != nullptr) {
                         dropped_annotations->increment(
-                            annotation_file.string() +
-                            ":" + std::to_string(line_number) +
-                            " (" + std::to_string(source_dims.width) + "x" +
-                            std::to_string(source_dims.height) + " -> " +
-                            std::to_string(target_width) + "x" +
-                            std::to_string(target_height) + ")");
+                            annotation_file.string() + ":" + std::to_string(line_number) + " (" +
+                            std::to_string(source_dims.width) + "x" + std::to_string(source_dims.height) + " -> " +
+                            std::to_string(target_width) + "x" + std::to_string(target_height) + ")");
                     }
                     MMLTK_PROFILE_ADD("compiler.labels.instances_dropped", 1);
                     continue;
@@ -454,8 +420,7 @@ PackedInstance pack_instance(const ParsedInstance& instance) {
     packed.bbox_y1 = instance.bbox[1];
     packed.bbox_x2 = instance.bbox[2];
     packed.bbox_y2 = instance.bbox[3];
-    packed.mask_rle_pairs =
-        checked_cast<uint16_t>(instance.rle_pairs.size(), "too many RLE pairs for one instance");
+    packed.mask_rle_pairs = checked_cast<uint16_t>(instance.rle_pairs.size(), "too many RLE pairs for one instance");
     return packed;
 }
 
@@ -469,7 +434,7 @@ std::pair<size_t, size_t> aggregate_worker_sizes(const std::vector<WorkerResult>
     return {total_labels, total_rle_pairs};
 }
 
-} // namespace
+}  // namespace
 
 std::filesystem::path image_path(const std::filesystem::path& split_dir, uint32_t zero_based_index) {
     return numbered_path(split_dir, zero_based_index + 1, ".png");
@@ -509,12 +474,10 @@ DatasetScan scan_dataset(const CompilerConfig& config) {
         throw std::runtime_error("no classes found in categories.json");
     }
 
-    // Mirror RF-DETR category normalization: leave dense 0-based ids alone, and
-    // shift dense 1-based ids down into the same 0-based internal space.
-    const int class_id_base =
-        min_raw_id == 0 ? 0 :
-        min_raw_id == 1 ? 1 :
-        throw std::runtime_error("class ids must be dense and start at 0 or 1");
+    const int class_id_base = min_raw_id == 0 ? 0
+                              : min_raw_id == 1
+                                  ? 1
+                                  : throw std::runtime_error("class ids must be dense and start at 0 or 1");
 
     std::array<bool, MAX_CLASSES> seen_ids{};
     for (const auto& category : parsed_categories) {
@@ -541,11 +504,10 @@ DatasetScan scan_dataset(const CompilerConfig& config) {
         }
     }
 
-    // Determine num_images
     if (categories.contains("splits") && categories["splits"].contains(config.split)) {
         scan.num_images = categories["splits"][config.split]["total"].get<uint32_t>();
-        MMLTK_DEBUG_LOG("[compile] split '%s' count from categories.json: %u images\n",
-                             config.split.c_str(), scan.num_images);
+        MMLTK_DEBUG_LOG("[compile] split '%s' count from categories.json: %u images\n", config.split.c_str(),
+                        scan.num_images);
     } else {
         scan.num_images = count_sequential_images(std::filesystem::path(config.source_dir) / config.split);
     }
@@ -553,12 +515,9 @@ DatasetScan scan_dataset(const CompilerConfig& config) {
     return scan;
 }
 
-LabelBlocks build_label_blocks(const std::filesystem::path& split_dir,
-                               uint32_t num_images,
-                               const CompilerConfig& config,
-                               const std::unordered_map<std::string, uint8_t>& class_map,
-                               int num_workers,
-                               ProgressCounter* completed_images,
+LabelBlocks build_label_blocks(const std::filesystem::path& split_dir, uint32_t num_images,
+                               const CompilerConfig& config, const std::unordered_map<std::string, uint8_t>& class_map,
+                               int num_workers, ProgressCounter* completed_images,
                                DroppedAnnotationTracker* dropped_annotations) {
     MMLTK_PROFILE_SCOPE("compiler.labels.build_blocks");
     const uint32_t target_width = config.target_width;
@@ -586,67 +545,61 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir,
         }
         MMLTK_PROFILE_SET("compiler.labels.worker.count", active_workers);
         MMLTK_PROFILE_SET("compiler.labels.worker.active_skew_x1000",
-                               compute_skew_x1000(total_active_ns, max_active_ns, active_workers));
+                          compute_skew_x1000(total_active_ns, max_active_ns, active_workers));
         MMLTK_PROFILE_SET("compiler.labels.worker.instances_skew_x1000",
-                               compute_skew_x1000(total_instances, max_instances, active_workers));
+                          compute_skew_x1000(total_instances, max_instances, active_workers));
     };
 
     std::atomic<bool> any_image_resize{false};
     std::atomic<bool> any_image_downscale{false};
 
     std::vector<WorkerResult> worker_results(num_images);
-    const int worker_count = std::max(
-        1,
-        std::min(num_workers, checked_cast<int>(num_images, "label worker count overflow")));
+    const int worker_count =
+        std::max(1, std::min(num_workers, checked_cast<int>(num_images, "label worker count overflow")));
     std::vector<LabelWorkerStats> worker_stats(static_cast<size_t>(worker_count));
 
-    parallel_for_range_indexed<uint32_t>(0, num_images, num_workers, [&](int worker_id, uint32_t start, uint32_t end) { // NOLINT(bugprone-easily-swappable-parameters)
-        LabelWorkerStats& stats = worker_stats[static_cast<size_t>(worker_id)];
-        const auto worker_start = std::chrono::steady_clock::now();
-        std::vector<uint8_t> source_mask_scratch;
-        std::vector<uint8_t> target_mask_scratch;
-        for (uint32_t image_index = start; image_index < end; ++image_index) {
-            ResizeObservation resize_observation;
-            std::vector<ParsedInstance> instances =
-                parse_jsonl(annotation_path(split_dir, image_index),
-                            image_path(split_dir, image_index),
-                            class_map,
-                            target_width,
-                            target_height,
-                            &resize_observation,
-                            dropped_annotations,
-                            source_mask_scratch,
-                            target_mask_scratch);
-            if (resize_observation.needs_resize) {
-                any_image_resize.store(true, std::memory_order_relaxed);
-            }
-            if (resize_observation.needs_downscale) {
-                any_image_downscale.store(true, std::memory_order_relaxed);
-            }
-            WorkerResult& result = worker_results[image_index];
-            result.labels.reserve(instances.size());
-            const size_t instance_rle_pairs = parsed_rle_pair_count(instances);
-            result.rle_pairs.reserve(instance_rle_pairs);
+    parallel_for_range_indexed<uint32_t>(
+        0, num_images, num_workers,
+        [&](int worker_id, uint32_t start, uint32_t end) {  // NOLINT(bugprone-easily-swappable-parameters)
+            LabelWorkerStats& stats = worker_stats[static_cast<size_t>(worker_id)];
+            const auto worker_start = std::chrono::steady_clock::now();
+            std::vector<uint8_t> source_mask_scratch;
+            std::vector<uint8_t> target_mask_scratch;
+            for (uint32_t image_index = start; image_index < end; ++image_index) {
+                ResizeObservation resize_observation;
+                std::vector<ParsedInstance> instances =
+                    parse_jsonl(annotation_path(split_dir, image_index), image_path(split_dir, image_index), class_map,
+                                target_width, target_height, &resize_observation, dropped_annotations,
+                                source_mask_scratch, target_mask_scratch);
+                if (resize_observation.needs_resize) {
+                    any_image_resize.store(true, std::memory_order_relaxed);
+                }
+                if (resize_observation.needs_downscale) {
+                    any_image_downscale.store(true, std::memory_order_relaxed);
+                }
+                WorkerResult& result = worker_results[image_index];
+                result.labels.reserve(instances.size());
+                const size_t instance_rle_pairs = parsed_rle_pair_count(instances);
+                result.rle_pairs.reserve(instance_rle_pairs);
 
-            for (const ParsedInstance& instance : instances) {
-                result.labels.push_back(pack_instance(instance));
-                result.rle_pairs.insert(result.rle_pairs.end(),
-                                        instance.rle_pairs.begin(),
-                                        instance.rle_pairs.end());
-            }
+                for (const ParsedInstance& instance : instances) {
+                    result.labels.push_back(pack_instance(instance));
+                    result.rle_pairs.insert(result.rle_pairs.end(), instance.rle_pairs.begin(),
+                                            instance.rle_pairs.end());
+                }
 
-            ++stats.images;
-            stats.instances += instances.size();
-            stats.rle_pairs += instance_rle_pairs;
-            if (completed_images != nullptr) {
-                completed_images->increment();
+                ++stats.images;
+                stats.instances += instances.size();
+                stats.rle_pairs += instance_rle_pairs;
+                if (completed_images != nullptr) {
+                    completed_images->increment();
+                }
             }
-        }
-        stats.active_ns = checked_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - worker_start).count(),
-            "worker active time overflow");
-    });
+            stats.active_ns = checked_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - worker_start)
+                    .count(),
+                "worker active time overflow");
+        });
     record_worker_stats(worker_stats);
 
     const auto [total_labels, total_rle_pairs] = aggregate_worker_sizes(worker_results);
@@ -671,33 +624,27 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir,
         for (uint32_t image_index = 0; image_index < num_images; ++image_index) {
             WorkerResult& result = worker_results[image_index];
             ImageEntry& entry = blocks.index[image_index];
-            entry.num_instances =
-                checked_cast<uint16_t>(result.labels.size(), "too many instances for one image");
-            entry.label_offset =
-                checked_cast<uint32_t>(label_cursor * sizeof(PackedInstance), "label offset overflow");
+            entry.num_instances = checked_cast<uint16_t>(result.labels.size(), "too many instances for one image");
+            entry.label_offset = checked_cast<uint32_t>(label_cursor * sizeof(PackedInstance), "label offset overflow");
             entry.label_bytes =
-                checked_cast<uint32_t>(result.labels.size() * sizeof(PackedInstance),
-                                       "label bytes overflow");
+                checked_cast<uint32_t>(result.labels.size() * sizeof(PackedInstance), "label bytes overflow");
 
             const size_t image_rle_start = rle_cursor;
             size_t image_rle_cursor = image_rle_start;
             for (PackedInstance& packed : result.labels) {
                 packed.mask_rle_offset =
-                    checked_cast<uint32_t>(image_rle_cursor * sizeof(RLEPair),
-                                           "mask RLE offset overflow");
+                    checked_cast<uint32_t>(image_rle_cursor * sizeof(RLEPair), "mask RLE offset overflow");
                 image_rle_cursor += packed.mask_rle_pairs;
             }
             if (image_rle_cursor - image_rle_start != result.rle_pairs.size()) {
-                throw std::runtime_error(
-                    "label and RLE counts diverged while assembling label blocks");
+                throw std::runtime_error("label and RLE counts diverged while assembling label blocks");
             }
 
             if (!result.labels.empty()) {
                 std::ranges::copy(result.labels, blocks.labels.data() + label_cursor);
             }
             if (!result.rle_pairs.empty()) {
-                std::ranges::copy(result.rle_pairs,
-                          blocks.rle_pairs.data() + image_rle_start);
+                std::ranges::copy(result.rle_pairs, blocks.rle_pairs.data() + image_rle_start);
             }
 
             label_cursor += result.labels.size();
@@ -708,4 +655,4 @@ LabelBlocks build_label_blocks(const std::filesystem::path& split_dir,
     return blocks;
 }
 
-} // namespace mmltk::compiler_internal
+}  // namespace mmltk::compiler_internal

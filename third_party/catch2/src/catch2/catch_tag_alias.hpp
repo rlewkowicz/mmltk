@@ -14,16 +14,13 @@
 
 namespace Catch {
 
-    struct TagAlias {
-        TagAlias(std::string const& _tag, SourceLineInfo _lineInfo):
-            tag(_tag),
-            lineInfo(_lineInfo)
-        {}
+struct TagAlias {
+    TagAlias(std::string const& _tag, SourceLineInfo _lineInfo) : tag(_tag), lineInfo(_lineInfo) {}
 
-        std::string tag;
-        SourceLineInfo lineInfo;
-    };
+    std::string tag;
+    SourceLineInfo lineInfo;
+};
 
-} // end namespace Catch
+}  // namespace Catch
 
-#endif // CATCH_TAG_ALIAS_HPP_INCLUDED
+#endif  // CATCH_TAG_ALIAS_HPP_INCLUDED

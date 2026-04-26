@@ -19,9 +19,7 @@ using namespace torch::indexing;
 
 torch::Tensor unpack_packed_masks(const mmltk::rfdetr::PackedTargetMasks& masks) {
     const auto bits = masks.bits.to(torch::kCPU, torch::kInt64).contiguous();
-    auto dense = torch::zeros(
-        {bits.size(0), masks.height, masks.width},
-        torch::TensorOptions().dtype(torch::kFloat32));
+    auto dense = torch::zeros({bits.size(0), masks.height, masks.width}, torch::TensorOptions().dtype(torch::kFloat32));
     const auto* bits_ptr = reinterpret_cast<const uint64_t*>(bits.data_ptr<int64_t>());
     auto dense_a = dense.accessor<float, 3>();
     const int64_t words_per_mask = bits.size(1);
@@ -44,12 +42,7 @@ void test_target_builder_with_masks(int first_class_id) {
     CUDA_ASSERT_OK(cudaSetDevice(kDeviceId));
 
     const mmltk::testsupport::FixtureSpec fixture{
-        "/tmp/mmltk_rfdetr_target_builder",
-        "train",
-        65,
-        65,
-        12,
-        first_class_id,
+        "/tmp/mmltk_rfdetr_target_builder", "train", 65, 65, 12, first_class_id,
     };
     mmltk::testsupport::create_synthetic_dataset(fixture);
 
@@ -62,15 +55,9 @@ void test_target_builder_with_masks(int first_class_id) {
     compile_config.num_workers = 2;
     mmltk::DatasetCompiler::compile(compile_config);
 
-    mmltk::DatasetLoader loader(mmltk::rfdetr::make_loader_config(
-        mmltk::testsupport::compiled_bin_path(fixture),
-        static_cast<size_t>(fixture.num_images),
-        false,
-        1,
-        0,
-        "",
-        kDeviceId,
-        42));
+    mmltk::DatasetLoader loader(mmltk::rfdetr::make_loader_config(mmltk::testsupport::compiled_bin_path(fixture),
+                                                                  static_cast<size_t>(fixture.num_images), false, 1, 0,
+                                                                  "", kDeviceId, 42));
     std::vector<uint32_t> image_indices(static_cast<size_t>(fixture.num_images));
     std::iota(image_indices.begin(), image_indices.end(), 0u);
     mmltk::Batch batch{};
@@ -88,14 +75,7 @@ void test_target_builder_with_masks(int first_class_id) {
     c10::cuda::CUDAGuard device_guard(device_index);
 
     mmltk::rfdetr::TargetScratch scratch;
-    auto prepared = mmltk::rfdetr::build_targets(
-        batch,
-        fixture.height,
-        fixture.width,
-        true,
-        true,
-        kDeviceId,
-        scratch);
+    auto prepared = mmltk::rfdetr::build_targets(batch, fixture.height, fixture.width, true, true, kDeviceId, scratch);
     scratch.wait_for_pending_copy();
     CUDA_ASSERT_OK(cudaDeviceSynchronize());
 
@@ -157,14 +137,14 @@ void test_target_builder_with_masks(int first_class_id) {
     assert(dense_masks.index({1, 40, 40}).item<float>() == 0.0f);
 }
 
-} // namespace
+}  // namespace
 
 void test_target_builder_with_one_based_classes() {
-    test_target_builder_with_masks(/*first_class_id=*/1);
+    test_target_builder_with_masks(1);
 }
 
 void test_target_builder_with_zero_based_classes() {
-    test_target_builder_with_masks(/*first_class_id=*/0);
+    test_target_builder_with_masks(0);
 }
 
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][target_builder]", test_target_builder_with_one_based_classes);

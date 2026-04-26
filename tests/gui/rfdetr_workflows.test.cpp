@@ -3,30 +3,17 @@
 
 #include "mmltk/runtime/async_runtime.h"
 
+#include "support/async_runtime_test_utils.h"
 #include "support/catch2_compat.hpp"
 
-#include <chrono>
-#include <functional>
 #include <stdexcept>
-#include <thread>
 
 namespace {
 
 using namespace mmltk::gui;
 using namespace mmltk::gui::rfdetr_workflows;
 using namespace mmltk::runtime;
-
-void drain_until(UiCallbackQueue& queue, const std::function<bool()>& done) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-    while (!done()) {
-        queue.drain();
-        if (std::chrono::steady_clock::now() >= deadline) {
-            break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
-    queue.drain();
-}
+using mmltk::testsupport::drain_until;
 
 std::vector<LocalGpuInfo> make_local_gpus(std::initializer_list<int> device_ids) {
     std::vector<LocalGpuInfo> gpus;
@@ -67,7 +54,7 @@ PredictViewState make_predict_state() {
     state.workers = 2;
     state.lanes = 1;
     state.threshold = 0.5f;
-    state.compile_mode = 1;
+    state.compile_mode = mmltk::rfdetr::CompilationMode::kSelective;
     return state;
 }
 
@@ -121,7 +108,7 @@ void test_predict_request_round_trips_through_view_state() {
     source.backend = "onnx";
     source.cpu_affinity = "0-3";
     source.progress_bar = true;
-    source.compile_mode = 2;
+    source.compile_mode = mmltk::rfdetr::CompilationMode::kFullTrace;
 
     const mmltk::rfdetr::PredictRequest request = build_predict_request(source);
 
@@ -143,7 +130,7 @@ void test_predict_request_round_trips_through_view_state() {
     mapped.threshold = 0.0f;
     mapped.allow_fp16 = false;
     mapped.progress_bar = false;
-    mapped.compile_mode = 0;
+    mapped.compile_mode = mmltk::rfdetr::CompilationMode::kNone;
 
     apply_predict_request(mapped, request);
 
@@ -164,7 +151,7 @@ void test_predict_request_round_trips_through_view_state() {
     assert(mapped.threshold == 0.5f);
     assert(mapped.allow_fp16);
     assert(mapped.progress_bar);
-    assert(mapped.compile_mode == 2);
+    assert(mapped.compile_mode == mmltk::rfdetr::CompilationMode::kFullTrace);
 }
 
 void test_export_request_defaults_onnx_output_from_weights() {
@@ -180,8 +167,7 @@ void test_export_request_defaults_onnx_output_from_weights() {
 void test_build_engine_request_uses_exported_onnx_output() {
     const ExportViewState state = make_export_state();
     const mmltk::rfdetr::ExportOnnxRequest export_request = build_export_onnx_request(state);
-    const mmltk::rfdetr::BuildEngineRequest build_request =
-        build_build_engine_request(export_request, state);
+    const mmltk::rfdetr::BuildEngineRequest build_request = build_build_engine_request(export_request, state);
     assert(build_request.onnx_path == "/tmp/rf-detr-seg-medium.onnx");
     assert(build_request.output_path == "/tmp/rf-detr-seg-medium.engine");
     assert(build_request.device_id == 3);
@@ -296,7 +282,7 @@ void test_train_request_round_trips_through_view_state() {
     source.progress_bar = false;
     source.freeze_encoder = true;
     source.optimizer = TrainOptimizerMode::Muon;
-    source.compile_mode = 2;
+    source.compile_mode = mmltk::rfdetr::CompilationMode::kFullTrace;
     source.local_device_ids = {1, 3};
     source.recipe_overrides.lr = true;
     source.recipe_overrides.lr_scheduler = true;
@@ -307,7 +293,7 @@ void test_train_request_round_trips_through_view_state() {
     mapped.execution_target = TrainExecutionTarget::Remote;
     mapped.local_device_ids = {9};
     mapped.optimizer = TrainOptimizerMode::AdamW;
-    mapped.compile_mode = 0;
+    mapped.compile_mode = mmltk::rfdetr::CompilationMode::kNone;
 
     apply_train_request(mapped, request);
 
@@ -347,7 +333,7 @@ void test_train_request_round_trips_through_view_state() {
     assert(!mapped.progress_bar);
     assert(mapped.freeze_encoder);
     assert(mapped.optimizer == TrainOptimizerMode::Muon);
-    assert(mapped.compile_mode == 2);
+    assert(mapped.compile_mode == mmltk::rfdetr::CompilationMode::kFullTrace);
     assert(mapped.local_device_ids == std::vector<int>({1, 3}));
     assert(mapped.recipe_overrides.lr);
     assert(mapped.recipe_overrides.lr_scheduler);
@@ -356,15 +342,12 @@ void test_train_request_round_trips_through_view_state() {
 void test_local_train_controller_refresh_applies_preferred_device_selection() {
     BackgroundExecutor executor(1);
     UiCallbackQueue queue;
-    LocalTrainController controller(
-        executor,
-        queue,
-        [](std::string* error) {
-            if (error != nullptr) {
-                error->clear();
-            }
-            return make_local_gpus({0, 1, 2});
-        });
+    LocalTrainController controller(executor, queue, [](std::string* error) {
+        if (error != nullptr) {
+            error->clear();
+        }
+        return make_local_gpus({0, 1, 2});
+    });
 
     controller.initialize({1});
     assert(controller.gpu_refresh_running());
@@ -384,19 +367,16 @@ void test_local_train_controller_refresh_preserves_existing_selection_by_device_
     BackgroundExecutor executor(1);
     UiCallbackQueue queue;
     int refresh_count = 0;
-    LocalTrainController controller(
-        executor,
-        queue,
-        [&refresh_count](std::string* error) {
-            if (error != nullptr) {
-                error->clear();
-            }
-            ++refresh_count;
-            if (refresh_count == 1) {
-                return make_local_gpus({0, 1});
-            }
-            return make_local_gpus({1, 2, 0});
-        });
+    LocalTrainController controller(executor, queue, [&refresh_count](std::string* error) {
+        if (error != nullptr) {
+            error->clear();
+        }
+        ++refresh_count;
+        if (refresh_count == 1) {
+            return make_local_gpus({0, 1});
+        }
+        return make_local_gpus({1, 2, 0});
+    });
 
     controller.refresh_visible_gpus({});
     drain_until(queue, [&]() { return !controller.gpu_refresh_running(); });
@@ -421,12 +401,9 @@ void test_local_train_controller_refresh_preserves_existing_selection_by_device_
 void test_local_train_controller_refresh_reports_background_errors() {
     BackgroundExecutor executor(1);
     UiCallbackQueue queue;
-    LocalTrainController controller(
-        executor,
-        queue,
-        [](std::string*) -> std::vector<LocalGpuInfo> {
-            throw std::runtime_error("gpu refresh failed");
-        });
+    LocalTrainController controller(executor, queue, [](std::string*) -> std::vector<LocalGpuInfo> {
+        throw std::runtime_error("gpu refresh failed");
+    });
 
     controller.refresh_visible_gpus({});
     drain_until(queue, [&]() { return !controller.gpu_refresh_running(); });
@@ -437,7 +414,25 @@ void test_local_train_controller_refresh_reports_background_errors() {
     assert(controller.gpu_selection().empty());
 }
 
-} // namespace
+void test_ui_callback_queue_wakes_when_callback_is_posted() {
+    UiCallbackQueue queue;
+    int wake_count = 0;
+    int drain_count = 0;
+    queue.set_wake_callback([&wake_count]() { ++wake_count; });
+
+    queue.post([&drain_count]() { ++drain_count; });
+    assert(wake_count == 1);
+    assert(drain_count == 0);
+    assert(queue.drain() == 1U);
+    assert(drain_count == 1);
+
+    queue.set_wake_callback({});
+    queue.post([]() {});
+    assert(wake_count == 1);
+    assert(queue.drain() == 1U);
+}
+
+}  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[gui][rfdetr_workflows]", test_train_progress_bar_is_forwarded);
 MMLTK_REGISTER_TEST_CASE("[gui][rfdetr_workflows]", test_predict_progress_bar_is_forwarded);
@@ -446,6 +441,9 @@ MMLTK_REGISTER_TEST_CASE("[gui][rfdetr_workflows]", test_export_request_defaults
 MMLTK_REGISTER_TEST_CASE("[gui][rfdetr_workflows]", test_build_engine_request_uses_exported_onnx_output);
 MMLTK_REGISTER_TEST_CASE("[gui][rfdetr_workflows]", test_validate_request_round_trips_through_view_state);
 MMLTK_REGISTER_TEST_CASE("[gui][rfdetr_workflows]", test_train_request_round_trips_through_view_state);
-MMLTK_REGISTER_TEST_CASE("[gui][rfdetr_workflows]", test_local_train_controller_refresh_applies_preferred_device_selection);
-MMLTK_REGISTER_TEST_CASE("[gui][rfdetr_workflows]", test_local_train_controller_refresh_preserves_existing_selection_by_device_id);
+MMLTK_REGISTER_TEST_CASE("[gui][rfdetr_workflows]",
+                         test_local_train_controller_refresh_applies_preferred_device_selection);
+MMLTK_REGISTER_TEST_CASE("[gui][rfdetr_workflows]",
+                         test_local_train_controller_refresh_preserves_existing_selection_by_device_id);
 MMLTK_REGISTER_TEST_CASE("[gui][rfdetr_workflows]", test_local_train_controller_refresh_reports_background_errors);
+MMLTK_REGISTER_TEST_CASE("[gui][rfdetr_workflows]", test_ui_callback_queue_wakes_when_callback_is_posted);

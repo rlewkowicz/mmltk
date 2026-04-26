@@ -12,20 +12,20 @@
 
 namespace Catch {
 
-    void throw_test_failure_exception() {
-#if !defined( CATCH_CONFIG_DISABLE_EXCEPTIONS )
-        throw TestFailureException{};
+void throw_test_failure_exception() {
+#if !defined(CATCH_CONFIG_DISABLE_EXCEPTIONS)
+    throw TestFailureException{};
 #else
-        CATCH_ERROR( "Test failure requires aborting test!" );
+    CATCH_ERROR("Test failure requires aborting test!");
 #endif
-    }
+}
 
-    void throw_test_skip_exception() {
-#if !defined( CATCH_CONFIG_DISABLE_EXCEPTIONS )
-        throw Catch::TestSkipException();
+void throw_test_skip_exception() {
+#if !defined(CATCH_CONFIG_DISABLE_EXCEPTIONS)
+    throw Catch::TestSkipException();
 #else
-        CATCH_ERROR( "Explicitly skipping tests during runtime requires exceptions" );
+    CATCH_ERROR("Explicitly skipping tests during runtime requires exceptions");
 #endif
-    }
+}
 
-} // namespace Catch
+}  // namespace Catch

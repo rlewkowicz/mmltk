@@ -15,28 +15,35 @@
 namespace Catch {
 
 #if !defined(CATCH_CONFIG_POLYFILL_ISNAN)
-    bool isnan(float f) {
-        return std::isnan(f);
-    }
-    bool isnan(double d) {
-        return std::isnan(d);
-    }
+bool isnan(float f) {
+    return std::isnan(f);
+}
+bool isnan(double d) {
+    return std::isnan(d);
+}
 #else
-    // For now we only use this for embarcadero
-    bool isnan(float f) {
-        return std::_isnan(f);
-    }
-    bool isnan(double d) {
-        return std::_isnan(d);
-    }
+bool isnan(float f) {
+    return std::_isnan(f);
+}
+bool isnan(double d) {
+    return std::_isnan(d);
+}
 #endif
 
-#if !defined( CATCH_CONFIG_GLOBAL_NEXTAFTER )
-    float nextafter( float x, float y ) { return std::nextafter( x, y ); }
-    double nextafter( double x, double y ) { return std::nextafter( x, y ); }
+#if !defined(CATCH_CONFIG_GLOBAL_NEXTAFTER)
+float nextafter(float x, float y) {
+    return std::nextafter(x, y);
+}
+double nextafter(double x, double y) {
+    return std::nextafter(x, y);
+}
 #else
-    float nextafter( float x, float y ) { return ::nextafterf( x, y ); }
-    double nextafter( double x, double y ) { return ::nextafter( x, y ); }
+float nextafter(float x, float y) {
+    return ::nextafterf(x, y);
+}
+double nextafter(double x, double y) {
+    return ::nextafter(x, y);
+}
 #endif
 
-} // end namespace Catch
+}  // namespace Catch

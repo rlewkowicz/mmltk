@@ -11,19 +11,19 @@
 
 namespace Catch {
 
-    auto operator << (std::ostream& os, LazyExpression const& lazyExpr) -> std::ostream& {
-        if (lazyExpr.m_isNegated)
-            os << '!';
+auto operator<<(std::ostream& os, LazyExpression const& lazyExpr) -> std::ostream& {
+    if (lazyExpr.m_isNegated)
+        os << '!';
 
-        if (lazyExpr) {
-            if (lazyExpr.m_isNegated && lazyExpr.m_transientExpression->isBinaryExpression())
-                os << '(' << *lazyExpr.m_transientExpression << ')';
-            else
-                os << *lazyExpr.m_transientExpression;
-        } else {
-            os << "{** error - unchecked empty expression requested **}";
-        }
-        return os;
+    if (lazyExpr) {
+        if (lazyExpr.m_isNegated && lazyExpr.m_transientExpression->isBinaryExpression())
+            os << '(' << *lazyExpr.m_transientExpression << ')';
+        else
+            os << *lazyExpr.m_transientExpression;
+    } else {
+        os << "{** error - unchecked empty expression requested **}";
     }
+    return os;
+}
 
-} // namespace Catch
+}  // namespace Catch

@@ -1,0 +1,83 @@
+@use "tokens" as *;
+@use "mixins" as *;
+
+.detail-grid {
+  @include grid(repeat(2, minmax(0, 1fr)), 0.65rem);
+
+  margin: 0;
+
+  &--dense {
+    gap: 0.5rem;
+  }
+
+  div {
+    padding: 0.65rem;
+    border-radius: radius-token(sm);
+    background: var(--inset-fill);
+  }
+
+  dt {
+    @include uppercase-label;
+
+    margin: 0 0 0.35rem;
+  }
+
+  dd {
+    margin: 0;
+    word-break: break-word;
+  }
+}
+
+.form-grid {
+  @include grid(repeat(2, minmax(0, 1fr)), 0.65rem);
+
+  margin-top: space-token(md);
+}
+
+.field {
+  @include stack(space-token(xs));
+
+  min-width: 0;
+
+  span {
+    @include uppercase-label;
+  }
+}
+
+.field-group {
+  @include grid(minmax(0, 1fr) auto, 0.7rem);
+
+  align-items: end;
+  min-width: 0;
+}
+
+.field-span {
+  grid-column: 1 / -1;
+}
+
+.field-browse {
+  border-radius: radius-token(sm);
+  white-space: nowrap;
+}
+
+.field-inline {
+  @include row-between;
+  @include inset-surface($padding: 0.6rem 0.7rem, $radius: radius-token(sm));
+
+  span {
+    margin-right: 1rem;
+  }
+}
+
+.choice-grid {
+  @include grid(repeat(2, minmax(0, 1fr)), 0.7rem);
+}
+
+.choice-chip {
+  @include row-center(0.55rem);
+  @include inset-surface($padding: 0.6rem 0.7rem, $radius: radius-token(sm));
+
+  span {
+    @include uppercase-label($size: 0.76rem, $color: var(--text-1));
+  }
+}

@@ -77,14 +77,14 @@ SPDLOG_INLINE spdlog::log_clock::time_point now() SPDLOG_NOEXCEPT {
     timespec ts;
     ::clock_gettime(CLOCK_REALTIME_COARSE, &ts);
     return std::chrono::time_point<log_clock, typename log_clock::duration>(
-        std::chrono::duration_cast<typename log_clock::duration>(
-            std::chrono::seconds(ts.tv_sec) + std::chrono::nanoseconds(ts.tv_nsec)));
+        std::chrono::duration_cast<typename log_clock::duration>(std::chrono::seconds(ts.tv_sec) +
+                                                                 std::chrono::nanoseconds(ts.tv_nsec)));
 
 #else
     return log_clock::now();
 #endif
 }
-SPDLOG_INLINE std::tm localtime(const std::time_t &time_tt) SPDLOG_NOEXCEPT {
+SPDLOG_INLINE std::tm localtime(const std::time_t& time_tt) SPDLOG_NOEXCEPT {
 #ifdef _WIN32
     std::tm tm;
     ::localtime_s(&tm, &time_tt);
@@ -100,7 +100,7 @@ SPDLOG_INLINE std::tm localtime() SPDLOG_NOEXCEPT {
     return localtime(now_t);
 }
 
-SPDLOG_INLINE std::tm gmtime(const std::time_t &time_tt) SPDLOG_NOEXCEPT {
+SPDLOG_INLINE std::tm gmtime(const std::time_t& time_tt) SPDLOG_NOEXCEPT {
 #ifdef _WIN32
     std::tm tm;
     ::gmtime_s(&tm, &time_tt);
@@ -116,8 +116,7 @@ SPDLOG_INLINE std::tm gmtime() SPDLOG_NOEXCEPT {
     return gmtime(now_t);
 }
 
-// fopen_s on non windows for writing
-SPDLOG_INLINE bool fopen_s(FILE **fp, const filename_t &filename, const filename_t &mode) {
+SPDLOG_INLINE bool fopen_s(FILE** fp, const filename_t& filename, const filename_t& mode) {
 #ifdef _WIN32
 #ifdef SPDLOG_WCHAR_FILENAMES
     *fp = ::_wfsopen((filename.c_str()), mode.c_str(), _SH_DENYNO);
@@ -136,8 +135,7 @@ SPDLOG_INLINE bool fopen_s(FILE **fp, const filename_t &filename, const filename
 #else  // unix
 #if defined(SPDLOG_PREVENT_CHILD_FD)
     const int mode_flag = mode == SPDLOG_FILENAME_T("ab") ? O_APPEND : O_TRUNC;
-    const int fd =
-        ::open((filename.c_str()), O_CREAT | O_WRONLY | O_CLOEXEC | mode_flag, mode_t(0644));
+    const int fd = ::open((filename.c_str()), O_CREAT | O_WRONLY | O_CLOEXEC | mode_flag, mode_t(0644));
     if (fd == -1) {
         return true;
     }
@@ -153,7 +151,7 @@ SPDLOG_INLINE bool fopen_s(FILE **fp, const filename_t &filename, const filename
     return *fp == nullptr;
 }
 
-SPDLOG_INLINE int remove(const filename_t &filename) SPDLOG_NOEXCEPT {
+SPDLOG_INLINE int remove(const filename_t& filename) SPDLOG_NOEXCEPT {
 #if defined(_WIN32) && defined(SPDLOG_WCHAR_FILENAMES)
     return ::_wremove(filename.c_str());
 #else
@@ -161,11 +159,11 @@ SPDLOG_INLINE int remove(const filename_t &filename) SPDLOG_NOEXCEPT {
 #endif
 }
 
-SPDLOG_INLINE int remove_if_exists(const filename_t &filename) SPDLOG_NOEXCEPT {
+SPDLOG_INLINE int remove_if_exists(const filename_t& filename) SPDLOG_NOEXCEPT {
     return path_exists(filename) ? remove(filename) : 0;
 }
 
-SPDLOG_INLINE int rename(const filename_t &filename1, const filename_t &filename2) SPDLOG_NOEXCEPT {
+SPDLOG_INLINE int rename(const filename_t& filename1, const filename_t& filename2) SPDLOG_NOEXCEPT {
 #if defined(_WIN32) && defined(SPDLOG_WCHAR_FILENAMES)
     return ::_wrename(filename1.c_str(), filename2.c_str());
 #else
@@ -173,8 +171,7 @@ SPDLOG_INLINE int rename(const filename_t &filename1, const filename_t &filename
 #endif
 }
 
-// Return true if path exists (file or directory)
-SPDLOG_INLINE bool path_exists(const filename_t &filename) SPDLOG_NOEXCEPT {
+SPDLOG_INLINE bool path_exists(const filename_t& filename) SPDLOG_NOEXCEPT {
 #ifdef _WIN32
     struct _stat buffer;
 #ifdef SPDLOG_WCHAR_FILENAMES
@@ -189,13 +186,11 @@ SPDLOG_INLINE bool path_exists(const filename_t &filename) SPDLOG_NOEXCEPT {
 }
 
 #ifdef _MSC_VER
-// avoid warning about unreachable statement at the end of filesize()
 #pragma warning(push)
 #pragma warning(disable : 4702)
 #endif
 
-// Return file size according to open FILE* object
-SPDLOG_INLINE size_t filesize(FILE *f) {
+SPDLOG_INLINE size_t filesize(FILE* f) {
     if (f == nullptr) {
         throw_spdlog_ex("Failed getting file size. fd is null");
     }
@@ -215,13 +210,11 @@ SPDLOG_INLINE size_t filesize(FILE *f) {
 #endif
 
 #else  // unix
-// OpenBSD and AIX doesn't compile with :: before the fileno(..)
 #if defined(__OpenBSD__) || defined(_AIX)
     int fd = fileno(f);
 #else
     int fd = ::fileno(f);
 #endif
-// 64 bits(but not in osx, linux/musl or cygwin, where fstat64 is deprecated)
 #if ((defined(__linux__) && defined(__GLIBC__)) || defined(__sun) || defined(_AIX)) && \
     (defined(__LP64__) || defined(_LP64))
     struct stat64 st;
@@ -236,7 +229,7 @@ SPDLOG_INLINE size_t filesize(FILE *f) {
 #endif
 #endif
     throw_spdlog_ex("Failed getting file size from fd", errno);
-    return 0;  // will not be reached.
+    return 0;
 }
 
 #ifdef _MSC_VER
@@ -245,32 +238,27 @@ SPDLOG_INLINE size_t filesize(FILE *f) {
 
 #if !defined(SPDLOG_NO_TZ_OFFSET)
 #ifdef _WIN32
-// Compare the timestamp as Local (mktime) vs UTC (_mkgmtime) to get the offset.
-SPDLOG_INLINE int utc_minutes_offset(const std::tm &tm) {
-    std::tm local_tm = tm;  // copy since mktime might adjust it (normalize dates, set tm_isdst)
+SPDLOG_INLINE int utc_minutes_offset(const std::tm& tm) {
+    std::tm local_tm = tm;
     std::time_t local_time_t = std::mktime(&local_tm);
     if (local_time_t == -1) {
-        return 0; // fallback
+        return 0;
     }
 
     std::time_t utc_time_t = _mkgmtime(&local_tm);
     if (utc_time_t == -1) {
-        return 0; // fallback
+        return 0;
     }
     auto offset_seconds = utc_time_t - local_time_t;
     return static_cast<int>(offset_seconds / 60);
 }
 #else
-// On unix simply use tm_gmtoff
-SPDLOG_INLINE int utc_minutes_offset(const std::tm &tm) {
+SPDLOG_INLINE int utc_minutes_offset(const std::tm& tm) {
     return static_cast<int>(tm.tm_gmtoff / 60);
 }
 #endif  // _WIN32
 #endif  // SPDLOG_NO_TZ_OFFSET
 
-// Return current thread id as size_t
-// It exists because the std::this_thread::get_id() is much slower(especially
-// under VS 2013)
 SPDLOG_INLINE size_t _thread_id() SPDLOG_NOEXCEPT {
 #ifdef _WIN32
     return static_cast<size_t>(::GetCurrentThreadId());
@@ -296,8 +284,6 @@ SPDLOG_INLINE size_t _thread_id() SPDLOG_NOEXCEPT {
     return static_cast<size_t>(::thr_self());
 #elif __APPLE__
     uint64_t tid;
-// There is no pthread_threadid_np prior to Mac OS X 10.6, and it is not supported on any PPC,
-// including 10.6.8 Rosetta. __POWERPC__ is Apple-specific define encompassing ppc and ppc64.
 #ifdef MAC_OS_X_VERSION_MAX_ALLOWED
     {
 #if (MAC_OS_X_VERSION_MAX_ALLOWED < 1060) || defined(__POWERPC__)
@@ -321,7 +307,6 @@ SPDLOG_INLINE size_t _thread_id() SPDLOG_NOEXCEPT {
 #endif
 }
 
-// Return current thread id as size_t (from thread local storage)
 SPDLOG_INLINE size_t thread_id() SPDLOG_NOEXCEPT {
 #if defined(SPDLOG_NO_TLS)
     return _thread_id();
@@ -331,8 +316,6 @@ SPDLOG_INLINE size_t thread_id() SPDLOG_NOEXCEPT {
 #endif
 }
 
-// This is avoid msvc issue in sleep_for that happens if the clock changes.
-// See https://github.com/gabime/spdlog/issues/609
 SPDLOG_INLINE void sleep_for_millis(unsigned int milliseconds) SPDLOG_NOEXCEPT {
 #if defined(_WIN32)
     ::Sleep(milliseconds);
@@ -341,15 +324,16 @@ SPDLOG_INLINE void sleep_for_millis(unsigned int milliseconds) SPDLOG_NOEXCEPT {
 #endif
 }
 
-// wchar support for windows file names (SPDLOG_WCHAR_FILENAMES must be defined)
 #if defined(_WIN32) && defined(SPDLOG_WCHAR_FILENAMES)
-SPDLOG_INLINE std::string filename_to_str(const filename_t &filename) {
+SPDLOG_INLINE std::string filename_to_str(const filename_t& filename) {
     memory_buf_t buf;
     wstr_to_utf8buf(filename, buf);
     return SPDLOG_BUF_TO_STRING(buf);
 }
 #else
-SPDLOG_INLINE std::string filename_to_str(const filename_t &filename) { return filename; }
+SPDLOG_INLINE std::string filename_to_str(const filename_t& filename) {
+    return filename;
+}
 #endif
 
 SPDLOG_INLINE int pid() SPDLOG_NOEXCEPT {
@@ -360,40 +344,35 @@ SPDLOG_INLINE int pid() SPDLOG_NOEXCEPT {
 #endif
 }
 
-// Determine if the terminal supports colors
-// Based on: https://github.com/agauniyal/rang/
 SPDLOG_INLINE bool is_color_terminal() SPDLOG_NOEXCEPT {
 #ifdef _WIN32
     return true;
 #else
 
     static const bool result = []() {
-        const char *env_colorterm_p = std::getenv("COLORTERM");
+        const char* env_colorterm_p = std::getenv("COLORTERM");
         if (env_colorterm_p != nullptr) {
             return true;
         }
 
-        static constexpr std::array<const char *, 16> terms = {
-            {"ansi", "color", "console", "cygwin", "gnome", "konsole", "kterm", "linux", "msys",
-             "putty", "rxvt", "screen", "vt100", "xterm", "alacritty", "vt102"}};
+        static constexpr std::array<const char*, 16> terms = {{"ansi", "color", "console", "cygwin", "gnome", "konsole",
+                                                               "kterm", "linux", "msys", "putty", "rxvt", "screen",
+                                                               "vt100", "xterm", "alacritty", "vt102"}};
 
-        const char *env_term_p = std::getenv("TERM");
+        const char* env_term_p = std::getenv("TERM");
         if (env_term_p == nullptr) {
             return false;
         }
 
-        return std::any_of(terms.begin(), terms.end(), [&](const char *term) {
-            return std::strstr(env_term_p, term) != nullptr;
-        });
+        return std::any_of(terms.begin(), terms.end(),
+                           [&](const char* term) { return std::strstr(env_term_p, term) != nullptr; });
     }();
 
     return result;
 #endif
 }
 
-// Determine if the terminal attached
-// Source: https://github.com/agauniyal/rang/
-SPDLOG_INLINE bool in_terminal(FILE *file) SPDLOG_NOEXCEPT {
+SPDLOG_INLINE bool in_terminal(FILE* file) SPDLOG_NOEXCEPT {
 #ifdef _WIN32
     return ::_isatty(_fileno(file)) != 0;
 #else
@@ -402,7 +381,7 @@ SPDLOG_INLINE bool in_terminal(FILE *file) SPDLOG_NOEXCEPT {
 }
 
 #if (defined(SPDLOG_WCHAR_TO_UTF8_SUPPORT) || defined(SPDLOG_WCHAR_FILENAMES)) && defined(_WIN32)
-SPDLOG_INLINE void wstr_to_utf8buf(wstring_view_t wstr, memory_buf_t &target) {
+SPDLOG_INLINE void wstr_to_utf8buf(wstring_view_t wstr, memory_buf_t& target) {
     if (wstr.size() > static_cast<size_t>((std::numeric_limits<int>::max)()) / 4 - 1) {
         throw_spdlog_ex("UTF-16 string is too big to be converted to UTF-8");
     }
@@ -415,14 +394,12 @@ SPDLOG_INLINE void wstr_to_utf8buf(wstring_view_t wstr, memory_buf_t &target) {
 
     int result_size = static_cast<int>(target.capacity());
     if ((wstr_size + 1) * 4 > result_size) {
-        result_size =
-            ::WideCharToMultiByte(CP_UTF8, 0, wstr.data(), wstr_size, NULL, 0, NULL, NULL);
+        result_size = ::WideCharToMultiByte(CP_UTF8, 0, wstr.data(), wstr_size, NULL, 0, NULL, NULL);
     }
 
     if (result_size > 0) {
         target.resize(result_size);
-        result_size = ::WideCharToMultiByte(CP_UTF8, 0, wstr.data(), wstr_size, target.data(),
-                                            result_size, NULL, NULL);
+        result_size = ::WideCharToMultiByte(CP_UTF8, 0, wstr.data(), wstr_size, target.data(), result_size, NULL, NULL);
 
         if (result_size > 0) {
             target.resize(result_size);
@@ -430,11 +407,10 @@ SPDLOG_INLINE void wstr_to_utf8buf(wstring_view_t wstr, memory_buf_t &target) {
         }
     }
 
-    throw_spdlog_ex(
-        fmt_lib::format("WideCharToMultiByte failed. Last error: {}", ::GetLastError()));
+    throw_spdlog_ex(fmt_lib::format("WideCharToMultiByte failed. Last error: {}", ::GetLastError()));
 }
 
-SPDLOG_INLINE void utf8_to_wstrbuf(string_view_t str, wmemory_buf_t &target) {
+SPDLOG_INLINE void utf8_to_wstrbuf(string_view_t str, wmemory_buf_t& target) {
     if (str.size() > static_cast<size_t>((std::numeric_limits<int>::max)()) - 1) {
         throw_spdlog_ex("UTF-8 string is too big to be converted to UTF-16");
     }
@@ -445,27 +421,22 @@ SPDLOG_INLINE void utf8_to_wstrbuf(string_view_t str, wmemory_buf_t &target) {
         return;
     }
 
-    // find the size to allocate for the result buffer
     int result_size = ::MultiByteToWideChar(CP_UTF8, 0, str.data(), str_size, NULL, 0);
 
     if (result_size > 0) {
         target.resize(result_size);
-        result_size =
-            ::MultiByteToWideChar(CP_UTF8, 0, str.data(), str_size, target.data(), result_size);
+        result_size = ::MultiByteToWideChar(CP_UTF8, 0, str.data(), str_size, target.data(), result_size);
         if (result_size > 0) {
             assert(result_size == static_cast<int>(target.size()));
             return;
         }
     }
 
-    throw_spdlog_ex(
-        fmt_lib::format("MultiByteToWideChar failed. Last error: {}", ::GetLastError()));
+    throw_spdlog_ex(fmt_lib::format("MultiByteToWideChar failed. Last error: {}", ::GetLastError()));
 }
 #endif  // (defined(SPDLOG_WCHAR_TO_UTF8_SUPPORT) || defined(SPDLOG_WCHAR_FILENAMES)) &&
-        // defined(_WIN32)
 
-// return true on success
-static SPDLOG_INLINE bool mkdir_(const filename_t &path) {
+static SPDLOG_INLINE bool mkdir_(const filename_t& path) {
 #ifdef _WIN32
 #ifdef SPDLOG_WCHAR_FILENAMES
     return ::_wmkdir(path.c_str()) == 0;
@@ -477,9 +448,7 @@ static SPDLOG_INLINE bool mkdir_(const filename_t &path) {
 #endif
 }
 
-// create the given directory - and all directories leading to it
-// return true on success or if the directory already exists
-SPDLOG_INLINE bool create_dir(const filename_t &path) {
+SPDLOG_INLINE bool create_dir(const filename_t& path) {
     if (path_exists(path)) {
         return true;
     }
@@ -491,15 +460,12 @@ SPDLOG_INLINE bool create_dir(const filename_t &path) {
     size_t search_offset = 0;
     do {
         auto token_pos = path.find_first_of(folder_seps_filename, search_offset);
-        // treat the entire path as a folder if no folder separator not found
         if (token_pos == filename_t::npos) {
             token_pos = path.size();
         }
 
         auto subdir = path.substr(0, token_pos);
 #ifdef _WIN32
-        // if subdir is just a drive letter, add a slash e.g. "c:"=>"c:\",
-        // otherwise path_exists(subdir) returns false (issue #3079)
         const bool is_drive = subdir.length() == 2 && subdir[1] == ':';
         if (is_drive) {
             subdir += '\\';
@@ -508,7 +474,7 @@ SPDLOG_INLINE bool create_dir(const filename_t &path) {
 #endif
 
         if (!subdir.empty() && !path_exists(subdir) && !mkdir_(subdir)) {
-            return false;  // return error if failed creating dir
+            return false;
         }
         search_offset = token_pos + 1;
     } while (search_offset < path.size());
@@ -516,12 +482,7 @@ SPDLOG_INLINE bool create_dir(const filename_t &path) {
     return true;
 }
 
-// Return directory name from given path or empty string
-// "abc/file" => "abc"
-// "abc/" => "abc"
-// "abc" => ""
-// "abc///" => "abc//"
-SPDLOG_INLINE filename_t dir_name(const filename_t &path) {
+SPDLOG_INLINE filename_t dir_name(const filename_t& path) {
     auto pos = path.find_last_of(folder_seps_filename);
     return pos != filename_t::npos ? path.substr(0, pos) : filename_t{};
 }
@@ -530,12 +491,12 @@ SPDLOG_INLINE filename_t dir_name(const filename_t &path) {
 #pragma warning(push)
 #pragma warning(disable : 4996)
 #endif  // _MSC_VER
-std::string SPDLOG_INLINE getenv(const char *field) {
+std::string SPDLOG_INLINE getenv(const char* field) {
 #if defined(_MSC_VER) && defined(WINAPI_FAMILY) && defined(WINAPI_FAMILY_DESKTOP_APP) && \
     (WINAPI_FAMILY != WINAPI_FAMILY_DESKTOP_APP)
-    return std::string{};  // not supported under uwp
+    return std::string{};
 #else
-    char *buf = std::getenv(field);
+    char* buf = std::getenv(field);
     return buf ? buf : std::string{};
 #endif
 }
@@ -543,9 +504,7 @@ std::string SPDLOG_INLINE getenv(const char *field) {
 #pragma warning(pop)
 #endif  // _MSC_VER
 
-// Do fsync by FILE handlerpointer
-// Return true on success
-SPDLOG_INLINE bool fsync(FILE *fp) {
+SPDLOG_INLINE bool fsync(FILE* fp) {
 #ifdef _WIN32
     return FlushFileBuffers(reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(fp)))) != 0;
 #else
@@ -553,9 +512,7 @@ SPDLOG_INLINE bool fsync(FILE *fp) {
 #endif
 }
 
-// Do non-locking fwrite if possible by the os or use the regular locking fwrite
-// Return true on success.
-SPDLOG_INLINE bool fwrite_bytes(const void *ptr, const size_t n_bytes, FILE *fp) {
+SPDLOG_INLINE bool fwrite_bytes(const void* ptr, const size_t n_bytes, FILE* fp) {
 #if defined(_WIN32) && defined(SPDLOG_FWRITE_UNLOCKED)
     return _fwrite_nolock(ptr, 1, n_bytes, fp) == n_bytes;
 #elif defined(SPDLOG_FWRITE_UNLOCKED)

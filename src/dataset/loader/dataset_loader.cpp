@@ -32,8 +32,7 @@ void validate_config(const DatasetLoader::Config& config) {
     if (config.gather_workers < 0) {
         throw std::invalid_argument("gather_workers must be non-negative");
     }
-    if (config.shuffle && config.gather_workers > 0 &&
-        config.gather_workers > config.prefetch_factor) {
+    if (config.shuffle && config.gather_workers > 0 && config.gather_workers > config.prefetch_factor) {
         throw std::invalid_argument("gather_workers must not exceed prefetch_factor");
     }
     if (config.batch_shard_count == 0) {
@@ -44,19 +43,15 @@ void validate_config(const DatasetLoader::Config& config) {
     }
 }
 
-// Dataset size plus batch size intentionally mirror the caller's epoch inputs.
 // NOLINTBEGIN(bugprone-easily-swappable-parameters)
-void build_block_shuffled_order(std::vector<uint32_t>& order,
-                                uint32_t num_images,
-                                size_t batch_size,
+void build_block_shuffled_order(std::vector<uint32_t>& order, uint32_t num_images, size_t batch_size,
                                 std::mt19937_64& rng) {
     if (num_images == 0) {
         return;
     }
 
     const auto total_images = static_cast<size_t>(num_images);
-    const size_t chunk_images =
-        std::min(total_images, std::max(kShuffleChunkImages, batch_size));
+    const size_t chunk_images = std::min(total_images, std::max(kShuffleChunkImages, batch_size));
     const size_t chunks_per_block = std::max<size_t>(1, kShuffleBlockImages / chunk_images);
     const size_t num_chunks = (total_images + chunk_images - 1) / chunk_images;
     const size_t num_blocks = (num_chunks + chunks_per_block - 1) / chunks_per_block;
@@ -95,7 +90,7 @@ void build_block_shuffled_order(std::vector<uint32_t>& order,
 }
 // NOLINTEND(bugprone-easily-swappable-parameters)
 
-} // namespace
+}  // namespace
 
 DatasetLoader::DatasetLoader(const Config& config) : impl_(std::make_unique<Impl>()) {
     MMLTK_PROFILE_SCOPE("loader.construct");
@@ -103,8 +98,7 @@ DatasetLoader::DatasetLoader(const Config& config) : impl_(std::make_unique<Impl
 
     impl_->config = config;
     impl_->use_gather_path = true;
-    MMLTK_PROFILE_SET("loader.prefetch_factor_requested",
-                           static_cast<size_t>(config.prefetch_factor));
+    MMLTK_PROFILE_SET("loader.prefetch_factor_requested", static_cast<size_t>(config.prefetch_factor));
     impl_->num_buffers = static_cast<size_t>(config.prefetch_factor);
     MMLTK_PROFILE_SET("loader.prefetch_factor", impl_->num_buffers);
     impl_->load_runtime_data();
@@ -112,24 +106,18 @@ DatasetLoader::DatasetLoader(const Config& config) : impl_(std::make_unique<Impl
     impl_->slots.resize(impl_->num_buffers);
     impl_->worker_cpus = resolve_cpu_affinity(config.cpu_affinity);
     if (impl_->use_gather_path) {
-        const int requested_gather_workers =
-            config.gather_workers > 0 ? config.gather_workers : config.prefetch_factor;
+        const int requested_gather_workers = config.gather_workers > 0 ? config.gather_workers : config.prefetch_factor;
         const int clamped_gather_workers =
             clamp_worker_count_to_cpus(requested_gather_workers, impl_->worker_cpus.size(), 1, 1);
-        log_worker_budget_clamp("loader.gather",
-                                requested_gather_workers,
-                                clamped_gather_workers,
-                                impl_->worker_cpus,
-                                1,
-                                1);
+        log_worker_budget_clamp("loader.gather", requested_gather_workers, clamped_gather_workers, impl_->worker_cpus,
+                                1, 1);
         impl_->gather_worker_count = static_cast<size_t>(clamped_gather_workers);
     } else {
         impl_->gather_worker_count = 0;
     }
     MMLTK_PROFILE_SET("loader.worker_cpu_count", impl_->worker_cpus.size());
     MMLTK_PROFILE_SET("loader.gather.worker_budget", impl_->gather_worker_count);
-    MMLTK_PROFILE_SET("loader.worker_thread_count",
-                           impl_->gather_worker_count + static_cast<size_t>(1));
+    MMLTK_PROFILE_SET("loader.worker_thread_count", impl_->gather_worker_count + static_cast<size_t>(1));
 
     const auto image_stride = static_cast<size_t>(impl_->header.image_stride);
     CudaStreamManagerConfig cuda_config{};
@@ -151,8 +139,7 @@ DatasetLoader::~DatasetLoader() {
     {
         std::lock_guard<std::mutex> lock(impl_->slot_mtx);
         if (impl_->has_checked_out_slots_locked()) {
-            mmltk::logging::logger("loader")->critical(
-                "DatasetLoader destroyed with unreleased batches");
+            mmltk::logging::logger("loader")->critical("DatasetLoader destroyed with unreleased batches");
             std::terminate();
         }
     }
@@ -173,22 +160,17 @@ void DatasetLoader::begin_epoch() {
     }
     while (true) {
         impl_->reclaim_reusable_slots();
-        {
-            std::lock_guard<std::mutex> lock(impl_->slot_mtx);
-            if (impl_->pipeline_idle_locked()) {
-                break;
-            }
+        std::unique_lock<std::mutex> lock(impl_->slot_mtx);
+        if (impl_->pipeline_idle_locked()) {
+            break;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        impl_->consume_cv.wait_for(lock, std::chrono::milliseconds(1));
     }
 
     if (impl_->config.shuffle) {
         MMLTK_PROFILE_SCOPE("loader.shuffle_order");
         std::mt19937_64 rng(impl_->config.seed++);
-        build_block_shuffled_order(impl_->order,
-                                   impl_->header.num_images,
-                                   impl_->config.batch_size,
-                                   rng);
+        build_block_shuffled_order(impl_->order, impl_->header.num_images, impl_->config.batch_size, rng);
     }
     impl_->rebuild_batch_schedule();
 
@@ -257,9 +239,7 @@ bool DatasetLoader::next_batch(Batch& out) {
 void DatasetLoader::wait_batch(const Batch& batch) {
     {
         std::lock_guard<std::mutex> lock(impl_->slot_mtx);
-        impl_->require_batch_slot_locked(batch,
-                                         "wait_batch",
-                                         {Impl::SlotState::CheckedOut, Impl::SlotState::Released},
+        impl_->require_batch_slot_locked(batch, "wait_batch", {Impl::SlotState::CheckedOut, Impl::SlotState::Released},
                                          "a checked-out or released batch");
     }
     impl_->cuda_mgr->wait_for_transfer(static_cast<int>(batch.slot_index));
@@ -267,10 +247,7 @@ void DatasetLoader::wait_batch(const Batch& batch) {
 
 void DatasetLoader::handoff_batch(const Batch& batch, void* consumer_stream) {
     std::lock_guard<std::mutex> lock(impl_->slot_mtx);
-    impl_->require_batch_slot_locked(batch,
-                                     "handoff_batch",
-                                     {Impl::SlotState::CheckedOut},
-                                     "a checked-out batch");
+    impl_->require_batch_slot_locked(batch, "handoff_batch", {Impl::SlotState::CheckedOut}, "a checked-out batch");
     impl_->cuda_mgr->handoff_to_stream(static_cast<int>(batch.slot_index), consumer_stream);
 }
 
@@ -290,11 +267,21 @@ void DatasetLoader::release_batch(const Batch& batch, void* consumer_stream) {
     impl_->reclaim_reusable_slots();
 }
 
-size_t DatasetLoader::num_images() const { return impl_->header.num_images; }
-size_t DatasetLoader::num_batches() const { return impl_->total_batches(); }
-uint32_t DatasetLoader::image_width() const { return impl_->header.image_width; }
-uint32_t DatasetLoader::image_height() const { return impl_->header.image_height; }
-uint32_t DatasetLoader::num_classes() const { return impl_->header.num_classes; }
+size_t DatasetLoader::num_images() const {
+    return impl_->header.num_images;
+}
+size_t DatasetLoader::num_batches() const {
+    return impl_->total_batches();
+}
+uint32_t DatasetLoader::image_width() const {
+    return impl_->header.image_width;
+}
+uint32_t DatasetLoader::image_height() const {
+    return impl_->header.image_height;
+}
+uint32_t DatasetLoader::num_classes() const {
+    return impl_->header.num_classes;
+}
 
 const char* DatasetLoader::class_name(uint32_t id) const {
     if (id >= impl_->header.num_classes) {
@@ -303,16 +290,32 @@ const char* DatasetLoader::class_name(uint32_t id) const {
     return impl_->header.class_names[id].data();
 }
 
-size_t DatasetLoader::image_stride() const { return impl_->header.image_stride; }
-size_t DatasetLoader::num_label_instances() const { return impl_->labels.size(); }
-size_t DatasetLoader::num_rle_pairs() const { return impl_->rle_pairs.size(); }
+size_t DatasetLoader::image_stride() const {
+    return impl_->header.image_stride;
+}
+size_t DatasetLoader::num_label_instances() const {
+    return impl_->labels.size();
+}
+size_t DatasetLoader::num_rle_pairs() const {
+    return impl_->rle_pairs.size();
+}
 
-const float* DatasetLoader::pixel_blob() const { return impl_->pixels; }
-const LabelIndexEntry* DatasetLoader::label_index() const { return impl_->label_index.data(); }
-const PackedInstance* DatasetLoader::label_data() const { return impl_->labels.data(); }
-const RLEPair* DatasetLoader::rle_data() const { return impl_->rle_pairs.data(); }
+const float* DatasetLoader::pixel_blob() const {
+    return impl_->pixels;
+}
+const LabelIndexEntry* DatasetLoader::label_index() const {
+    return impl_->label_index.data();
+}
+const PackedInstance* DatasetLoader::label_data() const {
+    return impl_->labels.data();
+}
+const RLEPair* DatasetLoader::rle_data() const {
+    return impl_->rle_pairs.data();
+}
 
-CudaStreamManager& DatasetLoader::cuda() const { return *impl_->cuda_mgr; }
+CudaStreamManager& DatasetLoader::cuda() const {
+    return *impl_->cuda_mgr;
+}
 
 void DatasetLoader::Impl::rebuild_batch_schedule() {
     batch_starts.clear();
@@ -321,9 +324,8 @@ void DatasetLoader::Impl::rebuild_batch_schedule() {
         return;
     }
 
-    const size_t global_batches = config.drop_last ? 
-        (total_images / config.batch_size) : 
-        ((total_images + config.batch_size - 1) / config.batch_size);
+    const size_t global_batches = config.drop_last ? (total_images / config.batch_size)
+                                                   : ((total_images + config.batch_size - 1) / config.batch_size);
     const auto shard_count = static_cast<size_t>(config.batch_shard_count);
     const auto shard_rank = static_cast<size_t>(config.batch_shard_rank);
     batch_starts.reserve((global_batches + shard_count - 1) / shard_count);
@@ -336,8 +338,7 @@ void DatasetLoader::Impl::rebuild_batch_schedule() {
     MMLTK_PROFILE_SET("loader.batch_shard_batches", batch_starts.size());
 }
 
-bool DatasetLoader::Impl::slot_state_matches(SlotState state,
-                                             std::initializer_list<SlotState> allowed_states) const {
+bool DatasetLoader::Impl::slot_state_matches(SlotState state, std::initializer_list<SlotState> allowed_states) const {
     for (const auto allowed_state : allowed_states) {
         if (state == allowed_state) {
             return true;
@@ -347,9 +348,7 @@ bool DatasetLoader::Impl::slot_state_matches(SlotState state,
 }
 
 DatasetLoader::Impl::BatchSlot& DatasetLoader::Impl::require_batch_slot_locked(
-    const Batch& batch,
-    const char* operation,
-    std::initializer_list<SlotState> allowed_states,
+    const Batch& batch, const char* operation, std::initializer_list<SlotState> allowed_states,
     const char* required_state_message) {
     BatchSlot& slot = checked_out_slot_locked(batch, operation);
     if (!slot_state_matches(slot.state, allowed_states)) {
@@ -358,16 +357,12 @@ DatasetLoader::Impl::BatchSlot& DatasetLoader::Impl::require_batch_slot_locked(
     return slot;
 }
 
-void DatasetLoader::Impl::release_checked_out_batch_locked(const Batch& batch,
-                                                           void* consumer_stream) {
-    BatchSlot& slot = require_batch_slot_locked(batch,
-                                                "release_batch",
-                                                {SlotState::CheckedOut},
-                                                "a checked-out batch");
+void DatasetLoader::Impl::release_checked_out_batch_locked(const Batch& batch, void* consumer_stream) {
+    BatchSlot& slot = require_batch_slot_locked(batch, "release_batch", {SlotState::CheckedOut}, "a checked-out batch");
     if (consumer_stream) {
         cuda_mgr->record_consumer_done(static_cast<int>(batch.slot_index), consumer_stream);
     }
     slot.state = SlotState::Released;
 }
 
-} // namespace mmltk
+}  // namespace mmltk

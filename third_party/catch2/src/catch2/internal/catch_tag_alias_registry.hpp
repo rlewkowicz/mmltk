@@ -15,19 +15,19 @@
 #include <string>
 
 namespace Catch {
-    struct SourceLineInfo;
+struct SourceLineInfo;
 
-    class TagAliasRegistry : public ITagAliasRegistry {
-    public:
-        ~TagAliasRegistry() override;
-        TagAlias const* find( std::string const& alias ) const override;
-        std::string expandAliases( std::string const& unexpandedTestSpec ) const override;
-        void add( std::string const& alias, std::string const& tag, SourceLineInfo const& lineInfo );
+class TagAliasRegistry : public ITagAliasRegistry {
+   public:
+    ~TagAliasRegistry() override;
+    TagAlias const* find(std::string const& alias) const override;
+    std::string expandAliases(std::string const& unexpandedTestSpec) const override;
+    void add(std::string const& alias, std::string const& tag, SourceLineInfo const& lineInfo);
 
-    private:
-        std::map<std::string, TagAlias> m_registry;
-    };
+   private:
+    std::map<std::string, TagAlias> m_registry;
+};
 
-} // end namespace Catch
+}  // namespace Catch
 
-#endif // CATCH_TAG_ALIAS_REGISTRY_HPP_INCLUDED
+#endif  // CATCH_TAG_ALIAS_REGISTRY_HPP_INCLUDED

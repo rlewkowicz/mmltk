@@ -45,4 +45,4 @@ struct AlignmentStats {
     double top1_mask_xor_pixels_max = 0.0;
 };
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

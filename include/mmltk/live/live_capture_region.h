@@ -19,4 +19,4 @@ inline bool operator!=(const LiveCaptureRegion& lhs, const LiveCaptureRegion& rh
     return !(lhs == rhs);
 }
 
-} // namespace mmltk::live
+}  // namespace mmltk::live

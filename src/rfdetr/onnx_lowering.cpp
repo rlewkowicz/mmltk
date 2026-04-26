@@ -8,9 +8,10 @@
 #include <torch/csrc/jit/ir/constants.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
-#include <format>
 #include <deque>
+#include <format>
 #include <limits>
 #include <map>
 #include <numbers>
@@ -39,9 +40,8 @@ bool has_prefix(std::string_view value, std::string_view prefix) {
 }
 
 class LoweringContextScope {
-public:
-    explicit LoweringContextScope(const LoweringContext& context)
-        : previous_(g_current_lowering_context) {
+   public:
+    explicit LoweringContextScope(const LoweringContext& context) : previous_(g_current_lowering_context) {
         g_current_lowering_context = &context;
     }
 
@@ -49,7 +49,7 @@ public:
         g_current_lowering_context = previous_;
     }
 
-private:
+   private:
     const LoweringContext* previous_ = nullptr;
 };
 
@@ -93,6 +93,7 @@ const c10::Symbol kAtenAbs = c10::Symbol::fromQualString("aten::abs");
 const c10::Symbol kAtenFloor = c10::Symbol::fromQualString("aten::floor");
 const c10::Symbol kAtenGelu = c10::Symbol::fromQualString("aten::gelu");
 const c10::Symbol kAtenClampMin = c10::Symbol::fromQualString("aten::clamp_min");
+const c10::Symbol kAtenClampMax = c10::Symbol::fromQualString("aten::clamp_max");
 const c10::Symbol kAtenClamp = c10::Symbol::fromQualString("aten::clamp");
 const c10::Symbol kAtenDropout = c10::Symbol::fromQualString("aten::dropout");
 const c10::Symbol kAtenLayerNorm = c10::Symbol::fromQualString("aten::layer_norm");
@@ -153,8 +154,7 @@ const c10::Symbol kAtenNewOnes = c10::Symbol::fromQualString("aten::new_ones");
 const c10::Symbol kAtenUpsampleNearest2d = c10::Symbol::fromQualString("aten::upsample_nearest2d");
 const c10::Symbol kAtenUpsampleBilinear2d = c10::Symbol::fromQualString("aten::upsample_bilinear2d");
 const c10::Symbol kAtenGridSampler = c10::Symbol::fromQualString("aten::grid_sampler");
-const c10::Symbol kAtenScaledDotProductAttention =
-    c10::Symbol::fromQualString("aten::scaled_dot_product_attention");
+const c10::Symbol kAtenScaledDotProductAttention = c10::Symbol::fromQualString("aten::scaled_dot_product_attention");
 const c10::Symbol kPrimNumToTensor = c10::Symbol::fromQualString("prim::NumToTensor");
 
 const c10::Symbol kOnnxConstant = c10::Symbol::fromQualString("onnx::Constant");
@@ -206,6 +206,7 @@ const c10::Symbol kOnnxArgMax = c10::Symbol::fromQualString("onnx::ArgMax");
 const c10::Symbol kOnnxTopK = c10::Symbol::fromQualString("onnx::TopK");
 const c10::Symbol kOnnxSplit = c10::Symbol::fromQualString("onnx::Split");
 const c10::Symbol kOnnxMax = c10::Symbol::fromQualString("onnx::Max");
+const c10::Symbol kOnnxMin = c10::Symbol::fromQualString("onnx::Min");
 const c10::Symbol kOnnxResize = c10::Symbol::fromQualString("onnx::Resize");
 const c10::Symbol kOnnxGridSample = c10::Symbol::fromQualString("onnx::GridSample");
 
@@ -224,8 +225,7 @@ const c10::Symbol kAttrSorted = c10::Symbol::attr("sorted");
 const c10::Symbol kAttrValue = c10::attr::value;
 const c10::Symbol kAttrMode = c10::Symbol::attr("mode");
 const c10::Symbol kAttrPaddingMode = c10::Symbol::attr("padding_mode");
-const c10::Symbol kAttrCoordinateTransformationMode =
-    c10::Symbol::attr("coordinate_transformation_mode");
+const c10::Symbol kAttrCoordinateTransformationMode = c10::Symbol::attr("coordinate_transformation_mode");
 const c10::Symbol kAttrNearestMode = c10::Symbol::attr("nearest_mode");
 const c10::Symbol kAttrAlignCorners = c10::Symbol::attr("align_corners");
 const c10::Symbol kAttrEpsilon = c10::Symbol::attr("epsilon");
@@ -242,16 +242,31 @@ std::string format_missing_parameters(std::string_view prefix, const std::vector
     std::string message(prefix);
     message += " (missing: ";
     for (size_t i = 0; i < missing.size(); ++i) {
-        if (i != 0) message += ", ";
+        if (i != 0)
+            message += ", ";
         message += missing[i];
     }
     message += ")";
     return message;
 }
 
-// ── Node replacement helpers ────────────────────────────────────────────────
-// Replaces `node` with `replacement` in the graph: copies metadata, inserts
-// before the original, redirects all uses, and destroys the original.
+constexpr const char* kIntegerBitwiseAndUnsupportedMessage =
+    "integer bitwise_and is not supported by the native exporter";
+
+[[noreturn]] void throw_integer_bitwise_and_unsupported(torch::jit::Node* node) {
+    throw_lowering_error(node, kIntegerBitwiseAndUnsupportedMessage);
+}
+
+[[nodiscard]] bool is_bool_tensor(const at::Tensor& tensor) {
+    return tensor.defined() && tensor.numel() == 1 && tensor.scalar_type() == at::kBool;
+}
+
+[[nodiscard]] bool is_bool_literal_value(const c10::IValue& value) {
+    if (value.isBool() || value.isSymBool()) {
+        return true;
+    }
+    return value.isTensor() && is_bool_tensor(value.toTensor());
+}
 
 void replace_node_with(torch::jit::Node* node, torch::jit::Node* replacement) {
     replacement->copyMetadata(node);
@@ -267,9 +282,16 @@ void replace_node_with(torch::jit::Node* node, torch::jit::Value* replacement) {
     node->destroy();
 }
 
-std::optional<at::Tensor> lookup_initializer_tensor(
-    const torch::jit::Value* value,
-    const LoweringContext& context);
+void replace_inplace_node_with(torch::jit::Node* node, torch::jit::Node* replacement) {
+    replacement->copyMetadata(node);
+    replacement->insertBefore(node);
+    replacement->output()->copyMetadata(node->output());
+    node->input(0)->replaceAllUsesAfterNodeWith(node, replacement->output());
+    node->output()->replaceAllUsesWith(replacement->output());
+    node->destroy();
+}
+
+std::optional<at::Tensor> lookup_initializer_tensor(const torch::jit::Value* value, const LoweringContext& context);
 
 std::optional<at::ScalarType> value_scalar_type(const torch::jit::Value* value) {
     if (value == nullptr) {
@@ -338,11 +360,8 @@ int64_t normalize_axis(int64_t axis, size_t rank, const torch::jit::Node* node, 
     return axis;
 }
 
-std::vector<int64_t> normalize_axes(
-    const std::vector<int64_t>& axes,
-    size_t rank,
-    const torch::jit::Node* node,
-    const char* what = "axes") {
+std::vector<int64_t> normalize_axes(const std::vector<int64_t>& axes, size_t rank, const torch::jit::Node* node,
+                                    const char* what = "axes") {
     std::vector<int64_t> normalized;
     normalized.reserve(axes.size());
     for (const int64_t axis : axes) {
@@ -376,9 +395,8 @@ std::optional<bool> tensor_item_bool(const at::Tensor& tensor) {
     return tensor.item<bool>();
 }
 
-std::optional<std::string> full_attribute_name(
-    const torch::jit::Value* value,
-    const std::shared_ptr<torch::jit::Graph>& graph) {
+std::optional<std::string> full_attribute_name(const torch::jit::Value* value,
+                                               const std::shared_ptr<torch::jit::Graph>& graph) {
     if (value == nullptr || graph == nullptr || graph->inputs().empty()) {
         return std::nullopt;
     }
@@ -407,9 +425,7 @@ std::optional<std::string> full_attribute_name(
     return full_name;
 }
 
-std::optional<at::Tensor> lookup_initializer_tensor(
-    const torch::jit::Value* value,
-    const LoweringContext& context) {
+std::optional<at::Tensor> lookup_initializer_tensor(const torch::jit::Value* value, const LoweringContext& context) {
     if (value == nullptr) {
         return std::nullopt;
     }
@@ -437,10 +453,8 @@ std::optional<at::Tensor> lookup_initializer_tensor(
     return std::nullopt;
 }
 
-torch::jit::Node* create_onnx_constant_tensor(
-    torch::jit::Graph* graph,
-    const at::Tensor& value,
-    torch::jit::Node* insert_before) {
+torch::jit::Node* create_onnx_constant_tensor(torch::jit::Graph* graph, const at::Tensor& value,
+                                              torch::jit::Node* insert_before) {
     auto* constant = graph->create(kOnnxConstant, {}, 1);
     constant->t_(kAttrValue, value);
     constant->insertBefore(insert_before);
@@ -456,14 +470,107 @@ at::Tensor make_float_tensor(const std::vector<float>& values) {
     return at::tensor(values, at::TensorOptions().dtype(at::kFloat));
 }
 
-// ── Constant-fold add/sub/rsub with alpha ───────────────────────────────────
-// Shared by constant_int_value and constant_double_value to eliminate the
-// duplicated alpha-scaling blocks for aten::add, aten::sub, and aten::rsub.
+torch::jit::Value* create_scalar_constant(torch::jit::Node* node, double value, at::ScalarType scalar_type);
+torch::jit::Value* create_constant_value(torch::jit::Node* insert_before, const at::Tensor& value);
+
+std::optional<double> constant_double_value(const torch::jit::Value* value);
+torch::jit::Value* materialize_tensor_input(torch::jit::Node* node, torch::jit::Value* value,
+                                            at::ScalarType target_scalar_type);
+
+struct MaterializedBinaryInputs {
+    at::ScalarType preferred_scalar_type = at::kFloat;
+    torch::jit::Value* lhs = nullptr;
+    torch::jit::Value* rhs = nullptr;
+};
+
+MaterializedBinaryInputs materialize_binary_inputs(torch::jit::Node* node, torch::jit::Value* scalar_type_fallback) {
+    const auto preferred_scalar_type =
+        value_scalar_type(node->input(0)).value_or(value_scalar_type(scalar_type_fallback).value_or(at::kFloat));
+    return MaterializedBinaryInputs{
+        preferred_scalar_type,
+        materialize_tensor_input(node, node->input(0), preferred_scalar_type),
+        materialize_tensor_input(node, node->input(1), preferred_scalar_type),
+    };
+}
+
+torch::jit::Value* scale_tensor_input_by_alpha(torch::jit::Node* node, torch::jit::Value* input, double alpha,
+                                               at::ScalarType scalar_type) {
+    if (alpha == 1.0) {
+        return input;
+    }
+    auto* scaled = node->owningGraph()->create(kOnnxMul, {input, create_scalar_constant(node, alpha, scalar_type)}, 1);
+    scaled->copyMetadata(node);
+    scaled->insertBefore(node);
+    return scaled->output();
+}
+
+torch::jit::Value* scale_tensor_input_by_alpha(torch::jit::Node* node, torch::jit::Value* input,
+                                               torch::jit::Value* alpha_input, at::ScalarType scalar_type) {
+    const auto alpha = constant_double_value(alpha_input);
+    if (!alpha.has_value()) {
+        throw_lowering_error(node, "alpha must be a compile-time constant");
+    }
+    return scale_tensor_input_by_alpha(node, input, *alpha, scalar_type);
+}
+
+torch::jit::Node* create_binary_onnx_node(torch::jit::Node* node, c10::Symbol onnx_kind, torch::jit::Value* lhs,
+                                          torch::jit::Value* rhs) {
+    return node->owningGraph()->create(onnx_kind, {lhs, rhs}, 1);
+}
+
+void replace_with_binary_onnx_node(torch::jit::Node* node, c10::Symbol onnx_kind, torch::jit::Value* lhs,
+                                   torch::jit::Value* rhs) {
+    replace_node_with(node, create_binary_onnx_node(node, onnx_kind, lhs, rhs));
+}
+
+void replace_inplace_with_binary_onnx_node(torch::jit::Node* node, c10::Symbol onnx_kind, torch::jit::Value* lhs,
+                                           torch::jit::Value* rhs) {
+    replace_inplace_node_with(node, create_binary_onnx_node(node, onnx_kind, lhs, rhs));
+}
+
+std::array<torch::jit::Value*, 2> materialize_clamp_bound_inputs(torch::jit::Node* node, const size_t bound_input_index,
+                                                                 const at::ScalarType scalar_type) {
+    return {
+        materialize_tensor_input(node, node->input(0), scalar_type),
+        materialize_tensor_input(node, node->input(bound_input_index), scalar_type),
+    };
+}
+
+void append_materialized_clip_bound(std::vector<torch::jit::Value*>& inputs, torch::jit::Node* node,
+                                    const size_t bound_input_index, const at::ScalarType scalar_type) {
+    if (is_none_value(node->input(bound_input_index))) {
+        return;
+    }
+    if (bound_input_index == 2 && inputs.size() == 1) {
+        inputs.push_back(
+            create_constant_value(node, at::tensor(std::vector<float>{}, at::TensorOptions().dtype(at::kFloat))));
+    }
+    inputs.push_back(materialize_tensor_input(node, node->input(bound_input_index), scalar_type));
+}
+
+std::vector<torch::jit::Value*> materialize_clip_inputs(torch::jit::Node* node, at::ScalarType scalar_type) {
+    std::vector<torch::jit::Value*> inputs{
+        materialize_tensor_input(node, node->input(0), scalar_type),
+    };
+    append_materialized_clip_bound(inputs, node, 1, scalar_type);
+    append_materialized_clip_bound(inputs, node, 2, scalar_type);
+    return inputs;
+}
+
+torch::jit::Value* create_negated_binary_comparison(torch::jit::Node* node, c10::Symbol compare_kind,
+                                                    torch::jit::Value* lhs, torch::jit::Value* rhs) {
+    auto* compare = create_binary_onnx_node(node, compare_kind, lhs, rhs);
+    compare->copyMetadata(node);
+    compare->insertBefore(node);
+
+    auto* not_node = node->owningGraph()->create(kOnnxNot, {compare->output()}, 1);
+    not_node->copyMetadata(node);
+    not_node->insertAfter(compare);
+    return not_node->output();
+}
 
 template <typename T, typename ExtractFn>
-std::optional<T> fold_add_sub_with_alpha(
-    const torch::jit::Node* node,
-    ExtractFn extract) {
+std::optional<T> fold_add_sub_with_alpha(const torch::jit::Node* node, ExtractFn extract) {
     if (node->inputs().size() < 2) {
         return std::nullopt;
     }
@@ -483,7 +590,6 @@ std::optional<T> fold_add_sub_with_alpha(
         }
         return *rhs - scaled_lhs;
     }
-    // aten::add or aten::sub
     T scaled_rhs = *rhs;
     if (node->inputs().size() == 3) {
         const auto alpha = extract(node->input(2));
@@ -493,6 +599,17 @@ std::optional<T> fold_add_sub_with_alpha(
         scaled_rhs *= *alpha;
     }
     return (node->kind() == kAtenAdd) ? *lhs + scaled_rhs : *lhs - scaled_rhs;
+}
+
+template <typename T, typename ExtractFn, typename CombineFn>
+std::optional<T> fold_binary_constant_node(const torch::jit::Node* node, const c10::Symbol kind, ExtractFn extract,
+                                           CombineFn combine) {
+    if (node->kind() != kind || node->inputs().size() != 2) {
+        return std::nullopt;
+    }
+    const auto lhs = extract(node->input(0));
+    const auto rhs = extract(node->input(1));
+    return lhs.has_value() && rhs.has_value() ? std::optional<T>(combine(*lhs, *rhs)) : std::nullopt;
 }
 
 std::optional<int64_t> constant_int_value(const torch::jit::Value* value);
@@ -515,8 +632,8 @@ at::Tensor make_scalar_tensor(double value, at::ScalarType scalar_type) {
     if (scalar_type == at::kBool) {
         return at::scalar_tensor(value != 0.0, options);
     }
-    if (scalar_type == at::kByte || scalar_type == at::kChar ||
-        scalar_type == at::kShort || scalar_type == at::kInt || scalar_type == at::kLong) {
+    if (scalar_type == at::kByte || scalar_type == at::kChar || scalar_type == at::kShort || scalar_type == at::kInt ||
+        scalar_type == at::kLong) {
         return at::scalar_tensor(static_cast<int64_t>(value), options);
     }
     return at::scalar_tensor(value, options);
@@ -559,8 +676,8 @@ std::optional<int64_t> constant_int_value(const torch::jit::Value* value) {
     if (const auto size_value = static_size_value(value)) {
         return size_value;
     }
-    if ((node->kind() == kPrimNumToTensor || node->kind() == kAtenInt ||
-         node->kind() == kAtenDetach || node->kind() == kAtenScalarImplicit) &&
+    if ((node->kind() == kPrimNumToTensor || node->kind() == kAtenInt || node->kind() == kAtenDetach ||
+         node->kind() == kAtenScalarImplicit) &&
         node->inputs().size() == 1) {
         return constant_int_value(node->input(0));
     }
@@ -577,18 +694,15 @@ std::optional<int64_t> constant_int_value(const torch::jit::Value* value) {
             return -*inner;
         }
     }
-    if ((node->kind() == kAtenAdd || node->kind() == kAtenSub ||
-         node->kind() == kAtenRsub) && node->inputs().size() >= 2) {
+    if ((node->kind() == kAtenAdd || node->kind() == kAtenSub || node->kind() == kAtenRsub) &&
+        node->inputs().size() >= 2) {
         if (const auto result = fold_add_sub_with_alpha<int64_t>(node, constant_int_value)) {
             return result;
         }
     }
-    if (node->kind() == kAtenMul && node->inputs().size() == 2) {
-        const auto lhs = constant_int_value(node->input(0));
-        const auto rhs = constant_int_value(node->input(1));
-        if (lhs.has_value() && rhs.has_value()) {
-            return (*lhs) * (*rhs);
-        }
+    if (const auto product = fold_binary_constant_node<int64_t>(
+            node, kAtenMul, constant_int_value, [](const int64_t lhs, const int64_t rhs) { return lhs * rhs; })) {
+        return product;
     }
     if (node->kind() == kAtenDiv && node->inputs().size() >= 2 &&
         (node->inputs().size() == 2 || is_none_value(node->input(2)))) {
@@ -648,8 +762,8 @@ std::optional<double> constant_double_value(const torch::jit::Value* value) {
     if (const auto size_value = static_size_value(value)) {
         return static_cast<double>(*size_value);
     }
-    if ((node->kind() == kPrimNumToTensor || node->kind() == kAtenFloat ||
-         node->kind() == kAtenDetach || node->kind() == kAtenScalarImplicit) &&
+    if ((node->kind() == kPrimNumToTensor || node->kind() == kAtenFloat || node->kind() == kAtenDetach ||
+         node->kind() == kAtenScalarImplicit) &&
         node->inputs().size() == 1) {
         return constant_double_value(node->input(0));
     }
@@ -666,18 +780,15 @@ std::optional<double> constant_double_value(const torch::jit::Value* value) {
             return -*inner;
         }
     }
-    if ((node->kind() == kAtenAdd || node->kind() == kAtenSub ||
-         node->kind() == kAtenRsub) && node->inputs().size() >= 2) {
+    if ((node->kind() == kAtenAdd || node->kind() == kAtenSub || node->kind() == kAtenRsub) &&
+        node->inputs().size() >= 2) {
         if (const auto result = fold_add_sub_with_alpha<double>(node, constant_double_value)) {
             return result;
         }
     }
-    if (node->kind() == kAtenMul && node->inputs().size() == 2) {
-        const auto lhs = constant_double_value(node->input(0));
-        const auto rhs = constant_double_value(node->input(1));
-        if (lhs.has_value() && rhs.has_value()) {
-            return (*lhs) * (*rhs);
-        }
+    if (const auto product = fold_binary_constant_node<double>(
+            node, kAtenMul, constant_double_value, [](const double lhs, const double rhs) { return lhs * rhs; })) {
+        return product;
     }
     if (node->kind() == kAtenDiv && node->inputs().size() >= 2 &&
         (node->inputs().size() == 2 || is_none_value(node->input(2)))) {
@@ -887,22 +998,15 @@ std::optional<at::ScalarType> extract_target_scalar_type(const torch::jit::Node*
     return std::nullopt;
 }
 
-torch::jit::Value* create_constant_value(
-    torch::jit::Node* insert_before,
-    const at::Tensor& value) {
+torch::jit::Value* create_constant_value(torch::jit::Node* insert_before, const at::Tensor& value) {
     return create_onnx_constant_tensor(insert_before->owningGraph(), value, insert_before)->output();
 }
 
-torch::jit::Value* create_int64s_constant(
-    torch::jit::Node* insert_before,
-    const std::vector<int64_t>& values) {
+torch::jit::Value* create_int64s_constant(torch::jit::Node* insert_before, const std::vector<int64_t>& values) {
     return create_constant_value(insert_before, make_int64_tensor(values));
 }
 
-torch::jit::Value* create_scalar_constant(
-    torch::jit::Node* insert_before,
-    double value,
-    at::ScalarType scalar_type) {
+torch::jit::Value* create_scalar_constant(torch::jit::Node* insert_before, double value, at::ScalarType scalar_type) {
     return create_constant_value(insert_before, make_scalar_tensor(value, scalar_type));
 }
 
@@ -914,15 +1018,11 @@ torch::jit::Value* create_output_shape_constant(torch::jit::Node* node, const to
     return create_int64s_constant(node, *output_sizes);
 }
 
-torch::jit::Value* create_onnx_cast(
-    torch::jit::Node* insert_before,
-    torch::jit::Value* input,
-    at::ScalarType scalar_type);
+torch::jit::Value* create_onnx_cast(torch::jit::Node* insert_before, torch::jit::Value* input,
+                                    at::ScalarType scalar_type);
 
-torch::jit::Value* materialize_tensor_input(
-    torch::jit::Node* node,
-    torch::jit::Value* value,
-    at::ScalarType target_scalar_type) {
+torch::jit::Value* materialize_tensor_input(torch::jit::Node* node, torch::jit::Value* value,
+                                            at::ScalarType target_scalar_type) {
     if (value == nullptr) {
         throw_lowering_error(node, "encountered a null tensor input");
     }
@@ -952,10 +1052,8 @@ torch::jit::Value* materialize_tensor_input(
     if (const auto bool_value = constant_bool_value(value)) {
         return create_scalar_constant(node, *bool_value ? 1.0 : 0.0, target_scalar_type);
     }
-    if ((value->node()->kind() == kPrimNumToTensor ||
-         value->node()->kind() == kAtenDetach ||
-         value->node()->kind() == kAtenInt ||
-         value->node()->kind() == kAtenFloat) &&
+    if ((value->node()->kind() == kPrimNumToTensor || value->node()->kind() == kAtenDetach ||
+         value->node()->kind() == kAtenInt || value->node()->kind() == kAtenFloat) &&
         value->node()->inputs().size() == 1) {
         return materialize_tensor_input(node, value->node()->input(0), target_scalar_type);
     }
@@ -974,10 +1072,8 @@ torch::jit::Value* materialize_tensor_input(
     throw_lowering_error(node, message.str());
 }
 
-torch::jit::Value* create_onnx_cast(
-    torch::jit::Node* insert_before,
-    torch::jit::Value* input,
-    at::ScalarType scalar_type) {
+torch::jit::Value* create_onnx_cast(torch::jit::Node* insert_before, torch::jit::Value* input,
+                                    at::ScalarType scalar_type) {
     auto* cast = insert_before->owningGraph()->create(kOnnxCast, {input}, 1);
     cast->copyMetadata(insert_before);
     cast->i_(kAttrTo, onnx_tensor_data_type(scalar_type));
@@ -985,28 +1081,23 @@ torch::jit::Value* create_onnx_cast(
     return cast->output();
 }
 
-torch::jit::Value* reshape_value_to_output(
-    torch::jit::Node* node,
-    torch::jit::Value* input,
-    torch::jit::Value* output_template) {
-    auto* reshape = node->owningGraph()->create(kOnnxReshape, {input, create_output_shape_constant(node, output_template)}, 1);
+torch::jit::Value* reshape_value_to_output(torch::jit::Node* node, torch::jit::Value* input,
+                                           torch::jit::Value* output_template) {
+    auto* reshape =
+        node->owningGraph()->create(kOnnxReshape, {input, create_output_shape_constant(node, output_template)}, 1);
     reshape->copyMetadata(node);
     reshape->insertBefore(node);
     reshape->output()->copyMetadata(output_template);
     return reshape->output();
 }
 
-torch::jit::Value* create_constant_of_shape(
-    torch::jit::Node* node,
-    const at::Tensor& fill_value) {
+torch::jit::Value* create_constant_of_shape(torch::jit::Node* node, const at::Tensor& fill_value) {
     const auto output_sizes = value_tensor_sizes(node->output());
     if (!output_sizes.has_value()) {
         throw_lowering_error(node, "output tensor shape must be statically known");
     }
-    auto* constant_of_shape = node->owningGraph()->create(
-        kOnnxConstantOfShape,
-        {create_int64s_constant(node, *output_sizes)},
-        1);
+    auto* constant_of_shape =
+        node->owningGraph()->create(kOnnxConstantOfShape, {create_int64s_constant(node, *output_sizes)}, 1);
     constant_of_shape->copyMetadata(node);
     constant_of_shape->t_(kAttrValue, fill_value);
     constant_of_shape->insertBefore(node);
@@ -1029,17 +1120,17 @@ bool is_trivially_removable_prim_node(const torch::jit::Node* node) {
         return false;
     }
     switch (node->kind()) {
-    case c10::prim::Constant:
-    case c10::prim::ListConstruct:
-    case c10::prim::ListUnpack:
-    case c10::prim::TupleConstruct:
-    case c10::prim::TupleUnpack:
-    case c10::prim::DictConstruct:
-    case c10::prim::GetAttr:
-    case c10::prim::NumToTensor:
-        return true;
-    default:
-        return false;
+        case c10::prim::Constant:
+        case c10::prim::ListConstruct:
+        case c10::prim::ListUnpack:
+        case c10::prim::TupleConstruct:
+        case c10::prim::TupleUnpack:
+        case c10::prim::DictConstruct:
+        case c10::prim::GetAttr:
+        case c10::prim::NumToTensor:
+            return true;
+        default:
+            return false;
     }
 }
 
@@ -1055,12 +1146,12 @@ bool is_safe_to_erase_if_unused(const torch::jit::Node* node) {
         return false;
     }
     switch (op->aliasAnalysisKind()) {
-    case c10::AliasAnalysisKind::PURE_FUNCTION:
-    case c10::AliasAnalysisKind::FROM_SCHEMA:
-    case c10::AliasAnalysisKind::INTERNAL_SPECIAL_CASE:
-        return true;
-    case c10::AliasAnalysisKind::CONSERVATIVE:
-        return false;
+        case c10::AliasAnalysisKind::PURE_FUNCTION:
+        case c10::AliasAnalysisKind::FROM_SCHEMA:
+        case c10::AliasAnalysisKind::INTERNAL_SPECIAL_CASE:
+            return true;
+        case c10::AliasAnalysisKind::CONSERVATIVE:
+            return false;
     }
     return false;
 }
@@ -1224,12 +1315,10 @@ void topologically_sort_block(torch::jit::Block* block) {
             ready.push_back(node);
         }
     }
-    std::ranges::sort(
-        ready,
-        [&](const torch::jit::Node* lhs, const torch::jit::Node* rhs) {
-            return original_index.at(const_cast<torch::jit::Node*>(lhs)) <
-                   original_index.at(const_cast<torch::jit::Node*>(rhs));
-        });
+    std::ranges::sort(ready, [&](const torch::jit::Node* lhs, const torch::jit::Node* rhs) {
+        return original_index.at(const_cast<torch::jit::Node*>(lhs)) <
+               original_index.at(const_cast<torch::jit::Node*>(rhs));
+    });
 
     std::vector<torch::jit::Node*> sorted;
     sorted.reserve(nodes.size());
@@ -1247,14 +1336,11 @@ void topologically_sort_block(torch::jit::Block* block) {
             TORCH_INTERNAL_ASSERT(degree > 0);
             --degree;
             if (degree == 0) {
-                auto insert_it = std::upper_bound(
-                    ready.begin(),
-                    ready.end(),
-                    user,
-                    [&](const torch::jit::Node* lhs, const torch::jit::Node* rhs) {
-                        return original_index.at(const_cast<torch::jit::Node*>(lhs)) <
-                               original_index.at(const_cast<torch::jit::Node*>(rhs));
-                    });
+                auto insert_it = std::upper_bound(ready.begin(), ready.end(), user,
+                                                  [&](const torch::jit::Node* lhs, const torch::jit::Node* rhs) {
+                                                      return original_index.at(const_cast<torch::jit::Node*>(lhs)) <
+                                                             original_index.at(const_cast<torch::jit::Node*>(rhs));
+                                                  });
                 ready.insert(insert_it, user);
             }
         }
@@ -1269,9 +1355,7 @@ void topologically_sort_block(torch::jit::Block* block) {
     }
 }
 
-void collect_non_onnx_node_kinds(
-    const torch::jit::Block* block,
-    std::map<std::string, size_t>* counts) {
+void collect_non_onnx_node_kinds(const torch::jit::Block* block, std::map<std::string, size_t>* counts) {
     if (block == nullptr || counts == nullptr) {
         return;
     }
@@ -1308,9 +1392,8 @@ void validate_graph_is_onnx_only(const std::shared_ptr<torch::jit::Graph>& graph
 void lower_cast_like_node(torch::jit::Node* node) {
     const auto target_scalar_type = extract_target_scalar_type(node);
     if (!target_scalar_type.has_value()) {
-        throw std::runtime_error(
-            std::string("RF-DETR ONNX export requires a statically known target dtype for ") +
-            node->kind().toQualString());
+        throw std::runtime_error(std::string("RF-DETR ONNX export requires a statically known target dtype for ") +
+                                 node->kind().toQualString());
     }
 
     const auto input_scalar_type = value_scalar_type(node->input(0));
@@ -1346,8 +1429,8 @@ void lower_convolution_node(torch::jit::Node* node, const LoweringContext& conte
     const auto transposed = constant_bool_value(node->input(6));
     const auto output_padding = constant_int_list_value(node->input(7));
     const auto groups = constant_int_value(node->input(8));
-    if (!stride.has_value() || !padding.has_value() || !dilation.has_value() ||
-        !transposed.has_value() || !output_padding.has_value() || !groups.has_value()) {
+    if (!stride.has_value() || !padding.has_value() || !dilation.has_value() || !transposed.has_value() ||
+        !output_padding.has_value() || !groups.has_value()) {
         std::vector<std::string> missing;
         if (!stride.has_value()) {
             missing.emplace_back("stride");
@@ -1367,7 +1450,8 @@ void lower_convolution_node(torch::jit::Node* node, const LoweringContext& conte
         if (!groups.has_value()) {
             missing.emplace_back("groups");
         }
-        throw_lowering_error(node, format_missing_parameters("convolution parameters must be compile-time constants", missing));
+        throw_lowering_error(
+            node, format_missing_parameters("convolution parameters must be compile-time constants", missing));
     }
     if (*transposed) {
         throw_lowering_error(node, "transposed convolutions are not supported by the native exporter");
@@ -1433,9 +1517,7 @@ void lower_static_reshape_node(torch::jit::Node* node) {
         throw_lowering_error(node, "expected a single output");
     }
     auto* reshape = node->owningGraph()->create(
-        kOnnxReshape,
-        {node->input(0), create_output_shape_constant(node, node->output())},
-        1);
+        kOnnxReshape, {node->input(0), create_output_shape_constant(node, node->output())}, 1);
     replace_node_with(node, reshape);
 }
 
@@ -1538,12 +1620,9 @@ void lower_dropout_node(torch::jit::Node* node) {
     lower_passthrough_node(node);
 }
 
-torch::jit::Value* materialize_layer_norm_affine_input(
-    torch::jit::Node* node,
-    torch::jit::Value* value,
-    const std::vector<int64_t>& normalized_shape,
-    at::ScalarType scalar_type,
-    double fill_value) {
+torch::jit::Value* materialize_layer_norm_affine_input(torch::jit::Node* node, torch::jit::Value* value,
+                                                       const std::vector<int64_t>& normalized_shape,
+                                                       at::ScalarType scalar_type, double fill_value) {
     if (!is_none_value(value)) {
         return materialize_tensor_input(node, value, scalar_type);
     }
@@ -1556,15 +1635,13 @@ torch::jit::Value* materialize_layer_norm_affine_input(
     }
 
     at::Tensor tensor;
-    if (scalar_type == at::kBool || scalar_type == at::kByte || scalar_type == at::kChar ||
-        scalar_type == at::kShort || scalar_type == at::kInt || scalar_type == at::kLong) {
-        tensor = at::tensor(
-            std::vector<int64_t>(static_cast<size_t>(numel), static_cast<int64_t>(fill_value)),
-            at::TensorOptions().dtype(scalar_type));
+    if (scalar_type == at::kBool || scalar_type == at::kByte || scalar_type == at::kChar || scalar_type == at::kShort ||
+        scalar_type == at::kInt || scalar_type == at::kLong) {
+        tensor = at::tensor(std::vector<int64_t>(static_cast<size_t>(numel), static_cast<int64_t>(fill_value)),
+                            at::TensorOptions().dtype(scalar_type));
     } else {
-        tensor = at::tensor(
-            std::vector<double>(static_cast<size_t>(numel), fill_value),
-            at::TensorOptions().dtype(scalar_type));
+        tensor = at::tensor(std::vector<double>(static_cast<size_t>(numel), fill_value),
+                            at::TensorOptions().dtype(scalar_type));
     }
     return create_constant_value(node, tensor.reshape(normalized_shape));
 }
@@ -1597,13 +1674,11 @@ void lower_layer_norm_node(torch::jit::Node* node) {
     }
 
     const auto scalar_type =
-        value_scalar_type(node->input(0))
-            .value_or(value_scalar_type(node->output(0)).value_or(at::kFloat));
+        value_scalar_type(node->input(0)).value_or(value_scalar_type(node->output(0)).value_or(at::kFloat));
     const auto axis = static_cast<int64_t>(*input_rank - normalized_shape->size());
 
     std::vector<torch::jit::Value*> inputs{
-        node->input(0),
-        materialize_layer_norm_affine_input(node, node->input(2), *normalized_shape, scalar_type, 1.0),
+        node->input(0), materialize_layer_norm_affine_input(node, node->input(2), *normalized_shape, scalar_type, 1.0),
         materialize_layer_norm_affine_input(node, node->input(3), *normalized_shape, scalar_type, 0.0)};
 
     auto* layer_norm = node->owningGraph()->create(kOnnxLayerNormalization, inputs, node->outputs().size());
@@ -1659,10 +1734,8 @@ void lower_stack_node(torch::jit::Node* node) {
     std::vector<int64_t> unsqueezed_shape = *output_sizes;
     unsqueezed_shape[static_cast<size_t>(axis)] = 1;
     for (auto* tensor : *tensors) {
-        auto* reshape = node->owningGraph()->create(
-            kOnnxReshape,
-            {tensor, create_int64s_constant(node, unsqueezed_shape)},
-            1);
+        auto* reshape =
+            node->owningGraph()->create(kOnnxReshape, {tensor, create_int64s_constant(node, unsqueezed_shape)}, 1);
         reshape->copyMetadata(node);
         reshape->insertBefore(node);
         unsqueezed.push_back(reshape->output());
@@ -1674,10 +1747,8 @@ void lower_stack_node(torch::jit::Node* node) {
 }
 
 void lower_expand_node(torch::jit::Node* node) {
-    auto* expand = node->owningGraph()->create(
-        kOnnxExpand,
-        {node->input(0), create_output_shape_constant(node, node->output())},
-        1);
+    auto* expand = node->owningGraph()->create(kOnnxExpand,
+                                               {node->input(0), create_output_shape_constant(node, node->output())}, 1);
     replace_node_with(node, expand);
 }
 
@@ -1702,19 +1773,15 @@ void lower_repeat_node(torch::jit::Node* node) {
     if (normalized_repeats.size() > input_sizes->size()) {
         std::vector<int64_t> reshape_sizes(normalized_repeats.size() - input_sizes->size(), 1);
         reshape_sizes.insert(reshape_sizes.end(), input_sizes->begin(), input_sizes->end());
-        auto* reshape = node->owningGraph()->create(
-            kOnnxReshape,
-            {node->input(0), create_int64s_constant(node, reshape_sizes)},
-            1);
+        auto* reshape =
+            node->owningGraph()->create(kOnnxReshape, {node->input(0), create_int64s_constant(node, reshape_sizes)}, 1);
         reshape->copyMetadata(node);
         reshape->insertBefore(node);
         repeated_input = reshape->output();
     }
 
-    auto* tile = node->owningGraph()->create(
-        kOnnxTile,
-        {repeated_input, create_int64s_constant(node, normalized_repeats)},
-        1);
+    auto* tile =
+        node->owningGraph()->create(kOnnxTile, {repeated_input, create_int64s_constant(node, normalized_repeats)}, 1);
     replace_node_with(node, tile);
 }
 
@@ -1735,8 +1802,7 @@ void lower_softmax_node(torch::jit::Node* node) {
     torch::jit::Value* replacement = softmax->output();
     const auto output_scalar_type = value_scalar_type(node->output());
     const auto input_scalar_type = value_scalar_type(node->input(0));
-    if (output_scalar_type.has_value() && input_scalar_type.has_value() &&
-        *output_scalar_type != *input_scalar_type) {
+    if (output_scalar_type.has_value() && input_scalar_type.has_value() && *output_scalar_type != *input_scalar_type) {
         replacement = create_onnx_cast(node, softmax->output(), *output_scalar_type);
     }
     replace_node_with(node, replacement);
@@ -1757,9 +1823,7 @@ void lower_gelu_node(torch::jit::Node* node) {
     }
     const auto scalar_type = value_scalar_type(node->input(0)).value_or(at::kFloat);
     auto* div = node->owningGraph()->create(
-        kOnnxDiv,
-        {node->input(0), create_scalar_constant(node, std::numbers::sqrt2, scalar_type)},
-        1);
+        kOnnxDiv, {node->input(0), create_scalar_constant(node, std::numbers::sqrt2, scalar_type)}, 1);
     div->copyMetadata(node);
     div->insertBefore(node);
 
@@ -1767,17 +1831,13 @@ void lower_gelu_node(torch::jit::Node* node) {
     erf->copyMetadata(node);
     erf->insertAfter(div);
 
-    auto* add = node->owningGraph()->create(
-        kOnnxAdd,
-        {erf->output(), create_scalar_constant(node, 1.0, scalar_type)},
-        1);
+    auto* add =
+        node->owningGraph()->create(kOnnxAdd, {erf->output(), create_scalar_constant(node, 1.0, scalar_type)}, 1);
     add->copyMetadata(node);
     add->insertAfter(erf);
 
-    auto* half_mul = node->owningGraph()->create(
-        kOnnxMul,
-        {node->input(0), create_scalar_constant(node, 0.5, scalar_type)},
-        1);
+    auto* half_mul =
+        node->owningGraph()->create(kOnnxMul, {node->input(0), create_scalar_constant(node, 0.5, scalar_type)}, 1);
     half_mul->copyMetadata(node);
     half_mul->insertAfter(add);
 
@@ -1789,67 +1849,31 @@ void lower_gelu_node(torch::jit::Node* node) {
 
 void lower_clamp_min_node(torch::jit::Node* node) {
     const auto scalar_type = value_scalar_type(node->input(0)).value_or(at::kFloat);
-    auto* max = node->owningGraph()->create(
-        kOnnxMax,
-        {node->input(0), materialize_tensor_input(node, node->input(1), scalar_type)},
-        1);
-    replace_node_with(node, max);
+    const auto inputs = materialize_clamp_bound_inputs(node, 1, scalar_type);
+    replace_with_binary_onnx_node(node, kOnnxMax, inputs[0], inputs[1]);
+}
+
+void lower_clamp_max_node(torch::jit::Node* node) {
+    const auto scalar_type = value_scalar_type(node->input(0)).value_or(at::kFloat);
+    const auto inputs = materialize_clamp_bound_inputs(node, 1, scalar_type);
+    replace_with_binary_onnx_node(node, kOnnxMin, inputs[0], inputs[1]);
 }
 
 void lower_clamp_node(torch::jit::Node* node) {
     const auto scalar_type = value_scalar_type(node->input(0)).value_or(at::kFloat);
-    std::vector<torch::jit::Value*> inputs{node->input(0)};
-    if (!is_none_value(node->input(1))) {
-        inputs.push_back(materialize_tensor_input(node, node->input(1), scalar_type));
-    }
-    if (!is_none_value(node->input(2))) {
-        if (inputs.size() == 1) {
-            inputs.push_back(create_constant_value(
-                node,
-                at::tensor(std::vector<float>{}, at::TensorOptions().dtype(at::kFloat))));
-        }
-        inputs.push_back(materialize_tensor_input(node, node->input(2), scalar_type));
-    }
-    auto* clip = node->owningGraph()->create(kOnnxClip, inputs, 1);
+    auto* clip = node->owningGraph()->create(kOnnxClip, materialize_clip_inputs(node, scalar_type), 1);
     replace_node_with(node, clip);
 }
 
 void lower_binary_arithmetic_node(torch::jit::Node* node, c10::Symbol onnx_kind) {
-    const auto preferred_scalar_type =
-        value_scalar_type(node->input(0))
-            .value_or(value_scalar_type(node->output()).value_or(at::kFloat));
-    torch::jit::Value* lhs = materialize_tensor_input(node, node->input(0), preferred_scalar_type);
-    torch::jit::Value* rhs = materialize_tensor_input(node, node->input(1), preferred_scalar_type);
+    auto inputs = materialize_binary_inputs(node, node->output());
+    torch::jit::Value* lhs = inputs.lhs;
+    torch::jit::Value* rhs = inputs.rhs;
 
-    if ((node->kind() == kAtenAdd || node->kind() == kAtenSub) &&
-        node->inputs().size() == 3) {
-        const auto alpha = constant_double_value(node->input(2));
-        if (!alpha.has_value()) {
-            throw_lowering_error(node, "alpha must be a compile-time constant");
-        }
-        if (*alpha != 1.0) {
-            auto* scaled_rhs = node->owningGraph()->create(
-                kOnnxMul,
-                {rhs, create_scalar_constant(node, *alpha, preferred_scalar_type)},
-                1);
-            scaled_rhs->copyMetadata(node);
-            scaled_rhs->insertBefore(node);
-            rhs = scaled_rhs->output();
-        }
+    if ((node->kind() == kAtenAdd || node->kind() == kAtenSub) && node->inputs().size() == 3) {
+        rhs = scale_tensor_input_by_alpha(node, rhs, node->input(2), inputs.preferred_scalar_type);
     } else if (node->kind() == kAtenRsub && node->inputs().size() == 3) {
-        const auto alpha = constant_double_value(node->input(2));
-        if (!alpha.has_value()) {
-            throw_lowering_error(node, "alpha must be a compile-time constant");
-        }
-        if (*alpha != 1.0) {
-            auto* scaled_lhs = node->owningGraph()->create(
-                kOnnxMul,
-                {lhs, create_scalar_constant(node, *alpha, preferred_scalar_type)},
-                1);
-            scaled_lhs->copyMetadata(node);
-            scaled_lhs->insertBefore(node);
-            lhs = scaled_lhs->output();
-        }
+        lhs = scale_tensor_input_by_alpha(node, lhs, node->input(2), inputs.preferred_scalar_type);
     } else if (node->kind() == kAtenDiv && node->inputs().size() == 3) {
         if (!is_none_value(node->input(2))) {
             throw_lowering_error(node, "rounding_mode is not supported");
@@ -1860,44 +1884,21 @@ void lower_binary_arithmetic_node(torch::jit::Node* node, c10::Symbol onnx_kind)
         std::swap(lhs, rhs);
     }
 
-    auto* binary = node->owningGraph()->create(onnx_kind, {lhs, rhs}, 1);
-    replace_node_with(node, binary);
+    replace_with_binary_onnx_node(node, onnx_kind, lhs, rhs);
 }
 
 void lower_inplace_add_node(torch::jit::Node* node) {
     if (node->inputs().size() < 2 || node->inputs().size() > 3 || node->outputs().size() != 1) {
         throw_lowering_error(node, "expected add_(self, other[, alpha]) -> Tensor");
     }
-    const auto preferred_scalar_type =
-        value_scalar_type(node->input(0))
-            .value_or(value_scalar_type(node->output()).value_or(at::kFloat));
-    torch::jit::Value* lhs = materialize_tensor_input(node, node->input(0), preferred_scalar_type);
-    torch::jit::Value* rhs = materialize_tensor_input(node, node->input(1), preferred_scalar_type);
+    auto inputs = materialize_binary_inputs(node, node->output());
+    torch::jit::Value* rhs = inputs.rhs;
 
     if (node->inputs().size() == 3) {
-        const auto alpha = constant_double_value(node->input(2));
-        if (!alpha.has_value()) {
-            throw_lowering_error(node, "alpha must be a compile-time constant");
-        }
-        if (*alpha != 1.0) {
-            auto* scaled_rhs = node->owningGraph()->create(
-                kOnnxMul,
-                {rhs, create_scalar_constant(node, *alpha, preferred_scalar_type)},
-                1);
-            scaled_rhs->copyMetadata(node);
-            scaled_rhs->insertBefore(node);
-            rhs = scaled_rhs->output();
-        }
+        rhs = scale_tensor_input_by_alpha(node, rhs, node->input(2), inputs.preferred_scalar_type);
     }
 
-    auto* add = node->owningGraph()->create(kOnnxAdd, {lhs, rhs}, 1);
-    add->copyMetadata(node);
-    add->insertBefore(node);
-    add->output()->copyMetadata(node->output());
-
-    node->input(0)->replaceAllUsesAfterNodeWith(node, add->output());
-    node->output()->replaceAllUsesWith(add->output());
-    node->destroy();
+    replace_inplace_with_binary_onnx_node(node, kOnnxAdd, inputs.lhs, rhs);
 }
 
 void lower_arange_node(torch::jit::Node* node) {
@@ -1922,13 +1923,11 @@ void lower_arange_node(torch::jit::Node* node) {
     }
 
     const auto scalar_type = value_scalar_type(node->output()).value_or(at::kFloat);
-    torch::jit::Value* start = start_value != nullptr
-        ? materialize_tensor_input(node, start_value, scalar_type)
-        : create_scalar_constant(node, 0.0, scalar_type);
+    torch::jit::Value* start = start_value != nullptr ? materialize_tensor_input(node, start_value, scalar_type)
+                                                      : create_scalar_constant(node, 0.0, scalar_type);
     torch::jit::Value* limit = materialize_tensor_input(node, end_value, scalar_type);
-    torch::jit::Value* delta = step_value != nullptr
-        ? materialize_tensor_input(node, step_value, scalar_type)
-        : create_scalar_constant(node, 1.0, scalar_type);
+    torch::jit::Value* delta = step_value != nullptr ? materialize_tensor_input(node, step_value, scalar_type)
+                                                     : create_scalar_constant(node, 1.0, scalar_type);
 
     if (step_value != nullptr) {
         const auto step_const = constant_double_value(step_value);
@@ -1941,10 +1940,8 @@ void lower_arange_node(torch::jit::Node* node) {
     replace_node_with(node, range);
 }
 
-void lower_einsum_bchw_bnc_to_bnhw_node(
-    torch::jit::Node* node,
-    torch::jit::Value* spatial_features,
-    torch::jit::Value* query_features) {
+void lower_einsum_bchw_bnc_to_bnhw_node(torch::jit::Node* node, torch::jit::Value* spatial_features,
+                                        torch::jit::Value* query_features) {
     const auto spatial_sizes = value_tensor_sizes(spatial_features);
     const auto query_sizes = value_tensor_sizes(query_features);
     const auto output_sizes = value_tensor_sizes(node->output());
@@ -1963,8 +1960,8 @@ void lower_einsum_bchw_bnc_to_bnhw_node(
     if (batch != query_batch || channels != query_channels) {
         throw_lowering_error(node, "einsum bchw,bnc->bnhw requires matching batch and channel dimensions");
     }
-    if (output_sizes->at(0) != batch || output_sizes->at(1) != num_queries ||
-        output_sizes->at(2) != height || output_sizes->at(3) != width) {
+    if (output_sizes->at(0) != batch || output_sizes->at(1) != num_queries || output_sizes->at(2) != height ||
+        output_sizes->at(3) != width) {
         throw_lowering_error(node, "einsum output shape does not match statically inferred bnhw dimensions");
     }
 
@@ -1974,8 +1971,7 @@ void lower_einsum_bchw_bnc_to_bnhw_node(
     spatial_transpose->insertBefore(node);
 
     auto* spatial_flatten = node->owningGraph()->create(
-        kOnnxReshape,
-        {spatial_transpose->output(), create_int64s_constant(node, {batch, height * width, channels})},
+        kOnnxReshape, {spatial_transpose->output(), create_int64s_constant(node, {batch, height * width, channels})},
         1);
     spatial_flatten->copyMetadata(node);
     spatial_flatten->insertAfter(spatial_transpose);
@@ -1985,10 +1981,7 @@ void lower_einsum_bchw_bnc_to_bnhw_node(
     query_transpose->is_(kAttrPerm, std::vector<int64_t>{0, 2, 1});
     query_transpose->insertAfter(spatial_flatten);
 
-    auto* matmul = node->owningGraph()->create(
-        kOnnxMatMul,
-        {spatial_flatten->output(), query_transpose->output()},
-        1);
+    auto* matmul = node->owningGraph()->create(kOnnxMatMul, {spatial_flatten->output(), query_transpose->output()}, 1);
     matmul->copyMetadata(node);
     matmul->insertAfter(query_transpose);
 
@@ -1998,9 +1991,7 @@ void lower_einsum_bchw_bnc_to_bnhw_node(
     logits_transpose->insertAfter(matmul);
 
     auto* reshape = node->owningGraph()->create(
-        kOnnxReshape,
-        {logits_transpose->output(), create_output_shape_constant(node, node->output())},
-        1);
+        kOnnxReshape, {logits_transpose->output(), create_output_shape_constant(node, node->output())}, 1);
     reshape->copyMetadata(node);
     reshape->insertAfter(logits_transpose);
     replace_node_with(node, reshape->output());
@@ -2032,33 +2023,13 @@ void lower_einsum_node(torch::jit::Node* node) {
 }
 
 void lower_binary_comparison_node(torch::jit::Node* node, c10::Symbol onnx_kind) {
-    const auto preferred_scalar_type =
-        value_scalar_type(node->input(0))
-            .value_or(value_scalar_type(node->input(1)).value_or(at::kFloat));
-    auto* compare = node->owningGraph()->create(
-        onnx_kind,
-        {materialize_tensor_input(node, node->input(0), preferred_scalar_type),
-         materialize_tensor_input(node, node->input(1), preferred_scalar_type)},
-        1);
-    replace_node_with(node, compare);
+    const auto inputs = materialize_binary_inputs(node, node->input(1));
+    replace_with_binary_onnx_node(node, onnx_kind, inputs.lhs, inputs.rhs);
 }
 
 void lower_not_equal_node(torch::jit::Node* node) {
-    const auto preferred_scalar_type =
-        value_scalar_type(node->input(0))
-            .value_or(value_scalar_type(node->input(1)).value_or(at::kFloat));
-    auto* equal = node->owningGraph()->create(
-        kOnnxEqual,
-        {materialize_tensor_input(node, node->input(0), preferred_scalar_type),
-         materialize_tensor_input(node, node->input(1), preferred_scalar_type)},
-        1);
-    equal->copyMetadata(node);
-    equal->insertBefore(node);
-
-    auto* not_node = node->owningGraph()->create(kOnnxNot, {equal->output()}, 1);
-    not_node->copyMetadata(node);
-    not_node->insertAfter(equal);
-    replace_node_with(node, not_node->output());
+    const auto inputs = materialize_binary_inputs(node, node->input(1));
+    replace_node_with(node, create_negated_binary_comparison(node, kOnnxEqual, inputs.lhs, inputs.rhs));
 }
 
 bool is_explicit_bool_literal(const torch::jit::Value* value) {
@@ -2067,14 +2038,7 @@ bool is_explicit_bool_literal(const torch::jit::Value* value) {
     }
     const auto ivalue = torch::jit::toIValue(value);
     if (ivalue.has_value()) {
-        if (ivalue->isBool() || ivalue->isSymBool()) {
-            return true;
-        }
-        if (ivalue->isTensor()) {
-            const auto tensor = ivalue->toTensor();
-            return tensor.defined() && tensor.numel() == 1 && tensor.scalar_type() == at::kBool;
-        }
-        return false;
+        return is_bool_literal_value(*ivalue);
     }
     if (value == nullptr) {
         return false;
@@ -2084,14 +2048,7 @@ bool is_explicit_bool_literal(const torch::jit::Value* value) {
         return false;
     }
     if (node->kindOf(kAttrValue) == torch::jit::AttributeKind::ival) {
-        const auto& attr_value = node->ival(kAttrValue);
-        if (attr_value.isBool() || attr_value.isSymBool()) {
-            return true;
-        }
-        if (attr_value.isTensor()) {
-            const auto tensor = attr_value.toTensor();
-            return tensor.defined() && tensor.numel() == 1 && tensor.scalar_type() == at::kBool;
-        }
+        return is_bool_literal_value(node->ival(kAttrValue));
     }
     return false;
 }
@@ -2099,7 +2056,7 @@ bool is_explicit_bool_literal(const torch::jit::Value* value) {
 void ensure_bool_bitwise_operand(torch::jit::Node* node, torch::jit::Value* value, bool output_is_bool) {
     if (const auto scalar_type = resolved_scalar_type(value)) {
         if (*scalar_type != at::kBool) {
-            throw_lowering_error(node, "integer bitwise_and is not supported by the native exporter");
+            throw_integer_bitwise_and_unsupported(node);
         }
         return;
     }
@@ -2107,7 +2064,7 @@ void ensure_bool_bitwise_operand(torch::jit::Node* node, torch::jit::Value* valu
         return;
     }
     if (constant_int_value(value).has_value() || constant_double_value(value).has_value()) {
-        throw_lowering_error(node, "integer bitwise_and is not supported by the native exporter");
+        throw_integer_bitwise_and_unsupported(node);
     }
     if ((is_tensor_value(value) || constant_bool_value(value).has_value()) && output_is_bool) {
         return;
@@ -2115,49 +2072,45 @@ void ensure_bool_bitwise_operand(torch::jit::Node* node, torch::jit::Value* valu
     throw_lowering_error(node, "bitwise_and operand types must resolve to bool");
 }
 
-void lower_bool_and_node(torch::jit::Node* node) {
+bool resolved_bool_bitwise_output_is_bool(torch::jit::Node* node) {
+    const auto output_scalar_type = resolved_scalar_type(node->output());
+    if (output_scalar_type.has_value() && *output_scalar_type != at::kBool) {
+        throw_integer_bitwise_and_unsupported(node);
+    }
+    return !output_scalar_type.has_value() || *output_scalar_type == at::kBool;
+}
+
+std::array<torch::jit::Value*, 2> materialize_bool_bitwise_inputs(torch::jit::Node* node, const bool output_is_bool) {
+    std::array<torch::jit::Value*, 2> inputs{
+        node->input(0),
+        node->input(1),
+    };
+    for (auto*& input : inputs) {
+        ensure_bool_bitwise_operand(node, input, output_is_bool);
+        input = materialize_tensor_input(node, input, at::kBool);
+    }
+    return inputs;
+}
+
+torch::jit::Node* create_lowered_bool_and_node(torch::jit::Node* node) {
     if (node->inputs().size() != 2 || node->outputs().size() != 1) {
         throw_lowering_error(node, "expected bitwise/logical and with 2 inputs and 1 output");
     }
-    const auto output_scalar_type = resolved_scalar_type(node->output());
-    if (output_scalar_type.has_value() && *output_scalar_type != at::kBool) {
-        throw_lowering_error(node, "integer bitwise_and is not supported by the native exporter");
-    }
-    const bool output_is_bool = !output_scalar_type.has_value() || *output_scalar_type == at::kBool;
-    ensure_bool_bitwise_operand(node, node->input(0), output_is_bool);
-    ensure_bool_bitwise_operand(node, node->input(1), output_is_bool);
+    const auto inputs = materialize_bool_bitwise_inputs(node, resolved_bool_bitwise_output_is_bool(node));
 
-    auto* and_node = node->owningGraph()->create(
-        kOnnxAnd,
-        {materialize_tensor_input(node, node->input(0), at::kBool),
-         materialize_tensor_input(node, node->input(1), at::kBool)},
-        1);
-    replace_node_with(node, and_node);
+    return node->owningGraph()->create(kOnnxAnd, {inputs[0], inputs[1]}, 1);
+}
+
+void lower_bool_and_node(torch::jit::Node* node) {
+    replace_node_with(node, create_lowered_bool_and_node(node));
 }
 
 void lower_inplace_bool_and_node(torch::jit::Node* node) {
     if (node->inputs().size() != 2 || node->outputs().size() != 1) {
         throw_lowering_error(node, "expected bitwise_and_(self, other) -> Tensor");
     }
-    const auto output_scalar_type = resolved_scalar_type(node->output());
-    if (output_scalar_type.has_value() && *output_scalar_type != at::kBool) {
-        throw_lowering_error(node, "integer bitwise_and is not supported by the native exporter");
-    }
-    const bool output_is_bool = !output_scalar_type.has_value() || *output_scalar_type == at::kBool;
-    ensure_bool_bitwise_operand(node, node->input(0), output_is_bool);
-    ensure_bool_bitwise_operand(node, node->input(1), output_is_bool);
-
-    auto* and_node = node->owningGraph()->create(
-        kOnnxAnd,
-        {materialize_tensor_input(node, node->input(0), at::kBool),
-         materialize_tensor_input(node, node->input(1), at::kBool)},
-        1);
-    and_node->copyMetadata(node);
-    and_node->insertBefore(node);
-    and_node->output()->copyMetadata(node->output());
-    node->input(0)->replaceAllUsesAfterNodeWith(node, and_node->output());
-    node->output()->replaceAllUsesWith(and_node->output());
-    node->destroy();
+    auto* and_node = create_lowered_bool_and_node(node);
+    replace_inplace_node_with(node, and_node);
 }
 
 void lower_select_node(torch::jit::Node* node) {
@@ -2171,10 +2124,11 @@ void lower_select_node(torch::jit::Node* node) {
         throw_lowering_error(node, "select axis and index must be compile-time constants");
     }
 
-    auto* gather = node->owningGraph()->create(
-        kOnnxGather,
-        {node->input(0), create_constant_value(node, make_scalar_tensor(static_cast<double>(*index), at::kLong))},
-        1);
+    std::array<torch::jit::Value*, 2> gather_inputs{
+        node->input(0),
+        create_constant_value(node, make_scalar_tensor(static_cast<double>(*index), at::kLong)),
+    };
+    auto* gather = node->owningGraph()->create(kOnnxGather, gather_inputs, 1);
     gather->copyMetadata(node);
     gather->i_(kAttrAxis, normalize_axis(*dim, *input_rank, node));
     gather->insertBefore(node);
@@ -2186,21 +2140,32 @@ void lower_select_node(torch::jit::Node* node) {
     replace_node_with(node, replacement);
 }
 
-void lower_slice_like_node(
-    torch::jit::Node* node,
-    int64_t axis,
-    int64_t start,
-    int64_t end,
-    int64_t step) {
+void lower_slice_like_node(torch::jit::Node* node, int64_t axis, int64_t start, int64_t end, int64_t step) {
     auto* slice = node->owningGraph()->create(
         kOnnxSlice,
-        {node->input(0),
-         create_int64s_constant(node, {start}),
-         create_int64s_constant(node, {end}),
-         create_int64s_constant(node, {axis}),
-         create_int64s_constant(node, {step})},
+        {node->input(0), create_int64s_constant(node, {start}), create_int64s_constant(node, {end}),
+         create_int64s_constant(node, {axis}), create_int64s_constant(node, {step})},
         1);
     replace_node_with(node, slice);
+}
+
+struct TensorAxisResolution {
+    std::optional<int64_t> axis;
+    std::optional<std::vector<int64_t>> output_sizes;
+};
+
+TensorAxisResolution resolve_tensor_axis_from_dim(torch::jit::Node* node, const std::optional<int64_t> dim) {
+    auto input_rank = value_tensor_rank(node->input(0));
+    auto output_sizes = value_tensor_sizes(node->output());
+    if (!input_rank.has_value() && output_sizes.has_value()) {
+        input_rank = output_sizes->size();
+    }
+    std::optional<int64_t> axis;
+    if (dim.has_value()) {
+        axis = input_rank.has_value() ? std::optional<int64_t>(normalize_axis(*dim, *input_rank, node))
+                                      : (*dim >= 0 ? dim : std::nullopt);
+    }
+    return {axis, std::move(output_sizes)};
 }
 
 void lower_slice_node(torch::jit::Node* node) {
@@ -2208,24 +2173,10 @@ void lower_slice_node(torch::jit::Node* node) {
         throw_lowering_error(node, "expected 5 inputs");
     }
     const auto dim = constant_int_value(node->input(1));
-    auto step = is_none_value(node->input(4))
-        ? std::optional<int64_t>(1)
-        : constant_int_value(node->input(4));
+    auto step = is_none_value(node->input(4)) ? std::optional<int64_t>(1) : constant_int_value(node->input(4));
 
-    auto input_rank = value_tensor_rank(node->input(0));
-    const auto output_sizes = value_tensor_sizes(node->output());
-    if (!input_rank.has_value() && output_sizes.has_value()) {
-        input_rank = output_sizes->size();
-    }
-
-    std::optional<int64_t> axis;
-    if (dim.has_value()) {
-        if (input_rank.has_value()) {
-            axis = normalize_axis(*dim, *input_rank, node);
-        } else if (*dim >= 0) {
-            axis = dim;
-        }
-    }
+    const TensorAxisResolution axis_resolution = resolve_tensor_axis_from_dim(node, dim);
+    const std::optional<int64_t>& axis = axis_resolution.axis;
 
     if (!axis.has_value() || !step.has_value()) {
         std::vector<std::string> missing;
@@ -2235,23 +2186,17 @@ void lower_slice_node(torch::jit::Node* node) {
         if (!step.has_value()) {
             missing.emplace_back("step");
         }
-        throw_lowering_error(node, format_missing_parameters("slice axis and step must be compile-time constants", missing));
+        throw_lowering_error(node,
+                             format_missing_parameters("slice axis and step must be compile-time constants", missing));
     }
-    const auto start_value = is_none_value(node->input(2))
-        ? std::optional<int64_t>(0)
-        : constant_int_value(node->input(2));
-    const auto end_value = is_none_value(node->input(3))
-        ? std::optional<int64_t>(std::numeric_limits<int64_t>::max())
-        : constant_int_value(node->input(3));
+    const auto start_value =
+        is_none_value(node->input(2)) ? std::optional<int64_t>(0) : constant_int_value(node->input(2));
+    const auto end_value = is_none_value(node->input(3)) ? std::optional<int64_t>(std::numeric_limits<int64_t>::max())
+                                                         : constant_int_value(node->input(3));
     if (!start_value.has_value() || !end_value.has_value()) {
         throw_lowering_error(node, "slice start and end must be compile-time constants");
     }
-    lower_slice_like_node(
-        node,
-        *axis,
-        *start_value,
-        *end_value,
-        *step);
+    lower_slice_like_node(node, *axis, *start_value, *end_value, *step);
 }
 
 void lower_narrow_node(torch::jit::Node* node) {
@@ -2262,20 +2207,9 @@ void lower_narrow_node(torch::jit::Node* node) {
     const auto start = constant_int_value(node->input(2));
     auto length = constant_int_value(node->input(3));
 
-    const auto output_sizes = value_tensor_sizes(node->output());
-    auto input_rank = value_tensor_rank(node->input(0));
-    if (!input_rank.has_value() && output_sizes.has_value()) {
-        input_rank = output_sizes->size();
-    }
-
-    std::optional<int64_t> axis;
-    if (dim.has_value()) {
-        if (input_rank.has_value()) {
-            axis = normalize_axis(*dim, *input_rank, node);
-        } else if (*dim >= 0) {
-            axis = dim;
-        }
-    }
+    const TensorAxisResolution axis_resolution = resolve_tensor_axis_from_dim(node, dim);
+    const std::optional<int64_t>& axis = axis_resolution.axis;
+    const auto& output_sizes = axis_resolution.output_sizes;
 
     if (!length.has_value() && axis.has_value() && output_sizes.has_value() &&
         static_cast<size_t>(*axis) < output_sizes->size()) {
@@ -2293,14 +2227,10 @@ void lower_narrow_node(torch::jit::Node* node) {
         if (!length.has_value()) {
             missing.emplace_back("length");
         }
-        throw_lowering_error(node, format_missing_parameters("narrow parameters must be compile-time constants", missing));
+        throw_lowering_error(node,
+                             format_missing_parameters("narrow parameters must be compile-time constants", missing));
     }
-    lower_slice_like_node(
-        node,
-        *axis,
-        *start,
-        *start + *length,
-        1);
+    lower_slice_like_node(node, *axis, *start, *start + *length, 1);
 }
 
 void lower_gather_node(torch::jit::Node* node) {
@@ -2340,9 +2270,7 @@ void lower_masked_fill_node(torch::jit::Node* node) {
     }
 
     auto* where = node->owningGraph()->create(
-        kOnnxWhere,
-        {mask, materialize_tensor_input(node, node->input(2), data_scalar_type), node->input(0)},
-        1);
+        kOnnxWhere, {mask, materialize_tensor_input(node, node->input(2), data_scalar_type), node->input(0)}, 1);
     replace_node_with(node, where);
 }
 
@@ -2376,9 +2304,6 @@ bool extract_keepdim(const torch::jit::Node* node, bool default_value = false) {
     return constant_bool_value(node->input(2)).value_or(default_value);
 }
 
-// ── Reduce argument extraction ──────────────────────────────────────────────
-// Common 3-input pattern: input(0)=tensor, input(1)=dim, input(2)=keepdim.
-
 struct ReduceArgs {
     size_t input_rank;
     int64_t dim;
@@ -2390,8 +2315,7 @@ ReduceArgs extract_reduce_args(torch::jit::Node* node, const char* error_context
     const auto dim = constant_int_value(node->input(1));
     const auto keepdim = constant_bool_value(node->input(2));
     if (!input_rank.has_value() || !dim.has_value() || !keepdim.has_value()) {
-        throw_lowering_error(node,
-            std::format("{} parameters must be compile-time constants", error_context));
+        throw_lowering_error(node, std::format("{} parameters must be compile-time constants", error_context));
     }
     return {*input_rank, *dim, *keepdim};
 }
@@ -2404,8 +2328,7 @@ void lower_reduce_node(torch::jit::Node* node, c10::Symbol onnx_kind) {
     const auto output_scalar_type = value_scalar_type(node->output());
     const auto input_scalar_type = value_scalar_type(node->input(0));
     torch::jit::Value* reduce_input = node->input(0);
-    if (output_scalar_type.has_value() && input_scalar_type.has_value() &&
-        *output_scalar_type != *input_scalar_type) {
+    if (output_scalar_type.has_value() && input_scalar_type.has_value() && *output_scalar_type != *input_scalar_type) {
         reduce_input = create_onnx_cast(node, reduce_input, *output_scalar_type);
     }
 
@@ -2467,17 +2390,16 @@ void lower_cumsum_node(torch::jit::Node* node) {
     const auto output_scalar_type = value_scalar_type(node->output());
     const auto input_scalar_type = value_scalar_type(node->input(0));
     torch::jit::Value* input = node->input(0);
-    if (output_scalar_type.has_value() && input_scalar_type.has_value() &&
-        *output_scalar_type != *input_scalar_type) {
+    if (output_scalar_type.has_value() && input_scalar_type.has_value() && *output_scalar_type != *input_scalar_type) {
         input = create_onnx_cast(node, input, *output_scalar_type);
     }
 
-    auto* cumsum = node->owningGraph()->create(
-        kOnnxCumSum,
-        {input, create_constant_value(node, make_scalar_tensor(
-            static_cast<double>(normalize_axis(*dim, *input_rank, node)),
-            at::kLong))},
-        1);
+    std::array<torch::jit::Value*, 2> cumsum_inputs{
+        input,
+        create_constant_value(
+            node, make_scalar_tensor(static_cast<double>(normalize_axis(*dim, *input_rank, node)), at::kLong)),
+    };
+    auto* cumsum = node->owningGraph()->create(kOnnxCumSum, cumsum_inputs, 1);
     replace_node_with(node, cumsum);
 }
 
@@ -2501,14 +2423,10 @@ void lower_topk_node(torch::jit::Node* node) {
     const auto dim = constant_int_value(node->input(2));
     const auto largest = constant_bool_value(node->input(3));
     const auto sorted = constant_bool_value(node->input(4));
-    if (!input_rank.has_value() || !k.has_value() || !dim.has_value() ||
-        !largest.has_value() || !sorted.has_value()) {
+    if (!input_rank.has_value() || !k.has_value() || !dim.has_value() || !largest.has_value() || !sorted.has_value()) {
         throw_lowering_error(node, "topk parameters must be compile-time constants");
     }
-    auto* topk = node->owningGraph()->create(
-        kOnnxTopK,
-        {node->input(0), create_int64s_constant(node, {*k})},
-        2);
+    auto* topk = node->owningGraph()->create(kOnnxTopK, {node->input(0), create_int64s_constant(node, {*k})}, 2);
     topk->copyMetadata(node);
     topk->i_(kAttrAxis, normalize_axis(*dim, *input_rank, node));
     topk->i_(kAttrLargest, *largest ? 1 : 0);
@@ -2526,10 +2444,7 @@ void lower_max_reduce_node(torch::jit::Node* node) {
         throw_lowering_error(node, "expected 3 inputs and 2 outputs");
     }
     const auto [input_rank, dim, keepdim] = extract_reduce_args(node, "max reduction");
-    auto* topk = node->owningGraph()->create(
-        kOnnxTopK,
-        {node->input(0), create_int64s_constant(node, {1})},
-        2);
+    auto* topk = node->owningGraph()->create(kOnnxTopK, {node->input(0), create_int64s_constant(node, {1})}, 2);
     topk->copyMetadata(node);
     topk->i_(kAttrAxis, normalize_axis(dim, input_rank, node));
     topk->i_(kAttrLargest, 1);
@@ -2587,13 +2502,13 @@ void lower_resize_node(torch::jit::Node* node, std::string_view mode) {
         throw_lowering_error(node, "resize output tensor shape must be statically known");
     }
 
-    auto* resize = node->owningGraph()->create(
-        kOnnxResize,
-        {node->input(0),
-         create_constant_value(node, make_float_tensor({})),
-         create_constant_value(node, make_float_tensor({})),
-         create_int64s_constant(node, *output_sizes)},
-        1);
+    std::array<torch::jit::Value*, 4> resize_inputs{
+        node->input(0),
+        create_constant_value(node, make_float_tensor({})),
+        create_constant_value(node, make_float_tensor({})),
+        create_int64s_constant(node, *output_sizes),
+    };
+    auto* resize = node->owningGraph()->create(kOnnxResize, resize_inputs, 1);
     resize->copyMetadata(node);
     resize->s_(kAttrMode, std::string(mode));
     resize->s_(kAttrNearestMode, "floor");
@@ -2609,9 +2524,7 @@ void lower_resize_node(torch::jit::Node* node, std::string_view mode) {
             }
             align_corners = *align_corners_value;
         }
-        resize->s_(
-            kAttrCoordinateTransformationMode,
-            align_corners ? "align_corners" : "half_pixel");
+        resize->s_(kAttrCoordinateTransformationMode, align_corners ? "align_corners" : "half_pixel");
     }
 
     resize->insertBefore(node);
@@ -2634,9 +2547,7 @@ void lower_grid_sampler_node(torch::jit::Node* node) {
         throw_lowering_error(node, "unsupported grid_sampler mode enum " + std::to_string(*mode_enum));
     }
     if (*padding_mode_enum < 0 || static_cast<size_t>(*padding_mode_enum) >= kPaddingModeNames.size()) {
-        throw_lowering_error(
-            node,
-            "unsupported grid_sampler padding mode enum " + std::to_string(*padding_mode_enum));
+        throw_lowering_error(node, "unsupported grid_sampler padding mode enum " + std::to_string(*padding_mode_enum));
     }
 
     auto* grid_sample = node->owningGraph()->create(kOnnxGridSample, {node->input(0), node->input(1)}, 1);
@@ -2707,10 +2618,8 @@ void lower_scaled_dot_product_attention_node(torch::jit::Node* node) {
         scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
     }
     const auto scalar_type = value_scalar_type(node->input(0)).value_or(at::kFloat);
-    auto* scaled_scores = node->owningGraph()->create(
-        kOnnxMul,
-        {scores->output(), create_scalar_constant(node, scale, scalar_type)},
-        1);
+    auto* scaled_scores =
+        node->owningGraph()->create(kOnnxMul, {scores->output(), create_scalar_constant(node, scale, scalar_type)}, 1);
     scaled_scores->copyMetadata(node);
     scaled_scores->insertAfter(scores);
 
@@ -2725,10 +2634,7 @@ void lower_scaled_dot_product_attention_node(torch::jit::Node* node) {
     replace_node_with(node, output->output());
 }
 
-std::vector<int64_t> compute_split_sizes(
-    torch::jit::Node* producer,
-    size_t num_outputs,
-    int64_t dim_size) {
+std::vector<int64_t> compute_split_sizes(torch::jit::Node* producer, size_t num_outputs, int64_t dim_size) {
     if (producer->kind() == kAtenSplit) {
         if (const auto explicit_sizes = constant_int_list_value(producer->input(1))) {
             if (explicit_sizes->size() != num_outputs) {
@@ -2788,8 +2694,7 @@ void lower_split_list_unpack_node(torch::jit::Node* unpack_node) {
         return;
     }
     auto* producer = unpack_node->input(0)->node();
-    if (producer->kind() != kAtenSplit && producer->kind() != kAtenChunk &&
-        producer->kind() != kAtenUnbind) {
+    if (producer->kind() != kAtenSplit && producer->kind() != kAtenChunk && producer->kind() != kAtenUnbind) {
         return;
     }
     if (producer->output()->uses().size() != 1) {
@@ -2810,8 +2715,7 @@ void lower_split_list_unpack_node(torch::jit::Node* unpack_node) {
     const auto split_sizes = compute_split_sizes(producer, num_outputs, dim_size);
 
     auto* split = unpack_node->owningGraph()->create(
-        kOnnxSplit,
-        {producer->input(0), create_int64s_constant(unpack_node, split_sizes)},
+        kOnnxSplit, {producer->input(0), create_int64s_constant(unpack_node, split_sizes)},
         static_cast<size_t>(num_outputs));
     split->copyMetadata(unpack_node);
     split->i_(kAttrAxis, axis);
@@ -2819,10 +2723,8 @@ void lower_split_list_unpack_node(torch::jit::Node* unpack_node) {
     for (size_t i = 0; i < num_outputs; ++i) {
         torch::jit::Value* replacement = split->output(static_cast<size_t>(i));
         if (producer->kind() == kAtenUnbind) {
-            replacement = reshape_value_to_output(
-                unpack_node,
-                split->output(static_cast<size_t>(i)),
-                unpack_node->output(static_cast<size_t>(i)));
+            replacement = reshape_value_to_output(unpack_node, split->output(static_cast<size_t>(i)),
+                                                  unpack_node->output(static_cast<size_t>(i)));
         }
         replacement->copyMetadata(unpack_node->output(static_cast<size_t>(i)));
         unpack_node->output(static_cast<size_t>(i))->replaceAllUsesWith(replacement);
@@ -2831,7 +2733,116 @@ void lower_split_list_unpack_node(torch::jit::Node* unpack_node) {
     producer->destroy();
 }
 
+using LoweringFactory = void (*)(torch::jit::Node*, const LoweringContext&);
+
+#define MMLTK_LOWER_NODE(fn) [](torch::jit::Node* node, const LoweringContext&) { fn(node); }
+#define MMLTK_LOWER_CTX(fn) [](torch::jit::Node* node, const LoweringContext& context) { fn(node, context); }
+#define MMLTK_LOWER_SYMBOL(fn, symbol) [](torch::jit::Node* node, const LoweringContext&) { fn(node, symbol); }
+#define MMLTK_LOWER_CREATE(fill) [](torch::jit::Node* node, const LoweringContext&) { lower_creation_node(node, fill); }
+#define MMLTK_LOWER_RESIZE(mode) [](torch::jit::Node* node, const LoweringContext&) { lower_resize_node(node, mode); }
+
+const std::unordered_map<c10::Symbol, LoweringFactory>& onnx_lowering_factory() {
+    static const std::unordered_map<c10::Symbol, LoweringFactory> kFactory{
+        {kAtenTo, MMLTK_LOWER_NODE(lower_cast_like_node)},
+        {kAtenTypeAs, MMLTK_LOWER_NODE(lower_cast_like_node)},
+        {kAtenConvolution, MMLTK_LOWER_CTX(lower_convolution_node)},
+        {kAtenFlatten, MMLTK_LOWER_NODE(lower_static_reshape_node)},
+        {kAtenView, MMLTK_LOWER_NODE(lower_static_reshape_node)},
+        {kAtenReshape, MMLTK_LOWER_NODE(lower_static_reshape_node)},
+        {kAtenUnsqueeze, MMLTK_LOWER_NODE(lower_static_reshape_node)},
+        {kAtenSqueeze, MMLTK_LOWER_NODE(lower_static_reshape_node)},
+        {kAtenT, MMLTK_LOWER_NODE(lower_t_node)},
+        {kAtenTranspose, MMLTK_LOWER_NODE(lower_transpose_node)},
+        {kAtenPermute, MMLTK_LOWER_NODE(lower_permute_node)},
+        {kAtenContiguous, MMLTK_LOWER_NODE(lower_passthrough_node)},
+        {kAtenDetach, MMLTK_LOWER_NODE(lower_passthrough_node)},
+        {kAtenAlias, MMLTK_LOWER_NODE(lower_passthrough_node)},
+        {kAtenCat, MMLTK_LOWER_NODE(lower_cat_node)},
+        {kAtenStack, MMLTK_LOWER_NODE(lower_stack_node)},
+        {kAtenExpand, MMLTK_LOWER_NODE(lower_expand_node)},
+        {kAtenRepeat, MMLTK_LOWER_NODE(lower_repeat_node)},
+        {kAtenSoftmax, MMLTK_LOWER_NODE(lower_softmax_node)},
+        {kAtenSigmoid, MMLTK_LOWER_SYMBOL(lower_unary_node, kOnnxSigmoid)},
+        {kAtenRelu, MMLTK_LOWER_SYMBOL(lower_unary_node, kOnnxRelu)},
+        {kAtenTanh, MMLTK_LOWER_SYMBOL(lower_unary_node, kOnnxTanh)},
+        {kAtenDropout, MMLTK_LOWER_NODE(lower_dropout_node)},
+        {kAtenLayerNorm, MMLTK_LOWER_NODE(lower_layer_norm_node)},
+        {kAtenNativeLayerNorm, MMLTK_LOWER_NODE(lower_layer_norm_node)},
+        {kAtenSin, MMLTK_LOWER_SYMBOL(lower_unary_node, kOnnxSin)},
+        {kAtenCos, MMLTK_LOWER_SYMBOL(lower_unary_node, kOnnxCos)},
+        {kAtenExp, MMLTK_LOWER_SYMBOL(lower_unary_node, kOnnxExp)},
+        {kAtenLog, MMLTK_LOWER_SYMBOL(lower_unary_node, kOnnxLog)},
+        {kAtenAbs, MMLTK_LOWER_SYMBOL(lower_unary_node, kOnnxAbs)},
+        {kAtenFloor, MMLTK_LOWER_SYMBOL(lower_unary_node, kOnnxFloor)},
+        {kAtenGelu, MMLTK_LOWER_NODE(lower_gelu_node)},
+        {kAtenClampMin, MMLTK_LOWER_NODE(lower_clamp_min_node)},
+        {kAtenClampMax, MMLTK_LOWER_NODE(lower_clamp_max_node)},
+        {kAtenClamp, MMLTK_LOWER_NODE(lower_clamp_node)},
+        {kAtenAdd, MMLTK_LOWER_SYMBOL(lower_binary_arithmetic_node, kOnnxAdd)},
+        {kAtenAddInplace, MMLTK_LOWER_NODE(lower_inplace_add_node)},
+        {kAtenSub, MMLTK_LOWER_SYMBOL(lower_binary_arithmetic_node, kOnnxSub)},
+        {kAtenRsub, MMLTK_LOWER_SYMBOL(lower_binary_arithmetic_node, kOnnxSub)},
+        {kAtenMul, MMLTK_LOWER_SYMBOL(lower_binary_arithmetic_node, kOnnxMul)},
+        {kAtenDiv, MMLTK_LOWER_SYMBOL(lower_binary_arithmetic_node, kOnnxDiv)},
+        {kAtenPow, MMLTK_LOWER_SYMBOL(lower_binary_arithmetic_node, kOnnxPow)},
+        {kAtenGt, MMLTK_LOWER_SYMBOL(lower_binary_comparison_node, kOnnxGreater)},
+        {kAtenLt, MMLTK_LOWER_SYMBOL(lower_binary_comparison_node, kOnnxLess)},
+        {kAtenGe, MMLTK_LOWER_SYMBOL(lower_binary_comparison_node, kOnnxGreaterOrEqual)},
+        {kAtenLe, MMLTK_LOWER_SYMBOL(lower_binary_comparison_node, kOnnxLessOrEqual)},
+        {kAtenEq, MMLTK_LOWER_SYMBOL(lower_binary_comparison_node, kOnnxEqual)},
+        {kAtenNe, MMLTK_LOWER_NODE(lower_not_equal_node)},
+        {kAtenAnd, MMLTK_LOWER_NODE(lower_bool_and_node)},
+        {kAtenBitwiseAnd, MMLTK_LOWER_NODE(lower_bool_and_node)},
+        {kAtenBitwiseAndInplace, MMLTK_LOWER_NODE(lower_inplace_bool_and_node)},
+        {kAtenLogicalNot, MMLTK_LOWER_SYMBOL(lower_unary_node, kOnnxNot)},
+        {kAtenBitwiseNot, MMLTK_LOWER_SYMBOL(lower_unary_node, kOnnxNot)},
+        {kAtenSlice, MMLTK_LOWER_NODE(lower_slice_node)},
+        {kAtenSelect, MMLTK_LOWER_NODE(lower_select_node)},
+        {kAtenNarrow, MMLTK_LOWER_NODE(lower_narrow_node)},
+        {kAtenGather, MMLTK_LOWER_NODE(lower_gather_node)},
+        {kAtenIndexSelect, MMLTK_LOWER_NODE(lower_index_select_node)},
+        {kAtenMaskedFill, MMLTK_LOWER_NODE(lower_masked_fill_node)},
+        {kAtenArange, MMLTK_LOWER_NODE(lower_arange_node)},
+        {kAtenEinsum, MMLTK_LOWER_NODE(lower_einsum_node)},
+        {kAtenSum, MMLTK_LOWER_SYMBOL(lower_reduce_node, kOnnxReduceSum)},
+        {kAtenMean, MMLTK_LOWER_SYMBOL(lower_reduce_node, kOnnxReduceMean)},
+        {kAtenProd, MMLTK_LOWER_SYMBOL(lower_reduce_node, kOnnxReduceProd)},
+        {kAtenAll, MMLTK_LOWER_NODE(lower_all_node)},
+        {kAtenCumsum, MMLTK_LOWER_NODE(lower_cumsum_node)},
+        {kAtenArgmax, MMLTK_LOWER_NODE(lower_argmax_node)},
+        {kAtenTopk, MMLTK_LOWER_NODE(lower_topk_node)},
+        {kAtenMax,
+         [](torch::jit::Node* node, const LoweringContext&) {
+             if (node->outputs().size() == 2) {
+                 lower_max_reduce_node(node);
+             }
+         }},
+        {kAtenMatmul, MMLTK_LOWER_NODE(lower_matmul_node)},
+        {kAtenBmm, MMLTK_LOWER_NODE(lower_matmul_node)},
+        {kAtenOnesLike, MMLTK_LOWER_CREATE(1.0)},
+        {kAtenNewOnes, MMLTK_LOWER_CREATE(1.0)},
+        {kAtenOnes, MMLTK_LOWER_CREATE(1.0)},
+        {kAtenZerosLike, MMLTK_LOWER_CREATE(0.0)},
+        {kAtenNewZeros, MMLTK_LOWER_CREATE(0.0)},
+        {kAtenZeros, MMLTK_LOWER_CREATE(0.0)},
+        {kAtenFullLike, MMLTK_LOWER_NODE(lower_full_like_node)},
+        {kAtenFull, MMLTK_LOWER_NODE(lower_full_node)},
+        {kAtenUpsampleNearest2d, MMLTK_LOWER_RESIZE("nearest")},
+        {kAtenUpsampleBilinear2d, MMLTK_LOWER_RESIZE("linear")},
+        {kAtenGridSampler, MMLTK_LOWER_NODE(lower_grid_sampler_node)},
+        {kAtenScaledDotProductAttention, MMLTK_LOWER_NODE(lower_scaled_dot_product_attention_node)},
+    };
+    return kFactory;
+}
+
+#undef MMLTK_LOWER_RESIZE
+#undef MMLTK_LOWER_CREATE
+#undef MMLTK_LOWER_SYMBOL
+#undef MMLTK_LOWER_CTX
+#undef MMLTK_LOWER_NODE
+
 void lower_block_for_onnx_export(torch::jit::Block* block, const LoweringContext& context) {
+    const auto& factory = onnx_lowering_factory();
     for (auto it = block->nodes().begin(); it != block->nodes().end();) {
         torch::jit::Node* node = *it;
         ++it;
@@ -2845,187 +2856,52 @@ void lower_block_for_onnx_export(torch::jit::Block* block, const LoweringContext
             continue;
         }
 
-        if (node->kind() == kAtenTo || node->kind() == kAtenTypeAs) {
-            lower_cast_like_node(node);
-        } else if (node->kind() == kAtenConvolution) {
-            lower_convolution_node(node, context);
-        } else if (node->kind() == kAtenFlatten || node->kind() == kAtenView ||
-                   node->kind() == kAtenReshape || node->kind() == kAtenUnsqueeze ||
-                   node->kind() == kAtenSqueeze) {
-            lower_static_reshape_node(node);
-        } else if (node->kind() == kAtenT) {
-            lower_t_node(node);
-        } else if (node->kind() == kAtenTranspose) {
-            lower_transpose_node(node);
-        } else if (node->kind() == kAtenPermute) {
-            lower_permute_node(node);
-        } else if (node->kind() == kAtenContiguous || node->kind() == kAtenDetach ||
-                   node->kind() == kAtenAlias) {
-            lower_passthrough_node(node);
-        } else if (node->kind() == kAtenCat) {
-            lower_cat_node(node);
-        } else if (node->kind() == kAtenStack) {
-            lower_stack_node(node);
-        } else if (node->kind() == kAtenExpand) {
-            lower_expand_node(node);
-        } else if (node->kind() == kAtenRepeat) {
-            lower_repeat_node(node);
-        } else if (node->kind() == kAtenSoftmax) {
-            lower_softmax_node(node);
-        } else if (node->kind() == kAtenSigmoid) {
-            lower_unary_node(node, kOnnxSigmoid);
-        } else if (node->kind() == kAtenRelu) {
-            lower_unary_node(node, kOnnxRelu);
-        } else if (node->kind() == kAtenTanh) {
-            lower_unary_node(node, kOnnxTanh);
-        } else if (node->kind() == kAtenDropout) {
-            lower_dropout_node(node);
-        } else if (node->kind() == kAtenLayerNorm || node->kind() == kAtenNativeLayerNorm) {
-            lower_layer_norm_node(node);
-        } else if (node->kind() == kAtenSin) {
-            lower_unary_node(node, kOnnxSin);
-        } else if (node->kind() == kAtenCos) {
-            lower_unary_node(node, kOnnxCos);
-        } else if (node->kind() == kAtenExp) {
-            lower_unary_node(node, kOnnxExp);
-        } else if (node->kind() == kAtenLog) {
-            lower_unary_node(node, kOnnxLog);
-        } else if (node->kind() == kAtenAbs) {
-            lower_unary_node(node, kOnnxAbs);
-        } else if (node->kind() == kAtenFloor) {
-            lower_unary_node(node, kOnnxFloor);
-        } else if (node->kind() == kAtenGelu) {
-            lower_gelu_node(node);
-        } else if (node->kind() == kAtenClampMin) {
-            lower_clamp_min_node(node);
-        } else if (node->kind() == kAtenClamp) {
-            lower_clamp_node(node);
-        } else if (node->kind() == kAtenAdd) {
-            lower_binary_arithmetic_node(node, kOnnxAdd);
-        } else if (node->kind() == kAtenAddInplace) {
-            lower_inplace_add_node(node);
-        } else if (node->kind() == kAtenSub || node->kind() == kAtenRsub) {
-            lower_binary_arithmetic_node(node, kOnnxSub);
-        } else if (node->kind() == kAtenMul) {
-            lower_binary_arithmetic_node(node, kOnnxMul);
-        } else if (node->kind() == kAtenDiv) {
-            lower_binary_arithmetic_node(node, kOnnxDiv);
-        } else if (node->kind() == kAtenPow) {
-            lower_binary_arithmetic_node(node, kOnnxPow);
-        } else if (node->kind() == kAtenGt) {
-            lower_binary_comparison_node(node, kOnnxGreater);
-        } else if (node->kind() == kAtenLt) {
-            lower_binary_comparison_node(node, kOnnxLess);
-        } else if (node->kind() == kAtenGe) {
-            lower_binary_comparison_node(node, kOnnxGreaterOrEqual);
-        } else if (node->kind() == kAtenLe) {
-            lower_binary_comparison_node(node, kOnnxLessOrEqual);
-        } else if (node->kind() == kAtenEq) {
-            lower_binary_comparison_node(node, kOnnxEqual);
-        } else if (node->kind() == kAtenNe) {
-            lower_not_equal_node(node);
-        } else if (node->kind() == kAtenAnd || node->kind() == kAtenBitwiseAnd) {
-            lower_bool_and_node(node);
-        } else if (node->kind() == kAtenBitwiseAndInplace) {
-            lower_inplace_bool_and_node(node);
-        } else if (node->kind() == kAtenLogicalNot || node->kind() == kAtenBitwiseNot) {
-            lower_unary_node(node, kOnnxNot);
-        } else if (node->kind() == kAtenSlice) {
-            lower_slice_node(node);
-        } else if (node->kind() == kAtenSelect) {
-            lower_select_node(node);
-        } else if (node->kind() == kAtenNarrow) {
-            lower_narrow_node(node);
-        } else if (node->kind() == kAtenGather) {
-            lower_gather_node(node);
-        } else if (node->kind() == kAtenIndexSelect) {
-            lower_index_select_node(node);
-        } else if (node->kind() == kAtenMaskedFill) {
-            lower_masked_fill_node(node);
-        } else if (node->kind() == kAtenArange) {
-            lower_arange_node(node);
-        } else if (node->kind() == kAtenEinsum) {
-            lower_einsum_node(node);
-        } else if (node->kind() == kAtenSum) {
-            lower_reduce_node(node, kOnnxReduceSum);
-        } else if (node->kind() == kAtenMean) {
-            lower_reduce_node(node, kOnnxReduceMean);
-        } else if (node->kind() == kAtenProd) {
-            lower_reduce_node(node, kOnnxReduceProd);
-        } else if (node->kind() == kAtenAll) {
-            lower_all_node(node);
-        } else if (node->kind() == kAtenCumsum) {
-            lower_cumsum_node(node);
-        } else if (node->kind() == kAtenArgmax) {
-            lower_argmax_node(node);
-        } else if (node->kind() == kAtenTopk) {
-            lower_topk_node(node);
-        } else if (node->kind() == kAtenMax && node->outputs().size() == 2) {
-            lower_max_reduce_node(node);
-        } else if (node->kind() == kAtenMatmul || node->kind() == kAtenBmm) {
-            lower_matmul_node(node);
-        } else if (node->kind() == kAtenOnesLike || node->kind() == kAtenNewOnes || node->kind() == kAtenOnes) {
-            lower_creation_node(node, 1.0);
-        } else if (node->kind() == kAtenZerosLike || node->kind() == kAtenNewZeros || node->kind() == kAtenZeros) {
-            lower_creation_node(node, 0.0);
-        } else if (node->kind() == kAtenFullLike) {
-            lower_full_like_node(node);
-        } else if (node->kind() == kAtenFull) {
-            lower_full_node(node);
-        } else if (node->kind() == kAtenUpsampleNearest2d) {
-            lower_resize_node(node, "nearest");
-        } else if (node->kind() == kAtenUpsampleBilinear2d) {
-            lower_resize_node(node, "linear");
-        } else if (node->kind() == kAtenGridSampler) {
-            lower_grid_sampler_node(node);
-        } else if (node->kind() == kAtenScaledDotProductAttention) {
-            lower_scaled_dot_product_attention_node(node);
+        if (const auto factory_it = factory.find(node->kind()); factory_it != factory.end()) {
+            factory_it->second(node, context);
         }
     }
 }
 
-} // namespace
+}  // namespace
 
 int onnx_tensor_data_type(at::ScalarType scalar_type) {
     switch (scalar_type) {
-    case at::kFloat:
-        return kOnnxTensorProtoFloat;
-    case at::kHalf:
-        return kOnnxTensorProtoFloat16;
-    case at::kBFloat16:
-        return kOnnxTensorProtoBfloat16;
-    case at::kDouble:
-        return kOnnxTensorProtoDouble;
-    case at::kBool:
-        return kOnnxTensorProtoBool;
-    case at::kByte:
-        return kOnnxTensorProtoUint8;
-    case at::kChar:
-        return kOnnxTensorProtoInt8;
-    case at::kShort:
-        return kOnnxTensorProtoInt16;
-    case at::kInt:
-        return kOnnxTensorProtoInt32;
-    case at::kLong:
-        return kOnnxTensorProtoInt64;
-    default:
-        throw std::runtime_error(
-            std::string("RF-DETR ONNX export does not support dtype ") + scalar_type_name(scalar_type));
+        case at::kFloat:
+            return kOnnxTensorProtoFloat;
+        case at::kHalf:
+            return kOnnxTensorProtoFloat16;
+        case at::kBFloat16:
+            return kOnnxTensorProtoBfloat16;
+        case at::kDouble:
+            return kOnnxTensorProtoDouble;
+        case at::kBool:
+            return kOnnxTensorProtoBool;
+        case at::kByte:
+            return kOnnxTensorProtoUint8;
+        case at::kChar:
+            return kOnnxTensorProtoInt8;
+        case at::kShort:
+            return kOnnxTensorProtoInt16;
+        case at::kInt:
+            return kOnnxTensorProtoInt32;
+        case at::kLong:
+            return kOnnxTensorProtoInt64;
+        default:
+            throw std::runtime_error(std::string("RF-DETR ONNX export does not support dtype ") +
+                                     scalar_type_name(scalar_type));
     }
 }
 
 void validate_supported_onnx_export_opset(int opset_version) {
     if (opset_version != kSupportedOnnxExportOpsetVersion) {
-        throw std::runtime_error(
-            std::string("RF-DETR native ONNX export only supports opset ") +
-            std::to_string(kSupportedOnnxExportOpsetVersion) +
-            ", got " + std::to_string(opset_version));
+        throw std::runtime_error(std::string("RF-DETR native ONNX export only supports opset ") +
+                                 std::to_string(kSupportedOnnxExportOpsetVersion) + ", got " +
+                                 std::to_string(opset_version));
     }
 }
 
-void lower_graph_for_onnx_export(
-    const std::shared_ptr<torch::jit::Graph>& graph,
-    const OnnxInitializerMap* initializers) {
+void lower_graph_for_onnx_export(const std::shared_ptr<torch::jit::Graph>& graph,
+                                 const OnnxInitializerMap* initializers) {
     if (graph == nullptr) {
         throw std::runtime_error("RF-DETR ONNX export requires a valid TorchScript graph");
     }
@@ -3039,4 +2915,4 @@ void lower_graph_for_onnx_export(
     validate_graph_is_onnx_only(graph);
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

@@ -43,27 +43,19 @@ std::string join_cpu_list(const std::vector<int>& cpus) {
     return value;
 }
 
-} // namespace
+}  // namespace
 
-RuntimeConfig resolve_runtime_config(int requested_workers,
-                                     int requested_lanes,
+RuntimeConfig resolve_runtime_config(int requested_workers, int requested_lanes,
                                      const std::string& cpu_affinity_value) {
     RuntimeConfig config;
     config.cpu_affinity =
-        cpu_affinity_value.empty() ? mmltk::allowed_cpu_set()
-                                   : mmltk::resolve_cpu_affinity(cpu_affinity_value);
+        cpu_affinity_value.empty() ? mmltk::allowed_cpu_set() : mmltk::resolve_cpu_affinity(cpu_affinity_value);
     const int available_workers = static_cast<int>(std::max<size_t>(config.cpu_affinity.size(), 1));
     const int default_workers = available_workers;
     const int requested_total = clamp_positive(requested_workers, std::max(1, default_workers));
     if (available_workers >= 3) {
-        config.workers =
-            mmltk::clamp_worker_count_to_cpus(requested_total, config.cpu_affinity.size(), 0, 3);
-        mmltk::log_worker_budget_clamp("rfdetr.runtime",
-                                            requested_total,
-                                            config.workers,
-                                            config.cpu_affinity,
-                                            0,
-                                            3);
+        config.workers = mmltk::clamp_worker_count_to_cpus(requested_total, config.cpu_affinity.size(), 0, 3);
+        mmltk::log_worker_budget_clamp("rfdetr.runtime", requested_total, config.workers, config.cpu_affinity, 0, 3);
     } else {
         config.workers = std::max(3, requested_total);
         mmltk::logging::logger("exec")->warn(
@@ -95,9 +87,7 @@ RuntimeSplit split_runtime_workers(const RuntimeConfig& config) {
     return split;
 }
 
-RuntimeContext::RuntimeContext(const RuntimeConfig& config)
-    : config_(config),
-      split_(split_runtime_workers(config)) {
+RuntimeContext::RuntimeContext(const RuntimeConfig& config) : config_(config), split_(split_runtime_workers(config)) {
     at::globalContext().setAllowTF32CuDNN(false);
     at::globalContext().setAllowTF32CuBLAS(false);
     at::globalContext().setFlushDenormal(false);
@@ -119,10 +109,7 @@ RuntimeContext::RuntimeContext(const RuntimeConfig& config)
     if (cpu_cpus_.empty()) {
         cpu_cpus_ = config_.cpu_affinity;
     }
-    cpu_pool_ = std::make_shared<mmltk::WorkerPool>(
-        static_cast<size_t>(split_.cpu_threads),
-        cpu_cpus_,
-        "rfdetrcpu");
+    cpu_pool_ = std::make_shared<mmltk::WorkerPool>(static_cast<size_t>(split_.cpu_threads), cpu_cpus_, "rfdetrcpu");
 }
 
 std::string RuntimeContext::loader_affinity_string() const {
@@ -137,4 +124,4 @@ std::string RuntimeContext::cpu_affinity_string() const {
     return join_cpu_list(cpu_cpus_);
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

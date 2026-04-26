@@ -33,21 +33,17 @@ std::optional<AnnotationBox> bbox_from_points(const std::vector<AnnotationPoint>
     };
 }
 
-AnnotationBox clamp_capture_box(AnnotationBox box,
-                                const std::uint32_t capture_width,
+AnnotationBox clamp_capture_box(AnnotationBox box, const std::uint32_t capture_width,
                                 const std::uint32_t capture_height) {
-    const int max_width = static_cast<int>(capture_width);
-    const int max_height = static_cast<int>(capture_height);
-    box.x1 = std::clamp(box.x1, 0, max_width);
-    box.x2 = std::clamp(box.x2, 0, max_width);
-    box.y1 = std::clamp(box.y1, 0, max_height);
-    box.y2 = std::clamp(box.y2, 0, max_height);
-    if (box.x2 < box.x1) {
-        std::swap(box.x1, box.x2);
-    }
-    if (box.y2 < box.y1) {
-        std::swap(box.y1, box.y2);
-    }
+    const auto clamp_axis = [](int& low, int& high, const int max_value) {
+        low = std::clamp(low, 0, max_value);
+        high = std::clamp(high, 0, max_value);
+        if (high < low) {
+            std::swap(low, high);
+        }
+    };
+    clamp_axis(box.x1, box.x2, static_cast<int>(capture_width));
+    clamp_axis(box.y1, box.y2, static_cast<int>(capture_height));
     return box;
 }
 
@@ -56,11 +52,98 @@ bool box_has_area(const AnnotationBox& box) {
 }
 
 bool boxes_equal(const AnnotationBox& lhs, const AnnotationBox& rhs) {
-    return lhs.x1 == rhs.x1 &&
-           lhs.y1 == rhs.y1 &&
-           lhs.x2 == rhs.x2 &&
-           lhs.y2 == rhs.y2;
+    return lhs.x1 == rhs.x1 && lhs.y1 == rhs.y1 && lhs.x2 == rhs.x2 && lhs.y2 == rhs.y2;
 }
+
+std::pair<int, int> clamped_box_offset(const AnnotationBox& box, const int dx, const int dy,
+                                       const std::uint32_t capture_width, const std::uint32_t capture_height) {
+    const int box_width = std::max(0, box.x2 - box.x1);
+    const int box_height = std::max(0, box.y2 - box.y1);
+    const int max_x1 = std::max(0, static_cast<int>(capture_width) - box_width);
+    const int max_y1 = std::max(0, static_cast<int>(capture_height) - box_height);
+    const int next_x1 = std::clamp(box.x1 + dx, 0, max_x1);
+    const int next_y1 = std::clamp(box.y1 + dy, 0, max_y1);
+    return {
+        next_x1 - box.x1,
+        next_y1 - box.y1,
+    };
+}
+
+float clamp_capture_axis(const float value, const std::uint32_t extent) {
+    const float max_value = extent == 0U ? 0.0f : static_cast<float>(extent - 1U);
+    return std::clamp(value, 0.0f, max_value);
+}
+
+void translate_point(AnnotationPoint* point, const int dx, const int dy, const std::uint32_t capture_width,
+                     const std::uint32_t capture_height) {
+    if (point == nullptr) {
+        return;
+    }
+    point->x = clamp_capture_axis(point->x + static_cast<float>(dx), capture_width);
+    point->y = clamp_capture_axis(point->y + static_cast<float>(dy), capture_height);
+}
+
+float scale_axis(const float value, const float source_min, const float source_extent, const float target_min,
+                 const float target_extent, const std::uint32_t capture_extent) {
+    const float normalized = source_extent > 0.0f ? (value - source_min) / source_extent : 0.5f;
+    return clamp_capture_axis(target_min + normalized * target_extent, capture_extent);
+}
+
+void scale_point_to_box(AnnotationPoint* point, const AnnotationBox& source_box, const AnnotationBox& target_box,
+                        const std::uint32_t capture_width, const std::uint32_t capture_height) {
+    if (point == nullptr) {
+        return;
+    }
+    const auto source_width = static_cast<float>(source_box.x2 - source_box.x1);
+    const auto source_height = static_cast<float>(source_box.y2 - source_box.y1);
+    const auto target_width = static_cast<float>(target_box.x2 - target_box.x1);
+    const auto target_height = static_cast<float>(target_box.y2 - target_box.y1);
+    point->x = scale_axis(point->x, static_cast<float>(source_box.x1), source_width, static_cast<float>(target_box.x1),
+                          target_width, capture_width);
+    point->y = scale_axis(point->y, static_cast<float>(source_box.y1), source_height, static_cast<float>(target_box.y1),
+                          target_height, capture_height);
+}
+
+std::vector<std::uint8_t> resize_mask_nearest(const std::vector<std::uint8_t>& source, const std::uint32_t source_width,
+                                              const std::uint32_t source_height, const std::uint32_t target_width,
+                                              const std::uint32_t target_height) {
+    if (target_width == 0U || target_height == 0U) {
+        return {};
+    }
+    std::vector<std::uint8_t> resized(static_cast<std::size_t>(target_width) * static_cast<std::size_t>(target_height),
+                                      0U);
+    if (source_width == 0U || source_height == 0U ||
+        source.size() != static_cast<std::size_t>(source_width) * static_cast<std::size_t>(source_height)) {
+        std::ranges::fill(resized, 1U);
+        return resized;
+    }
+
+    for (std::uint32_t y = 0; y < target_height; ++y) {
+        const std::uint32_t source_y = std::min(source_height - 1U, (y * source_height) / target_height);
+        const std::size_t target_row = static_cast<std::size_t>(y) * static_cast<std::size_t>(target_width);
+        const std::size_t source_row = static_cast<std::size_t>(source_y) * static_cast<std::size_t>(source_width);
+        for (std::uint32_t x = 0; x < target_width; ++x) {
+            const std::uint32_t source_x = std::min(source_width - 1U, (x * source_width) / target_width);
+            resized[target_row + static_cast<std::size_t>(x)] = source[source_row + static_cast<std::size_t>(source_x)];
+        }
+    }
+    return resized;
+}
+
+AnnotationPoint cubic_bezier_point(const AnnotationPoint& p0, const AnnotationPoint& p1, const AnnotationPoint& p2,
+                                   const AnnotationPoint& p3, const float t) {
+    const float one_minus_t = 1.0f - t;
+    const float a = one_minus_t * one_minus_t * one_minus_t;
+    const float b = 3.0f * one_minus_t * one_minus_t * t;
+    const float c = 3.0f * one_minus_t * t * t;
+    const float d = t * t * t;
+    return AnnotationPoint{
+        a * p0.x + b * p1.x + c * p2.x + d * p3.x,
+        a * p0.y + b * p1.y + c * p2.y + d * p3.y,
+    };
+}
+
+}  // namespace
 
 AnnotationMaskRegion mask_region_from_box(const AnnotationBox& box) {
     return AnnotationMaskRegion{
@@ -80,143 +163,19 @@ AnnotationBox box_from_mask_region(const AnnotationMaskRegion& region) {
     };
 }
 
-std::pair<int, int> clamped_box_offset(const AnnotationBox& box,
-                                       const int dx,
-                                       const int dy,
-                                       const std::uint32_t capture_width,
-                                       const std::uint32_t capture_height) {
-    const int box_width = std::max(0, box.x2 - box.x1);
-    const int box_height = std::max(0, box.y2 - box.y1);
-    const int max_x1 = std::max(0, static_cast<int>(capture_width) - box_width);
-    const int max_y1 = std::max(0, static_cast<int>(capture_height) - box_height);
-    const int next_x1 = std::clamp(box.x1 + dx, 0, max_x1);
-    const int next_y1 = std::clamp(box.y1 + dy, 0, max_y1);
-    return {
-        next_x1 - box.x1,
-        next_y1 - box.y1,
-    };
-}
-
-float clamp_capture_axis(const float value, const std::uint32_t extent) {
-    const float max_value = extent == 0U ? 0.0f : static_cast<float>(extent - 1U);
-    return std::clamp(value, 0.0f, max_value);
-}
-
-void translate_point(AnnotationPoint* point,
-                     const int dx,
-                     const int dy,
-                     const std::uint32_t capture_width,
-                     const std::uint32_t capture_height) {
-    if (point == nullptr) {
-        return;
-    }
-    point->x = clamp_capture_axis(point->x + static_cast<float>(dx), capture_width);
-    point->y = clamp_capture_axis(point->y + static_cast<float>(dy), capture_height);
-}
-
-float scale_axis(const float value,
-                 const float source_min,
-                 const float source_extent,
-                 const float target_min,
-                 const float target_extent,
-                 const std::uint32_t capture_extent) {
-    const float normalized =
-        source_extent > 0.0f ? (value - source_min) / source_extent : 0.5f;
-    return clamp_capture_axis(target_min + normalized * target_extent, capture_extent);
-}
-
-void scale_point_to_box(AnnotationPoint* point,
-                        const AnnotationBox& source_box,
-                        const AnnotationBox& target_box,
-                        const std::uint32_t capture_width,
-                        const std::uint32_t capture_height) {
-    if (point == nullptr) {
-        return;
-    }
-    const auto source_width = static_cast<float>(source_box.x2 - source_box.x1);
-    const auto source_height = static_cast<float>(source_box.y2 - source_box.y1);
-    const auto target_width = static_cast<float>(target_box.x2 - target_box.x1);
-    const auto target_height = static_cast<float>(target_box.y2 - target_box.y1);
-    point->x = scale_axis(point->x,
-                          static_cast<float>(source_box.x1),
-                          source_width,
-                          static_cast<float>(target_box.x1),
-                          target_width,
-                          capture_width);
-    point->y = scale_axis(point->y,
-                          static_cast<float>(source_box.y1),
-                          source_height,
-                          static_cast<float>(target_box.y1),
-                          target_height,
-                          capture_height);
-}
-
-std::vector<std::uint8_t> resize_mask_nearest(const std::vector<std::uint8_t>& source,
-                                              const std::uint32_t source_width,
-                                              const std::uint32_t source_height,
-                                              const std::uint32_t target_width,
-                                              const std::uint32_t target_height) {
-    if (target_width == 0U || target_height == 0U) {
-        return {};
-    }
-    std::vector<std::uint8_t> resized(
-        static_cast<std::size_t>(target_width) * static_cast<std::size_t>(target_height),
-        0U);
-    if (source_width == 0U || source_height == 0U ||
-        source.size() != static_cast<std::size_t>(source_width) * static_cast<std::size_t>(source_height)) {
-        std::ranges::fill(resized, 1U);
-        return resized;
-    }
-
-    for (std::uint32_t y = 0; y < target_height; ++y) {
-        const std::uint32_t source_y =
-            std::min(source_height - 1U, (y * source_height) / target_height);
-        const std::size_t target_row =
-            static_cast<std::size_t>(y) * static_cast<std::size_t>(target_width);
-        const std::size_t source_row =
-            static_cast<std::size_t>(source_y) * static_cast<std::size_t>(source_width);
-        for (std::uint32_t x = 0; x < target_width; ++x) {
-            const std::uint32_t source_x =
-                std::min(source_width - 1U, (x * source_width) / target_width);
-            resized[target_row + static_cast<std::size_t>(x)] =
-                source[source_row + static_cast<std::size_t>(source_x)];
-        }
-    }
-    return resized;
-}
-
-AnnotationPoint cubic_bezier_point(const AnnotationPoint& p0,
-                                   const AnnotationPoint& p1,
-                                   const AnnotationPoint& p2,
-                                   const AnnotationPoint& p3,
-                                   const float t) {
-    const float one_minus_t = 1.0f - t;
-    const float a = one_minus_t * one_minus_t * one_minus_t;
-    const float b = 3.0f * one_minus_t * one_minus_t * t;
-    const float c = 3.0f * one_minus_t * t * t;
-    const float d = t * t * t;
-    return AnnotationPoint{
-        a * p0.x + b * p1.x + c * p2.x + d * p3.x,
-        a * p0.y + b * p1.y + c * p2.y + d * p3.y,
-    };
-}
-
-} // namespace
-
 const char* annotation_spline_handle_mode_name(const AnnotationSplineHandleMode mode) noexcept {
     switch (mode) {
-    case AnnotationSplineHandleMode::Corner:
-        return "corner";
-    case AnnotationSplineHandleMode::Smooth:
-        return "smooth";
-    case AnnotationSplineHandleMode::Mirrored:
-        return "mirrored";
+        case AnnotationSplineHandleMode::Corner:
+            return "corner";
+        case AnnotationSplineHandleMode::Smooth:
+            return "smooth";
+        case AnnotationSplineHandleMode::Mirrored:
+            return "mirrored";
     }
     return "corner";
 }
 
-AnnotationSplineHandleMode annotation_spline_handle_mode_from_name(
-    const std::string_view value) {
+AnnotationSplineHandleMode annotation_spline_handle_mode_from_name(const std::string_view value) {
     if (value == "smooth") {
         return AnnotationSplineHandleMode::Smooth;
     }
@@ -246,16 +205,16 @@ AnnotationShapeType annotation_shape_type(const AnnotationShapeVariant& shape) {
 
 const char* annotation_shape_type_name(const AnnotationShapeType shape_type) {
     switch (shape_type) {
-    case AnnotationShapeType::Box:
-        return "box";
-    case AnnotationShapeType::Mask:
-        return "mask";
-    case AnnotationShapeType::Spline:
-        return "spline";
-    case AnnotationShapeType::Point:
-        return "point";
-    case AnnotationShapeType::Skeleton:
-        return "skeleton";
+        case AnnotationShapeType::Box:
+            return "box";
+        case AnnotationShapeType::Mask:
+            return "mask";
+        case AnnotationShapeType::Spline:
+            return "spline";
+        case AnnotationShapeType::Point:
+            return "point";
+        case AnnotationShapeType::Skeleton:
+            return "skeleton";
     }
     return "unknown";
 }
@@ -266,7 +225,7 @@ const char* annotation_object_shape_label(const AnnotationObject& object) {
 
 std::optional<AnnotationBox> annotation_object_bbox(const AnnotationObject& object) {
     return std::visit(
-        [] (const auto& shape) -> std::optional<AnnotationBox> {
+        [](const auto& shape) -> std::optional<AnnotationBox> {
             using T = std::decay_t<decltype(shape)>;
             if constexpr (std::is_same_v<T, AnnotationBoxShape> || std::is_same_v<T, AnnotationMaskShape>) {
                 return shape.box;
@@ -310,7 +269,7 @@ std::optional<AnnotationBox> annotation_object_display_box(const AnnotationObjec
 
 std::vector<AnnotationPoint> annotation_object_points(const AnnotationObject& object) {
     return std::visit(
-        [] (const auto& shape) {
+        [](const auto& shape) {
             using T = std::decay_t<decltype(shape)>;
             std::vector<AnnotationPoint> points;
             if constexpr (std::is_same_v<T, AnnotationBoxShape>) {
@@ -355,11 +314,8 @@ bool annotation_object_supports_mask_editing(const AnnotationObject& object) {
            std::holds_alternative<AnnotationMaskShape>(object.shape);
 }
 
-bool translate_annotation_object(AnnotationObject* object,
-                                 const int dx,
-                                 const int dy,
-                                 const std::uint32_t capture_width,
-                                 const std::uint32_t capture_height) {
+bool translate_annotation_object(AnnotationObject* object, const int dx, const int dy,
+                                 const std::uint32_t capture_width, const std::uint32_t capture_height) {
     if (object == nullptr || (dx == 0 && dy == 0)) {
         return false;
     }
@@ -369,8 +325,7 @@ bool translate_annotation_object(AnnotationObject* object,
         return false;
     }
     const AnnotationBox object_bbox = *bbox;
-    const std::pair<int, int> clamped_offset =
-        clamped_box_offset(object_bbox, dx, dy, capture_width, capture_height);
+    const std::pair<int, int> clamped_offset = clamped_box_offset(object_bbox, dx, dy, capture_width, capture_height);
     const int clamped_dx = clamped_offset.first;
     const int clamped_dy = clamped_offset.second;
     if (clamped_dx == 0 && clamped_dy == 0) {
@@ -397,10 +352,8 @@ bool translate_annotation_object(AnnotationObject* object,
         shape->box.y1 += mask_dy;
         shape->box.x2 += mask_dx;
         shape->box.y2 += mask_dy;
-        shape->region.capture_x =
-            static_cast<std::uint32_t>(static_cast<int>(shape->region.capture_x) + mask_dx);
-        shape->region.capture_y =
-            static_cast<std::uint32_t>(static_cast<int>(shape->region.capture_y) + mask_dy);
+        shape->region.capture_x = static_cast<std::uint32_t>(static_cast<int>(shape->region.capture_x) + mask_dx);
+        shape->region.capture_y = static_cast<std::uint32_t>(static_cast<int>(shape->region.capture_y) + mask_dy);
         return true;
     }
 
@@ -432,10 +385,8 @@ bool translate_annotation_object(AnnotationObject* object,
     return true;
 }
 
-bool resize_annotation_object_to_box(AnnotationObject* object,
-                                     const AnnotationBox& box,
-                                     const std::uint32_t capture_width,
-                                     const std::uint32_t capture_height) {
+bool resize_annotation_object_to_box(AnnotationObject* object, const AnnotationBox& box,
+                                     const std::uint32_t capture_width, const std::uint32_t capture_height) {
     if (object == nullptr) {
         return false;
     }
@@ -456,11 +407,8 @@ bool resize_annotation_object_to_box(AnnotationObject* object,
                 shape.box = target_box;
             } else if constexpr (std::is_same_v<T, AnnotationMaskShape>) {
                 const AnnotationMaskRegion next_region = mask_region_from_box(target_box);
-                shape.mask = resize_mask_nearest(shape.mask,
-                                                shape.region.width,
-                                                shape.region.height,
-                                                next_region.width,
-                                                next_region.height);
+                shape.mask = resize_mask_nearest(shape.mask, shape.region.width, shape.region.height, next_region.width,
+                                                 next_region.height);
                 shape.region = next_region;
                 shape.box = target_box;
             } else if constexpr (std::is_same_v<T, AnnotationPointShape>) {
@@ -475,10 +423,12 @@ bool resize_annotation_object_to_box(AnnotationObject* object,
                 for (AnnotationSplineKnot& knot : shape.knots) {
                     scale_point_to_box(&knot.position, *source_box, target_box, capture_width, capture_height);
                     if (knot.in_handle.enabled) {
-                        scale_point_to_box(&knot.in_handle.position, *source_box, target_box, capture_width, capture_height);
+                        scale_point_to_box(&knot.in_handle.position, *source_box, target_box, capture_width,
+                                           capture_height);
                     }
                     if (knot.out_handle.enabled) {
-                        scale_point_to_box(&knot.out_handle.position, *source_box, target_box, capture_width, capture_height);
+                        scale_point_to_box(&knot.out_handle.position, *source_box, target_box, capture_width,
+                                           capture_height);
                     }
                 }
             } else {
@@ -500,28 +450,22 @@ bool resize_annotation_object_to_box(AnnotationObject* object,
     return true;
 }
 
-std::optional<AnnotationPoint> annotation_spline_segment_point(
-    const AnnotationSplineShape& spline,
-    const std::size_t segment_index,
-    const float t) {
+std::optional<AnnotationPoint> annotation_spline_segment_point(const AnnotationSplineShape& spline,
+                                                               const std::size_t segment_index, const float t) {
     if (spline.knots.size() < 2U) {
         return std::nullopt;
     }
 
-    const std::size_t segment_count =
-        spline.closed ? spline.knots.size() : spline.knots.size() - 1U;
+    const std::size_t segment_count = spline.closed ? spline.knots.size() : spline.knots.size() - 1U;
     if (segment_count == 0U || segment_index >= segment_count) {
         return std::nullopt;
     }
 
     const AnnotationSplineKnot& start = spline.knots[segment_index];
-    const AnnotationSplineKnot& end =
-        spline.knots[(segment_index + 1U) % spline.knots.size()];
+    const AnnotationSplineKnot& end = spline.knots[(segment_index + 1U) % spline.knots.size()];
     const AnnotationPoint p0 = start.position;
-    const AnnotationPoint p1 =
-        start.out_handle.enabled ? start.out_handle.position : start.position;
-    const AnnotationPoint p2 =
-        end.in_handle.enabled ? end.in_handle.position : end.position;
+    const AnnotationPoint p1 = start.out_handle.enabled ? start.out_handle.position : start.position;
+    const AnnotationPoint p2 = end.in_handle.enabled ? end.in_handle.position : end.position;
     const AnnotationPoint p3 = end.position;
     return cubic_bezier_point(p0, p1, p2, p3, std::clamp(t, 0.0f, 1.0f));
 }
@@ -538,13 +482,11 @@ std::vector<AnnotationPoint> sample_annotation_spline_points(const AnnotationSpl
     }
 
     const int segment_samples = std::max(1, samples_per_segment);
-    const std::size_t segment_count =
-        spline.closed ? spline.knots.size() : spline.knots.size() - 1U;
+    const std::size_t segment_count = spline.closed ? spline.knots.size() : spline.knots.size() - 1U;
     points.reserve(segment_count * static_cast<std::size_t>(segment_samples + 1));
     for (std::size_t segment_index = 0; segment_index < segment_count; ++segment_index) {
         const AnnotationSplineKnot& start = spline.knots[segment_index];
-        const AnnotationSplineKnot& end =
-            spline.knots[(segment_index + 1U) % spline.knots.size()];
+        const AnnotationSplineKnot& end = spline.knots[(segment_index + 1U) % spline.knots.size()];
         const AnnotationPoint p0 = start.position;
         const AnnotationPoint p1 = start.out_handle.enabled ? start.out_handle.position : start.position;
         const AnnotationPoint p2 = end.in_handle.enabled ? end.in_handle.position : end.position;
@@ -554,12 +496,11 @@ std::vector<AnnotationPoint> sample_annotation_spline_points(const AnnotationSpl
             points.push_back(p0);
         }
         for (int sample = 1; sample <= segment_samples; ++sample) {
-            const float t =
-                static_cast<float>(sample) / static_cast<float>(segment_samples);
+            const float t = static_cast<float>(sample) / static_cast<float>(segment_samples);
             points.push_back(cubic_bezier_point(p0, p1, p2, p3, t));
         }
     }
     return points;
 }
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

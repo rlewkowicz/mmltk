@@ -65,6 +65,6 @@ void test_prediction_json_writer_emits_expected_payload() {
     std::remove(output_path.c_str());
 }
 
-} // namespace
+}  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][prediction_json]", test_prediction_json_writer_emits_expected_payload);

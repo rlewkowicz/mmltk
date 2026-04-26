@@ -10,4 +10,4 @@ namespace mmltk::rfdetr {
 std::shared_ptr<const mmltk::model::ModelModule> make_model_module();
 const mmltk::model::CliModule& cli_module();
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

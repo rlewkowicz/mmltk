@@ -10,7 +10,13 @@ constexpr std::size_t tool_slot(const AnnotationToolKind kind) noexcept {
     return static_cast<std::size_t>(kind);
 }
 
-} // namespace
+template <typename Tools>
+auto* find_tool_in(Tools& tools, const AnnotationToolKind kind) noexcept {
+    const std::size_t slot = tool_slot(kind);
+    return slot < tools.size() ? tools[slot].get() : nullptr;
+}
+
+}  // namespace
 
 AnnotationToolMutation AnnotationTool::handle_canvas_click(const AnnotationToolContext&,
                                                            const AnnotationToolCanvasClickEvent&) {
@@ -34,8 +40,7 @@ bool AnnotationTool::handle_fill(const AnnotationToolContext&, const AnnotationT
     return false;
 }
 
-AnnotationToolMutation AnnotationTool::handle_action(const AnnotationToolContext&,
-                                                     const AnnotationToolActionEvent&) {
+AnnotationToolMutation AnnotationTool::handle_action(const AnnotationToolContext&, const AnnotationToolActionEvent&) {
     return {};
 }
 
@@ -43,9 +48,7 @@ std::optional<AnnotationObject> AnnotationTool::make_object(const AnnotationTool
     return std::nullopt;
 }
 
-void AnnotationTool::on_object_created(AnnotationDocument&,
-                                       AnnotationSession&,
-                                       const std::size_t) const {}
+void AnnotationTool::on_object_created(AnnotationDocument&, AnnotationSession&, const std::size_t) const {}
 
 void AnnotationToolManager::register_tool(std::unique_ptr<AnnotationTool> tool) {
     if (tool == nullptr) {
@@ -59,23 +62,14 @@ void AnnotationToolManager::register_tool(std::unique_ptr<AnnotationTool> tool) 
 }
 
 AnnotationTool* AnnotationToolManager::find_tool(const AnnotationToolKind kind) noexcept {
-    const std::size_t slot = tool_slot(kind);
-    if (slot >= tools_.size()) {
-        return nullptr;
-    }
-    return tools_[slot].get();
+    return find_tool_in(tools_, kind);
 }
 
 const AnnotationTool* AnnotationToolManager::find_tool(const AnnotationToolKind kind) const noexcept {
-    const std::size_t slot = tool_slot(kind);
-    if (slot >= tools_.size()) {
-        return nullptr;
-    }
-    return tools_[slot].get();
+    return find_tool_in(tools_, kind);
 }
 
-bool AnnotationToolManager::set_active_tool(const AnnotationToolKind kind,
-                                            AnnotationDocument& document,
+bool AnnotationToolManager::set_active_tool(const AnnotationToolKind kind, AnnotationDocument& document,
                                             AnnotationSession& session) {
     AnnotationTool* next = find_tool(kind);
     if (next == nullptr) {
@@ -94,4 +88,4 @@ bool AnnotationToolManager::set_active_tool(const AnnotationToolKind kind,
     return true;
 }
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

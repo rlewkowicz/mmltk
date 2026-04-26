@@ -12,7 +12,7 @@
 namespace mmltk::gui {
 
 class LivePredictController {
-public:
+   public:
     LivePredictController() = default;
     ~LivePredictController() = default;
 
@@ -23,18 +23,12 @@ public:
     void clear_errors();
     void clear_start_error();
 
-    void launch(mmltk::runtime::BackgroundExecutor& background_executor,
-                mmltk::runtime::UiCallbackQueue& ui_callbacks,
-                const PredictViewState& state,
-                const std::string& preset_name,
-                std::function<void(int)> on_started,
-                std::function<void(const std::string&)> on_error = {});
-    void stop(mmltk::runtime::BackgroundExecutor& background_executor,
-              mmltk::runtime::UiCallbackQueue& ui_callbacks,
-              SourceSelectionState* source,
-              const std::function<void()>& before_async_stop = {},
-              std::function<void()> on_stopped = {},
-              std::function<void(const std::string&)> on_error = {});
+    void launch(mmltk::runtime::BackgroundExecutor& background_executor, mmltk::runtime::UiCallbackQueue& ui_callbacks,
+                const PredictViewState& state, const std::string& preset_name, std::function<void()> on_workspace_ready,
+                std::function<void(int)> on_started, std::function<void(const std::string&)> on_error = {});
+    void stop(mmltk::runtime::BackgroundExecutor& background_executor, mmltk::runtime::UiCallbackQueue& ui_callbacks,
+              SourceSelectionState* source, const std::function<void()>& before_async_stop = {},
+              std::function<void()> on_stopped = {}, std::function<void(const std::string&)> on_error = {});
 
     [[nodiscard]] bool running() const noexcept;
     [[nodiscard]] bool active() const noexcept;
@@ -46,7 +40,7 @@ public:
     [[nodiscard]] const std::string& start_error() const noexcept;
     [[nodiscard]] const std::string& action_error() const noexcept;
 
-private:
+   private:
     struct StartOutcome {
         std::unique_ptr<mmltk::live::LiveSessionController> controller;
         mmltk::live::LiveSessionStatus status;
@@ -62,4 +56,4 @@ private:
     mmltk::runtime::TaskCancellation start_task_{};
 };
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

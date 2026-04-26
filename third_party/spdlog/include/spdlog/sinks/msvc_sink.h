@@ -14,34 +14,29 @@
 #include <mutex>
 #include <string>
 
-// Avoid including windows.h (https://stackoverflow.com/a/30741042)
 #if defined(SPDLOG_WCHAR_TO_UTF8_SUPPORT)
-extern "C" __declspec(dllimport) void __stdcall OutputDebugStringW(const wchar_t *lpOutputString);
+extern "C" __declspec(dllimport) void __stdcall OutputDebugStringW(const wchar_t* lpOutputString);
 #else
-extern "C" __declspec(dllimport) void __stdcall OutputDebugStringA(const char *lpOutputString);
+extern "C" __declspec(dllimport) void __stdcall OutputDebugStringA(const char* lpOutputString);
 #endif
 extern "C" __declspec(dllimport) int __stdcall IsDebuggerPresent();
 
 namespace spdlog {
 namespace sinks {
-/*
- * MSVC sink (logging using OutputDebugStringA)
- */
 template <typename Mutex>
 class msvc_sink : public base_sink<Mutex> {
-public:
+   public:
     msvc_sink() = default;
-    msvc_sink(bool check_debugger_present)
-        : check_debugger_present_{check_debugger_present} {}
+    msvc_sink(bool check_debugger_present) : check_debugger_present_{check_debugger_present} {}
 
-protected:
-    void sink_it_(const details::log_msg &msg) override {
+   protected:
+    void sink_it_(const details::log_msg& msg) override {
         if (check_debugger_present_ && !IsDebuggerPresent()) {
             return;
         }
         memory_buf_t formatted;
         base_sink<Mutex>::formatter_->format(msg, formatted);
-        formatted.push_back('\0');  // add a null terminator for OutputDebugString
+        formatted.push_back('\0');
 #if defined(SPDLOG_WCHAR_TO_UTF8_SUPPORT)
         wmemory_buf_t wformatted;
         details::os::utf8_to_wstrbuf(string_view_t(formatted.data(), formatted.size()), wformatted);

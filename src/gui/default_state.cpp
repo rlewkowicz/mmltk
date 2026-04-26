@@ -2,12 +2,8 @@
 
 namespace mmltk::gui {
 
-void apply_default_gui_state(std::string& selected_preset_name,
-                             TrainViewState& train,
-                             ValidateViewState& validate,
-                             PredictViewState& predict,
-                             AnnotateViewState& annotate,
-                             ExportViewState&) {
+void apply_default_gui_state(std::string& selected_preset_name, TrainViewState& train, ValidateViewState& validate,
+                             PredictViewState& predict, AnnotateViewState& annotate, ExportViewState&) {
     selected_preset_name = kDefaultGuiPresetName;
 
     train.train_compiled_path = "./compiled-seg-medium-synth/train.bin";
@@ -34,4 +30,4 @@ void apply_default_gui_state(std::string& selected_preset_name,
     annotate.backend = "auto";
 }
 
-} // namespace mmltk::gui
+}  // namespace mmltk::gui

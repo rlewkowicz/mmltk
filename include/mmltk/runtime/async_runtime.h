@@ -17,14 +17,14 @@
 namespace mmltk::runtime {
 
 class TaskCancellation {
-public:
+   public:
     TaskCancellation();
 
     void cancel() const noexcept;
     [[nodiscard]] bool cancelled() const noexcept;
     [[nodiscard]] bool finished() const noexcept;
 
-private:
+   private:
     struct State {
         std::atomic<bool> cancelled{false};
         std::atomic<bool> finished{false};
@@ -35,28 +35,28 @@ private:
     std::shared_ptr<State> state_;
 
     template <typename WorkFn, typename SuccessFn, typename ErrorFn>
-    friend TaskCancellation submit_background_task(class BackgroundExecutor& executor,
-                                                   class UiCallbackQueue& ui_queue,
-                                                   WorkFn&& work,
-                                                   SuccessFn&& on_success,
-                                                   ErrorFn&& on_error);
+    friend TaskCancellation submit_background_task(class BackgroundExecutor& executor, class UiCallbackQueue& ui_queue,
+                                                   WorkFn&& work, SuccessFn&& on_success, ErrorFn&& on_error);
 };
 
 class UiCallbackQueue {
-public:
+   public:
     void post(std::function<void()> callback);
     std::size_t drain(std::size_t max_callbacks = 0);
     bool empty() const;
+    void set_wake_callback(std::function<void()> callback);
 
-private:
+   private:
+    void wake() noexcept;
+
     mutable std::mutex mutex_;
     std::deque<std::function<void()>> callbacks_;
+    std::atomic<std::shared_ptr<const std::function<void()>>> wake_callback_{};
 };
 
 class BackgroundExecutor {
-public:
-    explicit BackgroundExecutor(std::size_t worker_count = 2,
-                                std::vector<int> cpu_affinity = {},
+   public:
+    explicit BackgroundExecutor(std::size_t worker_count = 2, std::vector<int> cpu_affinity = {},
                                 std::string thread_name_prefix = "guibg");
 
     [[nodiscard]] std::size_t size() const noexcept;
@@ -67,15 +67,12 @@ public:
         worker_pool_.enqueue(std::forward<Fn>(fn));
     }
 
-private:
+   private:
     mmltk::WorkerPool worker_pool_;
 
     template <typename WorkFn, typename SuccessFn, typename ErrorFn>
-    friend TaskCancellation submit_background_task(BackgroundExecutor& executor,
-                                                   UiCallbackQueue& ui_queue,
-                                                   WorkFn&& work,
-                                                   SuccessFn&& on_success,
-                                                   ErrorFn&& on_error);
+    friend TaskCancellation submit_background_task(BackgroundExecutor& executor, UiCallbackQueue& ui_queue,
+                                                   WorkFn&& work, SuccessFn&& on_success, ErrorFn&& on_error);
 };
 
 namespace detail {
@@ -94,14 +91,11 @@ using work_result_t = std::invoke_result_t<WorkFn>;
 template <typename WorkFn>
 constexpr bool kWorkReturnsVoid = std::is_void_v<work_result_t<WorkFn>>;
 
-} // namespace detail
+}  // namespace detail
 
 template <typename WorkFn, typename SuccessFn, typename ErrorFn>
-TaskCancellation submit_background_task(BackgroundExecutor& executor,
-                                        UiCallbackQueue& ui_queue,
-                                        WorkFn&& work,
-                                        SuccessFn&& on_success,
-                                        ErrorFn&& on_error) {
+TaskCancellation submit_background_task(BackgroundExecutor& executor, UiCallbackQueue& ui_queue, WorkFn&& work,
+                                        SuccessFn&& on_success, ErrorFn&& on_error) {
     auto state = std::make_shared<TaskCancellation::State>();
     TaskCancellation token(state);
     auto work_fn = std::make_shared<std::decay_t<WorkFn>>(std::forward<WorkFn>(work));
@@ -109,62 +103,38 @@ TaskCancellation submit_background_task(BackgroundExecutor& executor,
     auto error_fn = std::make_shared<std::decay_t<ErrorFn>>(std::forward<ErrorFn>(on_error));
 
     executor.enqueue([state, &ui_queue, work_fn, success_fn, error_fn]() mutable {
+        const auto post_if_active = [&ui_queue](const auto& task_state, auto&& callback) {
+            if (task_state->cancelled.load(std::memory_order_relaxed)) {
+                task_state->finished.store(true, std::memory_order_relaxed);
+                return;
+            }
+            ui_queue.post([task_state, callback = std::forward<decltype(callback)>(callback)]() mutable {
+                if (!task_state->cancelled.load(std::memory_order_relaxed)) {
+                    callback();
+                }
+                task_state->finished.store(true, std::memory_order_relaxed);
+            });
+        };
         try {
             if constexpr (detail::kWorkReturnsVoid<std::decay_t<WorkFn>>) {
                 (*work_fn)();
-                if (state->cancelled.load(std::memory_order_relaxed)) {
-                    state->finished.store(true, std::memory_order_relaxed);
-                    return;
-                }
-                ui_queue.post([state, success_fn]() mutable {
-                    if (!state->cancelled.load(std::memory_order_relaxed)) {
-                        (*success_fn)();
-                    }
-                    state->finished.store(true, std::memory_order_relaxed);
-                });
+                post_if_active(state, [success_fn]() { (*success_fn)(); });
                 return;
             } else {
                 using Result = detail::work_result_t<std::decay_t<WorkFn>>;
                 auto result = std::make_shared<Result>((*work_fn)());
-                if (state->cancelled.load(std::memory_order_relaxed)) {
-                    state->finished.store(true, std::memory_order_relaxed);
-                    return;
-                }
-                ui_queue.post([state, success_fn, result]() mutable {
-                    if (!state->cancelled.load(std::memory_order_relaxed)) {
-                        (*success_fn)(std::move(*result));
-                    }
-                    state->finished.store(true, std::memory_order_relaxed);
-                });
+                post_if_active(state, [success_fn, result]() mutable { (*success_fn)(std::move(*result)); });
                 return;
             }
         } catch (const std::exception& error) {
             const auto message = std::make_shared<std::string>(detail::exception_message(error));
-            if (state->cancelled.load(std::memory_order_relaxed)) {
-                state->finished.store(true, std::memory_order_relaxed);
-                return;
-            }
-            ui_queue.post([state, error_fn, message]() mutable {
-                if (!state->cancelled.load(std::memory_order_relaxed)) {
-                    (*error_fn)(*message);
-                }
-                state->finished.store(true, std::memory_order_relaxed);
-            });
+            post_if_active(state, [error_fn, message]() { (*error_fn)(*message); });
         } catch (...) {
             const auto message = std::make_shared<std::string>(detail::exception_message());
-            if (state->cancelled.load(std::memory_order_relaxed)) {
-                state->finished.store(true, std::memory_order_relaxed);
-                return;
-            }
-            ui_queue.post([state, error_fn, message]() mutable {
-                if (!state->cancelled.load(std::memory_order_relaxed)) {
-                    (*error_fn)(*message);
-                }
-                state->finished.store(true, std::memory_order_relaxed);
-            });
+            post_if_active(state, [error_fn, message]() { (*error_fn)(*message); });
         }
     });
     return token;
 }
 
-} // namespace mmltk::runtime
+}  // namespace mmltk::runtime

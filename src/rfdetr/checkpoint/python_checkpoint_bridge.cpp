@@ -1,5 +1,6 @@
 #include "rfdetr/python_checkpoint_bridge.h"
 
+#include "filesystem_utils.h"
 #include "gui/subprocess_utils.h"
 #include "mmltk_logging.h"
 #include "runtime_paths.h"
@@ -9,7 +10,6 @@
 #include <nlohmann/json.hpp>
 #include <torch/torch.h>
 
-#include <dirent.h>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -21,7 +21,6 @@
 #include <utility>
 #include <vector>
 
-#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -48,77 +47,43 @@ fs::path make_temp_directory(const char* prefix) {
 
     char* created = ::mkdtemp(buffer.data());
     if (created == nullptr) {
-        throw std::runtime_error(
-            std::string("failed to create temporary RF-DETR checkpoint directory: ") + std::strerror(errno));
+        throw std::runtime_error(std::string("failed to create temporary RF-DETR checkpoint directory: ") +
+                                 std::strerror(errno));
     }
     return {created};
 }
 
 void remove_path_recursively_best_effort(const fs::path& path) {
-    std::error_code exists_error;
-    if (!fs::exists(path, exists_error) || exists_error) {
-        return;
-    }
-
-    const std::string native = path.string();
-    struct stat status {};
-    if (::lstat(native.c_str(), &status) != 0) {
-        return;
-    }
-    if (!S_ISDIR(status.st_mode) || S_ISLNK(status.st_mode)) {
-        (void)::unlink(native.c_str());
-        return;
-    }
-
-    DIR* directory = ::opendir(native.c_str());
-    if (directory == nullptr) {
-        (void)::rmdir(native.c_str());
-        return;
-    }
-
-    while (dirent* entry = ::readdir(directory)) {
-        const char* name = entry->d_name;
-        if (std::strcmp(name, ".") == 0 || std::strcmp(name, "..") == 0) {
-            continue;
-        }
-        remove_path_recursively_best_effort(path / name);
-    }
-    (void)::closedir(directory);
-    (void)::rmdir(native.c_str());
+    mmltk::filesystem_utils::remove_path_recursively_best_effort(path);
 }
 
 void ensure_output_path_writable(const fs::path& output_path) {
-    const fs::path output_dir =
-        output_path.has_parent_path() ? output_path.parent_path() : fs::current_path();
+    const fs::path output_dir = output_path.has_parent_path() ? output_path.parent_path() : fs::current_path();
     std::error_code create_error;
     fs::create_directories(output_dir, create_error);
     if (create_error) {
-        throw std::runtime_error(
-            "RF-DETR Python checkpoint bridge cannot prepare output directory " +
-            output_dir.string() + ": " + create_error.message() + "; check perms");
+        throw std::runtime_error("RF-DETR Python checkpoint bridge cannot prepare output directory " +
+                                 output_dir.string() + ": " + create_error.message() + "; check perms");
     }
 
     const std::string output_dir_string = output_dir.string();
     if (::access(output_dir_string.c_str(), W_OK | X_OK) != 0) {
-        throw std::runtime_error(
-            "RF-DETR Python checkpoint bridge cannot write to output directory " +
-            output_dir.string() + ": " + std::strerror(errno) + "; check perms");
+        throw std::runtime_error("RF-DETR Python checkpoint bridge cannot write to output directory " +
+                                 output_dir.string() + ": " + std::strerror(errno) + "; check perms");
     }
 
     std::error_code exists_error;
     if (fs::exists(output_path, exists_error) && !exists_error) {
         const std::string output_path_string = output_path.string();
         if (::access(output_path_string.c_str(), W_OK) != 0) {
-            throw std::runtime_error(
-                "RF-DETR Python checkpoint bridge cannot overwrite output file " +
-                output_path.string() + ": " + std::strerror(errno) + "; check perms");
+            throw std::runtime_error("RF-DETR Python checkpoint bridge cannot overwrite output file " +
+                                     output_path.string() + ": " + std::strerror(errno) + "; check perms");
         }
     }
 }
 
 struct ScopedTempDirectory {
-    explicit ScopedTempDirectory(const char* prefix)
-        : path(make_temp_directory(prefix)) {}
+    explicit ScopedTempDirectory(const char* prefix) : path(make_temp_directory(prefix)) {}
 
     ~ScopedTempDirectory() {
         try {
@@ -196,8 +161,8 @@ void write_raw_tensor_file(const fs::path& path, const torch::Tensor& tensor) {
 void wait_for_child(const pid_t child_pid, const char* operation) {
     const int status = mmltk::gui::subprocess::wait_child_process(child_pid);
     if (status < 0) {
-        throw std::runtime_error(
-            std::format("failed to wait for RF-DETR Python checkpoint bridge during {}: {}", operation, std::strerror(errno)));
+        throw std::runtime_error(std::format("failed to wait for RF-DETR Python checkpoint bridge during {}: {}",
+                                             operation, std::strerror(errno)));
     }
 
     if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
@@ -210,8 +175,7 @@ void wait_for_child(const pid_t child_pid, const char* operation) {
     } else if (WIFSIGNALED(status)) {
         detail = std::format(" with signal {}", WTERMSIG(status));
     }
-    throw std::runtime_error(
-        std::format("RF-DETR Python checkpoint bridge failed during {}{}", operation, detail));
+    throw std::runtime_error(std::format("RF-DETR Python checkpoint bridge failed during {}{}", operation, detail));
 }
 
 fs::path checkpoint_bridge_script_path() {
@@ -245,17 +209,15 @@ void run_python_bridge(const char* operation, const std::vector<std::string>& ar
 
     const pid_t child_pid = ::fork();
     if (child_pid < 0) {
-        throw std::runtime_error(
-            std::string("failed to fork RF-DETR Python checkpoint bridge during ") + operation + ": " +
-            std::strerror(errno));
+        throw std::runtime_error(std::string("failed to fork RF-DETR Python checkpoint bridge during ") + operation +
+                                 ": " + std::strerror(errno));
     }
     if (child_pid == 0) {
         ::unsetenv("LD_LIBRARY_PATH");
         ::unsetenv("PYTHONPATH");
         ::execv(argv.front(), argv.data());
-        mmltk::logging::logger("rfdetr.checkpoint")->error(
-            "failed to exec Python checkpoint bridge: {}",
-            std::strerror(errno));
+        mmltk::logging::logger("rfdetr.checkpoint")
+            ->error("failed to exec Python checkpoint bridge: {}", std::strerror(errno));
         std::_Exit(127);
     }
 
@@ -286,7 +248,8 @@ NativeCheckpoint load_checkpoint_from_manifest(const fs::path& manifest_path) {
     NativeCheckpoint checkpoint;
     if (const auto metadata_it = manifest.find("metadata"); metadata_it != manifest.end()) {
         if (!metadata_it->is_object()) {
-            throw std::runtime_error("RF-DETR checkpoint manifest metadata is not an object: " + manifest_path.string());
+            throw std::runtime_error("RF-DETR checkpoint manifest metadata is not an object: " +
+                                     manifest_path.string());
         }
         populate_metadata_from_manifest(*metadata_it, checkpoint.metadata);
     }
@@ -305,9 +268,8 @@ NativeCheckpoint load_checkpoint_from_manifest(const fs::path& manifest_path) {
         const auto tensor_it = entry_json.find("tensor_path");
         const auto dtype_it = entry_json.find("dtype");
         const auto sizes_it = entry_json.find("sizes");
-        if (name_it == entry_json.end() || !name_it->is_string() ||
-            tensor_it == entry_json.end() || !tensor_it->is_string() ||
-            dtype_it == entry_json.end() || !dtype_it->is_string() ||
+        if (name_it == entry_json.end() || !name_it->is_string() || tensor_it == entry_json.end() ||
+            !tensor_it->is_string() || dtype_it == entry_json.end() || !dtype_it->is_string() ||
             sizes_it == entry_json.end() || !sizes_it->is_array()) {
             throw std::runtime_error("RF-DETR checkpoint manifest entry is missing name/tensor_path/dtype/sizes");
         }
@@ -366,7 +328,7 @@ json manifest_from_state_dict(const fs::path& root, const std::vector<StateDictE
     return manifest;
 }
 
-} // namespace
+}  // namespace
 
 NativeCheckpoint load_upstream_python_checkpoint(const fs::path& checkpoint_path) {
     ScopedTempDirectory temp_dir("mmltk_rfdetr_load_");
@@ -374,17 +336,15 @@ NativeCheckpoint load_upstream_python_checkpoint(const fs::path& checkpoint_path
     const fs::path tensor_dir = temp_dir.path / "tensors";
     fs::create_directories(tensor_dir);
 
-    run_python_bridge(
-        "checkpoint export",
-        {
-            "export-upstream",
-            "--input",
-            detail::canonical_checkpoint_path_string(checkpoint_path),
-            "--manifest",
-            manifest_path.string(),
-            "--tensor-dir",
-            tensor_dir.string(),
-        });
+    run_python_bridge("checkpoint export", {
+                                               "export-upstream",
+                                               "--input",
+                                               detail::canonical_checkpoint_path_string(checkpoint_path),
+                                               "--manifest",
+                                               manifest_path.string(),
+                                               "--tensor-dir",
+                                               tensor_dir.string(),
+                                           });
 
     return load_checkpoint_from_manifest(manifest_path);
 }
@@ -393,8 +353,7 @@ std::vector<StateDictEntry> load_upstream_python_state_dict(const fs::path& chec
     return load_upstream_python_checkpoint(checkpoint_path).state_dict;
 }
 
-void write_upstream_python_checkpoint(const fs::path& checkpoint_path,
-                                      const std::vector<StateDictEntry>& state_dict) {
+void write_upstream_python_checkpoint(const fs::path& checkpoint_path, const std::vector<StateDictEntry>& state_dict) {
     if (state_dict.empty()) {
         throw std::runtime_error("RF-DETR upstream checkpoint state_dict must not be empty");
     }
@@ -406,19 +365,17 @@ void write_upstream_python_checkpoint(const fs::path& checkpoint_path,
     const fs::path absolute_output = detail::canonical_checkpoint_path_string(checkpoint_path);
     ensure_output_path_writable(absolute_output);
     try {
-        run_python_bridge(
-            "checkpoint write",
-            {
-                "write-upstream",
-                "--output",
-                absolute_output.string(),
-                "--manifest",
-                manifest_path.string(),
-            });
+        run_python_bridge("checkpoint write", {
+                                                  "write-upstream",
+                                                  "--output",
+                                                  absolute_output.string(),
+                                                  "--manifest",
+                                                  manifest_path.string(),
+                                              });
     } catch (const std::exception& error) {
-        throw std::runtime_error(
-            std::string(error.what()) + "; check perms for " + absolute_output.parent_path().string());
+        throw std::runtime_error(std::string(error.what()) + "; check perms for " +
+                                 absolute_output.parent_path().string());
     }
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

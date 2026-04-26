@@ -12,20 +12,15 @@
 
 namespace Catch {
 
-    // Exception type to be thrown when a Generator runs into an error,
-    // e.g. it cannot initialize the first return value based on
-    // runtime information
-    class GeneratorException : public std::exception {
-        const char* const m_msg = "";
+class GeneratorException : public std::exception {
+    const char* const m_msg = "";
 
-    public:
-        GeneratorException(const char* msg):
-            m_msg(msg)
-        {}
+   public:
+    GeneratorException(const char* msg) : m_msg(msg) {}
 
-        const char* what() const noexcept final;
-    };
+    const char* what() const noexcept final;
+};
 
-} // end namespace Catch
+}  // namespace Catch
 
-#endif // CATCH_GENERATOR_EXCEPTION_HPP_INCLUDED
+#endif  // CATCH_GENERATOR_EXCEPTION_HPP_INCLUDED

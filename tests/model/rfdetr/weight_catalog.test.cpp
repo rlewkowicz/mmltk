@@ -20,24 +20,21 @@ using mmltk::rfdetr::StateDictEntry;
 using mmltk::rfdetr::testsupport::save_upstream_python_checkpoint;
 
 void write_upstream_checkpoint(const std::filesystem::path& path) {
-    save_upstream_python_checkpoint(path,
-                                    {
-                                        StateDictEntry{
-                                            "query_feat.weight",
-                                            torch::zeros({2600, 256}, torch::TensorOptions().dtype(torch::kFloat32)),
-                                        },
-                                        StateDictEntry{
-                                            "class_embed.bias",
-                                            torch::linspace(-1.0f,
-                                                            1.0f,
-                                                            91,
-                                                            torch::TensorOptions().dtype(torch::kFloat32)),
-                                        },
-                                        StateDictEntry{
-                                            "class_embed.weight",
-                                            torch::ones({91, 256}, torch::TensorOptions().dtype(torch::kFloat32)),
-                                        },
-                                    });
+    save_upstream_python_checkpoint(
+        path, {
+                  StateDictEntry{
+                      "query_feat.weight",
+                      torch::zeros({2600, 256}, torch::TensorOptions().dtype(torch::kFloat32)),
+                  },
+                  StateDictEntry{
+                      "class_embed.bias",
+                      torch::linspace(-1.0f, 1.0f, 91, torch::TensorOptions().dtype(torch::kFloat32)),
+                  },
+                  StateDictEntry{
+                      "class_embed.weight",
+                      torch::ones({91, 256}, torch::TensorOptions().dtype(torch::kFloat32)),
+                  },
+              });
 }
 #endif
 
@@ -94,8 +91,7 @@ void test_model_presets() {
     assert(preset->two_stage);
     assert(preset->canonical_weight_filename == "rf-detr-seg-medium.pt");
 
-    const auto* by_weight =
-        mmltk::rfdetr::find_model_preset_by_weight_filename("rf-detr-large-2026.pth");
+    const auto* by_weight = mmltk::rfdetr::find_model_preset_by_weight_filename("rf-detr-large-2026.pth");
     assert(by_weight != nullptr);
     assert(by_weight->preset_name == "rf-detr-large");
     assert(by_weight->patch_size == 16);
@@ -110,8 +106,7 @@ void test_model_presets() {
     assert(seg_nano->num_windows == 1);
     assert(seg_nano->positional_encoding_size == 26);
 
-    const auto* seg_medium_upstream =
-        mmltk::rfdetr::find_model_preset_by_weight_filename("rf-detr-seg-m-ft.pth");
+    const auto* seg_medium_upstream = mmltk::rfdetr::find_model_preset_by_weight_filename("rf-detr-seg-m-ft.pth");
     assert(seg_medium_upstream != nullptr);
     assert(seg_medium_upstream->preset_name == "rf-detr-seg-medium");
     const auto* seg_medium_legacy =
@@ -161,23 +156,20 @@ void test_weight_artifact_resolution() {
     assert(resolved.tensorrt_path.empty());
 
     write_upstream_checkpoint(root / "rf-detr-seg-m-ft.pth");
-    const auto upstream_named =
-        mmltk::rfdetr::resolve_upstream_weight_artifacts(root / "rf-detr-seg-m-ft.pth");
+    const auto upstream_named = mmltk::rfdetr::resolve_upstream_weight_artifacts(root / "rf-detr-seg-m-ft.pth");
     assert(upstream_named.config.preset_name == "rf-detr-seg-medium");
     assert(upstream_named.input_kind == "upstream-python");
     assert(upstream_named.input_path.filename() == "rf-detr-seg-m-ft.pth");
 
     fs::create_directories(root / "engines" / "output-seg-med" / "1train");
     write_upstream_checkpoint(root / "engines" / "output-seg-med" / "1train" / "checkpoint.pt");
-    const auto legacy_named =
-        mmltk::rfdetr::resolve_upstream_weight_artifacts(root / "engines" / "output-seg-med" / "1train" / "checkpoint.pt");
+    const auto legacy_named = mmltk::rfdetr::resolve_upstream_weight_artifacts(root / "engines" / "output-seg-med" /
+                                                                               "1train" / "checkpoint.pt");
     assert(legacy_named.config.preset_name == "rf-detr-seg-medium");
     assert(legacy_named.input_kind == "upstream-python");
     assert(legacy_named.input_path.filename() == "checkpoint.pt");
-    assert(
-        mmltk::rfdetr::infer_train_recipe_preset_name_from_path(
-            root / "engines" / "output-seg-med" / "1train" / "checkpoint.pt") ==
-        "rf-detr-seg-medium");
+    assert(mmltk::rfdetr::infer_train_recipe_preset_name_from_path(root / "engines" / "output-seg-med" / "1train" /
+                                                                   "checkpoint.pt") == "rf-detr-seg-medium");
 
     mmltk::rfdetr::ModelArtifactRequest onnx_request;
     onnx_request.onnx_path = cached_assets.onnx_path;
@@ -223,7 +215,7 @@ void test_weight_artifact_resolution() {
 }
 #endif
 
-} // namespace
+}  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][weight_catalog]", test_known_weight_assets);
 MMLTK_REGISTER_TEST_CASE("[model][rfdetr][weight_catalog]", test_weight_lookup_helpers);

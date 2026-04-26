@@ -1,0 +1,41 @@
+@use "tokens" as *;
+@use "mixins" as *;
+
+@include respond-max(shell) {
+  .shell-grid,
+  .workflow-main-grid,
+  .annotate-mask-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .workspace-frame,
+  #workspace-canvas {
+    min-height: 360px;
+  }
+}
+
+@include respond-max(mobile) {
+  .shell {
+    width: min(100vw - 1rem, 100%);
+    margin: 0.5rem auto;
+    padding: 0.8rem;
+    border-radius: radius-token(md);
+  }
+
+  .topbar,
+  .workspace-header,
+  .statusbar {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .workspace-meta {
+    width: 100%;
+  }
+
+  .detail-grid,
+  .form-grid,
+  .field-group {
+    grid-template-columns: 1fr;
+  }
+}

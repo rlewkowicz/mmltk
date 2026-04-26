@@ -19,9 +19,7 @@ inline bool is_onnx_logging_option(std::string_view arg, std::string_view name) 
     return arg == name || arg.starts_with(prefix);
 }
 
-inline SingleOnnxToolArgs parse_single_onnx_tool_args(int argc,
-                                                      char** argv,
-                                                      std::string_view usage) {
+inline SingleOnnxToolArgs parse_single_onnx_tool_args(int argc, char** argv, std::string_view usage) {
     SingleOnnxToolArgs parsed;
     for (int index = 1; index < argc; ++index) {
         const std::string_view arg = argv[index];
@@ -32,8 +30,7 @@ inline SingleOnnxToolArgs parse_single_onnx_tool_args(int argc,
                 }
                 parsed.logging.level = mmltk::logging::parse_level(argv[++index]);
             } else {
-                parsed.logging.level =
-                    mmltk::logging::parse_level(arg.substr(std::string_view("--log-level=").size()));
+                parsed.logging.level = mmltk::logging::parse_level(arg.substr(std::string_view("--log-level=").size()));
             }
             continue;
         }
@@ -44,8 +41,7 @@ inline SingleOnnxToolArgs parse_single_onnx_tool_args(int argc,
                 }
                 parsed.logging.log_file = std::filesystem::path(argv[++index]);
             } else {
-                parsed.logging.log_file =
-                    std::filesystem::path(arg.substr(std::string_view("--log-file=").size()));
+                parsed.logging.log_file = std::filesystem::path(arg.substr(std::string_view("--log-file=").size()));
             }
             continue;
         }
@@ -56,8 +52,7 @@ inline SingleOnnxToolArgs parse_single_onnx_tool_args(int argc,
                 }
                 parsed.logging.log_dir = std::filesystem::path(argv[++index]);
             } else {
-                parsed.logging.log_dir =
-                    std::filesystem::path(arg.substr(std::string_view("--log-dir=").size()));
+                parsed.logging.log_dir = std::filesystem::path(arg.substr(std::string_view("--log-dir=").size()));
             }
             continue;
         }
@@ -72,4 +67,4 @@ inline SingleOnnxToolArgs parse_single_onnx_tool_args(int argc,
     return parsed;
 }
 
-} // namespace mmltk::rfdetr
+}  // namespace mmltk::rfdetr

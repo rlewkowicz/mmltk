@@ -10,9 +10,6 @@
 #include <functional>
 #include <mutex>
 
-// Store log messages in circular buffer.
-// Useful for storing debug data in case of error/warning happens.
-
 namespace spdlog {
 namespace details {
 class SPDLOG_API backtracer {
@@ -20,21 +17,20 @@ class SPDLOG_API backtracer {
     std::atomic<bool> enabled_{false};
     circular_q<log_msg_buffer> messages_;
 
-public:
+   public:
     backtracer() = default;
-    backtracer(const backtracer &other);
+    backtracer(const backtracer& other);
 
-    backtracer(backtracer &&other) SPDLOG_NOEXCEPT;
-    backtracer &operator=(backtracer other);
+    backtracer(backtracer&& other) SPDLOG_NOEXCEPT;
+    backtracer& operator=(backtracer other);
 
     void enable(size_t size);
     void disable();
     bool enabled() const;
-    void push_back(const log_msg &msg);
+    void push_back(const log_msg& msg);
     bool empty() const;
 
-    // pop all items in the q and apply the given fun on each of them.
-    void foreach_pop(std::function<void(const details::log_msg &)> fun);
+    void foreach_pop(std::function<void(const details::log_msg&)> fun);
 };
 
 }  // namespace details
