@@ -1,0 +1,95 @@
+diff --git ui/ozone/platform/wayland/host/wayland_seat.cc ui/ozone/platform/wayland/host/wayland_seat.cc
+index a9e3135..329131e 100644
+--- ui/ozone/platform/wayland/host/wayland_seat.cc
++++ ui/ozone/platform/wayland/host/wayland_seat.cc
+@@ -5,7 +5,6 @@
+ #include "ui/ozone/platform/wayland/host/wayland_seat.h"
+ 
+ #include "base/logging.h"
+-#include "base/notimplemented.h"
+ #include "ui/events/ozone/layout/keyboard_layout_engine_manager.h"
+ #include "ui/ozone/platform/wayland/host/wayland_connection.h"
+ #include "ui/ozone/platform/wayland/host/wayland_event_source.h"
+@@ -88,7 +87,6 @@ void WaylandSeat::OnCapabilities(void* data,
+ 
+ // static
+ void WaylandSeat::OnName(void* data, wl_seat* seat, const char* name) {
+-  NOTIMPLEMENTED_LOG_ONCE();
+ }
+ 
+ void WaylandSeat::HandleCapabilities(void* data,
+diff --git ui/ozone/platform/wayland/host/wayland_zwp_linux_dmabuf.h ui/ozone/platform/wayland/host/wayland_zwp_linux_dmabuf.h
+index ae06cd8..efecb9b 100644
+--- ui/ozone/platform/wayland/host/wayland_zwp_linux_dmabuf.h
++++ ui/ozone/platform/wayland/host/wayland_zwp_linux_dmabuf.h
+@@ -71,6 +71,7 @@ class WaylandZwpLinuxDmabuf
+     Tranche();
+     ~Tranche();
+     dev_t target_device;
++    uint32_t flags = 0;
+     std::vector<uint16_t> formats;
+   };
+ 
+diff --git ui/ozone/platform/wayland/host/wayland_zwp_linux_dmabuf.cc ui/ozone/platform/wayland/host/wayland_zwp_linux_dmabuf.cc
+index 36f530b..a07b8b2 100644
+--- ui/ozone/platform/wayland/host/wayland_zwp_linux_dmabuf.cc
++++ ui/ozone/platform/wayland/host/wayland_zwp_linux_dmabuf.cc
+@@ -15,7 +15,6 @@
+ 
+ #include "base/files/scoped_file.h"
+ #include "base/logging.h"
+-#include "base/notimplemented.h"
+ #include "base/timer/elapsed_timer.h"
+ #include "ui/gfx/linux/drm_util_linux.h"
+ #include "ui/ozone/platform/wayland/host/wayland_buffer_factory.h"
+@@ -392,7 +391,9 @@ void WaylandZwpLinuxDmabuf::OnTrancheFlags(
+     void* data,
+     zwp_linux_dmabuf_feedback_v1* feedback,
+     uint32_t flags) {
+-  NOTIMPLEMENTED_LOG_ONCE();
++  if (auto* self = static_cast<WaylandZwpLinuxDmabuf*>(data)) {
++    self->pending_tranche_.flags = flags;
++  }
+ }
+ 
+ }  // namespace ui
+diff --git ui/ozone/platform/wayland/host/xdg_toplevel.cc ui/ozone/platform/wayland/host/xdg_toplevel.cc
+index e65499d..11fadbb 100644
+--- ui/ozone/platform/wayland/host/xdg_toplevel.cc
++++ ui/ozone/platform/wayland/host/xdg_toplevel.cc
+@@ -13,7 +13,6 @@
+ 
+ #include "base/bit_cast.h"
+ #include "base/logging.h"
+-#include "base/notimplemented.h"
+ #include "base/notreached.h"
+ #include "base/strings/utf_string_conversions.h"
+ #include "third_party/skia/include/core/SkBitmap.h"
+@@ -279,7 +278,6 @@ void XdgToplevel::OnConfigureBounds(void* data,
+                                     xdg_toplevel* toplevel,
+                                     int32_t width,
+                                     int32_t height) {
+-  NOTIMPLEMENTED_LOG_ONCE();
+ }
+ 
+ // static
+@@ -287,7 +285,6 @@ void XdgToplevel::OnConfigureBounds(void* data,
+ void XdgToplevel::OnWmCapabilities(void* data,
+                                    xdg_toplevel* toplevel,
+                                    wl_array* capabilities) {
+-  NOTIMPLEMENTED_LOG_ONCE();
+ }
+ 
+ // static
+diff --git ui/ozone/platform/wayland/host/wayland_pointer.cc ui/ozone/platform/wayland/host/wayland_pointer.cc
+index 5c7d0f9..b8d6eaf 100644
+--- ui/ozone/platform/wayland/host/wayland_pointer.cc
++++ ui/ozone/platform/wayland/host/wayland_pointer.cc
+@@ -264,7 +264,6 @@ void WaylandPointer::OnAxisRelativeDirection(void* data,
+                                              wl_pointer* obj,
+                                              uint32_t axis,
+                                              uint32_t direction) {
+-  NOTIMPLEMENTED_LOG_ONCE();
+ }
+ 
+ }  // namespace ui

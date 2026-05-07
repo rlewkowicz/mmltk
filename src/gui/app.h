@@ -2,6 +2,7 @@
 
 #include "browser/host_api.h"
 #include "gui/browser_retained_frame_registry.h"
+#include "mmltk/live/live_types.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -13,8 +14,12 @@
 #include <vector>
 
 namespace mmltk::live {
+enum class LivePipelineStage : std::uint8_t;
+struct LiveFrameId;
 class LiveSessionController;
+struct LiveSessionConfig;
 struct LiveSessionStatus;
+struct WorkspacePresentSnapshot;
 }  // namespace mmltk::live
 
 namespace mmltk::browser {
@@ -23,6 +28,7 @@ struct IntentMessage;
 struct StateSnapshot;
 struct FileDialogRequestIntent;
 struct ViewportCommitIntent;
+struct WorkspaceRendererEventIntent;
 }  // namespace mmltk::browser
 
 namespace mmltk::gui {
@@ -56,6 +62,22 @@ struct BrowserWorkspaceViewportState {
     mmltk::browser::ViewportCommitIntent commit{};
 };
 
+struct BrowserWorkspaceBoundsState {
+    mmltk::browser::Workflow workflow{};
+    mmltk::browser::WorkspaceBoundsIntent bounds{};
+};
+
+struct BrowserWorkspaceNativePresentState {
+    const mmltk::live::WorkspaceSwapchainDescriptor* swapchain_descriptor = nullptr;
+    mmltk::live::WorkspacePresentSnapshot latest_present{};
+    std::optional<BrowserWorkspaceBoundsState> bounds;
+    std::optional<int> cuda_device_index;
+
+    [[nodiscard]] bool ready() const noexcept {
+        return swapchain_descriptor != nullptr && latest_present.valid;
+    }
+};
+
 // NOLINTNEXTLINE(clang-analyzer-optin.performance.Padding)
 class App {
    public:
@@ -64,9 +86,13 @@ class App {
 
     void drain_background_work();
     void set_evented_work_wake_callback(std::function<void()> callback);
+    void set_annotation_live_session_start_override_for_testing(
+        std::function<void(const mmltk::live::LiveSessionConfig&)> callback);
     void shutdown();
     [[nodiscard]] mmltk::browser::StateSnapshot browser_state_snapshot();
     [[nodiscard]] std::optional<BrowserWorkspaceViewportState> browser_workspace_viewport_state() const;
+    [[nodiscard]] std::optional<BrowserWorkspaceBoundsState> browser_workspace_bounds_state() const;
+    [[nodiscard]] BrowserWorkspaceNativePresentState browser_workspace_native_present_state() const;
     void apply_browser_intent(const mmltk::browser::IntentMessage& intent);
     [[nodiscard]] std::optional<mmltk::browser::WorkspaceSurfaceInfo> acquire_workspace_surface(
         std::string_view surface_id) const;
@@ -74,6 +100,9 @@ class App {
         std::string_view surface_id, std::string_view revision) const;
     bool release_workspace_surface(std::string_view surface_id, std::string_view revision);
     void release_all_workspace_surface_publications();
+    void record_workspace_surface_bridge_error(std::string error_message);
+    void record_workspace_surface_pipeline_stage(mmltk::live::LivePipelineStage stage, std::string_view surface_id,
+                                                 std::string_view revision, std::uint64_t latency_base_ns = 0) noexcept;
 
    private:
     struct JobOutcome;
@@ -111,6 +140,8 @@ class App {
     void poll_annotate_work();
     void notify_evented_work_ready() const noexcept;
     [[nodiscard]] std::function<void()> live_workspace_ready_callback() const;
+    [[nodiscard]] std::function<void(const mmltk::live::WorkspacePresentSnapshot&)> live_workspace_present_callback()
+        const;
     void refresh_live_workspace_ready_callbacks();
     void invalidate_annotation_preview();
     void cancel_annotation_canvas_interactions();
@@ -120,6 +151,7 @@ class App {
     [[nodiscard]] bool live_predict_running() const;
     [[nodiscard]] bool live_predict_active() const;
     [[nodiscard]] std::optional<AnnotationFrame> make_live_annotation_frame_from_preview() const;
+    [[nodiscard]] bool browser_live_workspace_surface_retained() const noexcept;
     [[nodiscard]] bool has_static_preview() const;
     void clear_static_preview();
     void apply_static_preview(StillImagePreview preview);
@@ -128,6 +160,10 @@ class App {
     void launch_export_job();
     bool request_annotation_save_now();
     void apply_annotation_sidebar_mutation_result(const AnnotationSidebarMutationResult& result, bool allow_assist);
+    void apply_workspace_renderer_event(const mmltk::browser::WorkspaceRendererEventIntent& intent,
+                                        std::string_view intent_name);
+    void record_workspace_renderer_pipeline_stage(mmltk::live::LivePipelineStage stage,
+                                                  const mmltk::browser::WorkspaceRendererEventIntent& intent);
     void launch_browser_file_dialog(const mmltk::browser::FileDialogRequestIntent& intent);
     void queue_browser_viewport_commit(mmltk::browser::Workflow workflow,
                                        const mmltk::browser::ViewportCommitIntent& intent);
@@ -135,6 +171,8 @@ class App {
     void begin_live_predict_preview_stream(int device_id);
     void end_live_predict_preview_stream();
     void reset_live_predict_preview_state(bool clear_frame);
+    void refresh_annotate_live_startup_state(const mmltk::live::LiveSessionStatus& status);
+    void mark_annotate_live_drawable(const mmltk::live::LiveFrameId& frame_id);
     void refresh_browser_live_frame_publications(mmltk::live::LiveSessionController* browser_live_controller,
                                                  std::string* browser_preview_error);
     void refresh_browser_retained_frame_publications(bool static_preview_visible);

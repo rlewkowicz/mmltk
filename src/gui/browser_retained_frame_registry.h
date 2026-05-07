@@ -15,6 +15,13 @@ namespace mmltk::gui {
 enum class LinuxImportedImageSourceKind : std::uint8_t {
     Unknown = 0,
     CudaDevicePointer = 1,
+    DmaBufRgba = 2,
+};
+
+enum class LinuxDmaBufModifierMode : std::uint8_t {
+    Unknown = 0,
+    Implicit = 1,
+    Explicit = 2,
 };
 
 enum class LinuxImportedSyncHandleKind : std::uint8_t {
@@ -25,8 +32,16 @@ enum class LinuxImportedSyncHandleKind : std::uint8_t {
 
 struct LinuxImportedImageSource {
     LinuxImportedImageSourceKind kind = LinuxImportedImageSourceKind::Unknown;
-    std::uintptr_t handle = 0;
+    std::uintptr_t fd = 0;
     int cuda_device_index = -1;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint64_t stride_bytes = 0;
+    std::uint64_t offset = 0;
+    std::uint64_t allocation_size = 0;
+    std::uint32_t drm_format = 0;
+    std::uint64_t drm_modifier = 0;
+    LinuxDmaBufModifierMode modifier_mode = LinuxDmaBufModifierMode::Unknown;
 
     bool operator==(const LinuxImportedImageSource&) const noexcept = default;
 };
@@ -53,15 +68,46 @@ struct LinuxImportedFrameLifecycleContract {
     bool operator==(const LinuxImportedFrameLifecycleContract&) const noexcept = default;
 };
 
+class RetainedLinuxImageFd;
+
 struct RetainedBrowserImportedFrameSource {
     mmltk::browser::FrameSlotDescriptor descriptor;
     std::optional<LinuxImportedFrameSourceContract> linux_import;
     std::optional<LinuxImportedFrameLifecycleContract> linux_lifecycle;
+    std::shared_ptr<RetainedLinuxImageFd> owned_image_fd;
+};
+
+class RetainedLinuxImageFd {
+   public:
+    explicit RetainedLinuxImageFd(int fd) noexcept : fd_(fd) {}
+    ~RetainedLinuxImageFd();
+
+    RetainedLinuxImageFd(const RetainedLinuxImageFd&) = delete;
+    RetainedLinuxImageFd& operator=(const RetainedLinuxImageFd&) = delete;
+
+    RetainedLinuxImageFd(RetainedLinuxImageFd&& other) noexcept;
+    RetainedLinuxImageFd& operator=(RetainedLinuxImageFd&& other) noexcept;
+
+    [[nodiscard]] int fd() const noexcept {
+        return fd_;
+    }
+    [[nodiscard]] int release() noexcept {
+        const int fd = fd_;
+        fd_ = -1;
+        return fd;
+    }
+    void reset(int fd = -1) noexcept;
+
+   private:
+    int fd_ = -1;
 };
 
 [[nodiscard]] inline bool linux_imported_frame_source_contract_is_empty(
     const LinuxImportedFrameSourceContract& contract) noexcept {
-    return contract.image.handle == 0U && contract.image.cuda_device_index < 0 &&
+    return contract.image.fd == 0U && contract.image.cuda_device_index < 0 &&
+           contract.image.width == 0U && contract.image.height == 0U && contract.image.stride_bytes == 0U &&
+           contract.image.offset == 0U && contract.image.allocation_size == 0U && contract.image.drm_format == 0U &&
+           contract.image.drm_modifier == 0U && contract.image.modifier_mode == LinuxDmaBufModifierMode::Unknown &&
            contract.ready_sync.kind == LinuxImportedSyncHandleKind::None && contract.ready_sync.handle == 0U &&
            contract.ready_sync.value == 0U && contract.producer_stream.kind == LinuxImportedSyncHandleKind::None &&
            contract.producer_stream.handle == 0U && contract.producer_stream.value == 0U;
@@ -69,9 +115,6 @@ struct RetainedBrowserImportedFrameSource {
 
 inline void canonicalize_linux_imported_frame_source_contract(LinuxImportedFrameSourceContract& contract,
                                                               std::uint64_t ready_sync_value) noexcept {
-    if (contract.image.kind == LinuxImportedImageSourceKind::Unknown && contract.image.handle != 0U) {
-        contract.image.kind = LinuxImportedImageSourceKind::CudaDevicePointer;
-    }
     if (contract.ready_sync.kind == LinuxImportedSyncHandleKind::None && contract.ready_sync.handle != 0U) {
         contract.ready_sync.kind = LinuxImportedSyncHandleKind::CudaEvent;
     }

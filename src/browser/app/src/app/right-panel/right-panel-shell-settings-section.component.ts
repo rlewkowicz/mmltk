@@ -12,13 +12,6 @@ import { BrowserShellSettingsState } from "../state/browser-shell-settings.servi
     <section class="panel-section">
       <div class="section-header">
         <h2>Shell Settings</h2>
-        <button
-          type="button"
-          [disabled]="!store.canApplyShellSettings()"
-          (click)="store.apply()"
-        >
-          Apply UI
-        </button>
       </div>
       <div class="form-grid">
         <label class="field field-inline">
@@ -50,7 +43,6 @@ import { BrowserShellSettingsState } from "../state/browser-shell-settings.servi
           </select>
         </label>
       </div>
-      <p class="section-copy">{{ store.shellSettingsNote() }}</p>
     </section>
   `,
 })

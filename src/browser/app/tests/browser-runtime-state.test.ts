@@ -1,35 +1,36 @@
 import * as assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { inject, type StaticProvider } from "@angular/core";
+import { inject } from "@angular/core";
 
 import { BrowserHostRuntimeState } from "../src/app/state/browser-host-runtime.service";
 import { BrowserWorkspaceStateService } from "../src/app/state/browser-workspace.service";
-import { BrowserWorkflowRouteState } from "../src/app/state/browser-workflow-route.service";
+import { liveStatusState } from "../src/browser_shell_state";
 import type { StateSnapshot } from "../src/host_api";
+import { HOST_API_CONTRACT_HASH } from "../src/host_api.generated";
 import { buildWorkspaceCanvasLayout } from "../src/workspace_renderer";
 import {
   createAngularServiceHarness,
   type AngularServiceHarness,
 } from "./support/angular-test-harness";
 import {
+  makeAvailableBrowserTestRuntimeCapabilities,
+  makeBrowserTestSource,
   makeBrowserTestSnapshot,
+  makeBrowserTestWorkspaceSurface,
   makeBrowserTestWorkspaceBridgeSnapshot,
+  makeRuntimeWorkspaceProviders,
 } from "./support/browser-test-fixtures";
-import { assertSemanticViewportCommitPayload } from "./support/browser-state-assertions";
+import {
+  assertPrimaryChromeOmitsRawDiagnostics,
+  assertSemanticViewportCommitPayload,
+} from "./support/browser-state-assertions";
+import { makeTestOverlayRectPrimitive } from "./support/workspace-render-fixtures";
 
 function createHarness(
   snapshot: StateSnapshot,
 ): AngularServiceHarness {
-  const providers: StaticProvider[] = [
-    { provide: BrowserHostRuntimeState, useFactory: () => new BrowserHostRuntimeState() },
-    { provide: BrowserWorkflowRouteState, useFactory: () => new BrowserWorkflowRouteState() },
-    {
-      provide: BrowserWorkspaceStateService,
-      useFactory: () => new BrowserWorkspaceStateService(),
-    },
-  ];
-  return createAngularServiceHarness(snapshot, providers, {
+  return createAngularServiceHarness(snapshot, makeRuntimeWorkspaceProviders(), {
     mode: "native",
   });
 }
@@ -37,12 +38,17 @@ function createHarness(
 function updateWorkspaceSurfaceReport(
   workspace: BrowserWorkspaceStateService,
   surfaceBoundsCss: { x: number; y: number; width: number; height: number },
+  options: {
+    overlayPrimitive: boolean;
+  } = { overlayPrimitive: false },
 ): void {
   workspace.updateWorkspaceSurfaceReport(
     buildWorkspaceCanvasLayout(
       {
         ...workspace.workspaceRenderInput(),
-        overlayPrimitives: [],
+        overlayPrimitives: options.overlayPrimitive
+          ? [makeTestOverlayRectPrimitive()]
+          : [],
       },
       {
         devicePixelRatio: 2,
@@ -61,6 +67,82 @@ function assertWorkspaceBridgeFrameReady(
     diagnostics.statusItems.find((item) => item.key === "frame_path")?.status,
     "ready",
   );
+}
+
+function assertPrimaryWorkspaceChromeOmitsRawDiagnostics(
+  workspace: BrowserWorkspaceStateService,
+): void {
+  assertPrimaryChromeOmitsRawDiagnostics([workspace.workspace().title]);
+}
+
+function makeAvailableRuntimeSnapshot(
+  overrides: Partial<StateSnapshot> = {},
+): StateSnapshot {
+  return makeBrowserTestSnapshot({
+    state_revision: 4,
+    ...overrides,
+    runtime_capabilities: makeAvailableBrowserTestRuntimeCapabilities(
+      overrides.runtime_capabilities,
+    ),
+  });
+}
+
+function makeNativePresentedLiveSnapshot(
+  overrides: Partial<StateSnapshot> = {},
+): StateSnapshot {
+  return makeAvailableRuntimeSnapshot({
+    active_workflow: "live",
+    workspace_surface: makeBrowserTestWorkspaceSurface({ revision: "401" }),
+    ...overrides,
+    workflow_state: {
+      live_runtime: {
+        active_mode: "predict",
+        show_running_section: true,
+        preview: {
+          initialized: true,
+          has_frame: true,
+          displayed_region: { x: 0, y: 0, width: 1280, height: 720 },
+          frame_id: 401,
+          surface_revision: "401",
+          owner: "live",
+          native_presented: true,
+          display_startup_state: "native presented",
+        },
+      },
+      ...overrides.workflow_state,
+    },
+  });
+}
+
+function measuredWorkspace(
+  run: AngularServiceHarness["run"],
+): BrowserWorkspaceStateService {
+  const workspace = run(() => inject(BrowserWorkspaceStateService));
+  updateWorkspaceSurfaceReport(workspace, {
+    x: 20,
+    y: 30,
+    width: 640,
+    height: 360,
+  });
+  return workspace;
+}
+
+function publishBridgeCapabilities(
+  transport: AngularServiceHarness["transport"],
+  snapshot: StateSnapshot,
+  runtimeCapabilities: StateSnapshot["runtime_capabilities"],
+  capabilities?: NonNullable<
+    ReturnType<AngularServiceHarness["transport"]["getBridgeState"]>["capabilities"]
+  >,
+): void {
+  transport.publishBridgeState({
+    phase: "idle",
+    connected: true,
+    lastError: "",
+    lastSuccessRevision: snapshot.state_revision,
+    runtimeCapabilities,
+    ...(capabilities === undefined ? {} : { capabilities }),
+  });
 }
 
 test("BrowserHostRuntimeState reacts to browser runtime capability snapshots", () => {
@@ -139,31 +221,16 @@ test("BrowserHostRuntimeState reacts to browser runtime capability snapshots", (
 });
 
 test("BrowserHostRuntimeState keeps transport diagnostics focused on the workspace bridge contract", () => {
-  const snapshot = makeBrowserTestSnapshot({
-    state_revision: 4,
-    runtime_capabilities: {
-      host_backend: "cef",
-      navigator_gpu: "available",
-      workspace_surface_bridge: "available",
-      workspace_surface_zero_copy: "available",
-    },
-  });
+  const snapshot = makeAvailableRuntimeSnapshot();
   const { destroy, run, transport } = createHarness(snapshot);
 
   try {
     const runtime = run(() => inject(BrowserHostRuntimeState));
-    transport.publishBridgeState({
-      phase: "idle",
-      connected: true,
-      lastError: "",
-      lastSuccessRevision: snapshot.state_revision,
-      runtimeCapabilities: {
-        host_backend: "cef",
-        navigator_gpu: "available",
-        workspace_surface_bridge: "available",
-        workspace_surface_zero_copy: "available",
-      },
-    });
+    publishBridgeCapabilities(
+      transport,
+      snapshot,
+      makeAvailableBrowserTestRuntimeCapabilities(),
+    );
 
     assert.equal(
       runtime.runtimeCapabilityStatus().find((item) => item.key === "workspace_surface_bridge")
@@ -182,8 +249,88 @@ test("BrowserHostRuntimeState keeps transport diagnostics focused on the workspa
   }
 });
 
+test("BrowserHostRuntimeState keeps known snapshot capabilities when bridge updates are unknown", () => {
+  const snapshot = makeAvailableRuntimeSnapshot();
+  const { destroy, run, transport } = createHarness(snapshot);
+
+  try {
+    const runtime = run(() => inject(BrowserHostRuntimeState));
+    publishBridgeCapabilities(transport, snapshot, {
+      host_backend: "unknown",
+      navigator_gpu: "unknown",
+      workspace_surface_bridge: "unknown",
+      workspace_surface_zero_copy: "unknown",
+    });
+
+    assert.deepEqual(runtime.runtimeCapabilities(), {
+      host_backend: "cef",
+      navigator_gpu: "available",
+      workspace_surface_bridge: "available",
+      workspace_surface_zero_copy: "available",
+    });
+    assert.equal(
+      runtime.runtimeCapabilityStatus().find((item) => item.key === "host_backend")
+        ?.summary,
+      "host backend CEF",
+    );
+    assert.equal(
+      runtime.runtimeCapabilityStatus().find((item) => item.key === "workspace_surface_bridge")
+        ?.status,
+      "ready",
+    );
+  } finally {
+    destroy();
+  }
+});
+
+test("BrowserHostRuntimeState uses bridge capability contracts for CEF structural failures", () => {
+  const snapshot = makeAvailableRuntimeSnapshot({
+    state_revision: 4,
+    runtime_capabilities: {
+      host_backend: "cef",
+      navigator_gpu: "available",
+      workspace_surface_bridge: "available",
+      workspace_surface_zero_copy: "unknown",
+    },
+  });
+  const { destroy, run, transport } = createHarness(snapshot);
+
+  try {
+    const runtime = run(() => inject(BrowserHostRuntimeState));
+    publishBridgeCapabilities(
+      transport,
+      snapshot,
+      {
+        host_backend: "unknown",
+        navigator_gpu: "unknown",
+        workspace_surface_bridge: "unavailable",
+        workspace_surface_zero_copy: "unknown",
+      },
+      {
+        workspace_surface_bridge: {
+          status: "blocked",
+          summary: "workspace surface bridge unavailable",
+          detail: "CEF workspace texture import helper is absent",
+        },
+      },
+    );
+
+    const bridgeStatus = runtime.runtimeCapabilityStatus().find(
+      (item) => item.key === "workspace_surface_bridge",
+    );
+    assert.equal(runtime.runtimeCapabilities().host_backend, "cef");
+    assert.equal(bridgeStatus?.status, "blocked");
+    assert.equal(
+      bridgeStatus?.detail,
+      "CEF workspace texture import helper is absent",
+    );
+  } finally {
+    destroy();
+  }
+});
+
 test("BrowserHostRuntimeState keeps transport capability summaries scoped to transport, bridge, and zero-copy", () => {
-  const snapshot = makeBrowserTestSnapshot({
+  const snapshot = makeAvailableRuntimeSnapshot({
     state_revision: 5,
     runtime_capabilities: {
       host_backend: "cef",
@@ -205,6 +352,87 @@ test("BrowserHostRuntimeState keeps transport capability summaries scoped to tra
       runtime.transportStatus().statusItems.map((item) => item.key),
       ["transport", "workspace_surface_bridge", "workspace_surface_zero_copy"],
     );
+  } finally {
+    destroy();
+  }
+});
+
+test("Live runtime preview reports native-presented workspace without renderer draw state", () => {
+  const snapshot = makeNativePresentedLiveSnapshot();
+
+  const liveStatus = liveStatusState(snapshot);
+  assert.equal(liveStatus.preview.hasFrame, true);
+  assert.equal(liveStatus.preview.displayStartupState, "native presented");
+  assert.equal(liveStatus.preview.rendererImportedRevision, "");
+  assert.equal(liveStatus.preview.rendererSubmittedRevision, "");
+  assert.equal(liveStatus.preview.rendererDrawnRevision, "");
+  assert.equal(
+    liveStatus.statusItems.find((item) => item.key === "preview")?.status,
+    "active",
+  );
+});
+
+test("Live runtime preview does not imply native-presented from active live mode", () => {
+  const snapshot = makeAvailableRuntimeSnapshot({
+    active_workflow: "live",
+    source: makeBrowserTestSource({ kind: "video_stream" }),
+    workspace_surface: makeBrowserTestWorkspaceSurface({ revision: "400" }),
+    workflow_state: {
+      live_runtime: {
+        active_mode: "predict",
+        show_running_section: true,
+        preview: {
+          initialized: true,
+          has_frame: true,
+          surface_revision: "400",
+          owner: "live",
+          display_startup_state: "surface published",
+        },
+      },
+    },
+  });
+
+  const liveStatus = liveStatusState(snapshot);
+  assert.equal(liveStatus.runtime.activeMode, "predict");
+  assert.equal(liveStatus.preview.nativePresented, false);
+  assert.equal(liveStatus.preview.displayStartupState, "surface published");
+});
+
+test("BrowserWorkspaceStateService reports native-presented live diagnostics without bridge capability rows", () => {
+  const snapshot = makeNativePresentedLiveSnapshot({
+    source: makeBrowserTestSource({ kind: "video_stream" }),
+  });
+  const { destroy, run } = createHarness(snapshot);
+
+  try {
+    const workspace = measuredWorkspace(run);
+
+    const diagnostics = workspace.workspaceDiagnostics();
+    assert.equal(diagnostics.framePathLabel, "native-presented live workspace");
+    assert.deepEqual(
+      diagnostics.statusItems.map((item) => item.key),
+      ["frame_path", "overlay_path", "transport"],
+    );
+    assert.equal(
+      /navigator\.gpu|zero-copy|surface bridge/i.test(diagnostics.detail),
+      false,
+    );
+  } finally {
+    destroy();
+  }
+});
+
+test("BrowserHostRuntimeState reports generated contract hash mismatch", () => {
+  const snapshot = makeBrowserTestSnapshot({
+    contract_hash: "stale-contract",
+  });
+  const { destroy, run } = createHarness(snapshot);
+
+  try {
+    const runtime = run(() => inject(BrowserHostRuntimeState));
+    assert.equal(runtime.contractHashMatched(), false);
+    assert.match(runtime.contractMismatchDetail(), /stale-contract/);
+    assert.match(runtime.contractMismatchDetail(), new RegExp(HOST_API_CONTRACT_HASH));
   } finally {
     destroy();
   }
@@ -239,6 +467,43 @@ test("BrowserHostRuntimeState blocks the workspace bridge when the runtime repor
   }
 });
 
+test("BrowserWorkspaceStateService treats known-backend unknown bridge state as blocked diagnostics", () => {
+  const snapshot = makeBrowserTestWorkspaceBridgeSnapshot({
+    state_revision: 6,
+    runtime_capabilities: {
+      host_backend: "cef",
+      navigator_gpu: "available",
+      workspace_surface_bridge: "unknown",
+      workspace_surface_zero_copy: "unknown",
+    },
+  });
+  const { destroy, run } = createHarness(snapshot);
+
+  try {
+    const runtime = run(() => inject(BrowserHostRuntimeState));
+    const workspace = measuredWorkspace(run);
+
+    const bridgeStatus = runtime.runtimeCapabilityStatus().find(
+      (item) => item.key === "workspace_surface_bridge",
+    );
+    assert.equal(bridgeStatus?.status, "blocked");
+    assert.equal(
+      workspace.workspaceDiagnostics().framePathLabel,
+      "workspace surface bridge blocked",
+    );
+    assertPrimaryWorkspaceChromeOmitsRawDiagnostics(workspace);
+    assert.equal(
+      workspace.workspaceDiagnostics().statusItems.find((item) => item.key === "frame_path")
+        ?.status,
+      "blocked",
+    );
+    assert.equal(workspace.workspaceHardError()?.code, "workspace_surface_bridge");
+    assert.equal(workspace.workspaceInteractionBlocked(), true);
+  } finally {
+    destroy();
+  }
+});
+
 test("BrowserHostRuntimeState blocks workspace zero-copy when the runtime reports it unavailable", () => {
   const snapshot = makeBrowserTestSnapshot({
     state_revision: 5,
@@ -264,6 +529,44 @@ test("BrowserHostRuntimeState blocks workspace zero-copy when the runtime report
   }
 });
 
+test("BrowserWorkspaceStateService keeps zero-copy pending distinct from blocked bridge diagnostics", () => {
+  const snapshot = makeBrowserTestWorkspaceBridgeSnapshot({
+    state_revision: 7,
+    runtime_capabilities: {
+      host_backend: "cef",
+      navigator_gpu: "available",
+      workspace_surface_bridge: "available",
+      workspace_surface_zero_copy: "unknown",
+    },
+  });
+  const { destroy, run } = createHarness(snapshot);
+
+  try {
+    const workspace = run(() => inject(BrowserWorkspaceStateService));
+    updateWorkspaceSurfaceReport(workspace, {
+      x: 20,
+      y: 30,
+      width: 640,
+      height: 360,
+    });
+
+    assert.equal(
+      workspace.workspaceDiagnostics().framePathLabel,
+      "workspace zero-copy pending",
+    );
+    assertPrimaryWorkspaceChromeOmitsRawDiagnostics(workspace);
+    assert.equal(
+      workspace.workspaceDiagnostics().statusItems.find((item) => item.key === "frame_path")
+        ?.status,
+      "pending",
+    );
+    assert.equal(workspace.workspaceHardError(), null);
+    assert.equal(workspace.workspaceInteractionBlocked(), false);
+  } finally {
+    destroy();
+  }
+});
+
 test("BrowserWorkspaceStateService keeps the workspace on the bridge path once the canvas is measured and a surface is published", () => {
   const initialSnapshot = makeBrowserTestWorkspaceBridgeSnapshot({
     state_revision: 10,
@@ -277,8 +580,12 @@ test("BrowserWorkspaceStateService keeps the workspace on the bridge path once t
       y: 48,
       width: 640,
       height: 360,
+    }, {
+      overlayPrimitive: true,
     });
     assertWorkspaceBridgeFrameReady(workspace);
+    assertPrimaryWorkspaceChromeOmitsRawDiagnostics(workspace);
+    assert.equal(workspace.rendererStatus(), "surface-ready · annotations-ready");
 
     transport.publish(
       makeBrowserTestWorkspaceBridgeSnapshot({
@@ -300,7 +607,7 @@ test("BrowserWorkspaceStateService keeps the workspace on the bridge path once t
     );
     assert.equal(
       workspace.workspaceCanvasChrome().fallbackLabel,
-      "Workspace zero-copy unavailable",
+      "Zero-copy unavailable",
     );
     assert.equal(
       workspace.workspaceHardError()?.code,
@@ -384,6 +691,7 @@ test("BrowserWorkspaceStateService keeps the surface pending until Angular repor
       workspace.workspaceDiagnostics().framePathLabel,
       "workspace canvas pending",
     );
+    assertPrimaryWorkspaceChromeOmitsRawDiagnostics(workspace);
     assert.equal(
       workspace.workspaceDiagnostics().statusItems.find((item) => item.key === "frame_path")
         ?.status,

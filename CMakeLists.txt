@@ -18,6 +18,14 @@ target_include_directories(nlohmann_json SYSTEM INTERFACE ${CMAKE_SOURCE_DIR}/th
 add_library(cli11 INTERFACE)
 target_include_directories(cli11 SYSTEM INTERFACE ${CMAKE_SOURCE_DIR}/third_party)
 
+add_library(mmltk_browser_api_contract INTERFACE)
+target_include_directories(mmltk_browser_api_contract INTERFACE
+    ${CMAKE_SOURCE_DIR}/src
+)
+target_link_libraries(mmltk_browser_api_contract INTERFACE
+    nlohmann_json
+)
+
 set(MMLTK_AVIR_SOURCE_DIR "${CMAKE_SOURCE_DIR}/third_party/avir")
 if(NOT EXISTS "${MMLTK_AVIR_SOURCE_DIR}/avir.h")
     message(FATAL_ERROR

@@ -1,14 +1,30 @@
+diff --git cef/BUILD.gn cef/BUILD.gn
+index 4c3f1d1..a7d34e2 100644
+--- cef/BUILD.gn
++++ cef/BUILD.gn
+@@ -720,6 +720,8 @@ source_set("libcef_static") {
+     "libcef/browser/trace_subscriber.h",
+     "libcef/browser/thread_util.h",
+     "libcef/browser/ui_thread.cc",
+     "libcef/browser/ui_thread.h",
++    "libcef/browser/workspace_gpu_bridge_surface_service.cc",
++    "libcef/browser/workspace_gpu_bridge_surface_service.h",
+     "libcef/browser/views/basic_label_button_impl.cc",
+     "libcef/browser/views/basic_label_button_impl.h",
 diff --git cef/libcef/browser/browser_frame.h cef/libcef/browser/browser_frame.h
 index a5db6d7..3c65b1f 100644
 --- cef/libcef/browser/browser_frame.h
 +++ cef/libcef/browser/browser_frame.h
-@@ -41,6 +41,9 @@ class CefBrowserFrame : public CefFrameServiceBase<cef::mojom::BrowserFrame> {
+@@ -41,6 +41,12 @@ class CefBrowserFrame : public CefFrameServiceBase<cef::mojom::BrowserFrame> {
    void UpdateDraggableRegions(
        std::optional<std::vector<cef::mojom::DraggableRegionEntryPtr>> regions)
        override;
 +  void ReleaseWorkspaceGpuBridgeSurface(const std::string& surface_id,
 +                                        const std::string& revision,
 +                                        bool renderer_dissociated) override;
++  void RetainWorkspaceGpuBridgeSurfaceRenderer(
++      const std::string& surface_id,
++      const std::string& revision) override;
  
    CefRefPtr<CefFrameHostImpl> GetFrameHost(bool prefer_speculative,
                                             bool* is_excluded = nullptr) const;
@@ -24,7 +40,7 @@ index dfd8cd5..fa5db7a 100644
  #include "cef/libcef/browser/browser_host_base.h"
  #include "cef/libcef/browser/browser_info_manager.h"
  #include "cef/libcef/browser/thread_util.h"
-@@ -82,6 +83,14 @@ void CefBrowserFrame::UpdateDraggableRegions(
+@@ -82,6 +83,21 @@ void CefBrowserFrame::UpdateDraggableRegions(
      host->UpdateDraggableRegions(std::move(regions));
    }
  }
@@ -36,19 +52,29 @@ index dfd8cd5..fa5db7a 100644
 +  CefWorkspaceGpuBridgeSurfaceService::GetInstance().Release(
 +      render_frame_host(), surface_id, revision, renderer_dissociated);
 +}
++
++void CefBrowserFrame::RetainWorkspaceGpuBridgeSurfaceRenderer(
++    const std::string& surface_id,
++    const std::string& revision) {
++  CefWorkspaceGpuBridgeSurfaceService::GetInstance().RetainRendererAssociation(
++      render_frame_host(), surface_id, revision);
++}
  
  CefRefPtr<CefFrameHostImpl> CefBrowserFrame::GetFrameHost(
      bool prefer_speculative,
 diff --git cef/libcef/browser/frame_host_impl.h cef/libcef/browser/frame_host_impl.h
 --- cef/libcef/browser/frame_host_impl.h
 +++ cef/libcef/browser/frame_host_impl.h
-@@ -150,6 +150,9 @@ class CefFrameHostImpl : public CefFrame, public cef::mojom::BrowserFrame {
+@@ -150,6 +150,12 @@ class CefFrameHostImpl : public CefFrame, public cef::mojom::BrowserFrame {
    void UpdateDraggableRegions(
        std::optional<std::vector<cef::mojom::DraggableRegionEntryPtr>> regions)
        override;
 +  void ReleaseWorkspaceGpuBridgeSurface(const std::string& surface_id,
 +                                        const std::string& revision,
 +                                        bool renderer_dissociated) override;
++  void RetainWorkspaceGpuBridgeSurfaceRenderer(
++      const std::string& surface_id,
++      const std::string& revision) override;
  
    bool is_temporary() const { return !frame_token_.has_value(); }
    std::optional<content::GlobalRenderFrameHostToken> frame_token() const {
@@ -63,7 +89,7 @@ diff --git cef/libcef/browser/frame_host_impl.cc cef/libcef/browser/frame_host_i
  #include "cef/libcef/common/frame_util.h"
  #include "cef/libcef/common/net/url_util.h"
  #include "cef/libcef/common/process_message_impl.h"
-@@ -753,6 +754,27 @@ void CefFrameHostImpl::UpdateDraggableRegions(
+@@ -753,6 +754,47 @@ void CefFrameHostImpl::UpdateDraggableRegions(
        browser, this, std::move(draggable_regions));
  }
  
@@ -88,6 +114,26 @@ diff --git cef/libcef/browser/frame_host_impl.cc cef/libcef/browser/frame_host_i
 +      render_frame_host, surface_id, revision, renderer_dissociated);
 +}
 +
++void CefFrameHostImpl::RetainWorkspaceGpuBridgeSurfaceRenderer(
++    const std::string& surface_id,
++    const std::string& revision) {
++  if (!CEF_CURRENTLY_ON_UIT()) {
++    CEF_POST_TASK(
++        CEF_UIT,
++        base::BindOnce(&CefFrameHostImpl::RetainWorkspaceGpuBridgeSurfaceRenderer,
++                       this, surface_id, revision));
++    return;
++  }
++
++  auto* render_frame_host = GetRenderFrameHost();
++  if (!render_frame_host) {
++    return;
++  }
++
++  CefWorkspaceGpuBridgeSurfaceService::GetInstance().RetainRendererAssociation(
++      render_frame_host, surface_id, revision);
++}
++
  std::string CefFrameHostImpl::GetDebugString() const {
    return "frame " +
           (frame_token_ ? frame_util::GetFrameDebugString(*frame_token_)
@@ -95,7 +141,7 @@ diff --git cef/libcef/browser/workspace_gpu_bridge_surface_service.h cef/libcef/
 new file mode 100644
 --- /dev/null
 +++ cef/libcef/browser/workspace_gpu_bridge_surface_service.h
-@@ -0,0 +1,57 @@
+@@ -0,0 +1,85 @@
 +// Copyright 2026 The Chromium Embedded Framework Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -104,15 +150,23 @@ new file mode 100644
 +#define CEF_LIBCEF_BROWSER_WORKSPACE_GPU_BRIDGE_SURFACE_SERVICE_H_
 +#pragma once
 +
++#include <cmath>
++#include <cstdint>
++#include <limits>
 +#include <optional>
 +#include <string>
 +#include <string_view>
 +
 +#include "base/containers/flat_map.h"
++#include "base/memory/scoped_refptr.h"
 +#include "base/synchronization/lock.h"
 +#include "cef/include/internal/cef_string.h"
 +#include "cef/libcef/common/mojom/cef.mojom.h"
 +#include "content/public/browser/render_frame_host.h"
++
++namespace gpu {
++class ClientSharedImage;
++}  // namespace gpu
 +
 +class CefWorkspaceGpuBridgeSurfaceService {
 + public:
@@ -128,16 +182,32 @@ new file mode 100644
 +                        std::string_view revision,
 +                        std::string_view publication_source_json,
 +                        CefString* exported_shared_image_json_out,
-+                        CefString* exception);
++                        CefString* result_code,
++                        CefString* result_detail);
 +
-+  void Release(content::RenderFrameHost* render_frame_host,
++  bool Release(content::RenderFrameHost* render_frame_host,
 +               std::string_view surface_id,
 +               std::string_view revision,
-+               bool renderer_dissociated);
++               bool renderer_dissociated,
++               CefString* result_code = nullptr,
++               CefString* result_detail = nullptr);
++  void RetainRendererAssociation(content::RenderFrameHost* render_frame_host,
++                                 std::string_view surface_id,
++                                 std::string_view revision);
++
++  struct ProducerReadiness {
++    uint32_t ready_sync_kind = 0;
++    uint64_t ready_sync_handle = 0;
++    uint64_t ready_sync_value = 0;
++  };
 +
 +  struct Entry {
 +    std::string exported_shared_image_json;
++    scoped_refptr<gpu::ClientSharedImage> shared_image;
++    ProducerReadiness producer_readiness;
++    bool renderer_associated = false;
 +    bool renderer_dissociated = false;
++    bool browser_released = false;
 +  };
 +
 + public:
@@ -147,6 +217,10 @@ new file mode 100644
 +
 +  static std::string MakeKey(std::string_view surface_id,
 +                             std::string_view revision);
++  void ScheduleUnassociatedRelease(std::string surface_id,
++                                   std::string revision);
++  void EraseBrowserReleasedUnassociated(std::string surface_id,
++                                        std::string revision);
 +
 +  base::Lock lock_;
 +  base::flat_map<std::string, Entry> entries_ GUARDED_BY(lock_);
@@ -157,7 +231,7 @@ diff --git cef/libcef/browser/workspace_gpu_bridge_surface_service.cc cef/libcef
 new file mode 100644
 --- /dev/null
 +++ cef/libcef/browser/workspace_gpu_bridge_surface_service.cc
-@@ -0,0 +1,267 @@
+@@ -0,0 +1,691 @@
 +// Copyright 2026 The Chromium Embedded Framework Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -166,28 +240,68 @@ new file mode 100644
 +
 +#include "cef/libcef/common/workspace_gpu_bridge_export.h"
 +
-+#include <dlfcn.h>
++#include <fcntl.h>
++#include <unistd.h>
 +
++#include <cstdint>
 +#include <optional>
++#include <utility>
 +
++#include "base/functional/bind.h"
++#include "base/files/scoped_file.h"
 +#include "base/json/json_reader.h"
 +#include "base/json/json_writer.h"
++#include "base/logging.h"
 +#include "base/no_destructor.h"
-+#include "base/strings/strcat.h"
++#include "base/numerics/safe_conversions.h"
 +#include "base/strings/string_number_conversions.h"
-+#include "base/strings/string_util.h"
++#include "base/task/sequenced_task_runner.h"
++#include "base/time/time.h"
 +#include "components/viz/common/gpu/raster_context_provider.h"
 +#include "components/viz/common/resources/shared_image_format.h"
 +#include "content/browser/compositor/image_transport_factory.h"
++#include "gpu/command_buffer/client/client_shared_image.h"
++#include "gpu/command_buffer/client/shared_image_interface.h"
++#include "gpu/command_buffer/common/mailbox.h"
 +#include "gpu/command_buffer/common/shared_image_usage.h"
++#include "gpu/command_buffer/common/sync_token.h"
++#include "third_party/skia/include/core/SkAlphaType.h"
++#include "third_party/skia/include/gpu/ganesh/GrTypes.h"
 +#include "ui/compositor/compositor.h"
-+#include "ui/gfx/buffer_types.h"
 +#include "ui/gfx/color_space.h"
++#include "ui/gfx/geometry/size.h"
++#include "ui/gfx/gpu_memory_buffer_handle.h"
 +#include "ui/gfx/native_pixmap_handle.h"
 +
 +namespace {
 +
 +constexpr std::string_view kWorkspaceSurfaceId = "workspace";
++constexpr uint32_t kDrmFormatAbgr8888 = 0x34324241U;
++constexpr base::TimeDelta kUnassociatedReleaseGrace = base::Milliseconds(250);
++
++void SetResult(CefString* result_code,
++               CefString* result_detail,
++               std::string_view code,
++               std::string_view detail) {
++  if (result_code) {
++    *result_code = std::string(code);
++  }
++  if (result_detail) {
++    *result_detail = std::string(detail);
++  }
++}
++
++void SetResult(std::string* result_code,
++               std::string* result_detail,
++               std::string_view code,
++               std::string_view detail) {
++  if (result_code) {
++    *result_code = std::string(code);
++  }
++  if (result_detail) {
++    *result_detail = std::string(detail);
++  }
++}
 +
 +std::optional<uint32_t> ParseUint32(const base::Value& value) {
 +  if (const auto int_value = value.GetIfInt()) {
@@ -204,9 +318,24 @@ new file mode 100644
 +  return std::nullopt;
 +}
 +
-+std::optional<std::string> ParseString(const base::Value& value) {
++std::optional<uint64_t> ParseUint64(const base::Value& value) {
 +  if (const std::string* string_value = value.GetIfString()) {
-+    return *string_value;
++    uint64_t parsed = 0;
++    if (base::StringToUint64(*string_value, &parsed)) {
++      return parsed;
++    }
++  }
++  if (const auto int_value = value.GetIfInt()) {
++    if (*int_value >= 0) {
++      return static_cast<uint64_t>(*int_value);
++    }
++  }
++  if (const auto double_value = value.GetIfDouble()) {
++    if (*double_value >= 0.0 &&
++        *double_value <= static_cast<double>(std::numeric_limits<uint64_t>::max()) &&
++        std::floor(*double_value) == *double_value) {
++      return static_cast<uint64_t>(*double_value);
++    }
 +  }
 +  return std::nullopt;
 +}
@@ -215,114 +344,371 @@ new file mode 100644
 +  return surface_id == kWorkspaceSurfaceId;
 +}
 +
-+bool LooksLikeCurrentLinuxWorkspaceSource(const base::DictValue& dict) {
-+  return dict.FindDict("descriptor") && dict.FindDict("linux_import");
-+}
++struct DmaBufWorkspaceSource {
++  int fd = -1;
++  int cuda_device_index = -1;
++  uint32_t width = 0;
++  uint32_t height = 0;
++  uint64_t stride_bytes = 0;
++  uint64_t offset = 0;
++  uint64_t allocation_size = 0;
++  uint32_t drm_format = 0;
++  uint64_t drm_modifier = 0;
++  uint32_t modifier_mode = 0;
++  uint32_t ready_sync_kind = 0;
++  uint64_t ready_sync_handle = 0;
++  uint64_t ready_sync_value = 0;
++  uint32_t producer_stream_kind = 0;
++  uint64_t producer_stream_handle = 0;
++  uint32_t release_sync_kind = 0;
++  uint64_t release_sync_handle = 0;
++};
 +
-+std::optional<std::string> ParseSharedImageFormat(const base::Value& value) {
-+  std::optional<std::string> format_name = ParseString(value);
-+  if (!format_name.has_value() && value.is_dict()) {
-+    const base::DictValue& dict = value.GetDict();
-+    for (std::string_view key :
-+         {"single_plane", "single_plane_format", "format", "name"}) {
-+      if (const std::string* nested_name = dict.FindString(key)) {
-+        format_name = *nested_name;
-+        break;
-+      }
-+    }
-+  }
-+  if (!format_name.has_value()) {
-+    return std::nullopt;
-+  }
-+
-+  const std::string canonical_name = base::ToUpperASCII(*format_name);
-+  if (canonical_name == "RGBA_8888" || canonical_name == "RGBA8UNORM") {
-+    return std::string("rgba8unorm");
-+  }
-+  return std::nullopt;
-+}
-+
-+bool ValidateExportedSharedImage(const base::DictValue& exported,
-+                                 std::string* exception) {
-+  const base::DictValue* mailbox = exported.FindDict("mailbox");
-+  const base::DictValue* metadata = exported.FindDict("metadata");
-+  const base::DictValue* creation_sync_token =
-+      exported.FindDict("creation_sync_token");
-+  if (!mailbox || !metadata || !creation_sync_token) {
-+    if (exception) {
-+      *exception =
-+          "workspace GPU bridge browser service requires mailbox, metadata, "
-+          "and creation_sync_token in the exported SharedImage payload";
-+    }
-+    return false;
-+  }
-+
-+  const base::DictValue* size = metadata->FindDict("size");
-+  const std::optional<uint32_t> width =
-+      size && size->Find("width") ? ParseUint32(*size->Find("width"))
-+                                  : std::nullopt;
-+  const std::optional<uint32_t> height =
-+      size && size->Find("height") ? ParseUint32(*size->Find("height"))
-+                                   : std::nullopt;
-+  const std::optional<std::string> format =
-+      metadata->Find("format") ? ParseSharedImageFormat(*metadata->Find("format"))
-+                               : std::nullopt;
-+  const std::optional<uint32_t> usage =
-+      metadata->Find("usage") ? ParseUint32(*metadata->Find("usage"))
-+                              : std::nullopt;
-+  const std::optional<uint32_t> texture_target =
-+      exported.Find("texture_target")
-+          ? ParseUint32(*exported.Find("texture_target"))
-+          : std::nullopt;
-+  const bool is_software =
-+      exported.Find("is_software")
-+          ? exported.Find("is_software")->GetIfBool().value_or(false)
-+          : false;
-+
-+  constexpr uint32_t kRequiredUsage =
-+      static_cast<uint32_t>(gpu::SHARED_IMAGE_USAGE_WEBGPU_READ);
-+  if (!format.has_value() || *format != "rgba8unorm" ||
-+      !width.has_value() || !height.has_value() || *width == 0U ||
-+      *height == 0U || !usage.has_value() ||
-+      (*usage & kRequiredUsage) == 0U || !texture_target.has_value() ||
-+      *texture_target == 0U || is_software) {
-+    if (exception) {
-+      *exception =
-+          "workspace GPU bridge browser service only supports zero-copy "
-+          "workspace SharedImage payloads with upright opaque rgba8unorm "
-+          "metadata";
-+    }
-+    return false;
-+  }
-+
-+  return true;
-+}
-+
-+std::optional<std::string> ExtractExportedSharedImageJson(
-+    std::string_view publication_source_json,
-+    bool* saw_current_linux_workspace_source,
-+    std::string* exception) {
-+  *saw_current_linux_workspace_source = false;
++bool ParseDmaBufWorkspaceSource(std::string_view publication_source_json,
++                                DmaBufWorkspaceSource* source,
++                                std::string* result_code,
++                                std::string* result_detail) {
 +  std::optional<base::Value> parsed =
 +      base::JSONReader::Read(publication_source_json,
 +                             base::JSON_PARSE_CHROMIUM_EXTENSIONS);
 +  if (!parsed || !parsed->is_dict()) {
++    SetResult(result_code, result_detail, "invalid_dmabuf_metadata",
++              "workspace GPU bridge browser service could not parse "
++              "publication source JSON");
++    return false;
++  }
++  const base::DictValue& root = parsed->GetDict();
++  const base::DictValue* linux_import = root.FindDict("linux_import");
++  const base::DictValue* image = linux_import ? linux_import->FindDict("image")
++                                              : nullptr;
++  if (!image) {
++    SetResult(result_code, result_detail, "invalid_dmabuf_metadata",
++              "workspace GPU bridge browser service requires linux_import.image "
++              "DMA-BUF metadata");
++    return false;
++  }
++
++  const std::optional<uint32_t> kind =
++      image->Find("kind") ? ParseUint32(*image->Find("kind")) : std::nullopt;
++  const std::optional<uint64_t> fd =
++      image->Find("fd") ? ParseUint64(*image->Find("fd")) : std::nullopt;
++  const std::optional<uint32_t> cuda_device_index =
++      image->Find("cuda_device_index")
++          ? ParseUint32(*image->Find("cuda_device_index"))
++          : std::nullopt;
++  const std::optional<uint32_t> width =
++      image->Find("width") ? ParseUint32(*image->Find("width")) : std::nullopt;
++  const std::optional<uint32_t> height =
++      image->Find("height") ? ParseUint32(*image->Find("height"))
++                            : std::nullopt;
++  const std::optional<uint64_t> stride =
++      image->Find("stride_bytes") ? ParseUint64(*image->Find("stride_bytes"))
++                                  : std::nullopt;
++  const std::optional<uint64_t> offset =
++      image->Find("offset") ? ParseUint64(*image->Find("offset")) : std::nullopt;
++  const std::optional<uint64_t> allocation_size =
++      image->Find("allocation_size")
++          ? ParseUint64(*image->Find("allocation_size"))
++          : std::nullopt;
++  const std::optional<uint32_t> drm_format =
++      image->Find("drm_format") ? ParseUint32(*image->Find("drm_format"))
++                                : std::nullopt;
++  const std::optional<uint64_t> drm_modifier =
++      image->Find("drm_modifier") ? ParseUint64(*image->Find("drm_modifier"))
++                                  : std::nullopt;
++  const std::optional<uint32_t> modifier_mode =
++      image->Find("modifier_mode") ? ParseUint32(*image->Find("modifier_mode"))
++                                  : std::nullopt;
++  const base::DictValue* ready_sync = linux_import->FindDict("ready_sync");
++  const base::DictValue* producer_stream =
++      linux_import->FindDict("producer_stream");
++  const base::DictValue* linux_lifecycle = root.FindDict("linux_lifecycle");
++  const base::DictValue* release_sync =
++      linux_lifecycle ? linux_lifecycle->FindDict("release_sync") : nullptr;
++  const std::optional<uint32_t> ready_sync_kind =
++      ready_sync && ready_sync->Find("kind")
++          ? ParseUint32(*ready_sync->Find("kind"))
++          : std::nullopt;
++  const std::optional<uint64_t> ready_sync_handle =
++      ready_sync && ready_sync->Find("handle")
++          ? ParseUint64(*ready_sync->Find("handle"))
++          : std::nullopt;
++  const std::optional<uint64_t> ready_sync_value =
++      ready_sync && ready_sync->Find("value")
++          ? ParseUint64(*ready_sync->Find("value"))
++          : std::nullopt;
++  const std::optional<uint32_t> producer_stream_kind =
++      producer_stream && producer_stream->Find("kind")
++          ? ParseUint32(*producer_stream->Find("kind"))
++          : std::nullopt;
++  const std::optional<uint64_t> producer_stream_handle =
++      producer_stream && producer_stream->Find("handle")
++          ? ParseUint64(*producer_stream->Find("handle"))
++          : std::nullopt;
++  const std::optional<uint32_t> release_sync_kind =
++      release_sync && release_sync->Find("kind")
++          ? ParseUint32(*release_sync->Find("kind"))
++          : std::optional<uint32_t>(0U);
++  const std::optional<uint64_t> release_sync_handle =
++      release_sync && release_sync->Find("handle")
++          ? ParseUint64(*release_sync->Find("handle"))
++          : std::optional<uint64_t>(0U);
++  constexpr uint32_t kDmaBufRgbaKind = 2U;
++  constexpr uint32_t kModifierModeImplicit = 1U;
++  constexpr uint32_t kModifierModeExplicit = 2U;
++  constexpr uint32_t kSyncKindNone = 0U;
++  constexpr uint32_t kSyncKindCudaEvent = 1U;
++  constexpr uint32_t kSyncKindCudaStream = 2U;
++  constexpr uint64_t kDrmFormatModInvalid = (1ULL << 56U) - 1U;
++  const bool valid_modifier =
++      modifier_mode.has_value() &&
++      ((*modifier_mode == kModifierModeImplicit &&
++        drm_modifier.has_value() && *drm_modifier == kDrmFormatModInvalid) ||
++       (*modifier_mode == kModifierModeExplicit &&
++        drm_modifier.has_value() && *drm_modifier != kDrmFormatModInvalid));
++  if (!kind.has_value() || *kind != kDmaBufRgbaKind || !fd.has_value() ||
++      *fd == 0U || *fd > static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
++      !cuda_device_index.has_value() ||
++      *cuda_device_index > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
++      !width.has_value() || !height.has_value() || *width == 0U ||
++      *width > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
++      *height == 0U || !stride.has_value() ||
++      *height > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
++      *stride < static_cast<uint64_t>(*width) * 4U ||
++      *stride > static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
++      !offset.has_value() || !allocation_size.has_value() ||
++      *offset > static_cast<uint64_t>(std::numeric_limits<int>::max()) ||
++      *allocation_size < *offset ||
++      *height > std::numeric_limits<uint64_t>::max() / *stride ||
++      *allocation_size - *offset < *stride * *height ||
++      !drm_format.has_value() || *drm_format != kDrmFormatAbgr8888) {
++    SetResult(result_code, result_detail, "invalid_dmabuf_metadata",
++              "workspace GPU bridge browser service rejected invalid DMA-BUF "
++              "RGBA workspace metadata");
++    return false;
++  }
++  if (!valid_modifier) {
++    SetResult(result_code, result_detail, "unsupported_modifier",
++              "workspace GPU bridge browser service rejected unsupported "
++              "DMA-BUF modifier metadata");
++    return false;
++  }
++  if (!ready_sync_kind.has_value() || *ready_sync_kind != kSyncKindCudaEvent ||
++      !ready_sync_handle.has_value() || *ready_sync_handle == 0U ||
++      !producer_stream_kind.has_value() ||
++      *producer_stream_kind != kSyncKindCudaStream ||
++      !producer_stream_handle.has_value() || *producer_stream_handle == 0U ||
++      !release_sync_kind.has_value() || !release_sync_handle.has_value() ||
++      ((*release_sync_kind != kSyncKindNone) && *release_sync_handle == 0U)) {
++    SetResult(result_code, result_detail, "missing_sync_metadata",
++              "workspace GPU bridge browser service requires CUDA ready event, "
++              "producer stream, and valid release sync metadata");
++    return false;
++  }
++  source->fd = static_cast<int>(*fd);
++  source->cuda_device_index = static_cast<int>(*cuda_device_index);
++  source->width = *width;
++  source->height = *height;
++  source->stride_bytes = *stride;
++  source->offset = *offset;
++  source->allocation_size = *allocation_size;
++  source->drm_format = *drm_format;
++  source->drm_modifier = *drm_modifier;
++  source->modifier_mode = *modifier_mode;
++  source->ready_sync_kind = *ready_sync_kind;
++  source->ready_sync_handle = *ready_sync_handle;
++  source->ready_sync_value = ready_sync_value.value_or(0U);
++  source->producer_stream_kind = *producer_stream_kind;
++  source->producer_stream_handle = *producer_stream_handle;
++  source->release_sync_kind = *release_sync_kind;
++  source->release_sync_handle = *release_sync_handle;
++  return true;
++}
++
++base::ListValue MailboxBytesToList(const gpu::Mailbox& mailbox) {
++  base::ListValue bytes;
++  for (int index = 0; index < GL_MAILBOX_SIZE_CHROMIUM; ++index) {
++    bytes.Append(static_cast<int>(static_cast<uint8_t>(mailbox.name[index])));
++  }
++  return bytes;
++}
++
++base::DictValue SyncTokenToDict(const gpu::SyncToken& sync_token) {
++  base::DictValue dict;
++  dict.Set("verified_flush", sync_token.verified_flush());
++  dict.Set("namespace_id", static_cast<int>(sync_token.namespace_id()));
++  dict.Set("command_buffer_id",
++           base::NumberToString(sync_token.command_buffer_id().GetUnsafeValue()));
++  dict.Set("release_count", base::NumberToString(sync_token.release_count()));
++  return dict;
++}
++
++std::string SerializeSharedImage(scoped_refptr<gpu::ClientSharedImage> shared_image,
++                                 const gpu::SyncToken& creation_sync_token,
++                                 const DmaBufWorkspaceSource& source,
++                                 std::string_view surface_id,
++                                 std::string_view revision) {
++  base::DictValue mailbox;
++  mailbox.Set("name", MailboxBytesToList(shared_image->mailbox()));
++
++  base::DictValue size;
++  size.Set("width", shared_image->size().width());
++  size.Set("height", shared_image->size().height());
++
++  base::DictValue metadata;
++  metadata.Set("size", std::move(size));
++  metadata.Set("format", "rgba8unorm");
++  metadata.Set("usage", static_cast<int>(static_cast<uint32_t>(shared_image->usage())));
++
++  base::DictValue workspace_surface;
++  workspace_surface.Set("surface_id", std::string(surface_id));
++  workspace_surface.Set("revision", std::string(revision));
++  workspace_surface.Set("width", static_cast<int>(source.width));
++  workspace_surface.Set("height", static_cast<int>(source.height));
++  workspace_surface.Set("texture_format", "rgba8unorm");
++
++  base::DictValue dma_buf;
++  dma_buf.Set("fd", base::NumberToString(source.fd));
++  dma_buf.Set("cuda_device_index", source.cuda_device_index);
++  dma_buf.Set("stride_bytes", base::NumberToString(source.stride_bytes));
++  dma_buf.Set("offset", base::NumberToString(source.offset));
++  dma_buf.Set("allocation_size", base::NumberToString(source.allocation_size));
++  dma_buf.Set("drm_format", static_cast<int>(source.drm_format));
++  dma_buf.Set("drm_modifier", base::NumberToString(source.drm_modifier));
++  dma_buf.Set("modifier_mode", static_cast<int>(source.modifier_mode));
++
++  base::DictValue ready_sync;
++  ready_sync.Set("kind", static_cast<int>(source.ready_sync_kind));
++  ready_sync.Set("handle", base::NumberToString(source.ready_sync_handle));
++  ready_sync.Set("value", base::NumberToString(source.ready_sync_value));
++
++  base::DictValue producer_stream;
++  producer_stream.Set("kind", static_cast<int>(source.producer_stream_kind));
++  producer_stream.Set("handle", base::NumberToString(source.producer_stream_handle));
++  producer_stream.Set("value", "0");
++
++  base::DictValue release_sync;
++  release_sync.Set("kind", static_cast<int>(source.release_sync_kind));
++  release_sync.Set("handle", base::NumberToString(source.release_sync_handle));
++  release_sync.Set("value", "0");
++
++  base::DictValue exported;
++  exported.Set("mailbox", std::move(mailbox));
++  exported.Set("metadata", std::move(metadata));
++  exported.Set("workspace_surface", std::move(workspace_surface));
++  exported.Set("dma_buf", std::move(dma_buf));
++  exported.Set("ready_sync", std::move(ready_sync));
++  exported.Set("producer_stream", std::move(producer_stream));
++  exported.Set("release_sync", std::move(release_sync));
++  exported.Set("creation_sync_token", SyncTokenToDict(creation_sync_token));
++  exported.Set("texture_target", static_cast<int>(shared_image->GetTextureTarget()));
++  exported.Set("is_software", shared_image->is_software());
++
++  std::string serialized;
++  CHECK(base::JSONWriter::Write(exported, &serialized));
++  return serialized;
++}
++
++std::optional<CefWorkspaceGpuBridgeSurfaceService::Entry>
++CreateExportedSharedImageForDmaBuf(std::string_view publication_source_json,
++                                   std::string_view surface_id,
++                                   std::string_view revision,
++                                   std::string* result_code,
++                                   std::string* result_detail) {
++  DmaBufWorkspaceSource source;
++  if (!ParseDmaBufWorkspaceSource(publication_source_json, &source,
++                                  result_code, result_detail)) {
 +    return std::nullopt;
 +  }
-+  const base::DictValue& dict = parsed->GetDict();
-+  *saw_current_linux_workspace_source =
-+      LooksLikeCurrentLinuxWorkspaceSource(dict);
-+  const base::DictValue* exported_shared_image =
-+      dict.FindDict("exported_shared_image");
-+  if (!exported_shared_image ||
-+      !ValidateExportedSharedImage(*exported_shared_image, exception)) {
++  auto* transport_factory = content::ImageTransportFactory::GetInstance();
++  auto* context_factory =
++      transport_factory ? transport_factory->GetContextFactory() : nullptr;
++  scoped_refptr<viz::RasterContextProvider> context_provider =
++      context_factory ? context_factory->SharedMainThreadRasterContextProvider()
++                      : nullptr;
++  gpu::SharedImageInterface* shared_image_interface =
++      context_provider ? context_provider->SharedImageInterface() : nullptr;
++  if (!shared_image_interface) {
++    SetResult(result_code, result_detail, "shared_image_creation_failure",
++              "workspace GPU bridge browser service has no shared image "
++              "interface for DMA-BUF import");
 +    return std::nullopt;
 +  }
-+  std::string serialized_json;
-+  if (!base::JSONWriter::Write(*exported_shared_image, &serialized_json)) {
++
++  int duplicated_fd = ::fcntl(source.fd, F_DUPFD_CLOEXEC, 3);
++  if (duplicated_fd < 0) {
++    SetResult(result_code, result_detail, "invalid_dmabuf_metadata",
++              "workspace GPU bridge browser service failed to duplicate "
++              "the DMA-BUF fd");
 +    return std::nullopt;
 +  }
-+  return serialized_json;
++
++  gfx::NativePixmapHandle pixmap_handle;
++  pixmap_handle.modifier = source.drm_modifier;
++  pixmap_handle.planes.emplace_back(
++      base::checked_cast<int>(source.stride_bytes),
++      base::checked_cast<int>(source.offset),
++      source.allocation_size - source.offset,
++      base::ScopedFD(duplicated_fd));
++
++  gpu::SharedImageInfo shared_image_info(
++      viz::SinglePlaneFormat::kRGBA_8888,
++      gfx::Size(base::checked_cast<int>(source.width),
++                base::checked_cast<int>(source.height)),
++      gfx::ColorSpace::CreateSRGB(), kTopLeft_GrSurfaceOrigin,
++      kOpaque_SkAlphaType,
++      gpu::SharedImageUsageSet({gpu::SHARED_IMAGE_USAGE_WEBGPU_READ,
++                                gpu::SHARED_IMAGE_USAGE_DISPLAY_READ}),
++      "mmltk workspace DMA-BUF");
++  scoped_refptr<gpu::ClientSharedImage> shared_image =
++      shared_image_interface->CreateSharedImage(
++          shared_image_info,
++          gfx::GpuMemoryBufferHandle(std::move(pixmap_handle)));
++  if (!shared_image) {
++    SetResult(result_code, result_detail, "shared_image_creation_failure",
++              "workspace GPU bridge browser service failed to import "
++              "DMA-BUF as a SharedImage");
++    return std::nullopt;
++  }
++  if (shared_image->is_software()) {
++    SetResult(result_code, result_detail, "software_shared_image_rejected",
++              "workspace GPU bridge browser service rejected a software "
++              "SharedImage for a live workspace surface");
++    LOG(WARNING) << "workspace GPU bridge rejected software SharedImage "
++                 << surface_id << " revision " << revision;
++    return std::nullopt;
++  }
++
++  gpu::SyncToken creation_sync_token = shared_image->creation_sync_token();
++  if (creation_sync_token.HasData() &&
++      !creation_sync_token.verified_flush()) {
++    shared_image_interface->VerifySyncToken(creation_sync_token);
++  }
++  CefWorkspaceGpuBridgeSurfaceService::Entry entry;
++  entry.exported_shared_image_json =
++      SerializeSharedImage(shared_image, creation_sync_token, source,
++                           surface_id, revision);
++  entry.shared_image = std::move(shared_image);
++  entry.producer_readiness.ready_sync_kind = source.ready_sync_kind;
++  entry.producer_readiness.ready_sync_handle = source.ready_sync_handle;
++  entry.producer_readiness.ready_sync_value = source.ready_sync_value;
++  LOG(INFO) << "workspace GPU bridge created SharedImage " << surface_id
++            << " revision " << revision << " size " << source.width << "x"
++            << source.height << " texture_target "
++            << entry.shared_image->GetTextureTarget() << " usage "
++            << static_cast<uint32_t>(entry.shared_image->usage())
++            << " creation_sync_has_data " << creation_sync_token.HasData()
++            << " creation_sync_verified "
++            << creation_sync_token.verified_flush()
++            << " ready_sync_kind "
++            << entry.producer_readiness.ready_sync_kind
++            << " ready_sync_handle "
++            << entry.producer_readiness.ready_sync_handle
++            << " ready_sync_value "
++            << entry.producer_readiness.ready_sync_value
++            << " dmabuf_modifier " << source.drm_modifier
++            << " dmabuf_stride " << source.stride_bytes;
++  return entry;
 +}
 +
 +}  // namespace
@@ -345,54 +731,138 @@ new file mode 100644
 +    std::string_view revision,
 +    std::string_view publication_source_json,
 +    CefString* exported_shared_image_json_out,
-+    CefString* exception) {
++    CefString* result_code,
++    CefString* result_detail) {
 +  (void)render_frame_host;
 +  if (!IsWorkspaceSurfaceId(surface_id) || revision.empty()) {
-+    if (exception) {
-+      *exception =
-+          "workspace GPU bridge browser service only supports non-empty "
-+          "workspace surface revisions";
-+    }
++    SetResult(result_code, result_detail, "invalid_surface",
++              "workspace GPU bridge browser service only supports non-empty "
++              "workspace surface revisions");
 +    return false;
 +  }
-+  bool saw_current_linux_workspace_source = false;
-+  std::string export_exception;
-+  std::optional<std::string> exported_shared_image_json =
-+      ExtractExportedSharedImageJson(publication_source_json,
-+                                     &saw_current_linux_workspace_source,
-+                                     &export_exception);
-+  Entry entry;
-+  if (!exported_shared_image_json.has_value()) {
-+    if (exception) {
-+      *exception = !export_exception.empty()
-+                       ? export_exception
-+                   : saw_current_linux_workspace_source
-+                       ? "workspace GPU bridge browser service requires an "
-+                         "exported zero-copy SharedImage payload; the "
-+                         "current Linux workspace source fallback has been "
-+                         "removed"
-+                       : "workspace GPU bridge browser service requires an "
-+                         "exported zero-copy SharedImage payload";
-+    }
-+    return false;
-+  }
-+  entry.exported_shared_image_json = *exported_shared_image_json;
-+  const std::string exported_payload = entry.exported_shared_image_json;
++  const std::string key = MakeKey(surface_id, revision);
 +  {
 +    base::AutoLock hold(lock_);
-+    entries_.insert_or_assign(MakeKey(surface_id, revision), std::move(entry));
++    const auto existing = entries_.find(key);
++    if (existing != entries_.end()) {
++      if (exported_shared_image_json_out) {
++        *exported_shared_image_json_out =
++            existing->second.exported_shared_image_json;
++      }
++      SetResult(result_code, result_detail, "ok", "reused exported SharedImage");
++      return true;
++    }
++  }
++  std::string export_code;
++  std::string export_detail;
++  std::optional<Entry> maybe_entry =
++      CreateExportedSharedImageForDmaBuf(publication_source_json,
++                                         surface_id, revision, &export_code,
++                                         &export_detail);
++  if (!maybe_entry.has_value()) {
++    LOG(WARNING) << "workspace GPU bridge browser export rejected surface "
++                 << surface_id << " revision " << revision << ": "
++                 << export_code << ": " << export_detail;
++    SetResult(result_code, result_detail,
++              export_code.empty() ? "shared_image_creation_failure" : export_code,
++              export_detail.empty()
++                  ? "workspace GPU bridge browser service requires an importable "
++                    "DMA-BUF workspace payload"
++                  : export_detail);
++    return false;
++  }
++  Entry entry = std::move(*maybe_entry);
++  std::string exported_payload;
++  bool inserted = false;
++  {
++    base::AutoLock hold(lock_);
++    auto [it, inserted_entry] = entries_.try_emplace(key, std::move(entry));
++    exported_payload = it->second.exported_shared_image_json;
++    inserted = inserted_entry;
 +  }
 +  if (exported_shared_image_json_out) {
 +    *exported_shared_image_json_out = exported_payload;
 +  }
++  SetResult(result_code, result_detail, "ok",
++            inserted ? "exported SharedImage" : "reused exported SharedImage");
 +  return true;
 +}
 +
-+void CefWorkspaceGpuBridgeSurfaceService::Release(
++bool CefWorkspaceGpuBridgeSurfaceService::Release(
 +    content::RenderFrameHost* render_frame_host,
 +    std::string_view surface_id,
 +    std::string_view revision,
-+    bool renderer_dissociated) {
++    bool renderer_dissociated,
++    CefString* result_code,
++    CefString* result_detail) {
++  if (!IsWorkspaceSurfaceId(surface_id) || revision.empty()) {
++    SetResult(result_code, result_detail, "invalid_surface",
++              "workspace GPU bridge release requires workspace surface id and "
++              "revision");
++    return false;
++  }
++  base::AutoLock hold(lock_);
++  const auto it = entries_.find(MakeKey(surface_id, revision));
++  if (it == entries_.end()) {
++    SetResult(result_code, result_detail, "release_failure",
++              "workspace GPU bridge release could not find the surface revision");
++    return false;
++  }
++  if (render_frame_host == nullptr) {
++    it->second.browser_released = true;
++  } else if (renderer_dissociated) {
++    it->second.renderer_associated = true;
++    it->second.renderer_dissociated = true;
++  }
++  if (!it->second.browser_released) {
++    SetResult(result_code, result_detail, "ok", "renderer surface release recorded");
++    LOG(INFO) << "workspace GPU bridge renderer released surface "
++              << surface_id << " revision " << revision;
++    return true;
++  }
++  if (it->second.renderer_associated && it->second.renderer_dissociated) {
++    entries_.erase(it);
++    SetResult(result_code, result_detail, "ok", "browser and renderer surface release completed");
++    LOG(INFO) << "workspace GPU bridge browser released surface "
++              << surface_id << " revision " << revision;
++    return true;
++  }
++  if (!it->second.renderer_associated) {
++    ScheduleUnassociatedRelease(std::string(surface_id), std::string(revision));
++  }
++  SetResult(result_code, result_detail, "ok", "browser surface release recorded");
++  LOG(INFO) << "workspace GPU bridge browser released surface "
++            << surface_id << " revision " << revision;
++  return true;
++}
++
++void CefWorkspaceGpuBridgeSurfaceService::ScheduleUnassociatedRelease(
++    std::string surface_id,
++    std::string revision) {
++  base::SequencedTaskRunner::GetCurrentDefault()->PostDelayedTask(
++      FROM_HERE,
++      base::BindOnce(
++          &CefWorkspaceGpuBridgeSurfaceService::EraseBrowserReleasedUnassociated,
++          base::Unretained(this), std::move(surface_id), std::move(revision)),
++      kUnassociatedReleaseGrace);
++}
++
++void CefWorkspaceGpuBridgeSurfaceService::EraseBrowserReleasedUnassociated(
++    std::string surface_id,
++    std::string revision) {
++  base::AutoLock hold(lock_);
++  const auto it = entries_.find(MakeKey(surface_id, revision));
++  if (it == entries_.end() || !it->second.browser_released ||
++      it->second.renderer_associated) {
++    return;
++  }
++  entries_.erase(it);
++}
++
++void CefWorkspaceGpuBridgeSurfaceService::RetainRendererAssociation(
++    content::RenderFrameHost* render_frame_host,
++    std::string_view surface_id,
++    std::string_view revision) {
 +  (void)render_frame_host;
 +  if (!IsWorkspaceSurfaceId(surface_id) || revision.empty()) {
 +    return;
@@ -402,13 +872,11 @@ new file mode 100644
 +  if (it == entries_.end()) {
 +    return;
 +  }
-+  it->second.renderer_dissociated |= renderer_dissociated;
-+  if (it->second.renderer_dissociated) {
-+    entries_.erase(it);
-+  }
++  it->second.renderer_associated = true;
++  it->second.renderer_dissociated = false;
 +}
 +
-+extern "C" bool mmltk_cef_workspace_gpu_bridge_export_shared_image(
++extern "C" CEF_EXPORT bool mmltk_cef_workspace_gpu_bridge_export_shared_image(
 +    const char* surface_id,
 +    size_t surface_id_length,
 +    const char* revision,
@@ -416,12 +884,42 @@ new file mode 100644
 +    const char* publication_source_json,
 +    size_t publication_source_json_length,
 +    CefString* exported_shared_image_json_out,
-+    CefString* exception) noexcept {
++    CefString* result_code,
++    CefString* result_detail) noexcept {
++  if (!surface_id || surface_id_length == 0U || !revision ||
++      revision_length == 0U || !publication_source_json ||
++      publication_source_json_length == 0U) {
++    SetResult(result_code, result_detail, "invalid_surface",
++              "workspace GPU bridge export requires surface id, revision, and "
++              "publication source");
++    return false;
++  }
 +  return CefWorkspaceGpuBridgeSurfaceService::GetInstance().ExportForBrowser(
 +      /*render_frame_host=*/nullptr,
 +      std::string_view(surface_id, surface_id_length),
 +      std::string_view(revision, revision_length),
 +      std::string_view(publication_source_json,
 +                       publication_source_json_length),
-+      exported_shared_image_json_out, exception);
++      exported_shared_image_json_out, result_code, result_detail);
++}
++
++extern "C" CEF_EXPORT bool mmltk_cef_workspace_gpu_bridge_release_surface(
++    const char* surface_id,
++    size_t surface_id_length,
++    const char* revision,
++    size_t revision_length,
++    bool renderer_dissociated,
++    CefString* result_code,
++    CefString* result_detail) noexcept {
++  if (!surface_id || surface_id_length == 0U || !revision ||
++      revision_length == 0U) {
++    SetResult(result_code, result_detail, "invalid_surface",
++              "workspace GPU bridge release requires surface id and revision");
++    return false;
++  }
++  return CefWorkspaceGpuBridgeSurfaceService::GetInstance().Release(
++      /*render_frame_host=*/nullptr,
++      std::string_view(surface_id, surface_id_length),
++      std::string_view(revision, revision_length), renderer_dissociated,
++      result_code, result_detail);
 +}

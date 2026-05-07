@@ -1337,6 +1337,67 @@ static stbi_uc stbi__compute_y(int r, int g, int b) {
 #if defined(STBI_NO_PNG) && defined(STBI_NO_BMP) && defined(STBI_NO_PSD) && defined(STBI_NO_TGA) && \
     defined(STBI_NO_GIF) && defined(STBI_NO_PIC) && defined(STBI_NO_PNM)
 #else
+#define STBI__COMBO(a, b) ((a) * 8 + (b))
+#define STBI__CASE(a, b)    \
+    case STBI__COMBO(a, b): \
+        for (i = x - 1; i >= 0; --i, src += a, dest += b)
+#define STBI__CONVERT_FORMAT_SWITCH(alpha_value, compute_y_func, error_result) \
+    switch (STBI__COMBO(img_n, req_comp)) {                                    \
+        STBI__CASE(1, 2) {                                                      \
+            dest[0] = src[0];                                                   \
+            dest[1] = alpha_value;                                              \
+        }                                                                       \
+        break;                                                                  \
+        STBI__CASE(1, 3) { dest[0] = dest[1] = dest[2] = src[0]; }              \
+        break;                                                                  \
+        STBI__CASE(1, 4) {                                                      \
+            dest[0] = dest[1] = dest[2] = src[0];                               \
+            dest[3] = alpha_value;                                              \
+        }                                                                       \
+        break;                                                                  \
+        STBI__CASE(2, 1) { dest[0] = src[0]; }                                  \
+        break;                                                                  \
+        STBI__CASE(2, 3) { dest[0] = dest[1] = dest[2] = src[0]; }              \
+        break;                                                                  \
+        STBI__CASE(2, 4) {                                                      \
+            dest[0] = dest[1] = dest[2] = src[0];                               \
+            dest[3] = src[1];                                                   \
+        }                                                                       \
+        break;                                                                  \
+        STBI__CASE(3, 4) {                                                      \
+            dest[0] = src[0];                                                   \
+            dest[1] = src[1];                                                   \
+            dest[2] = src[2];                                                   \
+            dest[3] = alpha_value;                                              \
+        }                                                                       \
+        break;                                                                  \
+        STBI__CASE(3, 1) { dest[0] = compute_y_func(src[0], src[1], src[2]); }  \
+        break;                                                                  \
+        STBI__CASE(3, 2) {                                                      \
+            dest[0] = compute_y_func(src[0], src[1], src[2]);                   \
+            dest[1] = alpha_value;                                              \
+        }                                                                       \
+        break;                                                                  \
+        STBI__CASE(4, 1) { dest[0] = compute_y_func(src[0], src[1], src[2]); }  \
+        break;                                                                  \
+        STBI__CASE(4, 2) {                                                      \
+            dest[0] = compute_y_func(src[0], src[1], src[2]);                   \
+            dest[1] = src[3];                                                   \
+        }                                                                       \
+        break;                                                                  \
+        STBI__CASE(4, 3) {                                                      \
+            dest[0] = src[0];                                                   \
+            dest[1] = src[1];                                                   \
+            dest[2] = src[2];                                                   \
+        }                                                                       \
+        break;                                                                  \
+        default:                                                                \
+            STBI_ASSERT(0);                                                     \
+            STBI_FREE(data);                                                    \
+            STBI_FREE(good);                                                    \
+            return error_result;                                                \
+    }
+
 static unsigned char* stbi__convert_format(unsigned char* data, int img_n, int req_comp, unsigned int x,
                                            unsigned int y) {
     int i, j;
@@ -1356,76 +1417,7 @@ static unsigned char* stbi__convert_format(unsigned char* data, int img_n, int r
         unsigned char* src = data + j * x * img_n;
         unsigned char* dest = good + j * x * req_comp;
 
-#define STBI__COMBO(a, b) ((a) * 8 + (b))
-#define STBI__CASE(a, b)    \
-    case STBI__COMBO(a, b): \
-        for (i = x - 1; i >= 0; --i, src += a, dest += b)
-        switch (STBI__COMBO(img_n, req_comp)) {
-            STBI__CASE(1, 2) {
-                dest[0] = src[0];
-                dest[1] = 255;
-            }
-            break;
-            STBI__CASE(1, 3) {
-                dest[0] = dest[1] = dest[2] = src[0];
-            }
-            break;
-            STBI__CASE(1, 4) {
-                dest[0] = dest[1] = dest[2] = src[0];
-                dest[3] = 255;
-            }
-            break;
-            STBI__CASE(2, 1) {
-                dest[0] = src[0];
-            }
-            break;
-            STBI__CASE(2, 3) {
-                dest[0] = dest[1] = dest[2] = src[0];
-            }
-            break;
-            STBI__CASE(2, 4) {
-                dest[0] = dest[1] = dest[2] = src[0];
-                dest[3] = src[1];
-            }
-            break;
-            STBI__CASE(3, 4) {
-                dest[0] = src[0];
-                dest[1] = src[1];
-                dest[2] = src[2];
-                dest[3] = 255;
-            }
-            break;
-            STBI__CASE(3, 1) {
-                dest[0] = stbi__compute_y(src[0], src[1], src[2]);
-            }
-            break;
-            STBI__CASE(3, 2) {
-                dest[0] = stbi__compute_y(src[0], src[1], src[2]);
-                dest[1] = 255;
-            }
-            break;
-            STBI__CASE(4, 1) {
-                dest[0] = stbi__compute_y(src[0], src[1], src[2]);
-            }
-            break;
-            STBI__CASE(4, 2) {
-                dest[0] = stbi__compute_y(src[0], src[1], src[2]);
-                dest[1] = src[3];
-            }
-            break;
-            STBI__CASE(4, 3) {
-                dest[0] = src[0];
-                dest[1] = src[1];
-                dest[2] = src[2];
-            }
-            break;
-            default:
-                STBI_ASSERT(0);
-                STBI_FREE(data);
-                STBI_FREE(good);
-                return stbi__errpuc("unsupported", "Unsupported format conversion");
-        }
-#undef STBI__CASE
+        STBI__CONVERT_FORMAT_SWITCH(255, stbi__compute_y, stbi__errpuc("unsupported", "Unsupported format conversion"));
     }
 
     STBI_FREE(data);
@@ -1433,14 +1425,14 @@ static unsigned char* stbi__convert_format(unsigned char* data, int img_n, int r
 }
 #endif
 
-#if defined(STBI_NO_PNG) && defined(STBI_NO_PSD)
+#if defined(STBI_NO_PNG) && defined(STBI_NO_PSD) && defined(STBI_NO_PNM)
 #else
 static stbi__uint16 stbi__compute_y_16(int r, int g, int b) {
     return (stbi__uint16)(((r * 77) + (g * 150) + (29 * b)) >> 8);
 }
 #endif
 
-#if defined(STBI_NO_PNG) && defined(STBI_NO_PSD)
+#if defined(STBI_NO_PNG) && defined(STBI_NO_PSD) && defined(STBI_NO_PNM)
 #else
 static stbi__uint16* stbi__convert_format16(stbi__uint16* data, int img_n, int req_comp, unsigned int x,
                                             unsigned int y) {
@@ -1461,82 +1453,17 @@ static stbi__uint16* stbi__convert_format16(stbi__uint16* data, int img_n, int r
         stbi__uint16* src = data + j * x * img_n;
         stbi__uint16* dest = good + j * x * req_comp;
 
-#define STBI__COMBO(a, b) ((a) * 8 + (b))
-#define STBI__CASE(a, b)    \
-    case STBI__COMBO(a, b): \
-        for (i = x - 1; i >= 0; --i, src += a, dest += b)
-        switch (STBI__COMBO(img_n, req_comp)) {
-            STBI__CASE(1, 2) {
-                dest[0] = src[0];
-                dest[1] = 0xffff;
-            }
-            break;
-            STBI__CASE(1, 3) {
-                dest[0] = dest[1] = dest[2] = src[0];
-            }
-            break;
-            STBI__CASE(1, 4) {
-                dest[0] = dest[1] = dest[2] = src[0];
-                dest[3] = 0xffff;
-            }
-            break;
-            STBI__CASE(2, 1) {
-                dest[0] = src[0];
-            }
-            break;
-            STBI__CASE(2, 3) {
-                dest[0] = dest[1] = dest[2] = src[0];
-            }
-            break;
-            STBI__CASE(2, 4) {
-                dest[0] = dest[1] = dest[2] = src[0];
-                dest[3] = src[1];
-            }
-            break;
-            STBI__CASE(3, 4) {
-                dest[0] = src[0];
-                dest[1] = src[1];
-                dest[2] = src[2];
-                dest[3] = 0xffff;
-            }
-            break;
-            STBI__CASE(3, 1) {
-                dest[0] = stbi__compute_y_16(src[0], src[1], src[2]);
-            }
-            break;
-            STBI__CASE(3, 2) {
-                dest[0] = stbi__compute_y_16(src[0], src[1], src[2]);
-                dest[1] = 0xffff;
-            }
-            break;
-            STBI__CASE(4, 1) {
-                dest[0] = stbi__compute_y_16(src[0], src[1], src[2]);
-            }
-            break;
-            STBI__CASE(4, 2) {
-                dest[0] = stbi__compute_y_16(src[0], src[1], src[2]);
-                dest[1] = src[3];
-            }
-            break;
-            STBI__CASE(4, 3) {
-                dest[0] = src[0];
-                dest[1] = src[1];
-                dest[2] = src[2];
-            }
-            break;
-            default:
-                STBI_ASSERT(0);
-                STBI_FREE(data);
-                STBI_FREE(good);
-                return (stbi__uint16*)stbi__errpuc("unsupported", "Unsupported format conversion");
-        }
-#undef STBI__CASE
+        STBI__CONVERT_FORMAT_SWITCH(0xffff, stbi__compute_y_16,
+                                    (stbi__uint16*)stbi__errpuc("unsupported", "Unsupported format conversion"));
     }
 
     STBI_FREE(data);
     return good;
 }
 #endif
+#undef STBI__CONVERT_FORMAT_SWITCH
+#undef STBI__CASE
+#undef STBI__COMBO
 
 #ifndef STBI_NO_LINEAR
 static float* stbi__ldr_to_hdr(stbi_uc* data, int x, int y, int comp) {

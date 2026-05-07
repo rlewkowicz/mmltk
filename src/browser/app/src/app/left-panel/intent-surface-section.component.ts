@@ -1,7 +1,6 @@
-import { ChangeDetectionStrategy, Component, computed, inject } from '@angular/core';
+import { ChangeDetectionStrategy, Component, inject } from '@angular/core';
 import { BrowserAnnotateSidebarState } from '../state/browser-annotate-sidebar.service';
 import { BrowserExportWorkflowState } from '../state/browser-export-workflow.service';
-import { BrowserHostRuntimeState } from '../state/browser-host-runtime.service';
 import { BrowserLiveWorkflowState } from '../state/browser-live-workflow.service';
 import { BrowserPredictWorkflowState } from '../state/browser-predict-workflow.service';
 import { BrowserTrainWorkflowState } from '../state/browser-train-workflow.service';
@@ -147,21 +146,11 @@ import { BrowserWorkspaceStateService } from '../state/browser-workspace.service
           Focus Crop
         </button>
       </div>
-      <dl class="detail-grid">
-        @for (item of workspace.workspaceDiagnostics().statusItems; track item.key) {
-          <div>
-            <dt>{{ item.label }}</dt>
-            <dd>{{ item.summary }}</dd>
-          </div>
-        }
-      </dl>
-      <p class="section-copy">{{ diagnosticsNarrative() }}</p>
     </section>
   `,
 })
 export class IntentSurfaceSectionComponent {
   protected readonly annotate = inject(BrowserAnnotateSidebarState);
-  protected readonly runtime = inject(BrowserHostRuntimeState);
   protected readonly workspace = inject(BrowserWorkspaceStateService);
   protected readonly workflow = inject(BrowserWorkflowRouteState);
   protected readonly panels = inject(BrowserWorkflowPanelsState);
@@ -171,15 +160,6 @@ export class IntentSurfaceSectionComponent {
   protected readonly train = inject(BrowserTrainWorkflowState);
   protected readonly validate = inject(BrowserValidateWorkflowState);
   protected readonly exportWorkflow = inject(BrowserExportWorkflowState);
-  protected readonly diagnosticsNarrative = computed(() => {
-    const details = [
-      this.runtime.runtimeCapabilityStatus().find((item) => item.key === 'workspace_surface_bridge')?.detail,
-      this.runtime.transportStatus().statusItems.find((item) => item.key === 'workspace_surface_zero_copy')?.detail,
-      this.workspace.workspaceViewportDetail(),
-    ].filter((detail): detail is string => typeof detail === 'string' && detail.trim().length > 0);
-
-    return details.filter((detail, index, items) => items.indexOf(detail) === index).join(' ');
-  });
 
   protected isPredictLikeWorkflow(): boolean {
     return this.workflow.selectedWorkflow() === 'predict' || this.workflow.selectedWorkflow() === 'live';

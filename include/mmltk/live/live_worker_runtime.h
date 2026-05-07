@@ -113,6 +113,15 @@ inline bool try_acquire_latest_published_slot_view(std::vector<std::unique_ptr<S
 }
 
 template <typename Slot, typename Output>
+inline bool try_acquire_latest_ready_published_slot_view(std::vector<std::unique_ptr<Slot>>& slots,
+                                                        const std::atomic<int>& latest_index, Output* out,
+                                                        const char* event_context) {
+    return mmltk::live::try_acquire_latest_ready_published_slot(
+        slots, latest_index, out, [](Slot& published) { return published.make_view(); },
+        [](Slot& published) { return published.ready_event_handle(); }, event_context);
+}
+
+template <typename Slot, typename Output>
 inline bool try_acquire_latest_running_slot_view(std::vector<std::unique_ptr<Slot>>& slots,
                                                  const std::atomic<int>& latest_index, const std::atomic<bool>& running,
                                                  Output* out, const char* null_output_context) {
@@ -142,7 +151,7 @@ struct LiveFrameSlotCommon {
     bool short_frame = false;
 
     [[nodiscard]] BundleType make_view() const noexcept {
-        return BundleType{
+        BundleType bundle{
             slot_index,
             frame_id,
             device_buffer.data(),
@@ -154,6 +163,12 @@ struct LiveFrameSlotCommon {
             ready_ns,
             short_frame,
         };
+        if constexpr (requires(const DeviceBuffer& buffer, std::uint32_t width, std::uint32_t height) {
+                          buffer.dmabuf_image(width, height);
+                      }) {
+            bundle.dmabuf_image = device_buffer.dmabuf_image(region.width, region.height);
+        }
+        return bundle;
     }
 
     void reset_for_reuse() noexcept {
@@ -205,6 +220,31 @@ inline void allocate_pitched_device_slots(std::vector<std::unique_ptr<Slot>>& sl
                                           const char* stream_context, const char* event_context) {
     allocate_unique_slots(slots, slot_count, [&](Slot& slot, std::uint32_t slot_index) {
         initialize_pitched_device_slot(slot, slot_index, width, height, buffer_context, stream_context, event_context);
+    });
+}
+
+template <typename Slot>
+inline void initialize_dmabuf_cuda_rgba_slot(Slot& slot, LinuxGpuInteropDevice& interop_device,
+                                             const int cuda_device_index, const std::uint32_t slot_index,
+                                             const std::uint32_t width, const std::uint32_t height,
+                                             const char* buffer_context, const char* stream_context,
+                                             const char* event_context) {
+    slot.slot_index = slot_index;
+    interop_device.ensure_open(cuda_device_index, buffer_context);
+    slot.device_buffer.ensure_dimensions(interop_device, cuda_device_index, width, height, buffer_context);
+    slot.stream.create_with_highest_priority(stream_context);
+    slot.ready_event.create(cudaEventDisableTiming, event_context);
+}
+
+template <typename Slot>
+inline void allocate_dmabuf_cuda_rgba_slots(std::vector<std::unique_ptr<Slot>>& slots, std::uint32_t slot_count,
+                                            LinuxGpuInteropDevice& interop_device, const int cuda_device_index,
+                                            const std::uint32_t width, const std::uint32_t height,
+                                            const char* buffer_context, const char* stream_context,
+                                            const char* event_context) {
+    allocate_unique_slots(slots, slot_count, [&](Slot& slot, std::uint32_t slot_index) {
+        initialize_dmabuf_cuda_rgba_slot(slot, interop_device, cuda_device_index, slot_index, width, height,
+                                         buffer_context, stream_context, event_context);
     });
 }
 

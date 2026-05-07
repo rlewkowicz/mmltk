@@ -41,15 +41,8 @@ class XmlReporter : public StreamingReporterBase {
 
     void testRunEnded(TestRunStats const& testRunStats) override;
 
-    void benchmarkPreparing(StringRef name) override;
-    void benchmarkStarting(BenchmarkInfo const&) override;
-    void benchmarkEnded(BenchmarkStats<> const&) override;
-    void benchmarkFailed(StringRef error) override;
-
-    void listReporters(std::vector<ReporterDescription> const& descriptions) override;
-    void listListeners(std::vector<ListenerDescription> const& descriptions) override;
-    void listTests(std::vector<TestCaseHandle> const& tests) override;
-    void listTags(std::vector<TagInfo> const& tags) override;
+    CATCH_REPORTER_BENCHMARK_OVERRIDES();
+    CATCH_REPORTER_LISTING_OVERRIDES();
 
    private:
     Timer m_testCaseTimer;

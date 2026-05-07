@@ -298,8 +298,57 @@ test("liveStatusState keeps idle-start flags without inferring preview metadata 
   );
   assert.equal(
     state.statusItems.find((item) => item.key === "workspace_path")?.summary,
-    "workspace bridge staged",
+    "workspace path staged",
   );
+});
+
+test("liveStatusState carries stage-specific workspace failure context", () => {
+  const snapshot = makeSnapshot();
+  snapshot.active_workflow = "live";
+  snapshot.workflow_state.live_runtime = {
+    active_mode: "predict",
+    show_running_section: true,
+    preview: {
+      has_frame: false,
+      surface_revision: "733",
+      owner: "live",
+      display_startup_state: "surface published",
+      error: "dawn_import_failure: Dawn import failed",
+      renderer_last_result_code: "dawn_import_failure",
+      renderer_last_result_detail: "Dawn import failed",
+      last_failure_reason: "dawn_import_failure",
+      last_failure_detail: "Dawn import failed",
+      last_failure_revision: "733",
+      last_failure_stage: "renderer.import_texture",
+      last_failure_live_frame_id: {
+        session_nonce: 44,
+        sequence: 733,
+      },
+      last_failure_cuda_device: 2,
+      last_failure_result_code: "dawn_import_failure",
+      last_failure_result_detail: "Dawn import failed",
+      publication_counters: {
+        attempted_workspace_acquisitions: 5,
+        startup_workspace_acquisition_misses: 2,
+        post_startup_workspace_acquisition_misses: 1,
+      },
+    },
+  };
+
+  const state = liveStatusState(snapshot);
+
+  assert.equal(state.preview.lastFailureStage, "renderer.import_texture");
+  assert.deepEqual(state.preview.lastFailureLiveFrameId, {
+    session_nonce: 44,
+    sequence: 733,
+  });
+  assert.equal(state.preview.lastFailureCudaDevice, 2);
+  assert.equal(state.preview.lastFailureResultCode, "dawn_import_failure");
+  assert.equal(state.preview.publicationCounters.attemptedWorkspaceAcquisitions, 5);
+  assert.equal(state.preview.publicationCounters.startupWorkspaceAcquisitionMisses, 2);
+  assert.equal(state.preview.publicationCounters.postStartupWorkspaceAcquisitionMisses, 1);
+  assert.equal(state.preview.rendererLastResultDetail, "Dawn import failed");
+  assert.match(state.errorText, /Dawn import failed/);
 });
 
 test("liveStatusState ignores steady-state runtime state without explicit preview metadata", () => {
@@ -318,7 +367,7 @@ test("liveStatusState ignores steady-state runtime state without explicit previe
   assert.equal(state.preview.liveFrameId, null);
   assert.equal(state.workspacePath.lastFrameId, null);
   assert.equal(state.previewLabel, "No preview frame");
-  assert.equal(state.workspacePathLabel, "workspace bridge pending");
+  assert.equal(state.workspacePathLabel, "workspace path pending");
   assert.equal(state.statusItems.find((item) => item.key === "preview")?.status, "pending");
   assert.equal(
     state.statusItems.find((item) => item.key === "workspace_path")?.status,
@@ -338,16 +387,16 @@ test("annotateShellControlsState prefers published control sections and normaliz
       input_count: 9,
       reload: {
         enabled: true,
-        intent: "annotate.frame.reload",
+        intent: "annotate.setup_frame.reload",
       },
       prev: {
         enabled: true,
         workflow: "annotate",
-        intent: "annotate.frame.prev",
+        intent: "annotate.setup_frame.prev",
       },
       next: {
         enabled: false,
-        intent: "annotate.frame.next",
+        intent: "annotate.setup_frame.next",
       },
     },
     save: {
@@ -361,7 +410,7 @@ test("annotateShellControlsState prefers published control sections and normaliz
         value: true,
         blocked: false,
         intent: "annotate.hold_save",
-        payload_key: "active",
+        payload_key: "enabled",
       },
     },
     brush: {
@@ -385,14 +434,14 @@ test("annotateShellControlsState prefers published control sections and normaliz
   assert.equal(state.statusItems.find((item) => item.key === "save")?.summary, "hold save armed");
   assert.equal(state.setupFrame.currentIndex, 3);
   assert.equal(state.setupFrame.inputCount, 9);
-  assert.equal(state.setupFrame.reload.intent, "annotate.frame.reload");
-  assert.equal(state.setupFrame.previous.intent, "annotate.frame.prev");
+  assert.equal(state.setupFrame.reload.intent, "annotate.setup_frame.reload");
+  assert.equal(state.setupFrame.previous.intent, "annotate.setup_frame.prev");
   assert.equal(state.setupFrame.next.enabled, false);
   assert.equal(state.save.summary, "native save controls");
   assert.equal(state.statusItems.find((item) => item.key === "save")?.detail, "native save controls");
   assert.equal(state.save.saveNow.intent, "annotate.save_now");
   assert.equal(state.save.holdSave.value, true);
-  assert.equal(state.save.holdSave.payloadKey, "active");
+  assert.equal(state.save.holdSave.payloadKey, "enabled");
   assert.equal(state.brush.visible, true);
   assert.equal(state.brush.radius.value, 19);
   assert.equal(state.brush.radius.max, 64);
@@ -409,8 +458,8 @@ test("annotateShellControlsState supports flattened save and brush control metad
       hold_save_enabled: true,
       hold_save_active: true,
       hold_save_blocked: false,
-      hold_save_intent: "annotate.save.hold",
-      hold_save_payload_key: "armed",
+      hold_save_intent: "annotate.hold_save",
+      hold_save_payload_key: "enabled",
     },
     brush: {
       visible: true,
@@ -418,22 +467,22 @@ test("annotateShellControlsState supports flattened save and brush control metad
       radius_min: 2,
       radius_max: 40,
       radius_enabled: true,
-      radius_intent: "annotate.brush.set",
-      radius_payload_key: "size",
+      radius_intent: "annotate.brush_radius",
+      radius_payload_key: "radius",
     },
   };
 
   const state = annotateShellControlsState(snapshot);
 
   assert.equal(state.save.holdSave.value, true);
-  assert.equal(state.save.holdSave.intent, "annotate.save.hold");
-  assert.equal(state.save.holdSave.payloadKey, "armed");
+  assert.equal(state.save.holdSave.intent, "annotate.hold_save");
+  assert.equal(state.save.holdSave.payloadKey, "enabled");
   assert.equal(state.brush.visible, true);
   assert.equal(state.brush.radius.value, 23);
   assert.equal(state.brush.radius.min, 2);
   assert.equal(state.brush.radius.max, 40);
-  assert.equal(state.brush.radius.intent, "annotate.brush.set");
-  assert.equal(state.brush.radius.payloadKey, "size");
+  assert.equal(state.brush.radius.intent, "annotate.brush_radius");
+  assert.equal(state.brush.radius.payloadKey, "radius");
   assert.equal(state.statusItems.find((item) => item.key === "save")?.status, "active");
   assert.equal(state.statusItems.find((item) => item.key === "brush")?.status, "active");
 });
@@ -453,13 +502,13 @@ test("livePreviewControlsState falls back to live runtime preview booleans and s
     fit_to_capture: {
       value: true,
       enabled: true,
-      intent: "live.preview.fit",
+      intent: "live.preview.fit_to_capture",
       payload_key: "enabled",
     },
     full_frame_display: {
       value: false,
       enabled: true,
-      intent: "live.preview.full_frame",
+      intent: "live.preview.full_frame_display",
       payload_key: "enabled",
     },
   };
@@ -477,10 +526,10 @@ test("livePreviewControlsState falls back to live runtime preview booleans and s
     "fit to capture enabled",
   );
   assert.equal(state.fitToCapture.value, true);
-  assert.equal(state.fitToCapture.intent, "live.preview.fit");
+  assert.equal(state.fitToCapture.intent, "live.preview.fit_to_capture");
   assert.equal(state.fitToCapture.payloadKey, "enabled");
   assert.equal(state.fullFrameDisplay.value, false);
-  assert.equal(state.fullFrameDisplay.intent, "live.preview.full_frame");
+  assert.equal(state.fullFrameDisplay.intent, "live.preview.full_frame_display");
 });
 
 test("livePreviewControlsState consumes native capability contract summaries when published", () => {

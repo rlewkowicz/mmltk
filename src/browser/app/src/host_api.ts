@@ -1,32 +1,21 @@
-export type Workflow =
-  | "train"
-  | "validate"
-  | "predict"
-  | "annotate"
-  | "export"
-  | "live";
+import type {
+  AnnotationDocumentState,
+  BrowserHostBackend,
+  BrowserRuntimeCapabilities,
+  BrowserRuntimeCapabilityStatus,
+  CaptureRegion,
+  FileDialogMode,
+  IntentMessage,
+  JobLogEntry,
+  JobState,
+  SourceKind,
+  SourceMetadata,
+  StateSnapshot,
+  Workflow,
+  WorkspaceSurfaceInfo,
+} from "./host_api.generated";
 
-export type SourceKind =
-  | "compiled_dataset"
-  | "single_image"
-  | "image_folder"
-  | "video_stream";
-
-export type BrowserHostBackend = "unknown" | "cef";
-
-export type BrowserRuntimeCapabilityStatus =
-  | "unknown"
-  | "available"
-  | "unavailable";
-
-export type FileDialogMode = "open_file" | "open_folder" | "save_file";
-
-export interface CaptureRegion {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
+export type { AnnotationDocumentState, BrowserHostBackend, BrowserRuntimeCapabilities, BrowserRuntimeCapabilityStatus, CaptureRegion, FileDialogMode, IntentMessage, JobLogEntry, JobState, SourceKind, SourceMetadata, StateSnapshot, Workflow, WorkspaceSurfaceInfo } from "./host_api.generated";
 
 export interface WorkspaceGeometry {
   canvasWidth: number;
@@ -143,86 +132,9 @@ export interface AnnotateSidebarState {
   selectedObject: AnnotateSidebarSelectedObjectState | null;
 }
 
-export interface JobLogEntry {
-  sequence: number;
-  level: string;
-  message: string;
-}
-
-export interface JobState {
-  running: boolean;
-  label: string;
-  summary: string;
-  error: string;
-  output_tail: string;
-  recent_logs: JobLogEntry[];
-}
-
-export interface SourceMetadata {
-  kind: SourceKind;
-  locator: string;
-  recursive: boolean;
-  device_index: number;
-  capture_width: number;
-  capture_height: number;
-  capture_fps: number;
-  v4l2_buffer_count: number;
-  has_crop: boolean;
-  crop: CaptureRegion;
-}
-
-export interface AnnotationDocumentState {
-  document_generation: number;
-  session_revision: number;
-  capture_width: number;
-  capture_height: number;
-  instance_count: number;
-  selected_instance: number | null;
-}
-
-export interface WorkspaceSurfaceInfo {
-  surfaceId: "workspace";
-  revision: string;
-  width: number;
-  height: number;
-  textureFormat: "rgba8unorm";
-  opaque: true;
-  upright: true;
-}
-
 export interface LiveFrameId {
   session_nonce: number;
   sequence: number;
-}
-
-export interface BrowserRuntimeCapabilities {
-  host_backend: BrowserHostBackend;
-  navigator_gpu: BrowserRuntimeCapabilityStatus;
-  workspace_surface_bridge: BrowserRuntimeCapabilityStatus;
-  workspace_surface_zero_copy: BrowserRuntimeCapabilityStatus;
-}
-
-export interface StateSnapshot {
-  type: "state.snapshot";
-  protocol_version: number;
-  state_revision: number;
-  active_workflow: Workflow;
-  workflow_state: Record<string, unknown>;
-  settings_state: Record<string, unknown>;
-  job: JobState;
-  source: SourceMetadata;
-  annotation: AnnotationDocumentState;
-  runtime_capabilities: BrowserRuntimeCapabilities;
-  workspace_surface?: WorkspaceSurfaceInfo | null;
-}
-
-export interface IntentMessage {
-  type: "intent";
-  protocol_version: number;
-  request_id: number;
-  workflow: Workflow;
-  intent: string;
-  payload: Record<string, unknown>;
 }
 
 export type BrowserHostCapabilityStatus =
@@ -289,12 +201,25 @@ export interface BrowserHostWorkspaceGpuBridge {
     surfaceId: string,
     revision: string,
   ): GPUTexture;
-  releaseSurface(surfaceId: string, revision: string): void;
+  releaseSurface(surfaceId: string, revision: string): BrowserHostWorkspaceGpuBridgeReleaseResult;
+  releaseRendererTexture(surfaceId: string, revision: string): BrowserHostWorkspaceGpuBridgeReleaseResult;
 }
+
+export type BrowserHostWorkspaceGpuBridgeReleaseResult =
+  | boolean
+  | void
+  | {
+      released?: boolean;
+      resultCode?: string;
+      resultDetail?: string;
+      result_code?: string;
+      result_detail?: string;
+    };
 
 export interface BrowserHostControlBridge {
   postMessage(messageText: string): void;
   deliverSnapshot?(jsonText: string): void;
+  deliverSurfaceReady?(jsonText: string): void;
   setBridgeState?(jsonText: string): void;
   reportError?(messageText: string): void;
 }

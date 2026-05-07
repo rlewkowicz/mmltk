@@ -11,6 +11,8 @@
 #include <utility>
 #include <vector>
 
+#include <unistd.h>
+
 namespace mmltk::gui {
 
 namespace {
@@ -20,6 +22,9 @@ enum class ImportedDiscardDisposition : std::uint8_t {
     Released,
     RetainedUntilRelease,
 };
+
+constexpr std::uint32_t kDrmFormatAbgr8888 = 0x34324241U;
+constexpr std::uint64_t kDrmFormatModInvalid = (1ULL << 56U) - 1U;
 
 [[nodiscard]] std::string workspace_surface_key(const std::string_view surface_id, const std::string_view revision) {
     return std::string(surface_id) + '\n' + std::string(revision);
@@ -60,6 +65,9 @@ void validate_publication_descriptor(const mmltk::browser::FrameSlotDescriptor& 
     if (descriptor.transport != mmltk::browser::FrameTransportKind::CudaDeviceBuffer) {
         throw std::runtime_error(std::string(publication_kind) + " requires CUDA device-buffer transport");
     }
+    if (descriptor.pixel_format != mmltk::browser::FramePixelFormat::Rgba8) {
+        throw std::runtime_error(std::string(publication_kind) + " requires RGBA8 pixel format");
+    }
     if (!mmltk::browser::frame_slot_has_valid_byte_layout(descriptor)) {
         throw std::runtime_error(std::string(publication_kind) + " requires a valid frame byte layout");
     }
@@ -78,20 +86,40 @@ void validate_imported_frame_source(const mmltk::browser::FrameSlotDescriptor& d
                                     const RetainedBrowserImportedFrameSource& imported_frame_source) {
     const std::optional<LinuxImportedFrameSourceContract> linux_import =
         linux_imported_frame_source_contract(imported_frame_source);
-    if (!linux_import.has_value() || linux_import->image.kind != LinuxImportedImageSourceKind::CudaDevicePointer ||
-        linux_import->image.handle == 0U) {
+    if (!linux_import.has_value() || linux_import->image.kind != LinuxImportedImageSourceKind::DmaBufRgba ||
+        linux_import->image.fd == 0U) {
         throw std::runtime_error(
             "retained browser imported frame source requires "
-            "a CUDA device-pointer image");
+            "a DMA-BUF RGBA image");
     }
     if (linux_import->image.cuda_device_index < 0) {
         throw std::runtime_error(
             "retained browser imported frame source requires "
             "a non-negative CUDA device index");
     }
-    if (descriptor.ready_sync.kind != mmltk::browser::FrameSlotSyncKind::CpuReady &&
-        (linux_import->ready_sync.kind != LinuxImportedSyncHandleKind::CudaEvent ||
-         linux_import->ready_sync.handle == 0U)) {
+    const std::uint64_t min_rgba_row_bytes = static_cast<std::uint64_t>(descriptor.width) * 4U;
+    const bool modifier_valid =
+        (linux_import->image.modifier_mode == LinuxDmaBufModifierMode::Implicit &&
+         linux_import->image.drm_modifier == kDrmFormatModInvalid) ||
+        (linux_import->image.modifier_mode == LinuxDmaBufModifierMode::Explicit &&
+         linux_import->image.drm_modifier != kDrmFormatModInvalid);
+    if (linux_import->image.width != descriptor.width || linux_import->image.height != descriptor.height ||
+        linux_import->image.stride_bytes != descriptor.row_stride_bytes ||
+        linux_import->image.stride_bytes < min_rgba_row_bytes ||
+        linux_import->image.allocation_size < descriptor.byte_length ||
+        linux_import->image.drm_format != kDrmFormatAbgr8888 || !modifier_valid) {
+        throw std::runtime_error(
+            "retained browser imported frame source requires valid DMA-BUF "
+            "layout and modifier metadata");
+    }
+    if (linux_import->image.offset > linux_import->image.allocation_size ||
+        descriptor.byte_length > linux_import->image.allocation_size - linux_import->image.offset) {
+        throw std::runtime_error(
+            "retained browser imported frame source DMA-BUF layout is smaller "
+            "than the published workspace frame");
+    }
+    if (linux_import->ready_sync.kind != LinuxImportedSyncHandleKind::CudaEvent ||
+        linux_import->ready_sync.handle == 0U) {
         throw std::runtime_error(
             "retained browser imported frame source requires "
             "a CUDA event for readiness");
@@ -250,6 +278,26 @@ struct RetainedBrowserFrameRegistry::Impl {
     mutable std::mutex mutex;
     std::unordered_map<std::string, std::shared_ptr<RetainedEntry>> entries_by_surface_key;
 };
+
+RetainedLinuxImageFd::~RetainedLinuxImageFd() {
+    reset();
+}
+
+RetainedLinuxImageFd::RetainedLinuxImageFd(RetainedLinuxImageFd&& other) noexcept : fd_(other.release()) {}
+
+RetainedLinuxImageFd& RetainedLinuxImageFd::operator=(RetainedLinuxImageFd&& other) noexcept {
+    if (this != &other) {
+        reset(other.release());
+    }
+    return *this;
+}
+
+void RetainedLinuxImageFd::reset(const int fd) noexcept {
+    if (fd_ >= 0) {
+        (void)::close(fd_);
+    }
+    fd_ = fd;
+}
 
 RetainedBrowserFrameRegistry::RetainedBrowserFrameRegistry() : impl_(std::make_unique<Impl>()) {}
 

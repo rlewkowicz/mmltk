@@ -35,6 +35,13 @@ struct ManualOverlayEdge {
     std::uint32_t target_index = 0;
 };
 
+struct ManualOverlayBrushPreview {
+    int capture_x = 0;
+    int capture_y = 0;
+    int radius = 1;
+    bool erase = false;
+};
+
 struct ManualOverlayInstance {
     std::string instance_id;
     bool enabled = true;
@@ -56,6 +63,7 @@ struct ManualOverlayDocumentSnapshot {
     std::uint32_t capture_height = 0;
     std::vector<ManualOverlayInstance> instances;
     std::optional<std::size_t> selected_instance;
+    std::optional<ManualOverlayBrushPreview> brush_preview;
 };
 
 class ManualOverlayDocument {

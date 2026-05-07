@@ -1,26 +1,29 @@
 import * as assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { inject, runInInjectionContext, type StaticProvider } from "@angular/core";
+import { inject, runInInjectionContext } from "@angular/core";
 
 import { BrowserAnnotateSidebarState } from "../src/app/state/browser-annotate-sidebar.service";
 import { BrowserAnnotateWorkflowState } from "../src/app/state/browser-annotate-workflow.service";
 import { BrowserExportWorkflowState } from "../src/app/state/browser-export-workflow.service";
-import { BrowserHostRuntimeState } from "../src/app/state/browser-host-runtime.service";
 import { BrowserLiveWorkflowState } from "../src/app/state/browser-live-workflow.service";
+import { BrowserModelConfigState } from "../src/app/state/browser-model-config.service";
 import { BrowserPredictWorkflowState } from "../src/app/state/browser-predict-workflow.service";
 import { BrowserShellChromeState } from "../src/app/state/browser-shell-chrome.service";
 import { BrowserSourceState } from "../src/app/state/browser-source-state.service";
-import { BrowserTrainWorkflowState } from "../src/app/state/browser-train-workflow.service";
 import { BrowserWorkflowPrimaryActionState } from "../src/app/state/browser-workflow-primary-action.service";
-import { BrowserWorkflowDraftSharedState } from "../src/app/state/browser-workflow-draft-shared.service";
-import { BrowserValidateWorkflowState } from "../src/app/state/browser-validate-workflow.service";
 import { BrowserWorkflowPanelsState } from "../src/app/state/browser-workflow-panels.service";
 import { BrowserWorkflowRouteState } from "../src/app/state/browser-workflow-route.service";
+import { BrowserValidateWorkflowState } from "../src/app/state/browser-validate-workflow.service";
 import type { StateSnapshot } from "../src/host_api";
-import { createAngularServiceHarness } from "./support/angular-test-harness";
+import { RF_DETR_PRESET_OPTIONS } from "../src/workflow_contract.generated";
+import {
+  createAngularServiceHarness,
+  type SpyTransport,
+} from "./support/angular-test-harness";
 import {
   makeAnnotateSidebarFixture,
+  makeBrowserWorkflowServiceProviders,
   makeBrowserTestSnapshot,
   makeBrowserTestSource,
   makeLivePredictRuntimeFixture,
@@ -28,43 +31,12 @@ import {
 
 function createInjector(snapshot: StateSnapshot): {
   injector: ReturnType<typeof createAngularServiceHarness>["injector"];
-  transport: ReturnType<typeof createAngularServiceHarness>["transport"];
+  transport: SpyTransport;
 } {
-  const providers: StaticProvider[] = [
-    { provide: BrowserHostRuntimeState, useFactory: () => new BrowserHostRuntimeState() },
-    { provide: BrowserWorkflowRouteState, useFactory: () => new BrowserWorkflowRouteState() },
-    { provide: BrowserShellChromeState, useFactory: () => new BrowserShellChromeState() },
-    { provide: BrowserExportWorkflowState, useFactory: () => new BrowserExportWorkflowState() },
-    {
-      provide: BrowserValidateWorkflowState,
-      useFactory: () => new BrowserValidateWorkflowState(),
-    },
-    { provide: BrowserLiveWorkflowState, useFactory: () => new BrowserLiveWorkflowState() },
-    { provide: BrowserTrainWorkflowState, useFactory: () => new BrowserTrainWorkflowState() },
-    {
-      provide: BrowserPredictWorkflowState,
-      useFactory: () => new BrowserPredictWorkflowState(),
-    },
-    {
-      provide: BrowserAnnotateWorkflowState,
-      useFactory: () => new BrowserAnnotateWorkflowState(),
-    },
-    {
-      provide: BrowserWorkflowDraftSharedState,
-      useFactory: () => new BrowserWorkflowDraftSharedState(),
-    },
-    { provide: BrowserWorkflowPanelsState, useFactory: () => new BrowserWorkflowPanelsState() },
-    { provide: BrowserSourceState, useFactory: () => new BrowserSourceState() },
-    {
-      provide: BrowserWorkflowPrimaryActionState,
-      useFactory: () => new BrowserWorkflowPrimaryActionState(),
-    },
-    {
-      provide: BrowserAnnotateSidebarState,
-      useFactory: () => new BrowserAnnotateSidebarState(),
-    },
-  ];
-  const harness = createAngularServiceHarness(snapshot, providers);
+  const harness = createAngularServiceHarness(
+    snapshot,
+    makeBrowserWorkflowServiceProviders({ annotateSidebar: true }),
+  );
   return { injector: harness.injector, transport: harness.transport };
 }
 
@@ -89,8 +61,7 @@ test("BrowserWorkflowPanelsState follows the route workflow and composes export 
     exportWorkflow.updateTextField("outputPath", "/tmp/export.engine");
 
     assert.equal(panels.selectedWorkflow(), "export");
-    assert.equal(panels.workflowControlStatus()[0]?.summary, "workflow draft staged");
-    assert.equal(panels.workflowControlStatus()[1]?.label, "Export");
+    assert.equal(panels.workflowControlStatus()[0]?.label, "Export");
     assert.equal(panels.workflowDetailsStatus()[0]?.label, "Export Details");
   });
 });
@@ -117,6 +88,38 @@ test("BrowserShellChromeState updates workflow selection immediately and coalesc
   assert.deepEqual(transport.dispatched[0]?.payload, {
     patch: {
       current_view: "train",
+    },
+  });
+});
+
+test("BrowserModelConfigState exposes generated RF-DETR presets before backend hydration", () => {
+  const { injector, transport } = createInjector(
+    makeBrowserTestSnapshot({
+      active_workflow: "annotate",
+      workflow_state: {},
+    }),
+  );
+
+  runInInjectionContext(injector, () => {
+    const route = inject(BrowserWorkflowRouteState);
+    const model = inject(BrowserModelConfigState);
+    route.routeWorkflow.set("annotate");
+
+    assert.deepEqual(
+      model.presets().map((preset) => preset.presetName),
+      RF_DETR_PRESET_OPTIONS.map((preset) => preset.presetName),
+    );
+
+    model.setPreset("rf-detr-seg-xxlarge");
+    assert.equal(model.selectedPreset(), "rf-detr-seg-xxlarge");
+  });
+
+  assert.equal(transport.dispatched.length, 1);
+  assert.equal(transport.dispatched[0]?.workflow, "annotate");
+  assert.equal(transport.dispatched[0]?.intent, "settings.update");
+  assert.deepEqual(transport.dispatched[0]?.payload, {
+    patch: {
+      selected_preset: "rf-detr-seg-xxlarge",
     },
   });
 });
@@ -158,13 +161,141 @@ test("BrowserWorkflowPrimaryActionState dispatches predict.stop for an active li
 
   runInInjectionContext(injector, () => {
     const primary = inject(BrowserWorkflowPrimaryActionState);
-    assert.equal(primary.primaryActionLabel(), "Stop Live Predict");
+    assert.equal(primary.primaryActionLabel(), "Stop Capture");
     primary.runPrimaryAction();
   });
 
   assert.equal(transport.dispatched.length, 1);
   assert.equal(transport.dispatched[0]?.workflow, "live");
   assert.equal(transport.dispatched[0]?.intent, "predict.stop");
+});
+
+test("BrowserWorkflowPrimaryActionState starts live capture with current source and predict drafts", () => {
+  const { injector, transport } = createInjector(
+    makeBrowserTestSnapshot({
+      active_workflow: "live",
+      source: makeBrowserTestSource({
+        kind: "single_image",
+        locator: "/tmp/stale.png",
+      }),
+    }),
+  );
+
+  runInInjectionContext(injector, () => {
+    const source = inject(BrowserSourceState);
+    const predict = inject(BrowserPredictWorkflowState);
+    const primary = inject(BrowserWorkflowPrimaryActionState);
+
+    source.patch((current) => ({
+      ...current,
+      kind: "video_stream",
+      locator: "device:2",
+      deviceIndex: "2",
+      captureWidth: "1280",
+      captureHeight: "720",
+      captureFps: "60",
+    }));
+    predict.updateTextField("weightsPath", "/models/live.pt");
+
+    assert.equal(primary.primaryActionLabel(), "Start Capture");
+    primary.runPrimaryAction();
+  });
+
+  assert.equal(transport.dispatched.length, 3);
+  assert.equal(transport.dispatched[0]?.workflow, "live");
+  assert.equal(transport.dispatched[0]?.intent, "settings.update");
+  assert.equal(
+    (transport.dispatched[0]?.payload.patch as any).workflows.predict.source.kind,
+    3,
+  );
+  assert.equal(
+    (transport.dispatched[0]?.payload.patch as any).workflows.predict.source.device_index,
+    2,
+  );
+  assert.equal(transport.dispatched[1]?.workflow, "live");
+  assert.equal(transport.dispatched[1]?.intent, "settings.update");
+  assert.equal(
+    (transport.dispatched[1]?.payload.patch as any).workflows.predict.model_artifacts.weights_path,
+    "/models/live.pt",
+  );
+  assert.equal(transport.dispatched[2]?.workflow, "live");
+  assert.equal(transport.dispatched[2]?.intent, "predict.start");
+});
+
+test("BrowserAnnotateWorkflowState can start live annotate from a video draft without a visible apply step", () => {
+  const { injector, transport } = createInjector(
+    makeBrowserTestSnapshot({
+      active_workflow: "annotate",
+      source: makeBrowserTestSource({
+        kind: "single_image",
+        locator: "/datasets/frame.png",
+      }),
+    }),
+  );
+
+  runInInjectionContext(injector, () => {
+    const source = inject(BrowserSourceState);
+    const annotate = inject(BrowserAnnotateWorkflowState);
+
+    source.patch((current) => ({
+      ...current,
+      kind: "video_stream",
+      locator: "device:1",
+      deviceIndex: "1",
+      captureWidth: "1280",
+      captureHeight: "720",
+      captureFps: "60",
+      v4l2BufferCount: "4",
+    }));
+    annotate.updateTextField("outputDir", "/tmp/annotated-live");
+
+    assert.equal(annotate.annotateLiveVisible(), true);
+    assert.equal(annotate.annotateLiveStartEnabled(), true);
+    annotate.startLive();
+  });
+
+  assert.equal(transport.dispatched.length, 3);
+  assert.equal(transport.dispatched[0]?.workflow, "annotate");
+  assert.equal(transport.dispatched[0]?.intent, "settings.update");
+  const sourcePatch =
+    (transport.dispatched[0]?.payload.patch as any).workflows.annotate.source;
+  assert.equal("compiled_path" in sourcePatch, false);
+  assert.equal(
+    sourcePatch.kind,
+    3,
+  );
+  assert.equal(
+    sourcePatch.device_index,
+    1,
+  );
+  assert.equal(
+    sourcePatch.capture_width,
+    1280,
+  );
+  assert.equal(
+    sourcePatch.capture_height,
+    720,
+  );
+  assert.equal(
+    sourcePatch.capture_fps,
+    60,
+  );
+  assert.equal(
+    sourcePatch.v4l2_buffer_count,
+    4,
+  );
+  assert.equal(transport.dispatched[1]?.workflow, "annotate");
+  assert.equal(transport.dispatched[1]?.intent, "settings.update");
+  assert.equal(
+    (transport.dispatched[1]?.payload.patch as any).workflows.annotate.annotate.output_dir,
+    "/tmp/annotated-live",
+  );
+  assert.equal(
+    (transport.dispatched[1]?.payload.patch as any).workflows.annotate.annotate.model_input,
+    3,
+  );
+  assert.equal(transport.dispatched[2]?.workflow, "annotate");
+  assert.equal(transport.dispatched[2]?.intent, "annotate.live.start");
 });
 
 test("BrowserAnnotateSidebarState routes sidebar and workspace annotate commands without BrowserShellStore", () => {

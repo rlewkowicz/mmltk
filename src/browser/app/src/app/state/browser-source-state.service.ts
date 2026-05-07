@@ -42,7 +42,7 @@ export class BrowserSourceState {
     sourceKindOptionsForWorkflow(this.selectedWorkflow(), this.draft().kind),
   );
   readonly browseRequest = computed(() => {
-    if (!this.sourceEditingSupported() || this.dirty()) {
+    if (!this.sourceEditingSupported()) {
       return null;
     }
     return sourceBrowseRequestForDraft(this.selectedWorkflow(), this.draft());
@@ -90,9 +90,9 @@ export class BrowserSourceState {
       return "source editor unavailable";
     }
     if (this.dirty()) {
-      return "source draft staged locally";
+      return "source changes ready";
     }
-    return "source draft synchronized";
+    return "source ready";
   });
 
   constructor() {

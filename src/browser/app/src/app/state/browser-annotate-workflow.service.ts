@@ -17,6 +17,7 @@ import {
   dispatchIntentToggle,
   dispatchParsedIntentNumeric,
 } from "./browser-intent-dispatch";
+import { BrowserSourceState } from "./browser-source-state.service";
 import {
   annotateBrowseRequestForField,
   annotateDraftEquals,
@@ -34,6 +35,7 @@ import {
 @Injectable({ providedIn: "root" })
 export class BrowserAnnotateWorkflowState {
   private readonly runtime = inject(BrowserHostRuntimeState);
+  private readonly source = inject(BrowserSourceState);
   private readonly dispatchIntent: BrowserIntentDispatcher = (
     workflow,
     intent,
@@ -57,6 +59,22 @@ export class BrowserAnnotateWorkflowState {
       this.annotateControls().statusItems,
       "annotate shell controls pending",
     ),
+  );
+  readonly annotateLiveVisible = computed(
+    () =>
+      this.annotateControls().liveAnnotate.visible ||
+      this.source.draft().kind === "video_stream",
+  );
+  readonly annotateLiveStartEnabled = computed(
+    () =>
+      this.annotateControls().liveAnnotate.start.enabled ||
+      (this.source.draft().kind === "video_stream" &&
+        !this.annotateControls().liveAnnotate.running),
+  );
+  readonly annotateLiveSummary = computed(() =>
+    this.source.draft().kind === "video_stream"
+      ? this.annotateControls().liveAnnotate.summary
+      : "Choose a video stream source to start live annotate.",
   );
   readonly annotateToolPaletteSummary = computed(() =>
     capabilitySummaryText(
@@ -169,6 +187,7 @@ export class BrowserAnnotateWorkflowState {
   }
 
   reloadSetupFrame(): IntentMessage | null {
+    this.flushActionDrafts();
     return dispatchIntentAction(
       this.dispatchIntent,
       this.annotateControls().setupFrame.reload,
@@ -176,6 +195,7 @@ export class BrowserAnnotateWorkflowState {
   }
 
   previousSetupFrame(): IntentMessage | null {
+    this.flushActionDrafts();
     return dispatchIntentAction(
       this.dispatchIntent,
       this.annotateControls().setupFrame.previous,
@@ -183,6 +203,7 @@ export class BrowserAnnotateWorkflowState {
   }
 
   nextSetupFrame(): IntentMessage | null {
+    this.flushActionDrafts();
     return dispatchIntentAction(
       this.dispatchIntent,
       this.annotateControls().setupFrame.next,
@@ -190,13 +211,16 @@ export class BrowserAnnotateWorkflowState {
   }
 
   startLive(): IntentMessage | null {
-    return dispatchIntentAction(
-      this.dispatchIntent,
-      this.annotateControls().liveAnnotate.start,
-    );
+    const control = this.annotateControls().liveAnnotate.start;
+    if (!this.annotateLiveStartEnabled() || control.intent === null) {
+      return null;
+    }
+    this.flushActionDrafts();
+    return this.runtime.dispatch(control.workflow, control.intent, {});
   }
 
   stopLive(): IntentMessage | null {
+    this.flushActionDrafts();
     return dispatchIntentAction(
       this.dispatchIntent,
       this.annotateControls().liveAnnotate.stop,
@@ -204,6 +228,7 @@ export class BrowserAnnotateWorkflowState {
   }
 
   requestSaveNow(): IntentMessage | null {
+    this.flushActionDrafts();
     return dispatchIntentAction(
       this.dispatchIntent,
       this.annotateControls().save.saveNow,
@@ -224,5 +249,10 @@ export class BrowserAnnotateWorkflowState {
       this.annotateControls().brush.radius,
       radius,
     );
+  }
+
+  private flushActionDrafts(): void {
+    this.source.apply();
+    this.apply();
   }
 }

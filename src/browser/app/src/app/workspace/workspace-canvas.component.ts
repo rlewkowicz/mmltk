@@ -19,8 +19,10 @@ import {
   type AnnotationWorkspaceSceneState,
   type AnnotationWorkspaceBox,
   type AnnotateToolId,
+  liveStatusState,
 } from "../../browser_shell_state";
 import type { WorkspaceRenderInput } from "../../workspace_renderer";
+import { hostWorkspaceBoxDragKind } from "../host-annotation-intent";
 import { BrowserAnnotateSidebarState } from "../state/browser-annotate-sidebar.service";
 import { BrowserHostRuntimeState } from "../state/browser-host-runtime.service";
 import { BrowserWorkflowRouteState } from "../state/browser-workflow-route.service";
@@ -62,6 +64,14 @@ type WorkspaceMaskTool = Extract<
   "mask.paint" | "mask.erase" | "mask.fill"
 >;
 type WorkspaceMaskColorRangeKey = "sup" | "nosup";
+type LiveWorkspacePointerPhase = "begin" | "update" | "end" | "cancel";
+type LiveWorkspacePointerAction =
+  | "canvas.click"
+  | "editable_handle.drag"
+  | "box.drag"
+  | "mask.brush"
+  | "mask.fill"
+  | "mask.color_sample";
 
 function annotationBoxesEqual(
   left: AnnotationWorkspaceBox,
@@ -135,6 +145,7 @@ function interactionTargetsEqual(
     <div class="workspace-shell">
       <canvas
         #workspaceCanvas
+        id="workspace-canvas"
         class="workspace-canvas"
         aria-label="Workspace canvas"
       ></canvas>
@@ -145,14 +156,13 @@ function interactionTargetsEqual(
       :host {
         display: block;
         width: 100%;
-        height: 100%;
-        min-height: 240px;
+        min-height: var(--workspace-canvas-min-height, 480px);
       }
 
       .workspace-shell {
         position: relative;
         width: 100%;
-        height: 100%;
+        min-height: inherit;
         overflow: hidden;
         background: transparent;
       }
@@ -163,6 +173,7 @@ function interactionTargetsEqual(
         display: block;
         width: 100%;
         height: 100%;
+        min-height: inherit;
         touch-action: none;
       }
     `,
@@ -357,13 +368,21 @@ export class WorkspaceCanvasComponent {
                 lastCaptureY: capture.captureY,
                 previewBox: nextPreview,
               };
-              this.dispatchAnnotateWorkspaceEdit("box.drag", {
+              const payload = {
                 phase: "update",
                 drag_kind: this.boxDrag.dragKind,
                 object_index: this.boxDrag.objectIndex,
                 capture_x: capture.captureX,
                 capture_y: capture.captureY,
-              });
+              };
+              this.dispatchLiveAnnotateWorkspacePointer(
+                "box.drag",
+                payload,
+                event,
+                point,
+                "update",
+              );
+              this.dispatchAnnotateWorkspaceEdit("box.drag", payload);
               needsRender = true;
             }
           }
@@ -380,7 +399,7 @@ export class WorkspaceCanvasComponent {
               lastCaptureX: capture.captureX,
               lastCaptureY: capture.captureY,
             };
-            this.dispatchAnnotateWorkspaceEdit("editable_handle.drag", {
+            const payload = {
               phase: "update",
               tool: "direct",
               object_index: this.handleDrag.handle.objectIndex,
@@ -388,7 +407,15 @@ export class WorkspaceCanvasComponent {
               role: this.handleDrag.handle.role,
               capture_x: capture.captureX,
               capture_y: capture.captureY,
-            });
+            };
+            this.dispatchLiveAnnotateWorkspacePointer(
+              "editable_handle.drag",
+              payload,
+              event,
+              point,
+              "update",
+            );
+            this.dispatchAnnotateWorkspaceEdit("editable_handle.drag", payload);
             needsRender = true;
           }
           needsRender = this.syncHoveredTarget(point) || needsRender;
@@ -405,14 +432,22 @@ export class WorkspaceCanvasComponent {
               lastCaptureX: capture.captureX,
               lastCaptureY: capture.captureY,
             };
-            this.dispatchAnnotateWorkspaceEdit("mask.brush", {
+            const payload = {
               phase: "update",
               tool: this.maskBrushStroke.tool,
               capture_x: capture.captureX,
               capture_y: capture.captureY,
               radius: this.annotateBrushRadius(),
               erase: this.maskBrushStroke.tool === "mask.erase",
-            });
+            };
+            this.dispatchLiveAnnotateWorkspacePointer(
+              "mask.brush",
+              payload,
+              event,
+              point,
+              "update",
+            );
+            this.dispatchAnnotateWorkspaceEdit("mask.brush", payload);
             needsRender = true;
           }
           needsRender = this.syncHoveredTarget(point) || needsRender;
@@ -495,14 +530,22 @@ export class WorkspaceCanvasComponent {
             captureX: drag.lastCaptureX,
             captureY: drag.lastCaptureY,
           };
-          this.dispatchAnnotateWorkspaceEdit("box.drag", {
+          const payload = {
             phase: "end",
             drag_kind: drag.dragKind,
             object_index: drag.objectIndex,
             capture_x: capture.captureX,
             capture_y: capture.captureY,
             cancelled: false,
-          });
+          };
+          this.dispatchLiveAnnotateWorkspacePointer(
+            "box.drag",
+            payload,
+            event,
+            point,
+            "end",
+          );
+          this.dispatchAnnotateWorkspaceEdit("box.drag", payload);
           this.syncHoveredTarget(point);
           this.workspace.requestWorkspaceRender();
           return;
@@ -514,7 +557,7 @@ export class WorkspaceCanvasComponent {
             captureX: drag.lastCaptureX,
             captureY: drag.lastCaptureY,
           };
-          this.dispatchAnnotateWorkspaceEdit("editable_handle.drag", {
+          const payload = {
             phase: "end",
             tool: "direct",
             object_index: drag.handle.objectIndex,
@@ -523,7 +566,15 @@ export class WorkspaceCanvasComponent {
             capture_x: capture.captureX,
             capture_y: capture.captureY,
             cancelled: false,
-          });
+          };
+          this.dispatchLiveAnnotateWorkspacePointer(
+            "editable_handle.drag",
+            payload,
+            event,
+            point,
+            "end",
+          );
+          this.dispatchAnnotateWorkspaceEdit("editable_handle.drag", payload);
           if (this.syncHoveredTarget(point)) {
             this.workspace.requestWorkspaceRender();
           }
@@ -536,7 +587,7 @@ export class WorkspaceCanvasComponent {
             captureX: stroke.lastCaptureX,
             captureY: stroke.lastCaptureY,
           };
-          this.dispatchAnnotateWorkspaceEdit("mask.brush", {
+          const payload = {
             phase: "end",
             tool: stroke.tool,
             capture_x: capture.captureX,
@@ -544,7 +595,15 @@ export class WorkspaceCanvasComponent {
             radius: this.annotateBrushRadius(),
             erase: stroke.tool === "mask.erase",
             cancelled: false,
-          });
+          };
+          this.dispatchLiveAnnotateWorkspacePointer(
+            "mask.brush",
+            payload,
+            event,
+            point,
+            "end",
+          );
+          this.dispatchAnnotateWorkspaceEdit("mask.brush", payload);
           if (this.syncHoveredTarget(point)) {
             this.workspace.requestWorkspaceRender();
           }
@@ -556,25 +615,49 @@ export class WorkspaceCanvasComponent {
           const hoverChanged = this.syncHoveredTarget(point);
           if (!pendingClick.moved) {
             if (pendingClick.tool === "mask.color_sample") {
-              this.dispatchAnnotateWorkspaceEdit("mask.color_sample", {
+              const payload = {
                 capture_x: pendingClick.captureX,
                 capture_y: pendingClick.captureY,
-              });
+              };
+              this.dispatchLiveAnnotateWorkspacePointer(
+                "mask.color_sample",
+                payload,
+                event,
+                point,
+                "end",
+              );
+              this.dispatchAnnotateWorkspaceEdit("mask.color_sample", payload);
             } else if (pendingClick.tool === "mask.fill") {
               this.commitWorkspaceSelectionIfPresent(pendingClick.target);
-              this.dispatchAnnotateWorkspaceEdit("mask.fill", {
+              const payload = {
                 tool: pendingClick.tool,
                 capture_x: pendingClick.captureX,
                 capture_y: pendingClick.captureY,
-              });
+              };
+              this.dispatchLiveAnnotateWorkspacePointer(
+                "mask.fill",
+                payload,
+                event,
+                point,
+                "end",
+              );
+              this.dispatchAnnotateWorkspaceEdit("mask.fill", payload);
             } else {
               this.commitWorkspaceSelectionIfPresent(pendingClick.target);
-              this.dispatchAnnotateWorkspaceEdit("canvas.click", {
+              const payload = {
                 tool: pendingClick.tool,
                 capture_x: pendingClick.captureX,
                 capture_y: pendingClick.captureY,
                 default_category_index: this.defaultAnnotateCategoryIndex(),
-              });
+              };
+              this.dispatchLiveAnnotateWorkspacePointer(
+                "canvas.click",
+                payload,
+                event,
+                point,
+                "end",
+              );
+              this.dispatchAnnotateWorkspaceEdit("canvas.click", payload);
             }
           }
           if (hoverChanged || !pendingClick.moved) {
@@ -607,6 +690,7 @@ export class WorkspaceCanvasComponent {
         if (canvas.hasPointerCapture(event.pointerId)) {
           canvas.releasePointerCapture(event.pointerId);
         }
+        const point = this.canvasPointFromEvent(canvas, event);
         if (this.cropDrag?.pointerId === event.pointerId) {
           this.cropDrag = null;
           if (this.syncHoveredTarget(null)) {
@@ -617,14 +701,22 @@ export class WorkspaceCanvasComponent {
         if (this.boxDrag?.pointerId === event.pointerId) {
           const drag = this.boxDrag;
           this.boxDrag = null;
-          this.dispatchAnnotateWorkspaceEdit("box.drag", {
-            phase: "end",
+          const payload = {
+            phase: "cancel",
             drag_kind: drag.dragKind,
             object_index: drag.objectIndex,
             capture_x: drag.lastCaptureX,
             capture_y: drag.lastCaptureY,
             cancelled: true,
-          });
+          };
+          this.dispatchLiveAnnotateWorkspacePointer(
+            "box.drag",
+            payload,
+            event,
+            point,
+            "cancel",
+          );
+          this.dispatchAnnotateWorkspaceEdit("box.drag", payload);
           this.syncHoveredTarget(null);
           this.workspace.requestWorkspaceRender();
           return;
@@ -632,8 +724,8 @@ export class WorkspaceCanvasComponent {
         if (this.handleDrag?.pointerId === event.pointerId) {
           const drag = this.handleDrag;
           this.handleDrag = null;
-          this.dispatchAnnotateWorkspaceEdit("editable_handle.drag", {
-            phase: "end",
+          const payload = {
+            phase: "cancel",
             tool: "direct",
             object_index: drag.handle.objectIndex,
             element_index: drag.handle.elementIndex,
@@ -641,7 +733,15 @@ export class WorkspaceCanvasComponent {
             capture_x: drag.lastCaptureX,
             capture_y: drag.lastCaptureY,
             cancelled: true,
-          });
+          };
+          this.dispatchLiveAnnotateWorkspacePointer(
+            "editable_handle.drag",
+            payload,
+            event,
+            point,
+            "cancel",
+          );
+          this.dispatchAnnotateWorkspaceEdit("editable_handle.drag", payload);
           if (this.syncHoveredTarget(null)) {
             this.workspace.requestWorkspaceRender();
           }
@@ -650,22 +750,48 @@ export class WorkspaceCanvasComponent {
         if (this.maskBrushStroke?.pointerId === event.pointerId) {
           const stroke = this.maskBrushStroke;
           this.maskBrushStroke = null;
-          this.dispatchAnnotateWorkspaceEdit("mask.brush", {
-            phase: "end",
+          const payload = {
+            phase: "cancel",
             tool: stroke.tool,
             capture_x: stroke.lastCaptureX,
             capture_y: stroke.lastCaptureY,
             radius: this.annotateBrushRadius(),
             erase: stroke.tool === "mask.erase",
             cancelled: true,
-          });
+          };
+          this.dispatchLiveAnnotateWorkspacePointer(
+            "mask.brush",
+            payload,
+            event,
+            point,
+            "cancel",
+          );
+          this.dispatchAnnotateWorkspaceEdit("mask.brush", payload);
           if (this.syncHoveredTarget(null)) {
             this.workspace.requestWorkspaceRender();
           }
           return;
         }
         if (this.pendingWorkspaceEditClick?.pointerId === event.pointerId) {
+          const pendingClick = this.pendingWorkspaceEditClick;
           this.pendingWorkspaceEditClick = null;
+          const action =
+            pendingClick.tool === "mask.fill"
+              ? "mask.fill"
+              : pendingClick.tool === "mask.color_sample"
+                ? "mask.color_sample"
+                : "canvas.click";
+          this.dispatchLiveAnnotateWorkspacePointer(
+            action,
+            {
+              tool: pendingClick.tool,
+              capture_x: pendingClick.captureX,
+              capture_y: pendingClick.captureY,
+            },
+            event,
+            point,
+            "cancel",
+          );
           if (this.syncHoveredTarget(null)) {
             this.workspace.requestWorkspaceRender();
           }
@@ -1062,6 +1188,23 @@ export class WorkspaceCanvasComponent {
       startY: point.y,
       moved: false,
     };
+    const action =
+      tool === "mask.fill"
+        ? "mask.fill"
+        : tool === "mask.color_sample"
+          ? "mask.color_sample"
+          : "canvas.click";
+    this.dispatchLiveAnnotateWorkspacePointer(
+      action,
+      {
+        tool,
+        capture_x: capture.captureX,
+        capture_y: capture.captureY,
+      },
+      event,
+      point,
+      "begin",
+    );
     return this.claimWorkspacePointer(canvas, event, target);
   }
 
@@ -1094,12 +1237,13 @@ export class WorkspaceCanvasComponent {
     };
     this.hoveredTarget = null;
     this.applyCanvasCursor();
-    this.dispatchAnnotateWorkspaceEdit("box.drag", {
+    const payload = {
       phase: "begin",
       drag_kind: "create",
       capture_x: capture.captureX,
       capture_y: capture.captureY,
-    });
+    };
+    this.dispatchBoxDragBegin(payload, event, point);
     return this.claimWorkspacePointer(canvas, event, null);
   }
 
@@ -1128,14 +1272,30 @@ export class WorkspaceCanvasComponent {
     };
     this.hoveredTarget = target;
     this.applyCanvasCursor();
-    this.dispatchAnnotateWorkspaceEdit("box.drag", {
+    const payload = {
       phase: "begin",
       drag_kind: target.dragKind,
       object_index: target.object.index,
       capture_x: capture.captureX,
       capture_y: capture.captureY,
-    });
+    };
+    this.dispatchBoxDragBegin(payload, event, point);
     return this.claimWorkspacePointer(canvas, event, target);
+  }
+
+  private dispatchBoxDragBegin(
+    payload: Record<string, unknown>,
+    event: PointerEvent,
+    point: WorkspaceCanvasPoint,
+  ): void {
+    this.dispatchLiveAnnotateWorkspacePointer(
+      "box.drag",
+      payload,
+      event,
+      point,
+      "begin",
+    );
+    this.dispatchAnnotateWorkspaceEdit("box.drag", payload);
   }
 
   private beginEditableHandleDrag(
@@ -1162,7 +1322,7 @@ export class WorkspaceCanvasComponent {
     };
     this.hoveredTarget = target;
     this.applyCanvasCursor();
-    this.dispatchAnnotateWorkspaceEdit("editable_handle.drag", {
+    const payload = {
       phase: "begin",
       tool: "direct",
       object_index: target.handle.objectIndex,
@@ -1170,7 +1330,15 @@ export class WorkspaceCanvasComponent {
       role: target.handle.role,
       capture_x: capture.captureX,
       capture_y: capture.captureY,
-    });
+    };
+    this.dispatchLiveAnnotateWorkspacePointer(
+      "editable_handle.drag",
+      payload,
+      event,
+      point,
+      "begin",
+    );
+    this.dispatchAnnotateWorkspaceEdit("editable_handle.drag", payload);
     canvas.setPointerCapture(event.pointerId);
     event.preventDefault();
     return true;
@@ -1197,14 +1365,22 @@ export class WorkspaceCanvasComponent {
     };
     this.hoveredTarget = target;
     this.applyCanvasCursor();
-    this.dispatchAnnotateWorkspaceEdit("mask.brush", {
+    const payload = {
       phase: "begin",
       tool,
       capture_x: capture.captureX,
       capture_y: capture.captureY,
       radius: this.annotateBrushRadius(),
       erase: tool === "mask.erase",
-    });
+    };
+    this.dispatchLiveAnnotateWorkspacePointer(
+      "mask.brush",
+      payload,
+      event,
+      point,
+      "begin",
+    );
+    this.dispatchAnnotateWorkspaceEdit("mask.brush", payload);
     canvas.setPointerCapture(event.pointerId);
     event.preventDefault();
     return true;
@@ -1334,10 +1510,101 @@ export class WorkspaceCanvasComponent {
     return this.annotate.brushRadius();
   }
 
+  private liveAnnotatePointerActive(): boolean {
+    const snapshot = this.runtime.snapshot();
+    const liveStatus = liveStatusState(snapshot);
+    return (
+      this.workflowRoute.selectedWorkflow() === "annotate" &&
+      snapshot.source.kind === "video_stream" &&
+      (this.annotate.controls().liveAnnotate.running ||
+        liveStatus.runtime.activeMode === "annotate")
+    );
+  }
+
+  private dispatchLiveAnnotateWorkspacePointer(
+    action: LiveWorkspacePointerAction,
+    payload: Record<string, unknown>,
+    event: PointerEvent,
+    point: WorkspaceCanvasPoint,
+    phase: LiveWorkspacePointerPhase,
+  ): boolean {
+    if (!this.liveAnnotatePointerActive()) {
+      return false;
+    }
+    const payloadCaptureX =
+      typeof payload.capture_x === "number" && Number.isFinite(payload.capture_x)
+        ? Math.round(payload.capture_x)
+        : null;
+    const payloadCaptureY =
+      typeof payload.capture_y === "number" && Number.isFinite(payload.capture_y)
+        ? Math.round(payload.capture_y)
+        : null;
+    const fallbackCapture =
+      payloadCaptureX === null || payloadCaptureY === null
+        ? this.capturePointFromCanvasPoint(point, true)
+        : null;
+    const captureX = payloadCaptureX ?? fallbackCapture?.captureX ?? null;
+    const captureY = payloadCaptureY ?? fallbackCapture?.captureY ?? null;
+    if (captureX === null || captureY === null) {
+      return false;
+    }
+
+    const payloadTool =
+      typeof payload.tool === "string"
+        ? payload.tool
+        : this.annotate.toolPalette().activeTool;
+    const tool =
+      action === "mask.color_sample"
+        ? "mask.color_sample"
+        : action === "mask.fill"
+          ? "mask.fill"
+          : action === "mask.brush"
+            ? payloadTool
+            : payloadTool;
+    const brushRadius =
+      typeof payload.radius === "number" && Number.isFinite(payload.radius)
+        ? Math.max(1, Math.round(payload.radius))
+        : this.annotateBrushRadius();
+    const nativePayload: Record<string, unknown> = {
+      phase,
+      pointer_id: Math.max(0, Math.round(event.pointerId)),
+      button: Math.round(event.button),
+      buttons: Math.max(0, Math.round(event.buttons)),
+      canvas_x: point.x,
+      canvas_y: point.y,
+      capture_x: captureX,
+      capture_y: captureY,
+      tool,
+      brush_radius: brushRadius,
+      erase: payload.erase === true || tool === "mask.erase",
+      shift_key: event.shiftKey,
+      ctrl_key: event.ctrlKey,
+      alt_key: event.altKey,
+      meta_key: event.metaKey,
+    };
+    if (action === "box.drag") {
+      nativePayload.drag_kind = hostWorkspaceBoxDragKind(payload.drag_kind);
+      if (payload.object_index !== null && payload.object_index !== undefined) {
+        nativePayload.object_index = payload.object_index;
+      }
+    } else if (action === "editable_handle.drag") {
+      nativePayload.handle = {
+        object_index: payload.object_index,
+        element_index: payload.element_index,
+        role: payload.role,
+      };
+    }
+    this.annotate.dispatchWorkspacePointer(nativePayload);
+    return true;
+  }
+
   private dispatchAnnotateWorkspaceEdit(
     action: string,
     payload: Record<string, unknown>,
   ): void {
+    if (this.liveAnnotatePointerActive()) {
+      return;
+    }
     const nextPayload =
       payload.object_index === null || payload.object_index === undefined
         ? (() => {

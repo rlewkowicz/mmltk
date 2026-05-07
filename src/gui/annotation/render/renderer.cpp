@@ -1074,6 +1074,15 @@ mmltk::live::ManualOverlayDocumentSnapshot AnnotationRenderer::build_manual_over
     }
     snapshot.document_generation = document.generation();
     snapshot.session_revision = session.overlay_revision();
+    const AnnotationBrushPreview& brush_preview = session.brush_preview();
+    if (brush_preview.visible) {
+        snapshot.brush_preview = mmltk::live::ManualOverlayBrushPreview{
+            brush_preview.capture_x,
+            brush_preview.capture_y,
+            std::max(1, brush_preview.radius),
+            brush_preview.erase,
+        };
+    }
     return snapshot;
 }
 

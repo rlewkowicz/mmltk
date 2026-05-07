@@ -13,6 +13,7 @@ struct PreparedPredictSource {
 };
 
 std::string validate_predict_source(const SourceSelectionState& state);
+std::string validate_video_stream_source(const SourceSelectionState& state);
 PreparedPredictSource prepare_predict_source(const SourceSelectionState& state);
 
 }  // namespace mmltk::gui

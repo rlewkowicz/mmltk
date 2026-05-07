@@ -157,12 +157,12 @@ export function primaryActionLabelText(
     case "export":
       return "Run Export";
     case "live":
-      return livePredictActive ? "Stop Live Predict" : "Run Live Predict";
+      return livePredictActive ? "Stop Capture" : "Start Capture";
     case "predict":
       if (livePredictActive) {
         return "Stop Live Predict";
       }
-      return sourceKind === "video_stream" ? "Run Live Predict" : "Run Predict";
+      return sourceKind === "video_stream" ? "Start Live Predict" : "Run Predict";
     default:
       return "Run Predict";
   }

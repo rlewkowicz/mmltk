@@ -68,8 +68,10 @@ struct Subscriber {
 template <typename T, typename B>
 struct TopicTree {
     enum IteratorFlags {
+        NONE = 0,
         LAST = 1,
-        FIRST = 2
+        FIRST = 2,
+        FIRST_AND_LAST = FIRST | LAST
     };
 
     Subscriber* iteratingSubscriber = nullptr;
@@ -98,9 +100,16 @@ struct TopicTree {
         for (int i = 0; i < numMessageIndices; i++) {
             T& outgoingMessage = outgoingMessages[s->messageIndices[i]];
 
-            int flags = (i == numMessageIndices - 1) ? LAST : 0;
+            IteratorFlags flags = NONE;
+            if (i == 0 && i == numMessageIndices - 1) {
+                flags = FIRST_AND_LAST;
+            } else if (i == 0) {
+                flags = FIRST;
+            } else if (i == numMessageIndices - 1) {
+                flags = LAST;
+            }
 
-            if (cb(s, outgoingMessage, (IteratorFlags)(flags | (i == 0 ? FIRST : 0)))) {
+            if (cb(s, outgoingMessage, flags)) {
                 break;
             }
         }

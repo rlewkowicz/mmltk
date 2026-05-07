@@ -35,6 +35,29 @@ void get_optional_compile_mode(const nlohmann::json& j, const char* key, mmltk::
     out = mmltk::rfdetr::compilation_mode_from_index(compile_mode);
 }
 
+[[nodiscard]] ModelInputMode model_input_from_index(const int value, const ModelInputMode fallback) noexcept {
+    switch (static_cast<ModelInputMode>(value)) {
+        case ModelInputMode::Weights:
+            return ModelInputMode::Weights;
+        case ModelInputMode::Onnx:
+            return ModelInputMode::Onnx;
+        case ModelInputMode::TensorRt:
+            return ModelInputMode::TensorRt;
+        case ModelInputMode::None:
+            return ModelInputMode::None;
+    }
+    return fallback;
+}
+
+[[nodiscard]] ModelInputMode predict_model_input_from_index(const int value) noexcept {
+    const ModelInputMode mode = model_input_from_index(value, ModelInputMode::Weights);
+    return mode == ModelInputMode::None ? ModelInputMode::Weights : mode;
+}
+
+[[nodiscard]] ModelInputMode annotate_model_input_from_index(const int value) noexcept {
+    return model_input_from_index(value, ModelInputMode::None);
+}
+
 using mmltk::gui::DatasetPathState;
 using mmltk::gui::ExecutionTuningState;
 using mmltk::gui::ModelArtifactSelectionState;
@@ -818,7 +841,7 @@ void from_json(const nlohmann::json& j, PredictViewState& s) {
     get_optional(j, "cpu_affinity", s.cpu_affinity);
     int model_input = static_cast<int>(s.model_input);
     get_optional(j, "model_input", model_input);
-    s.model_input = static_cast<ModelInputMode>(model_input);
+    s.model_input = predict_model_input_from_index(model_input);
     get_optional(j, "batch_size", s.batch_size);
     get_optional(j, "max_dets_per_image", s.max_dets_per_image);
     get_optional(j, "live_split_count", s.live_split_count);
@@ -883,7 +906,7 @@ void from_json(const nlohmann::json& j, AnnotateViewState& s) {
     get_optional(j, "backend", s.backend);
     int model_input = static_cast<int>(s.model_input);
     get_optional(j, "model_input", model_input);
-    s.model_input = static_cast<ModelInputMode>(model_input);
+    s.model_input = annotate_model_input_from_index(model_input);
     get_optional(j, "device_id", s.device_id);
     get_optional(j, "max_dets_per_image", s.max_dets_per_image);
     get_optional(j, "threshold", s.threshold);
@@ -1176,7 +1199,7 @@ void apply_workflows(const nlohmann::json& j, WorkflowSettingsSnapshot& workflow
                 get_optional(*predict, "backend", s.backend);
                 int model_input = static_cast<int>(s.model_input);
                 get_optional(*predict, "model_input", model_input);
-                s.model_input = static_cast<ModelInputMode>(model_input);
+                s.model_input = predict_model_input_from_index(model_input);
                 get_optional(*predict, "batch_size", s.batch_size);
                 get_optional(*predict, "max_dets_per_image", s.max_dets_per_image);
                 get_optional(*predict, "live_split_count", s.live_split_count);
@@ -1211,7 +1234,7 @@ void apply_workflows(const nlohmann::json& j, WorkflowSettingsSnapshot& workflow
                 get_optional(*annotate, "backend", s.backend);
                 int model_input = static_cast<int>(s.model_input);
                 get_optional(*annotate, "model_input", model_input);
-                s.model_input = static_cast<ModelInputMode>(model_input);
+                s.model_input = annotate_model_input_from_index(model_input);
                 get_optional(*annotate, "max_dets_per_image", s.max_dets_per_image);
                 get_optional(*annotate, "threshold", s.threshold);
                 get_optional(*annotate, "full_frame", s.full_frame);

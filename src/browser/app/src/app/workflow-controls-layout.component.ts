@@ -58,6 +58,7 @@ export const WORKFLOW_TEXT_SELECT_BOOLEAN_ACTIONS_TEMPLATE = `
           [fields]="textFields"
           [readValue]="readTextValue"
           [writeValue]="writeTextValue"
+          [browse]="triggerAction"
         />
       }
       @if (selectFields.length > 0) {

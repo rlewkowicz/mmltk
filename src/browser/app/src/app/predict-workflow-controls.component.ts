@@ -12,45 +12,49 @@ import { BrowserPredictWorkflowState } from "./state/browser-predict-workflow.se
   template: `
     <div class="form-grid">
       <label class="field field-span">
-        <span>Selected Preset</span>
-        <input
-          type="text"
-          [ngModel]="predict.draft().selectedPreset"
-          (ngModelChange)="predict.updateTextField('selectedPreset', $event)"
-        />
-      </label>
-      <label class="field field-span">
         <span>Weights Path</span>
-        <input
-          type="text"
-          [ngModel]="predict.draft().weightsPath"
-          (ngModelChange)="predict.updateTextField('weightsPath', $event)"
-        />
+        <div class="field-group">
+          <input
+            type="text"
+            [ngModel]="predict.draft().weightsPath"
+            (ngModelChange)="predict.updateTextField('weightsPath', $event)"
+          />
+          <button class="field-browse" type="button" (click)="predict.browseField('weightsPath')">Browse</button>
+        </div>
       </label>
       <label class="field field-span">
         <span>ONNX Path</span>
-        <input
-          type="text"
-          [ngModel]="predict.draft().onnxPath"
-          (ngModelChange)="predict.updateTextField('onnxPath', $event)"
-        />
+        <div class="field-group">
+          <input
+            type="text"
+            [ngModel]="predict.draft().onnxPath"
+            (ngModelChange)="predict.updateTextField('onnxPath', $event)"
+          />
+          <button class="field-browse" type="button" (click)="predict.browseField('onnxPath')">Browse</button>
+        </div>
       </label>
       <label class="field field-span">
         <span>TensorRT Path</span>
-        <input
-          type="text"
-          [ngModel]="predict.draft().tensorrtPath"
-          (ngModelChange)="predict.updateTextField('tensorrtPath', $event)"
-        />
+        <div class="field-group">
+          <input
+            type="text"
+            [ngModel]="predict.draft().tensorrtPath"
+            (ngModelChange)="predict.updateTextField('tensorrtPath', $event)"
+          />
+          <button class="field-browse" type="button" (click)="predict.browseField('tensorrtPath')">Browse</button>
+        </div>
       </label>
       @if (!liveMode) {
         <label class="field field-span">
           <span>Output Path</span>
-          <input
-            type="text"
-            [ngModel]="predict.draft().outputPath"
-            (ngModelChange)="predict.updateTextField('outputPath', $event)"
-          />
+          <div class="field-group">
+            <input
+              type="text"
+              [ngModel]="predict.draft().outputPath"
+              (ngModelChange)="predict.updateTextField('outputPath', $event)"
+            />
+            <button class="field-browse" type="button" (click)="predict.browseField('outputPath')">Browse</button>
+          </div>
         </label>
       }
       <label class="field">
@@ -148,14 +152,6 @@ import { BrowserPredictWorkflowState } from "./state/browser-predict-workflow.se
           }
         </select>
       </label>
-    </div>
-    <div class="action-row">
-      <button type="button" (click)="predict.browseField('weightsPath')">Weights</button>
-      <button type="button" (click)="predict.browseField('onnxPath')">ONNX</button>
-      <button type="button" (click)="predict.browseField('tensorrtPath')">TensorRT</button>
-      @if (!liveMode) {
-        <button type="button" (click)="predict.browseField('outputPath')">Output</button>
-      }
     </div>
     @if (liveMode) {
       <div class="form-grid">

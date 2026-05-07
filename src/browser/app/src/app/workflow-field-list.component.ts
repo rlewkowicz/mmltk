@@ -7,6 +7,7 @@ export interface WorkflowTextFieldConfig<Field extends string = string> {
   wide?: boolean;
   inputmode?: "numeric" | "decimal";
   visible?: boolean;
+  browseAction?: string;
 }
 
 export interface WorkflowBooleanFieldConfig<Field extends string = string> {
@@ -83,12 +84,23 @@ export abstract class WorkflowTextBooleanActionBindings<
       @if (field.visible !== false) {
         <label class="field" [class.field-span]="field.wide">
           <span>{{ field.label }}</span>
-          <input
-            type="text"
-            [attr.inputmode]="field.inputmode ?? null"
-            [ngModel]="readValue(field.field)"
-            (ngModelChange)="writeValue(field.field, $event)"
-          />
+          <div [class.field-group]="field.browseAction !== undefined">
+            <input
+              type="text"
+              [attr.inputmode]="field.inputmode ?? null"
+              [ngModel]="readValue(field.field)"
+              (ngModelChange)="writeValue(field.field, $event)"
+            />
+            @if (field.browseAction !== undefined) {
+              <button
+                class="field-browse"
+                type="button"
+                (click)="browse(field.browseAction)"
+              >
+                Browse
+              </button>
+            }
+          </div>
         </label>
       }
     }
@@ -103,6 +115,9 @@ export class WorkflowTextFieldListComponent {
 
   @Input({ required: true })
   writeValue!: (field: string, value: string) => void;
+
+  @Input()
+  browse: (action: string) => void = () => {};
 }
 
 @Component({

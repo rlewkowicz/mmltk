@@ -8,7 +8,9 @@
 #include "annotation_core.h"
 #include "app.h"
 #include "app_api.h"
+#include "browser_dmabuf_fd.h"
 #include "browser_host_adapters.h"
+#include "browser_live_publication.h"
 #include "browser_retained_frame_registry.h"
 #include "browser_workspace_surface_bridge.h"
 #include "canvas_layers.h"
@@ -21,6 +23,7 @@
 #include "gui/annotation/workspace/model.h"
 #include "gui_settings.h"
 #include "live/live_helpers.h"
+#include "live/live_worker_logging.h"
 #include "live_predict_controller.h"
 #include "live_session_utils.h"
 #include "local_train_controller.h"
@@ -37,12 +40,14 @@
 #include "train_command.h"
 #include "vast_query_controller.h"
 #include "view_state.h"
+#include "workspace_gpu_bridge_result.h"
 
 #include "mmltk/rfdetr/live_predict.h"
 #include "mmltk/rfdetr/model.h"
 #include "mmltk/rfdetr/model_config.h"
 #include "mmltk/rfdetr/predict.h"
 #include "mmltk/rfdetr/validate.h"
+#include "mmltk/live/live_pipeline_trace.h"
 #include "rfdetr/backends.h"
 
 #if MMLTK_RFDETR_LIVE_CAPTURE
@@ -53,9 +58,13 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <charconv>
+#include <cerrno>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <format>
 #include <functional>
 #include <limits>
@@ -66,9 +75,13 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <system_error>
 #include <type_traits>
 #include <utility>
 #include <vector>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace mmltk::gui {
 
@@ -104,6 +117,28 @@ namespace console_output = mmltk::gui::console_output;
 constexpr int kWhiteCropStrokeWidth = 2;
 constexpr std::size_t kMaxUiCallbacksPerPoll = 32U;
 constexpr auto kSettingsPersistencePollInterval = std::chrono::milliseconds(250);
+constexpr auto kAnnotateLiveStartupDeadline = std::chrono::milliseconds(2500);
+
+enum class AnnotateLiveStartupState : std::uint8_t {
+    Idle = 0,
+    Starting = 1,
+    Drawable = 2,
+    Failed = 3,
+};
+
+[[nodiscard]] const char* annotate_live_startup_state_name(const AnnotateLiveStartupState state) noexcept {
+    switch (state) {
+        case AnnotateLiveStartupState::Starting:
+            return "starting";
+        case AnnotateLiveStartupState::Drawable:
+            return "drawable";
+        case AnnotateLiveStartupState::Failed:
+            return "failed";
+        case AnnotateLiveStartupState::Idle:
+            break;
+    }
+    return "idle";
+}
 
 template <typename T>
 [[nodiscard]] const T* optional_value_ptr(const std::optional<T>& value) noexcept {
@@ -119,6 +154,28 @@ template <typename T>
 
 [[nodiscard]] nlohmann::json json_optional_string(const std::optional<std::string>& value) {
     return value.has_value() ? nlohmann::json(*value) : nlohmann::json(nullptr);
+}
+
+[[nodiscard]] std::uint64_t parse_workspace_surface_revision(const std::string_view revision) noexcept {
+    std::uint64_t value = 0;
+    const char* first = revision.data();
+    const char* last = first + revision.size();
+    const auto [ptr, ec] = std::from_chars(first, last, value);
+    return ec == std::errc{} && ptr == last ? value : 0U;
+}
+
+[[nodiscard]] const char* model_input_log_name(const ModelInputMode mode) noexcept {
+    switch (mode) {
+        case ModelInputMode::Weights:
+            return "Weights";
+        case ModelInputMode::Onnx:
+            return "ONNX";
+        case ModelInputMode::TensorRt:
+            return "TensorRT";
+        case ModelInputMode::None:
+            return "None";
+    }
+    return "None";
 }
 
 [[nodiscard]] nlohmann::json annotation_box_to_json(const AnnotationBox& box) {
@@ -575,41 +632,6 @@ template <typename T>
     };
 }
 
-template <typename Bundle>
-[[nodiscard]] RetainedBrowserImportedFrameSource make_retained_browser_imported_frame_source(
-    const mmltk::browser::FrameSlotDescriptor& descriptor, const Bundle& bundle, const int cuda_device_index,
-    const std::optional<LinuxImportedFrameLifecycleContract>& lifecycle_contract = std::nullopt) {
-    RetainedBrowserImportedFrameSource source;
-    source.descriptor = descriptor;
-    mmltk::browser::normalize_frame_slot_native_import_metadata(source.descriptor);
-    apply_linux_imported_frame_source_contract(
-        source,
-        LinuxImportedFrameSourceContract{
-            LinuxImportedImageSource{
-                bundle.data == 0U ? LinuxImportedImageSourceKind::Unknown
-                                  : LinuxImportedImageSourceKind::CudaDevicePointer,
-                static_cast<std::uintptr_t>(bundle.data),
-                cuda_device_index,
-            },
-            LinuxImportedSyncSource{
-                bundle.ready_event == nullptr ? LinuxImportedSyncHandleKind::None
-                                              : LinuxImportedSyncHandleKind::CudaEvent,
-                reinterpret_cast<std::uintptr_t>(bundle.ready_event),
-                descriptor.ready_sync.value,
-            },
-            LinuxImportedSyncSource{
-                bundle.stream == nullptr ? LinuxImportedSyncHandleKind::None : LinuxImportedSyncHandleKind::CudaStream,
-                reinterpret_cast<std::uintptr_t>(bundle.stream),
-                0U,
-            },
-        });
-    if (lifecycle_contract.has_value()) {
-        apply_linux_imported_frame_lifecycle_contract(source, *lifecycle_contract);
-    }
-    normalize_retained_browser_imported_frame_source(source);
-    return source;
-}
-
 struct RecentJobTileConfig {
     std::string_view label;
     const char* tile_id;
@@ -827,7 +849,8 @@ TrainRecipeConfig current_train_recipe(const std::string& preset_name, TrainOpti
 struct LiveImportedBrowserPublicationSlot {
     mmltk::live::BgrPitchedDeviceBuffer upload_buffer;
     mmltk::live::PinnedUploadBuffer<std::uint8_t> host_upload_buffer;
-    mmltk::live::RgbaPitchedDeviceBuffer device_buffer;
+    mmltk::live::LinuxGpuInteropDevice interop_device;
+    mmltk::live::DmaBufCudaRgbaSurface device_buffer;
     mmltk::live::CudaStreamHandle stream;
     mmltk::live::CudaEventHandle ready_event;
     int cuda_device_index = -1;
@@ -890,13 +913,16 @@ LiveImportedBrowserPublicationSlot& acquire_native_publication_slot(
                 slot->upload_buffer.reset();
                 slot->host_upload_buffer.reset();
                 slot->device_buffer.reset();
+                slot->interop_device.reset();
                 slot->stream.reset();
                 slot->ready_event.reset();
                 mmltk::live::ensure_cuda_ok(cudaSetDevice(cuda_device_index),
                                             "cudaSetDevice for native publication slot reuse");
                 slot->cuda_device_index = cuda_device_index;
             }
-            slot->device_buffer.ensure_dimensions(width, height, buffer_context);
+            slot->interop_device.ensure_open(cuda_device_index, buffer_context);
+            slot->device_buffer.ensure_dimensions(slot->interop_device, cuda_device_index, width, height,
+                                                  buffer_context);
             if (slot->stream.empty()) {
                 slot->stream.create_with_highest_priority(stream_context);
             }
@@ -909,7 +935,8 @@ LiveImportedBrowserPublicationSlot& acquire_native_publication_slot(
     }
 
     auto slot = std::make_unique<LiveImportedBrowserPublicationSlot>();
-    slot->device_buffer.ensure_dimensions(width, height, buffer_context);
+    slot->interop_device.ensure_open(cuda_device_index, buffer_context);
+    slot->device_buffer.ensure_dimensions(slot->interop_device, cuda_device_index, width, height, buffer_context);
     slot->stream.create_with_highest_priority(stream_context);
     slot->ready_event.create(cudaEventDisableTiming, event_context);
     slot->cuda_device_index = cuda_device_index;
@@ -940,6 +967,7 @@ struct App::Impl {
     ~Impl();
 
     void initialize(App& app);
+    void write_e2e_intent_trace(const mmltk::browser::RoutedIntent& routed, const nlohmann::json& payload) noexcept;
 
     View current_view_ = View::Train;
     std::string selected_preset_name_;
@@ -980,8 +1008,15 @@ struct App::Impl {
     bool annotate_save_running_ = false;
     std::string annotate_save_summary_;
     std::string annotate_save_error_;
+    std::string annotate_live_start_error_;
+    AnnotateLiveStartupState annotate_live_startup_state_ = AnnotateLiveStartupState::Idle;
+    std::chrono::steady_clock::time_point annotate_live_startup_deadline_{};
+    std::uint64_t annotate_live_drawable_revision_ = 0;
     std::unique_ptr<mmltk::live::LiveSessionController> live_controller_;
     std::unique_ptr<mmltk::live::LiveSessionStatus> live_session_status_;
+    std::chrono::steady_clock::time_point next_live_pipeline_status_log_{};
+    std::function<void(const mmltk::live::LiveSessionConfig&)> annotation_live_session_start_override_;
+    bool annotation_live_session_running_for_testing_ = false;
     ActiveLiveMode active_live_mode_ = ActiveLiveMode::None;
     mmltk::runtime::UiCallbackQueue ui_callbacks_;
     mmltk::runtime::BackgroundExecutor background_executor_{2};
@@ -1000,16 +1035,18 @@ struct App::Impl {
     std::string active_browser_dialog_title_;
     std::string picker_error_;
     std::string vast_api_key_;
+    std::FILE* e2e_intent_trace_file_ = nullptr;
     mmltk::runtime::ModelRegistry model_registry_;
     GuiSettingsPersistence settings_persistence_;
     std::chrono::steady_clock::time_point next_settings_persistence_poll_{};
     std::unique_ptr<AnnotationWorkflowCoordinator> annotation_workflow_coordinator_;
     std::unique_ptr<BrowserPublicationState> browser_publication_state_;
     std::optional<BrowserWorkspaceViewportState> browser_workspace_viewport_state_;
+    std::optional<BrowserWorkspaceBoundsState> browser_workspace_bounds_state_;
     std::atomic<std::shared_ptr<const std::function<void()>>> evented_work_wake_callback_;
 };
 
-struct App::BrowserPublicationState {
+struct App::BrowserPublicationState : mmltk::browser::BrowserLivePreviewPublicationCountersState {
     struct PredictStaticPreviewSource {
         std::string source_name;
         std::uint32_t width = 0;
@@ -1021,15 +1058,34 @@ struct App::BrowserPublicationState {
         }
     };
 
-    BrowserWorkspaceSurfaceBridge workspace_surface_bridge;
+    std::vector<std::unique_ptr<LiveImportedBrowserPublicationSlot>> retained_publication_slots;
     mmltk::live::LiveSessionController* live_controller = nullptr;
     std::optional<int> live_cuda_device_index;
     std::optional<PredictStaticPreviewSource> predict_preview_source;
-    std::vector<std::unique_ptr<LiveImportedBrowserPublicationSlot>> retained_publication_slots;
     std::uint64_t predict_session_nonce = next_browser_frame_session_nonce();
     std::uint64_t annotate_session_nonce = next_browser_frame_session_nonce();
     std::uint64_t predict_sequence = 0;
     std::uint64_t annotate_workspace_sequence = 0;
+    std::string renderer_acquired_revision;
+    std::string renderer_imported_revision;
+    std::string renderer_submitted_revision;
+    std::string renderer_drawn_revision;
+    std::string renderer_release_pending_revision;
+    std::string renderer_last_draw_error;
+    std::string renderer_last_result_code;
+    std::string renderer_last_result_detail;
+    std::uint64_t renderer_event_count = 0;
+    std::string last_failure_reason;
+    std::string last_failure_detail;
+    std::string last_failure_revision;
+    const char* last_failure_stage = "";
+    std::optional<mmltk::live::LiveFrameId> last_failure_live_frame_id;
+    std::uint32_t last_failure_cuda_device_index = mmltk::live::kLivePipelineUnknownCudaDevice;
+    std::string last_failure_result_code;
+    std::string last_failure_result_detail;
+    std::string last_logged_failure_key;
+    std::string last_logged_bridge_error_key;
+    BrowserWorkspaceSurfaceBridge workspace_surface_bridge;
 };
 
 namespace {
@@ -1038,7 +1094,117 @@ struct RetainedBrowserUploadFrame {
     CUdeviceptr data = 0;
     cudaEvent_t ready_event = nullptr;
     cudaStream_t stream = nullptr;
+    mmltk::live::WorkspaceDmaBufImage dmabuf_image{};
 };
+
+[[nodiscard]] std::string browser_publication_failure_message(const std::string_view reason,
+                                                              const std::string_view detail) {
+    std::string message(reason);
+    if (!detail.empty()) {
+        message.append(": ");
+        message.append(detail);
+    }
+    return message;
+}
+
+[[nodiscard]] nlohmann::json browser_live_frame_id_json(const std::optional<mmltk::live::LiveFrameId>& frame_id) {
+    if (!frame_id.has_value()) {
+        return nullptr;
+    }
+    return nlohmann::json{
+        {"session_nonce", frame_id->session_nonce},
+        {"sequence", frame_id->sequence},
+    };
+}
+
+[[nodiscard]] bool should_log_browser_publication_cadence(const std::uint64_t count) noexcept {
+    return count <= 3U || count % 300U == 0U;
+}
+
+template <typename BrowserPublicationStateLike>
+void record_browser_publication_failure(
+    BrowserPublicationStateLike& published, const BrowserWorkspaceSurfaceOwner owner, const std::string_view reason,
+    const std::string_view detail, const std::string_view revision, std::string* browser_preview_error,
+    const bool sticky_preview_error, std::string* live_preview_error, const bool log_failure = true,
+    const mmltk::live::LivePipelineStage stage = mmltk::live::LivePipelineStage::CompositorPublishWorkspace,
+    const std::optional<mmltk::live::LiveFrameId> live_frame_id = std::nullopt,
+    const std::uint32_t cuda_device_index = mmltk::live::kLivePipelineUnknownCudaDevice) {
+    const std::string message = browser_publication_failure_message(reason, detail);
+    published.last_failure_reason = std::string(reason);
+    published.last_failure_detail = std::string(detail);
+    published.last_failure_revision = std::string(revision);
+    published.last_failure_stage = mmltk::live::live_pipeline_stage_name(stage);
+    published.last_failure_live_frame_id = live_frame_id;
+    published.last_failure_cuda_device_index = cuda_device_index;
+    published.last_failure_result_code = std::string(reason);
+    published.last_failure_result_detail = std::string(detail);
+    published.renderer_last_result_code = std::string(reason);
+    published.renderer_last_result_detail = std::string(detail);
+    published.workspace_surface_bridge.record_error(owner, std::string(revision), message);
+    if (browser_preview_error != nullptr) {
+        *browser_preview_error = message;
+    }
+    if (sticky_preview_error && live_preview_error != nullptr) {
+        *live_preview_error = message;
+    }
+
+    std::string log_key(browser_workspace_surface_owner_name(owner));
+    log_key.push_back('\n');
+    log_key.append(revision);
+    log_key.push_back('\n');
+    log_key.append(reason);
+    log_key.push_back('\n');
+    log_key.append(detail);
+    if (!log_failure || published.last_logged_failure_key == log_key) {
+        return;
+    }
+    published.last_logged_failure_key = std::move(log_key);
+    const std::string live_frame_label =
+        live_frame_id.has_value() ? std::to_string(live_frame_id->sequence) : std::string("unknown");
+    mmltk::logging::logger("gui")->warn(
+        "browser live publication blocked: owner={} revision={} reason={} detail={} stage={} live_frame={} "
+        "cuda_device={} result_code={} result_detail={}",
+        browser_workspace_surface_owner_name(owner), revision, reason, detail,
+        mmltk::live::live_pipeline_stage_name(stage), live_frame_label,
+        browser_live_publication_cuda_device_label(cuda_device_index), published.last_failure_result_code,
+        published.last_failure_result_detail);
+}
+
+template <typename BrowserPublicationStateLike>
+void clear_browser_publication_failure(BrowserPublicationStateLike& published) {
+    published.last_failure_reason.clear();
+    published.last_failure_detail.clear();
+    published.last_failure_revision.clear();
+    published.last_failure_stage = "";
+    published.last_failure_live_frame_id.reset();
+    published.last_failure_cuda_device_index = mmltk::live::kLivePipelineUnknownCudaDevice;
+    published.last_failure_result_code.clear();
+    published.last_failure_result_detail.clear();
+}
+
+template <typename BrowserPublicationStateLike>
+void clear_browser_renderer_stage_state(BrowserPublicationStateLike& published) {
+    published.renderer_acquired_revision.clear();
+    published.renderer_imported_revision.clear();
+    published.renderer_submitted_revision.clear();
+    published.renderer_drawn_revision.clear();
+    published.renderer_release_pending_revision.clear();
+    published.renderer_last_draw_error.clear();
+    published.renderer_last_result_code.clear();
+    published.renderer_last_result_detail.clear();
+}
+
+[[nodiscard]] mmltk::rfdetr::draw_launch::WorkspaceRgbaTarget workspace_target_for_publication_surface(
+    const mmltk::live::DmaBufCudaRgbaSurface& surface, const int width, const int height, const char* context) {
+    if (surface.is_pitch_frame()) {
+        return mmltk::rfdetr::draw_launch::make_workspace_rgba_pitched_target(
+            mmltk::live::device_ptr_as_bytes(surface.data()), surface.pitch_bytes(), width, height);
+    }
+    if (surface.is_array_frame()) {
+        return mmltk::rfdetr::draw_launch::make_workspace_rgba_surface_target(surface.surface_object(), width, height);
+    }
+    throw std::runtime_error(context);
+}
 
 void publish_workspace_surface(BrowserWorkspaceSurfaceBridge& bridge, const BrowserWorkspaceSurfaceOwner owner,
                                RetainedBrowserImportedFrameSource source,
@@ -1064,10 +1230,11 @@ void publish_retained_imported_browser_frame(
             "published byte length");
     }
 
-    LiveImportedBrowserPublicationSlot& publication_slot = acquire_native_publication_slot(
-        publication_slots, cuda_device_index, width, height, "cudaMallocPitch for retained browser frame publication",
-        "cudaStreamCreateWithPriority for retained browser frame publication",
-        "cudaEventCreateWithFlags for retained browser frame publication");
+    LiveImportedBrowserPublicationSlot& publication_slot =
+        acquire_native_publication_slot(publication_slots, cuda_device_index, width, height,
+                                        "GBM/CUDA DMA-BUF allocation for retained browser frame publication",
+                                        "cudaStreamCreateWithPriority for retained browser frame publication",
+                                        "cudaEventCreateWithFlags for retained browser frame publication");
     publication_slot.upload_buffer.ensure_dimensions(width, height,
                                                      "cudaMallocPitch for retained browser frame upload");
     publication_slot.host_upload_buffer.ensure_capacity(required_bytes,
@@ -1080,21 +1247,25 @@ void publish_retained_imported_browser_frame(
                           source_row_stride_bytes, static_cast<std::size_t>(width) * 3U, height, cudaMemcpyHostToDevice,
                           publication_slot.stream.get()),
         "cudaMemcpy2DAsync for retained browser frame upload");
-    mmltk::rfdetr::launch_copy_bgr_to_rgba_pitched(
+    const auto target = workspace_target_for_publication_surface(
+        publication_slot.device_buffer, static_cast<int>(width), static_cast<int>(height),
+        "retained browser publication surface has no CUDA write target");
+    mmltk::rfdetr::launch_copy_bgr_to_workspace_rgba(
         mmltk::live::device_ptr_as_bytes(publication_slot.upload_buffer.data()),
-        publication_slot.upload_buffer.pitch_bytes(),
-        mmltk::live::device_ptr_as_bytes(publication_slot.device_buffer.data()),
-        publication_slot.device_buffer.pitch_bytes(), static_cast<int>(width), static_cast<int>(height), 255U,
+        publication_slot.upload_buffer.pitch_bytes(), target, static_cast<int>(width), static_cast<int>(height), 255U,
         publication_slot.stream.get());
     mmltk::live::ensure_cuda_ok(cudaPeekAtLastError(),
-                                "launch_copy_bgr_to_rgba_pitched for retained browser frame publication");
+                                "launch_copy_bgr_to_workspace_rgba for retained browser frame publication");
     mmltk::live::ensure_cuda_ok(cudaEventRecord(publication_slot.ready_event.get(), publication_slot.stream.get()),
                                 "cudaEventRecord for retained browser frame publication");
+    mmltk::live::ensure_cuda_ok(cudaEventSynchronize(publication_slot.ready_event.get()),
+                                "cudaEventSynchronize for retained browser frame publication");
 
     const RetainedBrowserUploadFrame publication_frame{
         publication_slot.device_buffer.data(),
         publication_slot.ready_event.get(),
         publication_slot.stream.get(),
+        publication_slot.device_buffer.dmabuf_image(width, height),
     };
     mmltk::browser::FrameSlotDescriptor descriptor = mmltk::browser::frame_slot_from_bgr_frame(
         std::move(slot_name), slot_index, frame_id, capture_region, width, height,
@@ -1103,7 +1274,7 @@ void publish_retained_imported_browser_frame(
     try {
         publish_workspace_surface(
             published.workspace_surface_bridge, owner,
-            make_retained_browser_imported_frame_source(descriptor, publication_frame, cuda_device_index),
+            make_retained_workspace_dmabuf_source(descriptor, publication_frame, cuda_device_index),
             [slot = &publication_slot]() { slot->release_retained_publication(); });
     } catch (...) {
         if (publication_slot.ready_event.get() != nullptr) {
@@ -1116,19 +1287,6 @@ void publish_retained_imported_browser_frame(
 
 #if MMLTK_RFDETR_LIVE_CAPTURE
 
-void release_live_workspace_slot_silently(mmltk::live::LiveSessionController* controller,
-                                          const std::uint32_t slot_index) noexcept {
-    if (controller == nullptr) {
-        return;
-    }
-    try {
-        controller->release_workspace(slot_index);
-    } catch (const std::exception& error) {
-        mmltk::logging::logger("gui")->error("failed to release imported browser workspace slot {}: {}", slot_index,
-                                             error.what());
-    }
-}
-
 [[nodiscard]] bool live_frame_not_newer_than_current_publication(const BrowserWorkspaceSurfaceBridge& bridge,
                                                                  const mmltk::live::LiveFrameId& frame_id) noexcept {
     if (bridge.owner() != BrowserWorkspaceSurfaceOwner::Live) {
@@ -1139,6 +1297,28 @@ void release_live_workspace_slot_silently(mmltk::live::LiveSessionController* co
         return false;
     }
     return frame_id.sequence <= current->sequence;
+}
+
+[[nodiscard]] bool workspace_swapchain_descriptor_matches(
+    const std::optional<mmltk::live::WorkspaceSwapchainDescriptor>& current,
+    const mmltk::live::WorkspaceSwapchainDescriptor& next) noexcept {
+    if (!current.has_value() || current->generation != next.generation || current->width != next.width ||
+        current->height != next.height || current->slots.size() != next.slots.size()) {
+        return false;
+    }
+    for (std::size_t index = 0; index < current->slots.size(); ++index) {
+        const mmltk::live::WorkspaceSwapchainSlotDescriptor& a = current->slots[index];
+        const mmltk::live::WorkspaceSwapchainSlotDescriptor& b = next.slots[index];
+        if (a.slot_index != b.slot_index || a.dims.width != b.dims.width || a.dims.height != b.dims.height ||
+            a.dims.pitch_bytes != b.dims.pitch_bytes || a.dmabuf_image.fd != b.dmabuf_image.fd ||
+            a.dmabuf_image.stride_bytes != b.dmabuf_image.stride_bytes ||
+            a.dmabuf_image.drm_format != b.dmabuf_image.drm_format ||
+            a.dmabuf_image.drm_modifier != b.dmabuf_image.drm_modifier ||
+            a.dmabuf_image.modifier_mode != b.dmabuf_image.modifier_mode) {
+            return false;
+        }
+    }
+    return true;
 }
 
 #endif
@@ -1173,6 +1353,7 @@ class AnnotationWorkflowCoordinator {
     void handle_setup_browse_request(AnnotationSetupBrowseRequest browse_request);
     void load_frame(AnnotationFrame frame);
     void submit_preview();
+    bool publish_live_manual_overlay();
     bool request_save_now();
     void start_live_session();
     void stop_live_session();
@@ -1196,9 +1377,45 @@ App::Impl::Impl(std::string vast_api_key, std::string settings_path)
       remote_train_controller_(background_executor_, ui_callbacks_),
       local_train_controller_(background_executor_, ui_callbacks_),
       vast_api_key_(std::move(vast_api_key)),
-      settings_persistence_(std::move(settings_path)) {}
+      settings_persistence_(std::move(settings_path)) {
+    if (const char* trace_path = std::getenv("MMLTK_GUI_E2E_INTENT_TRACE_PATH");
+        trace_path != nullptr && *trace_path != '\0') {
+        e2e_intent_trace_file_ = std::fopen(trace_path, "w");
+        if (e2e_intent_trace_file_ == nullptr) {
+            mmltk::logging::logger("gui")->warn("failed to open GUI E2E intent trace `{}`: {}", trace_path,
+                                                std::strerror(errno));
+        }
+    }
+}
 
-App::Impl::~Impl() = default;
+App::Impl::~Impl() {
+    if (e2e_intent_trace_file_ != nullptr) {
+        std::fclose(e2e_intent_trace_file_);
+        e2e_intent_trace_file_ = nullptr;
+    }
+}
+
+void App::Impl::write_e2e_intent_trace(const mmltk::browser::RoutedIntent& routed,
+                                       const nlohmann::json& payload) noexcept {
+    if (e2e_intent_trace_file_ == nullptr) {
+        return;
+    }
+    try {
+        const nlohmann::json record = {
+            {"request_id", routed.request_id},
+            {"workflow", std::string(mmltk::browser::workflow_name(routed.workflow))},
+            {"intent", routed.intent},
+            {"payload", payload},
+        };
+        const std::string line = record.dump();
+        std::fwrite(line.data(), sizeof(char), line.size(), e2e_intent_trace_file_);
+        std::fputc('\n', e2e_intent_trace_file_);
+        std::fflush(e2e_intent_trace_file_);
+    } catch (...) {
+        std::fputs("{\"trace_error\":\"failed to serialize routed browser intent\"}\n", e2e_intent_trace_file_);
+        std::fflush(e2e_intent_trace_file_);
+    }
+}
 
 void App::Impl::initialize(App& app) {
     model_registry_.register_module(make_rfdetr_model_module());
@@ -1265,8 +1482,13 @@ void App::Impl::initialize(App& app) {
 #define annotate_save_running_ impl_->annotate_save_running_
 #define annotate_save_summary_ impl_->annotate_save_summary_
 #define annotate_save_error_ impl_->annotate_save_error_
+#define annotate_live_start_error_ impl_->annotate_live_start_error_
+#define annotate_live_startup_state_ impl_->annotate_live_startup_state_
+#define annotate_live_startup_deadline_ impl_->annotate_live_startup_deadline_
+#define annotate_live_drawable_revision_ impl_->annotate_live_drawable_revision_
 #define live_controller_ impl_->live_controller_
 #define live_session_status_ impl_->live_session_status_
+#define annotation_live_session_running_for_testing_ impl_->annotation_live_session_running_for_testing_
 #define active_live_mode_ impl_->active_live_mode_
 #define ui_callbacks_ impl_->ui_callbacks_
 #define background_executor_ impl_->background_executor_
@@ -1290,6 +1512,7 @@ void App::Impl::initialize(App& app) {
 #define annotation_workflow_coordinator_ impl_->annotation_workflow_coordinator_
 #define browser_publication_state_ impl_->browser_publication_state_
 #define browser_workspace_viewport_state_ impl_->browser_workspace_viewport_state_
+#define browser_workspace_bounds_state_ impl_->browser_workspace_bounds_state_
 
 App::App(std::string vast_api_key, std::string settings_path)
     : impl_(std::make_unique<Impl>(std::move(vast_api_key), std::move(settings_path))) {
@@ -1344,14 +1567,27 @@ std::function<void()> App::live_workspace_ready_callback() const {
     return [this]() noexcept { notify_evented_work_ready(); };
 }
 
+std::function<void(const mmltk::live::WorkspacePresentSnapshot&)> App::live_workspace_present_callback() const {
+    const std::shared_ptr<const std::function<void()>> callback =
+        impl_->evented_work_wake_callback_.load(std::memory_order_acquire);
+    if (!callback || !*callback) {
+        return {};
+    }
+    return [this](const mmltk::live::WorkspacePresentSnapshot&) noexcept { notify_evented_work_ready(); };
+}
+
 void App::refresh_live_workspace_ready_callbacks() {
 #if MMLTK_RFDETR_LIVE_CAPTURE
     std::function<void()> callback = live_workspace_ready_callback();
+    std::function<void(const mmltk::live::WorkspacePresentSnapshot&)> present_callback =
+        live_workspace_present_callback();
     if (live_controller_) {
         live_controller_->set_workspace_ready_callback(callback);
+        live_controller_->set_workspace_present_callback(present_callback);
     }
     if (mmltk::live::LiveSessionController* controller = live_predict_controller_.controller(); controller != nullptr) {
         controller->set_workspace_ready_callback(std::move(callback));
+        controller->set_workspace_present_callback(std::move(present_callback));
     }
 #endif
 }
@@ -1376,7 +1612,93 @@ bool App::release_workspace_surface(const std::string_view surface_id, const std
     if (browser_publication_state_ == nullptr) {
         return false;
     }
-    return browser_publication_state_->workspace_surface_bridge.release_surface(surface_id, revision);
+    BrowserPublicationState& published = *browser_publication_state_;
+    mmltk::browser::WorkspaceRendererEventIntent renderer_release;
+    renderer_release.surface_id = std::string(surface_id);
+    renderer_release.revision = std::string(revision);
+    renderer_release.operation = "releaseSurface";
+    record_workspace_renderer_pipeline_stage(mmltk::live::LivePipelineStage::RendererReleaseSurface, renderer_release);
+    published.renderer_release_pending_revision = renderer_release.revision;
+    try {
+        const bool released = published.workspace_surface_bridge.release_surface(surface_id, revision);
+        if (released) {
+            published.renderer_releases += 1U;
+            if (published.renderer_release_pending_revision == renderer_release.revision) {
+                published.renderer_release_pending_revision.clear();
+            }
+            return true;
+        }
+        published.native_release_failures += 1U;
+        record_browser_publication_failure(
+            published, published.workspace_surface_bridge.preview().owner, "native_release_failure",
+            "renderer requested an unknown workspace surface", revision, nullptr, true, &live_preview_error_, true,
+            mmltk::live::LivePipelineStage::BrowserReleaseSurface,
+            published.workspace_surface_bridge.preview().live_frame_id,
+            published.live_cuda_device_index.has_value() ? static_cast<std::uint32_t>(*published.live_cuda_device_index)
+                                                         : mmltk::live::kLivePipelineUnknownCudaDevice);
+    } catch (const std::exception& error) {
+        published.native_release_failures += 1U;
+        record_browser_publication_failure(
+            published, published.workspace_surface_bridge.preview().owner, "native_release_failure", error.what(),
+            revision, nullptr, true, &live_preview_error_, true, mmltk::live::LivePipelineStage::BrowserReleaseSurface,
+            published.workspace_surface_bridge.preview().live_frame_id,
+            published.live_cuda_device_index.has_value() ? static_cast<std::uint32_t>(*published.live_cuda_device_index)
+                                                         : mmltk::live::kLivePipelineUnknownCudaDevice);
+    }
+    return false;
+}
+
+bool App::browser_live_workspace_surface_retained() const noexcept {
+#if MMLTK_RFDETR_LIVE_CAPTURE
+    if (browser_publication_state_ == nullptr) {
+        return false;
+    }
+    const BrowserPublicationState& published = *browser_publication_state_;
+    return published.workspace_surface_bridge.owner() == BrowserWorkspaceSurfaceOwner::Live &&
+           published.workspace_surface_bridge.preview().has_frame;
+#else
+    return false;
+#endif
+}
+
+void App::record_workspace_surface_bridge_error(std::string error_message) {
+    if (browser_publication_state_ == nullptr) {
+        live_preview_error_ = std::move(error_message);
+        return;
+    }
+
+    BrowserPublicationState& published = *browser_publication_state_;
+    if (error_message.empty()) {
+        published.workspace_surface_bridge.clear_error();
+        live_preview_error_.clear();
+        return;
+    }
+
+    const BrowserWorkspaceSurfaceBridge::PreviewRuntimeState& preview = published.workspace_surface_bridge.preview();
+    std::string revision = preview.surface_revision;
+    if (revision.empty()) {
+        if (const std::optional<mmltk::browser::WorkspaceSurfaceInfo>& surface_info =
+                published.workspace_surface_bridge.surface_info();
+            surface_info.has_value()) {
+            revision = surface_info->revision;
+        }
+    }
+
+    std::string log_key = revision.empty() ? std::string{"unknown"} : revision;
+    if (published.last_logged_bridge_error_key != log_key) {
+        published.last_logged_bridge_error_key = log_key;
+        published.cef_export_failures += 1U;
+        mmltk::logging::logger("gui")->warn("browser workspace surface bridge export failed: revision={} reason={}",
+                                            revision, error_message);
+    }
+    const std::string result_code = workspace_gpu_bridge_last_export_result_code();
+    const std::string result_detail = workspace_gpu_bridge_last_export_result_detail();
+    record_browser_publication_failure(
+        published, preview.owner, result_code.empty() ? "cef_bridge_export_failure" : result_code,
+        result_detail.empty() ? error_message : result_detail, revision, nullptr, true, &live_preview_error_, false,
+        mmltk::live::LivePipelineStage::CefExportSharedImage, preview.live_frame_id,
+        published.live_cuda_device_index.has_value() ? static_cast<std::uint32_t>(*published.live_cuda_device_index)
+                                                     : mmltk::live::kLivePipelineUnknownCudaDevice);
 }
 
 void App::release_all_workspace_surface_publications() {
@@ -1400,6 +1722,7 @@ void App::shutdown() {
     shutting_down_ = true;
     set_evented_work_wake_callback({});
     browser_workspace_viewport_state_.reset();
+    browser_workspace_bounds_state_.reset();
     release_all_browser_frame_publications();
     stop_live_predict_session();
     annotation_workflow_coordinator_->shutdown();
@@ -1411,6 +1734,29 @@ void App::shutdown() {
 
 std::optional<BrowserWorkspaceViewportState> App::browser_workspace_viewport_state() const {
     return browser_workspace_viewport_state_;
+}
+
+std::optional<BrowserWorkspaceBoundsState> App::browser_workspace_bounds_state() const {
+    return browser_workspace_bounds_state_;
+}
+
+BrowserWorkspaceNativePresentState App::browser_workspace_native_present_state() const {
+    BrowserWorkspaceNativePresentState state;
+    if (browser_publication_state_ == nullptr) {
+        return state;
+    }
+    const BrowserPublicationState& published = *browser_publication_state_;
+    const BrowserWorkspaceSurfaceBridge& bridge = published.workspace_surface_bridge;
+    if (bridge.owner() != BrowserWorkspaceSurfaceOwner::Live || !bridge.native_presented()) {
+        return state;
+    }
+    if (bridge.swapchain_descriptor().has_value()) {
+        state.swapchain_descriptor = &*bridge.swapchain_descriptor();
+    }
+    state.latest_present = bridge.latest_present();
+    state.bounds = browser_workspace_bounds_state_;
+    state.cuda_device_index = published.live_cuda_device_index;
+    return state;
 }
 
 GuiSettingsSnapshot App::make_gui_settings_snapshot() {
@@ -1445,11 +1791,15 @@ mmltk::browser::StateSnapshot App::browser_state_snapshot() {
         const BrowserWorkspaceSurfaceBridge::PreviewRuntimeState& selected_preview =
             published.workspace_surface_bridge.preview();
         if (!selected_preview.has_frame) {
-            preview.last_error = browser_preview_error;
+            preview.last_error =
+                selected_preview.last_error.empty() ? browser_preview_error : selected_preview.last_error;
             return preview;
         }
 
-        preview.has_frame = true;
+        const bool live_surface_drawn = selected_preview.owner != BrowserWorkspaceSurfaceOwner::Live ||
+                                        published.workspace_surface_bridge.native_presented() ||
+                                        published.renderer_drawn_revision == selected_preview.surface_revision;
+        preview.has_frame = live_surface_drawn;
         preview.displayed_region = {
             selected_preview.displayed_region.x,
             selected_preview.displayed_region.y,
@@ -1458,6 +1808,7 @@ mmltk::browser::StateSnapshot App::browser_state_snapshot() {
         };
         preview.last_frame_id = selected_preview.frame_id;
         preview.live_frame_id = selected_preview.live_frame_id;
+        preview.last_error = selected_preview.last_error;
         return preview;
     }();
 
@@ -1529,6 +1880,13 @@ mmltk::browser::StateSnapshot App::browser_state_snapshot() {
         job_.running || live_predict_running() || annotate_assist_running_ || annotate_save_running_;
     const bool annotate_has_inputs = !annotate_inputs_.empty();
     const bool annotate_live_running_now = annotation_live_running();
+    const bool annotate_live_capture_supported = live_capture_supported();
+    const std::string annotate_live_source_error = annotate_live_video && annotate_live_capture_supported
+                                                       ? validate_video_stream_source(annotate_.source)
+                                                       : std::string{};
+    const bool annotate_live_ready = annotate_live_video && annotate_live_source_error.empty() &&
+                                     !annotate_live_running_now && !annotate_block_actions &&
+                                     annotate_live_capture_supported;
     const AnnotationObject* selected_annotation_object =
         mmltk::gui::selected_object(annotate_document_, annotate_session_);
     const bool selected_supports_mask_editing =
@@ -1538,17 +1896,17 @@ mmltk::browser::StateSnapshot App::browser_state_snapshot() {
     snapshot.workflow_state["annotate_runtime"] = {
         {"setup",
          {{"live_video_source", annotate_live_video},
-          {"live_capture_supported", live_capture_supported()},
+          {"live_capture_supported", annotate_live_capture_supported},
           {"live_running", annotate_live_running_now},
           {"block_actions", annotate_block_actions},
           {"prepare_running", annotate_prepare_running_},
           {"frame_load_running", annotate_frame_load_running_},
           {"has_inputs", annotate_has_inputs},
+          {"live_source_error", annotate_live_source_error},
           {"current_input_index",
            annotate_has_inputs ? nlohmann::json(annotate_current_input_index_) : nlohmann::json(nullptr)},
           {"input_count", annotate_inputs_.size()},
-          {"can_start_live",
-           annotate_live_video && !annotate_live_running_now && !annotate_block_actions && live_capture_supported()},
+          {"can_start_live", annotate_live_ready},
           {"can_stop_live", annotate_live_video && annotate_live_running_now},
           {"can_reload_frame", !annotate_live_video && annotate_has_inputs},
           {"can_prev_frame", !annotate_live_video && annotate_has_inputs && annotate_current_input_index_ > 0U},
@@ -1572,12 +1930,15 @@ mmltk::browser::StateSnapshot App::browser_state_snapshot() {
                           annotate_inputs_.size())
             : "No setup-frame metadata has been published yet.";
     const std::string annotate_live_summary =
-        !annotate_live_video        ? "Live annotate is only available for video-stream sources."
-        : annotate_live_running_now ? "Live annotate is streaming from the current capture "
-                                      "device."
-        : live_capture_supported()  ? "Start live annotate to keep the workspace bound to "
-                                      "incoming frames."
-                                    : "Live annotate is unavailable in this build.";
+        !annotate_live_video ? "Live annotate is only available for video-stream sources."
+        : annotate_live_startup_state_ == AnnotateLiveStartupState::Starting ? "Live annotate is starting."
+        : annotate_live_startup_state_ == AnnotateLiveStartupState::Failed || !annotate_live_start_error_.empty()
+            ? "Live annotate failed: " + annotate_live_start_error_
+        : annotate_live_startup_state_ == AnnotateLiveStartupState::Drawable || annotate_live_running_now
+            ? "Live annotate is streaming from the current capture device."
+        : !annotate_live_capture_supported    ? "Live annotate is unavailable in this build."
+        : !annotate_live_source_error.empty() ? annotate_live_source_error
+                                              : "Start live annotate to keep the workspace bound to incoming frames.";
     const bool annotate_save_now_enabled = annotate_poll.save_tab_plan.save_now.enabled;
     const bool annotate_hold_save_enabled = annotate_poll.save_tab_plan.hold_save.enabled;
     const std::string annotate_save_summary =
@@ -1621,8 +1982,7 @@ mmltk::browser::StateSnapshot App::browser_state_snapshot() {
           {"running", annotate_live_running_now},
           {"summary", annotate_live_summary},
           {"start",
-           {{"enabled",
-             annotate_live_video && !annotate_live_running_now && !annotate_block_actions && live_capture_supported()},
+           {{"enabled", annotate_live_ready},
             {"workflow", "annotate"},
             {"intent", "annotate.live.start"},
             {"label", "Start Live Annotate"}}},
@@ -1646,7 +2006,7 @@ mmltk::browser::StateSnapshot App::browser_state_snapshot() {
             {"workflow", "annotate"},
             {"intent", "annotate.hold_save"},
             {"label", "Hold Save"},
-            {"payload_key", "active"}}}}},
+            {"payload_key", "enabled"}}}}},
         {"brush",
          {{"visible", annotate_brush_enabled},
           {"summary", annotate_brush_summary},
@@ -1690,10 +2050,16 @@ mmltk::browser::StateSnapshot App::browser_state_snapshot() {
                                        : predict_.source.kind == SourceKind::VideoStream;
     mmltk::browser::BrowserLiveRuntimeState live_runtime;
     live_runtime.active_mode = active_live_mode_name();
-    live_runtime.starting = live_predict_controller_.starting();
+    live_runtime.startup_state = active_live_mode_ == ActiveLiveMode::Annotate || !annotate_live_start_error_.empty()
+                                     ? annotate_live_startup_state_name(annotate_live_startup_state_)
+                                     : "idle";
+    live_runtime.starting =
+        live_predict_controller_.starting() || (active_live_mode_ == ActiveLiveMode::Annotate &&
+                                                annotate_live_startup_state_ == AnnotateLiveStartupState::Starting);
     live_runtime.stopping = live_predict_controller_.stopping();
     live_runtime.show_static_preview = static_preview_visible;
-    live_runtime.show_idle_start_error = !live_predict_running() && !live_predict_controller_.start_error().empty();
+    live_runtime.show_idle_start_error = !live_predict_running() && (!live_predict_controller_.start_error().empty() ||
+                                                                     !annotate_live_start_error_.empty());
     live_runtime.video_stream_source = live_video_source;
     live_runtime.runtime_capabilities = snapshot.runtime_capabilities;
     live_runtime.preview.initialized = preview_state.initialized;
@@ -1707,7 +2073,8 @@ mmltk::browser::StateSnapshot App::browser_state_snapshot() {
     live_runtime.preview.static_source_name = live_static_preview_source_name_;
     live_runtime.preview.error = live_preview_error_.empty() ? preview_state.last_error : live_preview_error_;
     live_runtime.preview.interop_failed = preview_state.interop_failed;
-    live_runtime.start_error = live_predict_controller_.start_error();
+    live_runtime.start_error =
+        annotate_live_start_error_.empty() ? live_predict_controller_.start_error() : annotate_live_start_error_;
     live_runtime.action_error = live_predict_controller_.action_error();
 #if MMLTK_RFDETR_LIVE_CAPTURE
     mmltk::live::LiveSessionController* active_live_controller = nullptr;
@@ -1719,7 +2086,14 @@ mmltk::browser::StateSnapshot App::browser_state_snapshot() {
     live_runtime.controller.present = active_live_controller != nullptr;
     std::optional<mmltk::live::LiveSessionStatus> active_live_status;
     if (active_live_mode_ == ActiveLiveMode::Annotate) {
-        if (live_session_status_ != nullptr) {
+        if (live_controller_ != nullptr) {
+            active_live_status = live_controller_->snapshot_status();
+            if (!live_session_status_) {
+                live_session_status_ = std::make_unique<mmltk::live::LiveSessionStatus>();
+            }
+            *live_session_status_ = *active_live_status;
+            refresh_annotate_live_startup_state(*active_live_status);
+        } else if (live_session_status_ != nullptr) {
             active_live_status = *live_session_status_;
         }
     } else if (const auto* status = live_predict_controller_.status(); status != nullptr) {
@@ -1733,6 +2107,13 @@ mmltk::browser::StateSnapshot App::browser_state_snapshot() {
         const mmltk::live::LiveSessionStatus& status = *active_live_status;
         live_runtime.controller.running = status.running;
         live_runtime.controller.last_error = status.last_error;
+        live_runtime.fanout.running = status.fanout.running;
+        live_runtime.fanout.frames_fanned_out = status.fanout.frames_fanned_out;
+        live_runtime.fanout.skipped_detect_publishes = status.fanout.skipped_detect_publishes;
+        live_runtime.fanout.skipped_output_publishes = status.fanout.skipped_output_publishes;
+        live_runtime.fanout.release_backlog = status.fanout.release_backlog;
+        live_runtime.fanout.acquire_misses = status.fanout.acquire_misses;
+        live_runtime.fanout.last_error = status.fanout.last_error;
         live_runtime.analyzer.attached = status.analyzer.analyzer_attached;
         live_runtime.analyzer.model_hot = status.analyzer.model_hot;
         live_runtime.analyzer.running = status.analyzer.running;
@@ -1747,13 +2128,37 @@ mmltk::browser::StateSnapshot App::browser_state_snapshot() {
         live_runtime.manual_overlay.last_error = status.manual.last_error;
         live_runtime.compositor.running = status.compositor.running;
         live_runtime.compositor.frames_composited = status.compositor.frames_composited;
+        live_runtime.compositor.frames_composited_after_startup = status.compositor.frames_composited_after_startup;
         live_runtime.compositor.frames_dropped = status.compositor.frames_dropped;
+        live_runtime.compositor.skipped_compositor_presents = status.compositor.skipped_compositor_presents;
+        live_runtime.compositor.front_slot_index = status.compositor.front_slot_index;
+        live_runtime.compositor.front_slot_revision = status.compositor.front_slot_revision;
         live_runtime.compositor.last_frame_id = status.compositor.last_frame_id;
         live_runtime.compositor.manual_overlay_active = status.compositor.manual_overlay_active;
         live_runtime.compositor.analysis_overlay_active = status.compositor.analysis_overlay_active;
         live_runtime.compositor.last_error = status.compositor.last_error;
+        live_runtime.single_buffer_diagnostic.enabled = status.single_buffer_diagnostic.enabled;
+        live_runtime.single_buffer_diagnostic.frame_count = status.single_buffer_diagnostic.frame_count;
+        live_runtime.single_buffer_diagnostic.frame_budget_ns = status.single_buffer_diagnostic.frame_budget_ns;
+        live_runtime.single_buffer_diagnostic.drawn_frames = status.pipeline.diagnostic_drawn_frames;
+        live_runtime.single_buffer_diagnostic.consecutive_miss_limit =
+            status.single_buffer_diagnostic.consecutive_miss_limit;
+        live_runtime.single_buffer_diagnostic.completed = status.pipeline.diagnostic_completed;
+        live_runtime.single_buffer_diagnostic.analyzer_disabled =
+            status.single_buffer_diagnostic.enabled && status.single_buffer_diagnostic.disable_analyzer;
+        live_runtime.single_buffer_diagnostic.failed = status.pipeline.diagnostic_failed;
+        live_runtime.single_buffer_diagnostic.failure_stage = status.pipeline.diagnostic_failure_event.stage_name;
+        live_runtime.single_buffer_diagnostic.failure_frame =
+            status.pipeline.diagnostic_failure_event.frame_id.sequence;
+        live_runtime.single_buffer_diagnostic.failure_latency_us = status.pipeline.diagnostic_failure_event.latency_us;
     }
 #endif
+    live_runtime.startup_state = active_live_mode_ == ActiveLiveMode::Annotate || !annotate_live_start_error_.empty()
+                                     ? annotate_live_startup_state_name(annotate_live_startup_state_)
+                                     : "idle";
+    live_runtime.starting =
+        live_predict_controller_.starting() || (active_live_mode_ == ActiveLiveMode::Annotate &&
+                                                annotate_live_startup_state_ == AnnotateLiveStartupState::Starting);
     nlohmann::json live_runtime_json = mmltk::browser::live_runtime_state_to_json(live_runtime);
     nlohmann::json& live_preview_json = live_runtime_json["preview"];
     if (!live_preview_json.is_object()) {
@@ -1769,6 +2174,58 @@ mmltk::browser::StateSnapshot App::browser_state_snapshot() {
     live_preview_json["show_controls"] = show_live_preview_controls;
     live_preview_json["can_toggle_fit_to_capture"] = show_live_preview_controls;
     live_preview_json["can_toggle_full_frame"] = can_toggle_live_full_frame;
+    if (browser_publication_state_ != nullptr) {
+        const BrowserPublicationState& published = *browser_publication_state_;
+        const BrowserWorkspaceSurfaceBridge::PreviewRuntimeState& bridge_preview =
+            published.workspace_surface_bridge.preview();
+        const bool native_presented_live = published.workspace_surface_bridge.native_presented();
+        live_preview_json["surface_revision"] = bridge_preview.surface_revision;
+        live_preview_json["owner"] = browser_workspace_surface_owner_name(bridge_preview.owner);
+        live_preview_json["publish_ns"] = bridge_preview.publish_ns;
+        live_preview_json["last_error"] = bridge_preview.last_error;
+        live_preview_json["native_presented"] = native_presented_live;
+        live_preview_json["display_startup_state"] =
+            native_presented_live
+                ? "native presented"
+                : mmltk::browser::browser_live_display_startup_state(
+                      live_runtime.show_running_section || live_runtime.starting, bridge_preview.surface_revision,
+                      published.renderer_imported_revision, published.renderer_submitted_revision,
+                      published.renderer_drawn_revision);
+        if (!native_presented_live) {
+            live_preview_json["renderer_acquired_revision"] = published.renderer_acquired_revision;
+            live_preview_json["renderer_imported_revision"] = published.renderer_imported_revision;
+            live_preview_json["renderer_submitted_revision"] = published.renderer_submitted_revision;
+            live_preview_json["renderer_drawn_revision"] = published.renderer_drawn_revision;
+            live_preview_json["renderer_release_pending_revision"] = published.renderer_release_pending_revision;
+            live_preview_json["renderer_last_draw_error"] = published.renderer_last_draw_error;
+            live_preview_json["renderer_last_result_code"] = published.renderer_last_result_code;
+            live_preview_json["renderer_last_result_detail"] = published.renderer_last_result_detail;
+        }
+        live_preview_json["last_failure_reason"] = published.last_failure_reason;
+        live_preview_json["last_failure_detail"] = published.last_failure_detail;
+        live_preview_json["last_failure_revision"] = published.last_failure_revision;
+        live_preview_json["last_failure_stage"] = published.last_failure_stage;
+        live_preview_json["last_failure_live_frame_id"] =
+            browser_live_frame_id_json(published.last_failure_live_frame_id);
+        live_preview_json["last_failure_cuda_device"] =
+            published.last_failure_cuda_device_index == mmltk::live::kLivePipelineUnknownCudaDevice
+                ? nlohmann::json(nullptr)
+                : nlohmann::json(published.last_failure_cuda_device_index);
+        live_preview_json["last_failure_result_code"] = published.last_failure_result_code;
+        live_preview_json["last_failure_result_detail"] = published.last_failure_result_detail;
+        live_preview_json["publication_counters"] = {
+            {"attempted_workspace_acquisitions", published.attempted_workspace_acquisitions},
+            {"startup_workspace_acquisition_misses", published.startup_workspace_acquisition_misses},
+            {"post_startup_workspace_acquisition_misses", published.post_startup_workspace_acquisition_misses},
+            {"retained_surfaces", published.retained_surfaces},
+            {"rejected_stale_frames", published.rejected_stale_frames},
+            {"cef_export_failures", published.cef_export_failures},
+            {"renderer_releases", published.renderer_releases},
+            {"native_release_failures", published.native_release_failures},
+            {"renderer_import_failures", published.renderer_import_failures},
+            {"renderer_release_rejections", published.renderer_release_rejections},
+        };
+    }
     snapshot.workflow_state["live_runtime"] = std::move(live_runtime_json);
     snapshot.workflow_state["live_preview_controls"] = {
         {"fit_to_capture",
@@ -1856,8 +2313,173 @@ void App::apply_annotation_sidebar_mutation_result(const AnnotationSidebarMutati
         [this]() { invalidate_annotation_preview(); });
 }
 
+void App::record_workspace_renderer_pipeline_stage(const mmltk::live::LivePipelineStage stage,
+                                                   const mmltk::browser::WorkspaceRendererEventIntent& intent) {
+    record_workspace_surface_pipeline_stage(stage, intent.surface_id, intent.revision);
+}
+
+void App::record_workspace_surface_pipeline_stage(const mmltk::live::LivePipelineStage stage,
+                                                  const std::string_view surface_id, const std::string_view revision,
+                                                  const std::uint64_t latency_base_ns) noexcept {
+#if MMLTK_RFDETR_LIVE_CAPTURE
+    if (browser_publication_state_ == nullptr || surface_id != kBrowserWorkspaceSurfaceId) {
+        return;
+    }
+    const BrowserWorkspaceSurfaceBridge::PreviewRuntimeState& preview =
+        browser_publication_state_->workspace_surface_bridge.preview();
+    if (preview.owner != BrowserWorkspaceSurfaceOwner::Live || !preview.live_frame_id.has_value() ||
+        preview.surface_revision != revision) {
+        return;
+    }
+    mmltk::live::LiveSessionController* controller = active_browser_live_controller();
+    if (controller == nullptr) {
+        return;
+    }
+    controller->record_pipeline_stage(stage, *preview.live_frame_id, parse_workspace_surface_revision(revision),
+                                      latency_base_ns);
+#else
+    (void)stage;
+    (void)surface_id;
+    (void)revision;
+    (void)latency_base_ns;
+#endif
+}
+
+void App::apply_workspace_renderer_event(const mmltk::browser::WorkspaceRendererEventIntent& intent,
+                                         const std::string_view intent_name) {
+    if (browser_publication_state_ == nullptr || intent.surface_id != kBrowserWorkspaceSurfaceId) {
+        return;
+    }
+
+    BrowserPublicationState& published = *browser_publication_state_;
+    const BrowserWorkspaceSurfaceBridge::PreviewRuntimeState& preview = published.workspace_surface_bridge.preview();
+    const BrowserWorkspaceSurfaceOwner owner = preview.owner != BrowserWorkspaceSurfaceOwner::None ? preview.owner
+                                               : active_live_mode_ == ActiveLiveMode::None
+                                                   ? BrowserWorkspaceSurfaceOwner::None
+                                                   : BrowserWorkspaceSurfaceOwner::Live;
+    const std::string reason = intent.result_code.empty() ? std::string(intent_name) : intent.result_code;
+    const std::string detail = intent.result_detail.empty() ? intent.operation : intent.result_detail;
+    published.renderer_event_count += 1U;
+    const bool renderer_event_has_error = reason != "ok" || detail.find("device_lost") != std::string::npos ||
+                                          detail.find("webgpu") != std::string::npos ||
+                                          detail.find("WebGPU") != std::string::npos;
+    if (renderer_event_has_error || published.renderer_event_count <= 3U ||
+        published.renderer_event_count % 300U == 0U) {
+        const std::string live_frame_label = preview.live_frame_id.has_value()
+                                                 ? std::to_string(preview.live_frame_id->sequence)
+                                                 : std::string("unknown");
+        auto logger = mmltk::logging::logger("gui");
+        const auto log_renderer_event = [&](auto&& log_fn) {
+            log_fn("workspace renderer event: intent={} surface={} revision={} operation={} result_code={} "
+                   "result_detail={} owner={} live_frame={} cuda_device={}",
+                   intent_name, intent.surface_id, intent.revision, intent.operation, reason, detail,
+                   browser_workspace_surface_owner_name(owner), live_frame_label,
+                   browser_live_publication_cuda_device_label(
+                       published.live_cuda_device_index.has_value()
+                           ? static_cast<std::uint32_t>(*published.live_cuda_device_index)
+                           : mmltk::live::kLivePipelineUnknownCudaDevice));
+        };
+        if (renderer_event_has_error) {
+            log_renderer_event([&logger](const char* fmt, const auto&... args) { logger->warn(fmt, args...); });
+        } else {
+            log_renderer_event([&logger](const char* fmt, const auto&... args) { logger->info(fmt, args...); });
+        }
+    }
+    const auto remember_renderer_result = [&published](const std::string_view code,
+                                                       const std::string_view detail_text) {
+        published.renderer_last_result_code = std::string(code);
+        published.renderer_last_result_detail = std::string(detail_text);
+    };
+
+    if (intent_name == "workspace.drawn") {
+        remember_renderer_result(reason, detail);
+        published.renderer_acquired_revision = intent.revision;
+        published.renderer_imported_revision = intent.revision;
+        published.renderer_submitted_revision = intent.revision;
+        published.renderer_drawn_revision = intent.revision;
+        published.renderer_last_draw_error.clear();
+        published.workspace_surface_bridge.clear_error();
+        clear_browser_publication_failure(published);
+        live_preview_error_.clear();
+        record_workspace_renderer_pipeline_stage(mmltk::live::LivePipelineStage::WebGpuDrawSurface, intent);
+        if (preview.owner == BrowserWorkspaceSurfaceOwner::Live && preview.surface_revision == intent.revision &&
+            preview.live_frame_id.has_value() && active_live_mode_ == ActiveLiveMode::Annotate) {
+            mark_annotate_live_drawable(*preview.live_frame_id);
+        }
+        return;
+    }
+
+    if (intent_name == "workspace.imported") {
+        remember_renderer_result(reason, detail);
+        published.renderer_acquired_revision = intent.revision;
+        published.renderer_imported_revision = intent.revision;
+        published.renderer_last_draw_error.clear();
+        published.workspace_surface_bridge.clear_error();
+        record_workspace_renderer_pipeline_stage(mmltk::live::LivePipelineStage::RendererReceiveSurface, intent);
+        record_workspace_renderer_pipeline_stage(mmltk::live::LivePipelineStage::RendererImportTexture, intent);
+        return;
+    }
+
+    if (intent_name == "workspace.import_failed") {
+        remember_renderer_result(reason, detail);
+        published.renderer_acquired_revision = intent.revision;
+        published.renderer_import_failures += 1U;
+        published.renderer_last_draw_error = browser_publication_failure_message(reason, detail);
+        record_workspace_renderer_pipeline_stage(mmltk::live::LivePipelineStage::RendererReceiveSurface, intent);
+        record_workspace_renderer_pipeline_stage(mmltk::live::LivePipelineStage::RendererImportTexture, intent);
+        record_browser_publication_failure(
+            published, owner, reason, detail, intent.revision, nullptr, true, &live_preview_error_, true,
+            mmltk::live::LivePipelineStage::RendererImportTexture, preview.live_frame_id,
+            published.live_cuda_device_index.has_value() ? static_cast<std::uint32_t>(*published.live_cuda_device_index)
+                                                         : mmltk::live::kLivePipelineUnknownCudaDevice);
+        return;
+    }
+
+    if (intent_name == "workspace.acquire_failed") {
+        remember_renderer_result(reason, detail);
+        published.renderer_last_draw_error = browser_publication_failure_message(reason, detail);
+        if (owner == BrowserWorkspaceSurfaceOwner::None && reason == "no_published_live_surface") {
+            return;
+        }
+        const std::string failure_revision = intent.revision.empty() ? preview.surface_revision : intent.revision;
+        record_workspace_surface_pipeline_stage(mmltk::live::LivePipelineStage::RendererReceiveSurface,
+                                                intent.surface_id, failure_revision);
+        record_browser_publication_failure(
+            published, owner, reason, detail, failure_revision, nullptr, true, &live_preview_error_, true,
+            mmltk::live::LivePipelineStage::RendererReceiveSurface, preview.live_frame_id,
+            published.live_cuda_device_index.has_value() ? static_cast<std::uint32_t>(*published.live_cuda_device_index)
+                                                         : mmltk::live::kLivePipelineUnknownCudaDevice);
+        return;
+    }
+
+    if (intent_name == "workspace.release_complete") {
+        remember_renderer_result(reason, detail);
+        record_workspace_renderer_pipeline_stage(mmltk::live::LivePipelineStage::RendererReleaseSurface, intent);
+        if (published.renderer_release_pending_revision == intent.revision) {
+            published.renderer_release_pending_revision.clear();
+        }
+        return;
+    }
+
+    if (intent_name == "workspace.release_rejected") {
+        remember_renderer_result(reason, detail);
+        published.renderer_release_rejections += 1U;
+        published.renderer_last_draw_error = browser_publication_failure_message(reason, detail);
+        record_workspace_renderer_pipeline_stage(mmltk::live::LivePipelineStage::RendererReleaseSurface, intent);
+        if (published.renderer_release_pending_revision == intent.revision) {
+            published.renderer_release_pending_revision.clear();
+        }
+        record_browser_publication_failure(
+            published, owner, reason, detail, intent.revision, nullptr, true, &live_preview_error_, true,
+            mmltk::live::LivePipelineStage::RendererReleaseSurface, preview.live_frame_id,
+            published.live_cuda_device_index.has_value() ? static_cast<std::uint32_t>(*published.live_cuda_device_index)
+                                                         : mmltk::live::kLivePipelineUnknownCudaDevice);
+    }
+}
+
 void App::apply_browser_intent(const mmltk::browser::IntentMessage& intent) {
     const mmltk::browser::RoutedIntent routed = mmltk::browser::route_intent(intent);
+    impl_->write_e2e_intent_trace(routed, intent.payload);
     const auto make_gui_snapshot = [this]() { return make_gui_settings_snapshot(); };
     const auto apply_settings_patch = [this, &make_gui_snapshot](const nlohmann::json& patch) {
         if (!patch.is_object() || patch.empty()) {
@@ -1897,6 +2519,12 @@ void App::apply_browser_intent(const mmltk::browser::IntentMessage& intent) {
                     });
     };
 
+    if (const auto* workspace_renderer = std::get_if<mmltk::browser::WorkspaceRendererEventIntent>(&routed.payload);
+        workspace_renderer != nullptr) {
+        apply_workspace_renderer_event(*workspace_renderer, routed.intent);
+        return;
+    }
+
     if (const auto* settings = std::get_if<mmltk::browser::SettingsUpdateIntent>(&routed.payload);
         settings != nullptr) {
         apply_settings_patch(settings->patch);
@@ -1929,6 +2557,7 @@ void App::apply_browser_intent(const mmltk::browser::IntentMessage& intent) {
     if (std::holds_alternative<mmltk::browser::ToolSelectIntent>(routed.payload)) {
         apply_routed_host_intent();
         cancel_annotation_canvas_interactions();
+        invalidate_annotation_preview();
         return;
     }
 
@@ -1944,7 +2573,7 @@ void App::apply_browser_intent(const mmltk::browser::IntentMessage& intent) {
             const bool next_crop_overlay_mode = live_preview_controls->crop_overlay_mode.value();
             if (next_crop_overlay_mode && !can_toggle_full_frame) {
                 throw std::runtime_error(
-                    "browser live.preview.update full_frame requires a running live "
+                    "browser live.preview.full_frame_display requires a running live "
                     "video preview");
             }
             if (live_crop_overlay_mode_ != next_crop_overlay_mode) {
@@ -1959,6 +2588,7 @@ void App::apply_browser_intent(const mmltk::browser::IntentMessage& intent) {
         std::holds_alternative<mmltk::browser::AnnotateWorkspaceBoxDragIntent>(routed.payload) ||
         std::holds_alternative<mmltk::browser::AnnotateWorkspaceHandleDragIntent>(routed.payload) ||
         std::holds_alternative<mmltk::browser::AnnotateWorkspaceBrushIntent>(routed.payload) ||
+        std::holds_alternative<mmltk::browser::AnnotateWorkspacePointerIntent>(routed.payload) ||
         std::holds_alternative<mmltk::browser::AnnotateWorkspaceFillIntent>(routed.payload) ||
         std::holds_alternative<mmltk::browser::AnnotateWorkspaceColorSampleIntent>(routed.payload)) {
         apply_routed_host_intent();
@@ -2199,33 +2829,55 @@ void App::apply_browser_intent(const mmltk::browser::IntentMessage& intent) {
         const bool block_actions =
             job_.running || live_predict_running() || annotate_assist_running_ || annotate_save_running_;
         switch (annotate_setup->action) {
-            case mmltk::browser::AnnotateSetupAction::StartLive:
+            case mmltk::browser::AnnotateSetupAction::StartLive: {
+                const std::string device_path =
+                    "/dev/video" + std::to_string(std::max(0, annotate_.source.device_index));
+                mmltk::logging::logger("gui")->info(
+                    "browser annotate.live.start received: source={} device={} capture={}x{} fps={} buffers={} "
+                    "model_input={} analyzer_attached=false live_capture_supported={} running={} block_actions={}",
+                    source_kind_label(annotate_.source.kind), device_path, std::max(1, annotate_.source.capture_width),
+                    std::max(1, annotate_.source.capture_height), std::max(1, annotate_.source.capture_fps),
+                    std::max(1, annotate_.source.v4l2_buffer_count), model_input_log_name(annotate_.model_input),
+                    live_capture_supported(), annotation_live_running(), block_actions);
+                const auto fail_live_start = [this](std::string message) {
+                    annotate_live_startup_state_ = AnnotateLiveStartupState::Failed;
+                    annotate_live_start_error_ = std::move(message);
+                    annotate_save_error_ = annotate_live_start_error_;
+                    live_preview_error_ = annotate_live_start_error_;
+                    log_gui_error("annotate live start error", annotate_live_start_error_);
+                };
                 if (!live_video) {
-                    throw std::runtime_error(
-                        "browser annotate.setup start_live requires a video-stream "
-                        "annotate source");
+                    fail_live_start("browser annotate.setup start_live requires a video-stream annotate source");
+                    return;
                 }
                 if (!live_capture_supported()) {
-                    throw std::runtime_error(
-                        "browser annotate.setup start_live is not available in this "
-                        "build");
+                    fail_live_start("browser annotate.setup start_live is not available in this build");
+                    return;
                 }
                 if (annotation_live_running()) {
-                    throw std::runtime_error("browser annotate.setup start_live is already active");
+                    fail_live_start("browser annotate.setup start_live is already active");
+                    return;
                 }
                 if (block_actions) {
-                    throw std::runtime_error(
-                        "browser annotate.setup start_live is blocked while annotate "
-                        "shell actions are busy");
+                    fail_live_start(
+                        "browser annotate.setup start_live is blocked while annotate shell actions are busy");
+                    return;
+                }
+                if (const std::string live_source_error = validate_video_stream_source(annotate_.source);
+                    !live_source_error.empty()) {
+                    fail_live_start(live_source_error);
+                    return;
                 }
                 annotation_workflow_coordinator_->start_live_session();
                 if (!annotation_live_running()) {
-                    throw std::runtime_error(annotate_save_error_.empty()
-                                                 ? "browser annotate.setup start_live failed"
-                                                 : "browser annotate.setup start_live failed: " + annotate_save_error_);
+                    if (annotate_live_start_error_.empty()) {
+                        fail_live_start("browser annotate.setup start_live failed");
+                    }
                 }
                 return;
+            }
             case mmltk::browser::AnnotateSetupAction::StopLive:
+                annotate_live_start_error_.clear();
                 if (!annotation_live_running()) {
                     throw std::runtime_error("browser annotate.setup stop_live is not active");
                 }
@@ -2433,6 +3085,15 @@ void App::apply_browser_intent(const mmltk::browser::IntentMessage& intent) {
         queue_browser_viewport_commit(routed.workflow, *viewport);
         return;
     }
+
+    if (const auto* workspace_bounds = std::get_if<mmltk::browser::WorkspaceBoundsIntent>(&routed.payload);
+        workspace_bounds != nullptr) {
+        browser_workspace_bounds_state_ = BrowserWorkspaceBoundsState{
+            routed.workflow,
+            *workspace_bounds,
+        };
+        return;
+    }
 }
 
 void App::drain_background_work() {
@@ -2468,6 +3129,32 @@ void App::drain_background_work() {
             live_session_status_ = std::make_unique<mmltk::live::LiveSessionStatus>();
         }
         *live_session_status_ = live_controller_->snapshot_status();
+        refresh_annotate_live_startup_state(*live_session_status_);
+        if (now >= impl_->next_live_pipeline_status_log_) {
+            const frameshow::CaptureStats ingress_stats = live_controller_->ingress().snapshot_stats();
+            const BrowserPublicationState* published =
+                browser_publication_state_ == nullptr ? nullptr : browser_publication_state_.get();
+            mmltk::logging::logger("gui")->info(
+                "live pipeline progress: ingress queued={} dequeued={} inference_published={} "
+                "preview_published={} dropped={} inference_backpressure={} preview_backpressure={} "
+                "requeue_failures={} fanout_release_backlog={} acquire_misses={} compositor_frames={} "
+                "compositor_last_frame={} last_stage={} last_stage_frame={} retained_surfaces={} "
+                "renderer_releases={} post_startup_misses={}",
+                ingress_stats.queued_v4l2_buffers, ingress_stats.dequeued_v4l2_buffers,
+                ingress_stats.inference_frames_published, ingress_stats.preview_frames_published,
+                ingress_stats.frames_dropped, ingress_stats.inference_backpressure_drops,
+                ingress_stats.preview_backpressure_drops, ingress_stats.requeue_failures,
+                live_session_status_->release_backlog, live_session_status_->acquire_misses,
+                live_session_status_->compositor.frames_composited,
+                live_session_status_->compositor.last_frame_id.sequence, live_session_status_->last_stage_name,
+                live_session_status_->last_stage_frame_id.sequence,
+                published == nullptr ? 0U : published->retained_surfaces,
+                published == nullptr ? 0U : published->renderer_releases,
+                published == nullptr ? 0U : published->post_startup_workspace_acquisition_misses);
+            impl_->next_live_pipeline_status_log_ = now + std::chrono::seconds(1);
+        }
+    } else {
+        impl_->next_live_pipeline_status_log_ = {};
     }
 }
 
@@ -2633,16 +3320,22 @@ void App::launch_browser_file_dialog(const mmltk::browser::FileDialogRequestInte
     const std::string dialog_title = intent.title.empty() ? intent.dialog_id : intent.title;
     active_browser_dialog_id_ = intent.dialog_id;
     active_browser_dialog_title_ = dialog_title;
+    mmltk::logging::logger("gui")->info("browser file dialog request: id={} mode={} title={} initial_path={}",
+                                        intent.dialog_id, mmltk::browser::file_dialog_mode_name(intent.mode),
+                                        dialog_title, initial_path);
     mmltk::runtime::submit_background_task(
         background_executor_, ui_callbacks_,
         [dialog_title, initial_path, mode = file_picker_mode(), filters = std::move(filters)]() {
             return pick_path_with_dialog(dialog_title.c_str(), initial_path, mode, filters);
         },
-        [this, binding](std::optional<std::string> picked) {
+        [this, binding, dialog_id = intent.dialog_id](std::optional<std::string> picked) {
             if (picked.has_value()) {
+                mmltk::logging::logger("gui")->info("browser file dialog selected: id={} path={}", dialog_id, *picked);
                 mmltk::browser::apply_browser_file_dialog_selection(
                     binding, std::move(*picked),
                     mmltk::browser::BrowserFileDialogStateAccess{&train_, &predict_, &annotate_, &validate_, &export_});
+            } else {
+                mmltk::logging::logger("gui")->info("browser file dialog cancelled: id={}", dialog_id);
             }
             picker_error_.clear();
             if (active_file_browse_field_ == FileBrowseField::BrowserDialog) {
@@ -2651,8 +3344,9 @@ void App::launch_browser_file_dialog(const mmltk::browser::FileDialogRequestInte
             active_browser_dialog_id_.clear();
             active_browser_dialog_title_.clear();
         },
-        [this](const std::string& error) {
+        [this, dialog_id = intent.dialog_id](const std::string& error) {
             picker_error_ = error;
+            log_gui_error("browser file dialog error", std::format("{}: {}", dialog_id, error));
             if (active_file_browse_field_ == FileBrowseField::BrowserDialog) {
                 active_file_browse_field_ = FileBrowseField::None;
             }
@@ -2740,6 +3434,9 @@ std::string App::snapshot_job_output() {
 
 void AnnotationWorkflowCoordinator::invalidate_preview() {
     invalidate_annotation_workflow_preview(app_.annotate_workflow_);
+    if (live_running()) {
+        (void)publish_live_manual_overlay();
+    }
 }
 
 void AnnotationWorkflowCoordinator::cancel_canvas_interactions() {
@@ -2902,6 +3599,10 @@ void AnnotationWorkflowCoordinator::reset_live_session_state(const bool clear_li
         app_.live_controller_.reset();
     }
     app_.live_session_status_.reset();
+    app_.annotation_live_session_running_for_testing_ = false;
+    app_.annotate_live_startup_state_ = AnnotateLiveStartupState::Idle;
+    app_.annotate_live_startup_deadline_ = {};
+    app_.annotate_live_drawable_revision_ = 0;
     app_.annotate_frame_.reset();
     app_.annotate_resolved_instances_.clear();
     reset_annotation_workflow_preview(app_.annotate_workflow_, false);
@@ -3063,8 +3764,24 @@ void AnnotationWorkflowCoordinator::submit_preview() {
         });
 }
 
+bool AnnotationWorkflowCoordinator::publish_live_manual_overlay() {
+    if (!live_running() || app_.live_controller_ == nullptr) {
+        return false;
+    }
+    const AnnotationFrame* frame_ptr = annotation_frame_ptr(app_.annotate_frame_);
+    if (frame_ptr == nullptr) {
+        return false;
+    }
+    return publish_annotation_workflow_live_manual_overlay(
+        app_.annotate_workflow_, app_.annotate_document_, app_.annotate_session_, *frame_ptr,
+        [this](mmltk::live::ManualOverlayDocumentSnapshot snapshot) {
+            app_.live_controller_->manual_overlay_document().publish_snapshot(std::move(snapshot));
+        });
+}
+
 bool AnnotationWorkflowCoordinator::live_running() const {
-    return app_.active_live_mode_ == App::ActiveLiveMode::Annotate && app_.live_controller_ != nullptr;
+    return app_.active_live_mode_ == App::ActiveLiveMode::Annotate &&
+           (app_.live_controller_ != nullptr || app_.annotation_live_session_running_for_testing_);
 }
 
 bool AnnotationWorkflowCoordinator::ensure_live_annotation_frame_pixels(std::string* error_message) const {
@@ -3119,9 +3836,11 @@ bool AnnotationWorkflowCoordinator::launch_save(AnnotationSaveSnapshot save_snap
 
 void AnnotationWorkflowCoordinator::poll() {
     if (live_running()) {
-        std::optional<AnnotationFrame> synced_frame = app_.make_live_annotation_frame_from_preview();
-        if (synced_frame.has_value()) {
-            load_frame(std::move(*synced_frame));
+        if (app_.browser_live_workspace_surface_retained()) {
+            std::optional<AnnotationFrame> synced_frame = app_.make_live_annotation_frame_from_preview();
+            if (synced_frame.has_value()) {
+                load_frame(std::move(*synced_frame));
+            }
         }
         if (app_.live_controller_) {
             const std::string controller_error = app_.live_controller_->last_error();
@@ -3129,6 +3848,11 @@ void AnnotationWorkflowCoordinator::poll() {
                 app_.annotate_save_error_ = controller_error;
             }
         }
+        (void)publish_live_manual_overlay();
+    }
+
+    if (annotation_workflow_preview_pending(app_.annotate_workflow_, annotation_frame_ptr(app_.annotate_frame_))) {
+        submit_preview();
     }
 
     const AnnotationWorkflowPollPlan workflow_poll = plan_annotation_workflow_poll(make_save_request());
@@ -3171,44 +3895,69 @@ void AnnotationWorkflowCoordinator::start_live_session() {
     reset_live_session_state(true, App::ActiveLiveMode::None);
 
     app_.annotate_save_error_.clear();
+    app_.annotate_live_start_error_.clear();
+    app_.live_preview_error_.clear();
     try {
         if (app_.annotate_.source.kind != SourceKind::VideoStream) {
             throw std::runtime_error("annotation live capture requires a video source");
         }
 
-        mmltk::live::LiveSessionConfig session_config;
-        session_config.capture.device_path =
-            "/dev/video" + std::to_string(std::max(0, app_.annotate_.source.device_index));
-        session_config.capture.cuda_device_index = app_.annotate_.device_id;
-        session_config.capture.width = static_cast<std::uint32_t>(std::max(1, app_.annotate_.source.capture_width));
-        session_config.capture.height = static_cast<std::uint32_t>(std::max(1, app_.annotate_.source.capture_height));
-        session_config.capture.fps = static_cast<std::uint32_t>(std::max(1, app_.annotate_.source.capture_fps));
-        session_config.capture.v4l2_buffer_count =
-            static_cast<std::uint32_t>(std::max(1, app_.annotate_.source.v4l2_buffer_count));
-        session_config.capture.preview_buffer_count = 1U;
-        const mmltk::live::LiveCaptureRegion initial_region = full_capture_region_for_source(app_.annotate_.source);
-        session_config.capture.initial_region = frameshow::CaptureRegion{
-            initial_region.x,
-            initial_region.y,
-            initial_region.width,
-            initial_region.height,
-        };
-        session_config.detect_slot_count = 2U;
-        session_config.output_slot_count = 4U;
-        session_config.cuda_device_index = app_.annotate_.device_id;
+        const std::string device_path = "/dev/video" + std::to_string(std::max(0, app_.annotate_.source.device_index));
+        mmltk::live::LiveSessionConfig session_config = build_annotation_live_session_config(app_.annotate_);
+        mmltk::logging::logger("gui")->info(
+            "annotate live capture starting: device={} capture={}x{} fps={} v4l2_buffers={} "
+            "preview_buffers={} output_slots={} cuda_device={} model_input={} analyzer_attached=false "
+            "live_capture_supported={}",
+            session_config.capture.device_path, session_config.capture.width, session_config.capture.height,
+            session_config.capture.fps, session_config.capture.v4l2_buffer_count,
+            session_config.capture.preview_buffer_count, session_config.output_slot_count,
+            session_config.cuda_device_index, model_input_log_name(app_.annotate_.model_input),
+            live_capture_supported());
+
+        if (app_.impl_->annotation_live_session_start_override_) {
+            app_.impl_->annotation_live_session_start_override_(session_config);
+            auto status = std::make_unique<mmltk::live::LiveSessionStatus>();
+            status->running = true;
+            app_.live_session_status_ = std::move(status);
+            app_.annotation_live_session_running_for_testing_ = true;
+            app_.active_live_mode_ = App::ActiveLiveMode::Annotate;
+            app_.annotate_live_startup_state_ = AnnotateLiveStartupState::Drawable;
+            mmltk::logging::logger("gui")->info("annotate live capture started: device={}", device_path);
+            return;
+        }
 
         auto controller = std::make_unique<mmltk::live::LiveSessionController>(std::move(session_config));
-        controller->set_workspace_ready_callback(app_.live_workspace_ready_callback());
-        controller->start();
-        controller->manual_overlay_document().clear(
-            static_cast<std::uint32_t>(std::max(1, app_.annotate_.source.capture_width)),
-            static_cast<std::uint32_t>(std::max(1, app_.annotate_.source.capture_height)));
-        app_.live_session_status_ = std::make_unique<mmltk::live::LiveSessionStatus>(controller->snapshot_status());
         app_.live_controller_ = std::move(controller);
         app_.active_live_mode_ = App::ActiveLiveMode::Annotate;
+        app_.annotate_live_startup_state_ = AnnotateLiveStartupState::Starting;
+        app_.annotate_live_startup_deadline_ = std::chrono::steady_clock::now() + kAnnotateLiveStartupDeadline;
+        app_.annotate_live_drawable_revision_ = 0;
+        app_.live_controller_->set_workspace_ready_callback(app_.live_workspace_ready_callback());
+        app_.live_controller_->start();
+        app_.live_controller_->manual_overlay_document().clear(
+            static_cast<std::uint32_t>(std::max(1, app_.annotate_.source.capture_width)),
+            static_cast<std::uint32_t>(std::max(1, app_.annotate_.source.capture_height)));
+        app_.live_session_status_ =
+            std::make_unique<mmltk::live::LiveSessionStatus>(app_.live_controller_->snapshot_status());
+        app_.refresh_annotate_live_startup_state(*app_.live_session_status_);
+        mmltk::logging::logger("gui")->info("annotate live capture started: device={}", device_path);
     } catch (const std::exception& error) {
+        if (app_.live_controller_) {
+            try {
+                app_.live_controller_->stop();
+            } catch (const std::exception& stop_error) {
+                log_gui_error("annotate live stop after start failure", stop_error.what());
+            }
+            app_.live_controller_.reset();
+        }
         app_.active_live_mode_ = App::ActiveLiveMode::None;
+        app_.live_session_status_.reset();
+        app_.annotation_live_session_running_for_testing_ = false;
+        app_.annotate_live_startup_state_ = AnnotateLiveStartupState::Failed;
         app_.annotate_save_error_ = error.what();
+        app_.annotate_live_start_error_ = error.what();
+        app_.live_preview_error_ = error.what();
+        log_gui_error("annotate live start error", app_.annotate_live_start_error_);
     }
 }
 
@@ -3232,6 +3981,11 @@ bool App::annotation_live_running() const {
     return annotation_workflow_coordinator_->live_running();
 }
 
+void App::set_annotation_live_session_start_override_for_testing(
+    std::function<void(const mmltk::live::LiveSessionConfig&)> callback) {
+    impl_->annotation_live_session_start_override_ = std::move(callback);
+}
+
 void App::poll_annotate_work() {
     annotation_workflow_coordinator_->poll();
 }
@@ -3253,44 +4007,39 @@ std::optional<AnnotationFrame> App::make_live_annotation_frame_from_preview() co
         return std::nullopt;
     }
 
-    mmltk::live::WorkspaceOutputBundle output_bundle{};
-    if (!live_controller_->try_acquire_latest_workspace(&output_bundle)) {
+    const mmltk::live::WorkspacePresentSnapshot present = live_controller_->latest_workspace_present();
+    if (!present.valid) {
         return std::nullopt;
     }
-    const auto release_workspace_slot = [this, slot_index = output_bundle.slot_index]() {
-        live_controller_->release_workspace(slot_index);
-    };
 
     const mmltk::live::LiveCaptureRegion region =
-        preview_region_for_source(output_bundle.region, annotate_.source, annotate_.full_frame);
+        preview_region_for_source(present.source_region, annotate_.source, annotate_.full_frame);
     const mmltk::live::LiveCaptureRegion displayed_region{
         region.x,
         region.y,
-        region.width == 0U ? output_bundle.dims.width : region.width,
-        region.height == 0U ? output_bundle.dims.height : region.height,
+        region.width == 0U ? present.dims.width : region.width,
+        region.height == 0U ? present.dims.height : region.height,
     };
     const AnnotationFrame* current_annotation_frame = optional_value_ptr(annotate_frame_);
-    if (current_annotation_frame != nullptr && current_annotation_frame->live_frame_id == output_bundle.frame_id &&
+    if (current_annotation_frame != nullptr && current_annotation_frame->live_frame_id == present.frame_id &&
         current_annotation_frame->view_x == displayed_region.x &&
         current_annotation_frame->view_y == displayed_region.y &&
         current_annotation_frame->width == displayed_region.width &&
         current_annotation_frame->height == displayed_region.height) {
-        release_workspace_slot();
         return std::nullopt;
     }
 
     AnnotationFrame frame;
     frame.source_name = "live";
     frame.source_path = "/dev/video" + std::to_string(std::max(0, annotate_.source.device_index));
-    frame.frame_id = output_bundle.frame_id.sequence;
-    frame.live_frame_id = output_bundle.frame_id;
+    frame.frame_id = present.frame_id.sequence;
+    frame.live_frame_id = present.frame_id;
     frame.width = displayed_region.width;
     frame.height = displayed_region.height;
     frame.view_x = displayed_region.x;
     frame.view_y = displayed_region.y;
     frame.capture_width = static_cast<std::uint32_t>(std::max(1, annotate_.source.capture_width));
     frame.capture_height = static_cast<std::uint32_t>(std::max(1, annotate_.source.capture_height));
-    release_workspace_slot();
     return frame;
 }
 
@@ -3339,15 +4088,62 @@ void App::reset_live_predict_preview_state(const bool clear_frame) {
     live_crop_drag_session_ = {};
 }
 
+void App::refresh_annotate_live_startup_state(const mmltk::live::LiveSessionStatus& status) {
+#if MMLTK_RFDETR_LIVE_CAPTURE
+    if (active_live_mode_ != ActiveLiveMode::Annotate || live_controller_ == nullptr ||
+        annotate_live_startup_state_ != AnnotateLiveStartupState::Starting) {
+        return;
+    }
+    if (!status.last_error.empty()) {
+        annotate_live_startup_state_ = AnnotateLiveStartupState::Failed;
+        annotate_live_start_error_ = status.last_error;
+        live_preview_error_ = status.last_error;
+        log_gui_error("annotate live start error", annotate_live_start_error_);
+        return;
+    }
+    if (std::chrono::steady_clock::now() < annotate_live_startup_deadline_) {
+        return;
+    }
+    const BrowserLivePublicationFailureContext failure =
+        browser_live_workspace_acquisition_failure_context(status, mmltk::live::kLivePipelineUnknownCudaDevice);
+    std::string message = "annotate live did not publish a workspace surface before startup deadline: ";
+    message += failure.result_detail;
+    annotate_live_startup_state_ = AnnotateLiveStartupState::Failed;
+    annotate_live_start_error_ = std::move(message);
+    live_preview_error_ = annotate_live_start_error_;
+    log_gui_error("annotate live start error", annotate_live_start_error_);
+#else
+    (void)status;
+#endif
+}
+
+void App::mark_annotate_live_drawable(const mmltk::live::LiveFrameId& frame_id) {
+#if MMLTK_RFDETR_LIVE_CAPTURE
+    if (active_live_mode_ != ActiveLiveMode::Annotate || live_controller_ == nullptr) {
+        return;
+    }
+    if (annotate_live_startup_state_ != AnnotateLiveStartupState::Drawable) {
+        mmltk::logging::logger("gui")->info("annotate live drawable: frame={} revision={}", frame_id.sequence,
+                                            frame_id.sequence);
+    }
+    annotate_live_startup_state_ = AnnotateLiveStartupState::Drawable;
+    annotate_live_drawable_revision_ = frame_id.sequence;
+    annotate_live_start_error_.clear();
+    live_preview_error_.clear();
+#else
+    (void)frame_id;
+#endif
+}
+
 mmltk::live::LiveSessionController* App::active_browser_live_controller() noexcept {
 #if MMLTK_RFDETR_LIVE_CAPTURE
     if (active_live_mode_ == ActiveLiveMode::Annotate) {
         return live_controller_.get();
     }
-    if (mmltk::live::LiveSessionController* controller = live_predict_controller_.controller(); controller != nullptr) {
-        return controller;
+    if (active_live_mode_ == ActiveLiveMode::Predict) {
+        return live_predict_controller_.controller();
     }
-    return live_controller_.get();
+    return nullptr;
 #else
     return nullptr;
 #endif
@@ -3363,44 +4159,166 @@ void App::refresh_browser_live_frame_publications(mmltk::live::LiveSessionContro
     BrowserPublicationState& published = *browser_publication_state_;
     if (published.live_controller != browser_live_controller) {
         release_browser_live_frame_slots();
+        clear_browser_renderer_stage_state(published);
+        clear_browser_publication_failure(published);
         published.live_controller = browser_live_controller;
     }
     if (browser_live_controller == nullptr) {
+        if (active_live_mode_ != ActiveLiveMode::None) {
+            record_browser_publication_failure(published, BrowserWorkspaceSurfaceOwner::Live, "no_controller",
+                                               "active live mode has no controller", {}, browser_preview_error, false,
+                                               &live_preview_error_);
+        }
         return;
     }
 
-    const int live_cuda_device_index = published.live_cuda_device_index.value_or(predict_.device_id);
-    mmltk::live::ensure_cuda_ok(cudaSetDevice(live_cuda_device_index),
-                                "cudaSetDevice for browser live frame publication");
-    mmltk::live::WorkspaceOutputBundle workspace_bundle{};
-    if (browser_live_controller->try_acquire_latest_workspace(&workspace_bundle)) {
-        const std::uint32_t workspace_slot_index = workspace_bundle.slot_index;
-        try {
-            if (live_frame_not_newer_than_current_publication(published.workspace_surface_bridge,
-                                                              workspace_bundle.frame_id)) {
-                release_live_workspace_slot_silently(browser_live_controller, workspace_slot_index);
-                return;
-            }
-            const mmltk::browser::FrameSlotDescriptor descriptor =
-                mmltk::browser::frame_slot_from_workspace_output_bundle(
-                    "workspace", mmltk::browser::FrameTransportKind::CudaDeviceBuffer,
-                    mmltk::browser::FramePixelFormat::Rgba8, workspace_bundle);
-            publish_workspace_surface(
-                published.workspace_surface_bridge, BrowserWorkspaceSurfaceOwner::Live,
-                make_retained_browser_imported_frame_source(descriptor, workspace_bundle, live_cuda_device_index),
-                [browser_live_controller, workspace_slot_index]() noexcept {
-                    release_live_workspace_slot_silently(browser_live_controller, workspace_slot_index);
-                },
-                workspace_bundle.frame_id);
-        } catch (...) {
-            release_live_workspace_slot_silently(browser_live_controller, workspace_slot_index);
-            throw;
+    const BrowserLivePublicationMode live_publication_mode = [this]() {
+        if (active_live_mode_ == ActiveLiveMode::Annotate) {
+            return BrowserLivePublicationMode::Annotate;
         }
+        if (active_live_mode_ == ActiveLiveMode::Predict) {
+            return BrowserLivePublicationMode::Predict;
+        }
+        return BrowserLivePublicationMode::None;
+    }();
+    const int live_cuda_device_index = browser_live_publication_cuda_device_index(
+        live_publication_mode, annotate_.device_id, predict_.device_id, published.live_cuda_device_index);
+    published.live_cuda_device_index = live_cuda_device_index;
+
+    const auto has_current_live_surface = [&published]() noexcept {
+        return published.workspace_surface_bridge.owner() == BrowserWorkspaceSurfaceOwner::Live &&
+               published.workspace_surface_bridge.preview().has_frame;
+    };
+    const auto note_workspace_acquisition_miss = [&published](const mmltk::live::LiveSessionStatus& status) noexcept {
+        if (status.first_workspace_publication_ready || status.pipeline.first_workspace_publication_ready) {
+            published.post_startup_workspace_acquisition_misses += 1U;
+            return;
+        }
+        published.startup_workspace_acquisition_misses += 1U;
+    };
+
+    published.attempted_workspace_acquisitions += 1U;
+    const mmltk::live::WorkspacePresentSnapshot present = browser_live_controller->latest_workspace_present();
+    if (!present.valid) {
+        const mmltk::live::LiveSessionStatus status = browser_live_controller->snapshot_status();
+        note_workspace_acquisition_miss(status);
+        const BrowserLiveWorkspaceAcquisitionMissDecision decision = browser_live_workspace_acquisition_miss_decision(
+            status, static_cast<std::uint32_t>(live_cuda_device_index), "no persistent workspace present");
+        if (!decision.record_failure) {
+            const std::uint64_t miss_count =
+                status.first_workspace_publication_ready || status.pipeline.first_workspace_publication_ready
+                    ? published.post_startup_workspace_acquisition_misses
+                    : published.startup_workspace_acquisition_misses;
+            if (miss_count <= 3U || miss_count % 300U == 0U) {
+                const BrowserLivePublicationFailureContext& failure = decision.failure;
+                const std::string live_frame_label = failure.live_frame_id.has_value()
+                                                         ? std::to_string(failure.live_frame_id->sequence)
+                                                         : std::string("unknown");
+                mmltk::logging::logger("gui")->info(
+                    "browser live workspace present pending: attempts={} misses={} stage={} live_frame={} "
+                    "cuda_device={} detail={}",
+                    published.attempted_workspace_acquisitions, miss_count,
+                    mmltk::live::live_pipeline_stage_name(failure.stage), live_frame_label,
+                    browser_live_publication_cuda_device_label(failure.cuda_device_index), failure.result_detail);
+            }
+            return;
+        }
+        const bool has_live_surface = has_current_live_surface();
+        const BrowserLivePublicationFailureContext& failure = decision.failure;
+        record_browser_publication_failure(
+            published, BrowserWorkspaceSurfaceOwner::Live, kBrowserLiveNoWorkspaceOutputResultCode,
+            failure.result_detail, failure.revision, has_live_surface ? nullptr : browser_preview_error,
+            !has_live_surface, has_live_surface ? nullptr : &live_preview_error_, !has_live_surface, failure.stage,
+            failure.live_frame_id, failure.cuda_device_index);
+        return;
     }
-    if (browser_preview_error != nullptr &&
-        !(published.workspace_surface_bridge.owner() == BrowserWorkspaceSurfaceOwner::Live &&
-          published.workspace_surface_bridge.preview().has_frame)) {
-        *browser_preview_error = browser_live_controller->last_error();
+
+    mmltk::live::WorkspaceSwapchainDescriptor swapchain_descriptor;
+    try {
+        const std::optional<mmltk::live::WorkspaceSwapchainDescriptor>& current_swapchain =
+            published.workspace_surface_bridge.swapchain_descriptor();
+        if (!current_swapchain.has_value() || current_swapchain->generation != present.swapchain_generation) {
+            swapchain_descriptor = browser_live_controller->workspace_swapchain_descriptor();
+            if (!swapchain_descriptor.valid()) {
+                throw std::runtime_error("live compositor has not published a valid persistent workspace swapchain");
+            }
+            if (swapchain_descriptor.generation != present.swapchain_generation) {
+                throw std::runtime_error("live compositor swapchain descriptor generation does not match present");
+            }
+            if (!workspace_swapchain_descriptor_matches(current_swapchain, swapchain_descriptor)) {
+                const std::uint64_t generation = swapchain_descriptor.generation;
+                const std::size_t slot_count = swapchain_descriptor.slots.size();
+                const std::uint32_t width = swapchain_descriptor.width;
+                const std::uint32_t height = swapchain_descriptor.height;
+                published.workspace_surface_bridge.configure_swapchain(BrowserWorkspaceSurfaceOwner::Live,
+                                                                       std::move(swapchain_descriptor));
+                mmltk::logging::logger("gui")->info(
+                    "browser live workspace swapchain configured: generation={} slots={} dimensions={}x{}",
+                    generation, slot_count, width, height);
+            }
+        }
+    } catch (const std::exception& error) {
+        record_browser_publication_failure(
+            published, BrowserWorkspaceSurfaceOwner::Live, "swapchain_descriptor_failure", error.what(),
+            std::to_string(present.revision), browser_preview_error, true, &live_preview_error_, true,
+            mmltk::live::LivePipelineStage::BrowserRetainSurface, present.frame_id,
+            static_cast<std::uint32_t>(live_cuda_device_index));
+        return;
+    }
+
+    const std::string workspace_revision = std::to_string(present.revision);
+    if (live_frame_not_newer_than_current_publication(published.workspace_surface_bridge, present.frame_id)) {
+        published.rejected_stale_frames += 1U;
+        if (should_log_browser_publication_cadence(published.rejected_stale_frames)) {
+            const std::optional<mmltk::live::LiveFrameId>& current =
+                published.workspace_surface_bridge.preview().live_frame_id;
+            mmltk::logging::logger("gui")->info(
+                "browser live workspace present skipped stale frame: frame={} current_frame={} revision={} "
+                "rejected_stale_frames={} retained={} attempts={}",
+                present.frame_id.sequence, current.has_value() ? current->sequence : 0U, workspace_revision,
+                published.rejected_stale_frames, published.retained_surfaces,
+                published.attempted_workspace_acquisitions);
+        }
+        return;
+    }
+
+    if (!published.workspace_surface_bridge.present_swapchain(BrowserWorkspaceSurfaceOwner::Live, present)) {
+        record_browser_publication_failure(
+            published, BrowserWorkspaceSurfaceOwner::Live, "swapchain_present_failure",
+            "persistent workspace present did not match the configured swapchain", workspace_revision,
+            browser_preview_error, true, &live_preview_error_, true,
+            mmltk::live::LivePipelineStage::BrowserRetainSurface, present.frame_id,
+            static_cast<std::uint32_t>(live_cuda_device_index));
+        return;
+    }
+
+    try {
+        browser_live_controller->record_pipeline_stage(mmltk::live::LivePipelineStage::BrowserRetainSurface,
+                                                       present.frame_id, present.revision, present.capture_ns);
+        published.retained_surfaces += 1U;
+        if (published.retained_surfaces <= 3U || published.retained_surfaces % 300U == 0U) {
+            mmltk::logging::logger("gui")->info(
+                "browser live workspace native-presented: frame={} revision={} slot={} retained={} attempts={} "
+                "post_startup_misses={}",
+                present.frame_id.sequence, workspace_revision, present.front_slot_index,
+                published.retained_surfaces, published.attempted_workspace_acquisitions,
+                published.post_startup_workspace_acquisition_misses);
+        }
+        if (std::string_view{published.last_failure_reason} == kBrowserLiveNoWorkspaceOutputResultCode &&
+            (published.last_failure_revision.empty() || published.last_failure_revision == workspace_revision)) {
+            clear_browser_publication_failure(published);
+        }
+        live_preview_error_.clear();
+        if (active_live_mode_ == ActiveLiveMode::Annotate) {
+            mark_annotate_live_drawable(present.frame_id);
+        }
+    } catch (const std::exception& error) {
+        record_browser_publication_failure(
+            published, BrowserWorkspaceSurfaceOwner::Live, "native_present_record_failure", error.what(), workspace_revision,
+            browser_preview_error, true, &live_preview_error_, true,
+            mmltk::live::LivePipelineStage::BrowserRetainSurface, present.frame_id,
+            static_cast<std::uint32_t>(live_cuda_device_index));
+        return;
     }
 #else
     (void)browser_live_controller;
@@ -3414,25 +4332,32 @@ void App::release_browser_live_frame_slots() {
     }
 
     BrowserPublicationState& published = *browser_publication_state_;
-    if (published.live_cuda_device_index.has_value()) {
-        mmltk::live::ensure_cuda_ok(cudaSetDevice(*published.live_cuda_device_index),
-                                    "cudaSetDevice for browser live frame release");
-    }
     published.workspace_surface_bridge.clear_if_owner(BrowserWorkspaceSurfaceOwner::Live);
+    clear_browser_renderer_stage_state(published);
     published.live_controller = nullptr;
     published.live_cuda_device_index.reset();
 }
 
 void App::clear_browser_predict_publication() {
     if (browser_publication_state_ != nullptr) {
+        const bool owned =
+            browser_publication_state_->workspace_surface_bridge.owner() == BrowserWorkspaceSurfaceOwner::PredictStatic;
         browser_publication_state_->workspace_surface_bridge.clear_if_owner(
             BrowserWorkspaceSurfaceOwner::PredictStatic);
+        if (owned) {
+            clear_browser_renderer_stage_state(*browser_publication_state_);
+        }
     }
 }
 
 void App::clear_browser_annotate_publications() {
     if (browser_publication_state_ != nullptr) {
+        const bool owned =
+            browser_publication_state_->workspace_surface_bridge.owner() == BrowserWorkspaceSurfaceOwner::Annotate;
         browser_publication_state_->workspace_surface_bridge.clear_if_owner(BrowserWorkspaceSurfaceOwner::Annotate);
+        if (owned) {
+            clear_browser_renderer_stage_state(*browser_publication_state_);
+        }
     }
 }
 
@@ -3558,7 +4483,10 @@ void App::launch_live_predict_session() {
             refresh_live_workspace_ready_callbacks();
             current_view_ = View::Live;
         },
-        [this](const std::string& error) { log_gui_error("live start error", error); });
+        [this](const std::string& error) {
+            live_preview_error_ = error;
+            log_gui_error("live start error", error);
+        });
 }
 
 void App::stop_live_predict_session() {
@@ -3651,8 +4579,13 @@ bool AnnotationWorkflowCoordinator::request_save_now() {
 #undef annotate_save_running_
 #undef annotate_save_summary_
 #undef annotate_save_error_
+#undef annotate_live_start_error_
+#undef annotate_live_startup_state_
+#undef annotate_live_startup_deadline_
+#undef annotate_live_drawable_revision_
 #undef live_controller_
 #undef live_session_status_
+#undef annotation_live_session_running_for_testing_
 #undef active_live_mode_
 #undef ui_callbacks_
 #undef background_executor_
@@ -3676,5 +4609,6 @@ bool AnnotationWorkflowCoordinator::request_save_now() {
 #undef annotation_workflow_coordinator_
 #undef browser_publication_state_
 #undef browser_workspace_viewport_state_
+#undef browser_workspace_bounds_state_
 
 }  // namespace mmltk::gui

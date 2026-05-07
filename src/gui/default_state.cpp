@@ -23,7 +23,6 @@ void apply_default_gui_state(std::string& selected_preset_name, TrainViewState& 
     validate.compiled_path = "./compiled-seg-medium-synth/val.bin";
     predict.source.compiled_path = "./compiled-seg-medium-synth/val.bin";
     predict.weights_path = train.weights_path;
-    annotate.weights_path = train.weights_path;
 
     predict.source.kind = SourceKind::CompiledDataset;
     annotate.source.kind = SourceKind::ImageFolder;

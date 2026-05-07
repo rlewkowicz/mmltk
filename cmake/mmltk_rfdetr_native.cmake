@@ -218,7 +218,25 @@ function(mmltk_configure_rfdetr_native)
     )
 
     if(MMLTK_RFDETR_LIVE_CAPTURE_ENABLED)
+        find_path(MMLTK_GBM_INCLUDE_DIR gbm.h)
+        find_library(MMLTK_GBM_LIBRARY NAMES gbm)
+        find_path(MMLTK_DRM_INCLUDE_DIR drm_fourcc.h PATH_SUFFIXES libdrm drm)
+        find_library(MMLTK_DRM_LIBRARY NAMES drm)
+        find_path(MMLTK_EGL_INCLUDE_DIR EGL/egl.h)
+        find_library(MMLTK_EGL_LIBRARY NAMES EGL)
+        if(NOT MMLTK_GBM_INCLUDE_DIR OR NOT MMLTK_GBM_LIBRARY)
+            message(FATAL_ERROR "MMLTK live workspace DMA-BUF surfaces require libgbm development headers and library.")
+        endif()
+        if(NOT MMLTK_DRM_INCLUDE_DIR OR NOT MMLTK_DRM_LIBRARY)
+            message(FATAL_ERROR "MMLTK live workspace DMA-BUF surfaces require libdrm development headers and library.")
+        endif()
+        if(NOT MMLTK_EGL_INCLUDE_DIR OR NOT MMLTK_EGL_LIBRARY)
+            message(FATAL_ERROR "MMLTK live workspace DMA-BUF surfaces require EGL development headers and library.")
+        endif()
+
         add_library(mmltk_live_runtime STATIC
+            src/live/dmabuf_cuda_surface.cpp
+            src/live/live_pipeline_trace.cpp
             src/live/live_video_ingress.cpp
             src/live/live_frame_fanout.cpp
             src/live/manual_overlay_document.cpp
@@ -226,12 +244,16 @@ function(mmltk_configure_rfdetr_native)
             src/live/live_manual_overlay_worker.cpp
             src/live/live_compositor.cpp
             src/live/live_session_controller.cpp
+            src/live/synthetic_workspace_surface.cpp
         )
         target_include_directories(mmltk_live_runtime
             PUBLIC
                 ${CMAKE_SOURCE_DIR}/include
             PRIVATE
                 ${CMAKE_SOURCE_DIR}/src
+                ${MMLTK_EGL_INCLUDE_DIR}
+                ${MMLTK_GBM_INCLUDE_DIR}
+                ${MMLTK_DRM_INCLUDE_DIR}
         )
         target_link_libraries(mmltk_live_runtime
             PUBLIC
@@ -239,6 +261,10 @@ function(mmltk_configure_rfdetr_native)
                 mmltk_live_capture
                 CUDA::cudart
             PRIVATE
+                CUDA::cuda_driver
+                ${MMLTK_EGL_LIBRARY}
+                ${MMLTK_GBM_LIBRARY}
+                ${MMLTK_DRM_LIBRARY}
                 mmltk_logging
         )
         mmltk_enable_torch(mmltk_live_runtime PRIVATE)

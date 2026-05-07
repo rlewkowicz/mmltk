@@ -104,13 +104,19 @@ constexpr ExtendedMultResult<UInt> extendedMult(UInt lhs, UInt rhs) {
 }
 
 template <typename TargetType, typename Generator>
-std::enable_if_t<sizeof(typename Generator::result_type) >= sizeof(TargetType), TargetType> fillBitsFrom(
-    Generator& gen) {
+constexpr void requireFullRangeUnsignedGenerator() {
     using gresult_type = typename Generator::result_type;
     static_assert(std::is_unsigned<TargetType>::value, "Only unsigned integers are supported");
     static_assert(Generator::min() == 0 && Generator::max() == static_cast<gresult_type>(-1),
                   "Generator must be able to output all numbers in its result type (effectively it must be a random "
                   "bit generator)");
+}
+
+template <typename TargetType, typename Generator>
+std::enable_if_t<sizeof(typename Generator::result_type) >= sizeof(TargetType), TargetType> fillBitsFrom(
+    Generator& gen) {
+    using gresult_type = typename Generator::result_type;
+    requireFullRangeUnsignedGenerator<TargetType, Generator>();
 
     constexpr auto generated_bits = sizeof(gresult_type) * CHAR_BIT;
     constexpr auto return_bits = sizeof(TargetType) * CHAR_BIT;
@@ -122,10 +128,7 @@ template <typename TargetType, typename Generator>
 std::enable_if_t<sizeof(typename Generator::result_type) < sizeof(TargetType), TargetType> fillBitsFrom(
     Generator& gen) {
     using gresult_type = typename Generator::result_type;
-    static_assert(std::is_unsigned<TargetType>::value, "Only unsigned integers are supported");
-    static_assert(Generator::min() == 0 && Generator::max() == static_cast<gresult_type>(-1),
-                  "Generator must be able to output all numbers in its result type (effectively it must be a random "
-                  "bit generator)");
+    requireFullRangeUnsignedGenerator<TargetType, Generator>();
 
     constexpr auto generated_bits = sizeof(gresult_type) * CHAR_BIT;
     constexpr auto return_bits = sizeof(TargetType) * CHAR_BIT;

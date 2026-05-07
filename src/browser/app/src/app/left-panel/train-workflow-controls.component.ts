@@ -34,13 +34,12 @@ export class TrainWorkflowControlsComponent {
   protected readonly textFields: ReadonlyArray<
     WorkflowTextFieldConfig<TrainTextField>
   > = [
-    { label: "Selected Preset", field: "selectedPreset", wide: true },
-    { label: "Train Compiled", field: "trainCompiledPath", wide: true },
-    { label: "Val Compiled", field: "valCompiledPath", wide: true },
-    { label: "Test Compiled", field: "testCompiledPath", wide: true },
-    { label: "Weights Path", field: "weightsPath", wide: true },
-    { label: "Resume Path", field: "resumePath", wide: true },
-    { label: "Output Dir", field: "outputDir", wide: true },
+    { label: "Train Compiled", field: "trainCompiledPath", wide: true, browseAction: "trainCompiledPath" },
+    { label: "Val Compiled", field: "valCompiledPath", wide: true, browseAction: "valCompiledPath" },
+    { label: "Test Compiled", field: "testCompiledPath", wide: true, browseAction: "testCompiledPath" },
+    { label: "Weights Path", field: "weightsPath", wide: true, browseAction: "weightsPath" },
+    { label: "Resume Path", field: "resumePath", wide: true, browseAction: "resumePath" },
+    { label: "Output Dir", field: "outputDir", wide: true, browseAction: "outputDir" },
     { label: "CPU Affinity", field: "cpuAffinity", wide: true },
     { label: "Batch Size", field: "batchSize", inputmode: "numeric" },
     { label: "Val Batch Size", field: "valBatchSize", inputmode: "numeric" },
@@ -82,14 +81,7 @@ export class TrainWorkflowControlsComponent {
   ];
   protected readonly browseActions: ReadonlyArray<
     WorkflowActionButtonConfig<TrainBrowseField>
-  > = [
-    { label: "Train Data", action: "trainCompiledPath" },
-    { label: "Val Data", action: "valCompiledPath" },
-    { label: "Test Data", action: "testCompiledPath" },
-    { label: "Weights", action: "weightsPath" },
-    { label: "Resume", action: "resumePath" },
-    { label: "Output Dir", action: "outputDir" },
-  ];
+  > = [];
   protected readonly readTextField = (field: string): string =>
     this.store.draft()[field as TrainTextField];
   protected readonly writeTextField = (field: string, value: string): void => {

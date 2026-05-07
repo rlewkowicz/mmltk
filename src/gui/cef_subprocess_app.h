@@ -23,8 +23,8 @@ enum class CefWebGpuRuntime : std::uint8_t {
 };
 
 struct CefRuntimeLaunchConfig {
-    CefWebGpuRuntime webgpu_runtime = CefWebGpuRuntime::Vulkan;
-    bool enable_unsafe_webgpu = false;
+    CefWebGpuRuntime webgpu_runtime = CefWebGpuRuntime::Auto;
+    bool enable_unsafe_webgpu = true;
     bool force_high_performance_gpu = false;
 };
 
@@ -53,23 +53,25 @@ void install_renderer_bridge_in_context(const CefRefPtr<CefBrowser>& browser, co
 void install_ready_watcher_in_context(const CefRefPtr<CefBrowser>& browser, const CefRefPtr<CefFrame>& frame,
                                       const CefRefPtr<CefV8Context>& context);
 
-inline void install_renderer_workspace_context(CefWorkspaceGpuBridge& bridge, CefRefPtr<CefBrowser> browser,
-                                               CefRefPtr<CefFrame> frame, CefRefPtr<CefV8Context> context) {
+inline void install_renderer_workspace_context(CefWorkspaceGpuBridge& bridge, const CefRefPtr<CefBrowser>& browser,
+                                               const CefRefPtr<CefFrame>& frame,
+                                               const CefRefPtr<CefV8Context>& context) {
     install_renderer_bridge_in_context(browser, frame, context);
     bridge.install_in_context(browser, frame, context);
 }
 
-inline void release_renderer_workspace_context(CefWorkspaceGpuBridge& bridge, CefRefPtr<CefBrowser> browser,
-                                               CefRefPtr<CefFrame> frame, CefRefPtr<CefV8Context> context) {
+inline void release_renderer_workspace_context(CefWorkspaceGpuBridge& bridge, const CefRefPtr<CefBrowser>& browser,
+                                               const CefRefPtr<CefFrame>& frame,
+                                               const CefRefPtr<CefV8Context>& context) {
     (void)context;
     if (browser != nullptr && frame != nullptr && frame->IsMain()) {
         bridge.on_browser_destroyed(browser->GetIdentifier());
     }
 }
 
-inline bool dispatch_renderer_workspace_message(CefWorkspaceGpuBridge& bridge, CefRefPtr<CefBrowser> browser,
-                                                CefRefPtr<CefFrame> frame, CefProcessId source_process,
-                                                CefRefPtr<CefProcessMessage> message) {
+inline bool dispatch_renderer_workspace_message(CefWorkspaceGpuBridge& bridge, const CefRefPtr<CefBrowser>& browser,
+                                                const CefRefPtr<CefFrame>& frame, CefProcessId source_process,
+                                                const CefRefPtr<CefProcessMessage>& message) {
     return bridge.on_process_message_received(browser, frame, source_process, message);
 }
 

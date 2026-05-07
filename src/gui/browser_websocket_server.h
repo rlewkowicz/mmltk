@@ -27,7 +27,7 @@ class BrowserWebSocketServer {
     void publish_bridge_state(std::string message);
     void publish_snapshot(std::string message);
     void publish_surface_ready(std::string message);
-    void publish_error(std::string message);
+    void publish_error(const std::string& message);
 
    private:
     struct Impl;

@@ -18,6 +18,8 @@
   "include": [
     "src/app_shared.ts",
     "src/browser_shell_state.ts",
+    "src/host_api.generated.ts",
+    "src/workflow_contract.generated.ts",
     "src/types/wgsl.d.ts",
     "src/app/workspace/annotation-scene-overlay.ts",
     "src/host_api.ts",

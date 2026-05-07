@@ -58,12 +58,12 @@ type AnnotateBrowseField =
         </button>
       </div>
     }
-    @if (store.annotateControls().liveAnnotate.visible) {
-      <p class="section-copy">{{ store.annotateControls().liveAnnotate.summary }}</p>
+    @if (store.annotateLiveVisible()) {
+      <p class="section-copy">{{ store.annotateLiveSummary() }}</p>
       <div class="action-row">
         <button
           type="button"
-          [disabled]="!store.annotateControls().liveAnnotate.start.enabled"
+          [disabled]="!store.annotateLiveStartEnabled()"
           (click)="store.startLive()"
         >
           {{ store.annotateControls().liveAnnotate.start.label }}
@@ -127,10 +127,10 @@ export class AnnotateWorkflowControlsComponent {
   protected readonly textFields: ReadonlyArray<
     WorkflowTextFieldConfig<AnnotateTextField>
   > = [
-    { label: "Weights Path", field: "weightsPath", wide: true },
-    { label: "ONNX Path", field: "onnxPath", wide: true },
-    { label: "TensorRT Path", field: "tensorrtPath", wide: true },
-    { label: "Output Dir", field: "outputDir", wide: true },
+    { label: "Weights Path", field: "weightsPath", wide: true, browseAction: "weightsPath" },
+    { label: "ONNX Path", field: "onnxPath", wide: true, browseAction: "onnxPath" },
+    { label: "TensorRT Path", field: "tensorrtPath", wide: true, browseAction: "tensorrtPath" },
+    { label: "Output Dir", field: "outputDir", wide: true, browseAction: "outputDir" },
     { label: "Split", field: "split" },
     { label: "Backend", field: "backend" },
     { label: "Device", field: "deviceId", inputmode: "numeric" },
@@ -151,12 +151,7 @@ export class AnnotateWorkflowControlsComponent {
   ];
   protected readonly browseActions: ReadonlyArray<
     WorkflowActionButtonConfig<AnnotateBrowseField>
-  > = [
-    { label: "Weights", action: "weightsPath" },
-    { label: "ONNX", action: "onnxPath" },
-    { label: "TensorRT", action: "tensorrtPath" },
-    { label: "Output Dir", action: "outputDir" },
-  ];
+  > = [];
   protected readonly readTextField = (field: string): string =>
     this.store.draft()[field as AnnotateTextField];
   protected readonly writeTextField = (field: string, value: string): void => {

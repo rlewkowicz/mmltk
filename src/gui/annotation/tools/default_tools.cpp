@@ -263,7 +263,7 @@ const std::array<const AnnotationToolCreator*, annotation_tool_kind_count()>& de
 }
 
 const AnnotationToolCreator* find_default_tool_creator(const AnnotationToolKind kind) noexcept {
-    const std::size_t slot = static_cast<std::size_t>(kind);
+    const auto slot = static_cast<std::size_t>(kind);
     if (slot >= default_tool_creators().size()) {
         return nullptr;
     }

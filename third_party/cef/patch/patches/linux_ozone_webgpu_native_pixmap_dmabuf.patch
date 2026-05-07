@@ -1,0 +1,17 @@
+diff --git gpu/command_buffer/service/shared_image/ozone_image_backing_factory.cc gpu/command_buffer/service/shared_image/ozone_image_backing_factory.cc
+--- gpu/command_buffer/service/shared_image/ozone_image_backing_factory.cc
++++ gpu/command_buffer/service/shared_image/ozone_image_backing_factory.cc
+@@ -421,4 +421,12 @@ bool OzoneImageBackingFactory::CanImportNativePixmapToWebGPU() {
+   // against features in the 'dawn_context_provider' in the
+   // 'shared_context_state_'.
+-  return false;
++#if BUILDFLAG(IS_LINUX)
++  // MMLTK imports externally produced single-plane workspace DMA-BUFs as
++  // read-only WebGPU textures. Prefer the Ozone backing so Dawn wraps the
++  // native pixmap directly instead of routing through ExternalVkImageBacking,
++  // which can return an error texture for imported DMA-BUF memory.
++  return true;
++#else
++  return false;
++#endif
+ #endif

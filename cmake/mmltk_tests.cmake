@@ -100,9 +100,11 @@ if(BUILD_TESTS)
         tests/gui/browser_host_api.test.cpp
         tests/gui/browser_runtime_dispatch.test.cpp
         tests/gui/browser_retained_frame_registry.test.cpp
+        tests/gui/browser_synthetic_workspace_surface.test.cpp
         src/browser/host_api.cpp
         src/gui/browser_host_adapters.cpp
         src/gui/browser_retained_frame_registry.cpp
+        src/gui/browser_workspace_surface_bridge.cpp
         tests/gui/annotation_document.test.cpp
         tests/gui/annotation_save_tab.test.cpp
         tests/gui/annotation_workspace_canvas.test.cpp
@@ -156,6 +158,7 @@ if(BUILD_TESTS)
     target_link_libraries(mmltk_tests_gui PRIVATE
         ${MMLTK_TEST_CORE_BASE_LINK_LIBS}
         mmltk_rfdetr_core
+        mmltk_browser_api_contract
         mmltk_test_headers
         cli11
         nlohmann_json
@@ -169,6 +172,14 @@ if(BUILD_TESTS)
             mmltk_rfdetr_torch
         )
     endif()
+    if(MMLTK_RFDETR_LIVE_CAPTURE_ENABLED)
+        target_link_libraries(mmltk_tests_gui PRIVATE
+            mmltk_live_runtime
+        )
+    endif()
+    target_compile_definitions(mmltk_tests_gui PRIVATE
+        MMLTK_RFDETR_LIVE_CAPTURE=$<IF:$<BOOL:${MMLTK_RFDETR_LIVE_CAPTURE_ENABLED}>,1,0>
+    )
     catch_discover_tests(
         mmltk_tests_gui
         TEST_PREFIX "gui::"

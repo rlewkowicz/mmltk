@@ -113,6 +113,10 @@ spdlog::level::level_enum default_runtime_level() {
     return spdlog::level::info;
 }
 
+LoggingConfig lazy_process_config() {
+    return config_from_env("mmltk");
+}
+
 void install_logger_locked(LoggingConfig config) {
     const spdlog::level::level_enum runtime_level = config.level.value_or(default_runtime_level());
 
@@ -239,7 +243,7 @@ void initialize(const LoggingConfig& config) {
 std::shared_ptr<spdlog::logger> root_logger() {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_root_logger == nullptr) {
-        install_logger_locked(default_config("mmltk"));
+        install_logger_locked(lazy_process_config());
     }
     return g_root_logger;
 }
@@ -251,7 +255,7 @@ std::shared_ptr<spdlog::logger> logger(std::string_view name) {
 
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_root_logger == nullptr) {
-        install_logger_locked(default_config("mmltk"));
+        install_logger_locked(lazy_process_config());
     }
     if (name == g_app_name) {
         return g_root_logger;
@@ -290,7 +294,7 @@ void flush() {
 void set_level(spdlog::level::level_enum new_level) {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_root_logger == nullptr) {
-        install_logger_locked(default_config("mmltk"));
+        install_logger_locked(lazy_process_config());
     }
     g_level = new_level;
     spdlog::set_level(new_level);

@@ -8,9 +8,11 @@ import type {
 } from "../src/host_api";
 import { createMockBrowserHostTransport } from "./mock_transport";
 import {
+  installBrowserTestWindow,
   makeBrowserTestSnapshot,
   makeBrowserTestSource,
   makeNativeBridgeContractCapabilities,
+  type BrowserTestWindow,
 } from "./support/browser-test-fixtures";
 import {
   createIntent,
@@ -30,29 +32,108 @@ function makeSnapshot(): StateSnapshot {
   });
 }
 
-type TestWindow = Window & typeof globalThis;
+type TestWindow = BrowserTestWindow;
 
 type NativeBridgeTestWindow = TestWindow & {
   __MMLTK_NATIVE_BRIDGE__: BrowserHostNativeBridge & Record<string, unknown>;
 };
 
+type WebSocketTestWindow = TestWindow & {
+  __MMLTK_BROWSER_WS_URL__: string;
+  __MMLTK_WORKSPACE_GPU_BRIDGE__?: {
+    acquireCurrentSurface(): unknown;
+    importTexture(): unknown;
+    releaseSurface(): unknown;
+    releaseRendererTexture(): unknown;
+  };
+};
+
+type FakeWebSocketListener = (event?: { data?: string }) => void;
+
+class FakeWebSocket {
+  static readonly CONNECTING = 0;
+  static readonly OPEN = 1;
+  static readonly CLOSED = 3;
+  static readonly instances: FakeWebSocket[] = [];
+
+  readonly sent: string[] = [];
+  readyState = FakeWebSocket.CONNECTING;
+  private readonly listeners = new Map<string, Set<FakeWebSocketListener>>();
+
+  constructor(readonly url: string) {
+    FakeWebSocket.instances.push(this);
+  }
+
+  addEventListener(type: string, listener: FakeWebSocketListener): void {
+    const listeners = this.listeners.get(type) ?? new Set<FakeWebSocketListener>();
+    listeners.add(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  send(messageText: string): void {
+    this.sent.push(messageText);
+  }
+
+  open(): void {
+    this.readyState = FakeWebSocket.OPEN;
+    this.emit("open");
+  }
+
+  receive(messageText: string): void {
+    this.emit("message", { data: messageText });
+  }
+
+  private emit(type: string, event: { data?: string } = {}): void {
+    for (const listener of this.listeners.get(type) ?? []) {
+      listener(event);
+    }
+  }
+}
+
 function asTestWindow(overrides: object): TestWindow {
   return overrides as unknown as TestWindow;
 }
 
-function installWindow(windowValue: TestWindow): () => void {
-  const priorDescriptor = Object.getOwnPropertyDescriptor(globalThis, "window");
-  Object.defineProperty(globalThis, "window", {
-    value: windowValue,
+function installFakeWebSocket(): () => void {
+  FakeWebSocket.instances.length = 0;
+  const priorDescriptor = Object.getOwnPropertyDescriptor(globalThis, "WebSocket");
+  Object.defineProperty(globalThis, "WebSocket", {
+    value: FakeWebSocket,
     configurable: true,
     writable: true,
   });
   return () => {
+    FakeWebSocket.instances.length = 0;
     if (priorDescriptor) {
-      Object.defineProperty(globalThis, "window", priorDescriptor);
+      Object.defineProperty(globalThis, "WebSocket", priorDescriptor);
       return;
     }
-    Reflect.deleteProperty(globalThis, "window");
+    Reflect.deleteProperty(globalThis, "WebSocket");
+  };
+}
+
+function createWebSocketTransportHarness(): {
+  restore: () => void;
+  socket: FakeWebSocket;
+  transport: BrowserHostTransport;
+  windowValue: WebSocketTestWindow;
+} {
+  const restoreWebSocket = installFakeWebSocket();
+  const windowValue = asTestWindow({
+    __MMLTK_BROWSER_WS_URL__: "ws://127.0.0.1:38571/browser",
+  }) as WebSocketTestWindow;
+  const restoreWindow = installBrowserTestWindow(windowValue);
+  const transport = resolveBrowserHostTransport();
+  assert.equal(transport.mode, "websocket");
+  assert.equal(FakeWebSocket.instances.length, 1);
+  return {
+    socket: FakeWebSocket.instances[0],
+    transport,
+    windowValue,
+    restore: () => {
+      restoreWindow();
+      restoreWebSocket();
+    },
   };
 }
 
@@ -62,7 +143,7 @@ function installMockTransportWindow(): {
 } {
   const transport = createMockBrowserHostTransport();
   const windowValue = asTestWindow({});
-  const restoreWindow = installWindow(windowValue);
+  const restoreWindow = installBrowserTestWindow(windowValue);
   const restoreTransport = installBrowserHostTransportForTesting(
     windowValue,
     transport,
@@ -98,7 +179,7 @@ function installNativeBridgeWindow(options: {
   }) as NativeBridgeTestWindow;
   return {
     postMessages,
-    restoreWindow: installWindow(windowValue),
+    restoreWindow: installBrowserTestWindow(windowValue),
     windowValue,
   };
 }
@@ -166,10 +247,6 @@ function dispatchSplineKnotDrag(
   transport.dispatch(
     createIntent("annotate", "annotate.workspace.handle_drag", {
       phase,
-      tool: "direct",
-      object_index: 1,
-      element_index: 1,
-      role: "spline_knot",
       handle: {
         object_index: 1,
         element_index: 1,
@@ -252,7 +329,7 @@ test("resolveBrowserHostTransport prefers an injected native transport", () => {
     },
   };
   const windowValue = asTestWindow({});
-  const restoreWindow = installWindow(windowValue);
+  const restoreWindow = installBrowserTestWindow(windowValue);
   const restoreTransport = installBrowserHostTransportForTesting(
     windowValue,
     nativeTransport,
@@ -279,7 +356,7 @@ test("resolveBrowserHostTransport prefers an injected native transport", () => {
 
 test("resolveBrowserHostTransport ignores an injected mock transport when no runtime bridge exists", () => {
   const windowValue = asTestWindow({});
-  const restoreWindow = installWindow(windowValue);
+  const restoreWindow = installBrowserTestWindow(windowValue);
   const restoreTransport = installBrowserHostTransportForTesting(
     windowValue,
     createMockBrowserHostTransport(),
@@ -558,8 +635,111 @@ test("native bridge transport keeps bridge-published runtime capability state au
   }
 });
 
+test("websocket transport reports workspace bridge structure as pending until native helpers confirm", () => {
+  const { restore, socket, windowValue } = createWebSocketTransportHarness();
+
+  try {
+    socket.open();
+    let runtimeMessages = postedMessages(socket.sent).filter(
+      (message) => message.type === "host.runtime.capabilities",
+    );
+    assert.equal(runtimeMessages.length, 1);
+    assert.equal(runtimeMessages[0].workspace_surface_bridge, "unavailable");
+    assert.equal(runtimeMessages[0].workspace_surface_zero_copy, "unknown");
+    assert.equal(
+      recordFromValue(
+        recordFromValue(runtimeMessages[0].capabilities).workspace_surface_bridge,
+      ).detail,
+      "__MMLTK_WORKSPACE_GPU_BRIDGE__ is not installed",
+    );
+
+    windowValue.__MMLTK_WORKSPACE_GPU_BRIDGE__ = {
+      acquireCurrentSurface() {
+        return null;
+      },
+      importTexture() {
+        return {} as GPUTexture;
+      },
+      releaseSurface() {
+        return false;
+      },
+      releaseRendererTexture() {
+        return false;
+      },
+    };
+
+    runtimeMessages = postedMessages(socket.sent).filter(
+      (message) => message.type === "host.runtime.capabilities",
+    );
+    assert.equal(runtimeMessages.length, 2);
+    assert.equal(runtimeMessages[1].workspace_surface_bridge, "unknown");
+    assert.equal(runtimeMessages[1].workspace_surface_zero_copy, "unknown");
+    assert.equal(
+      recordFromValue(
+        recordFromValue(runtimeMessages[1].capabilities).workspace_surface_bridge,
+      ).detail,
+      "Workspace GPU bridge functions are installed; native helper capability is pending.",
+    );
+  } finally {
+    restore();
+  }
+});
+
+test("websocket transport keeps known CEF snapshot capabilities separate from unknown bridge diagnostics", async () => {
+  const { restore, socket, transport } = createWebSocketTransportHarness();
+
+  try {
+    socket.open();
+
+    const snapshot = makeSnapshot();
+    snapshot.state_revision = 24;
+    snapshot.runtime_capabilities = {
+      host_backend: "cef",
+      navigator_gpu: "available",
+      workspace_surface_bridge: "available",
+      workspace_surface_zero_copy: "available",
+    };
+    socket.receive(JSON.stringify(snapshot));
+    await waitFor(() => transport.getSnapshot().state_revision === 24);
+
+    socket.receive(
+      JSON.stringify({
+        phase: "idle",
+        connected: true,
+        lastSuccessRevision: 24,
+        runtimeCapabilities: {
+          hostBackend: "unknown",
+          navigatorGpu: "unknown",
+          workspaceSurfaceBridge: "unknown",
+          workspaceSurfaceZeroCopy: "unknown",
+        },
+      }),
+    );
+    await waitFor(
+      () =>
+        transport.getBridgeState?.().runtimeCapabilities?.workspace_surface_bridge ===
+        "unknown",
+    );
+
+    assert.deepEqual(transport.getSnapshot().runtime_capabilities, {
+      host_backend: "cef",
+      navigator_gpu: "available",
+      workspace_surface_bridge: "available",
+      workspace_surface_zero_copy: "available",
+    });
+    assert.deepEqual(transport.getBridgeState?.().runtimeCapabilities, {
+      host_backend: "unknown",
+      navigator_gpu: "unknown",
+      workspace_surface_bridge: "unknown",
+      workspace_surface_zero_copy: "unknown",
+    });
+  } finally {
+    restore();
+  }
+});
+
 test("resolveBrowserHostTransport keeps the shipped path native when no bridge is present", () => {
-  const restoreWindow = installWindow(asTestWindow({}));
+  const restoreWindow = installBrowserTestWindow(asTestWindow({}));
 
   try {
     const transport = resolveBrowserHostTransport();
@@ -660,7 +840,7 @@ test("mock transport exposes annotate shell controls and updates setup, save, li
     assert.equal(liveAnnotate.running, true);
 
     transport.dispatch(
-      createIntent("annotate", "annotate.hold_save", { active: true }),
+      createIntent("annotate", "annotate.hold_save", { enabled: true }),
     );
     snapshot = transport.getSnapshot();
     controls = annotateControls(snapshot);
@@ -669,7 +849,7 @@ test("mock transport exposes annotate shell controls and updates setup, save, li
     assert.match(snapshot.job.summary, /annotate\.hold_save armed/);
 
     transport.dispatch(
-      createIntent("annotate", "annotate.hold_save", { active: false }),
+      createIntent("annotate", "annotate.hold_save", { enabled: false }),
     );
     transport.dispatch(createIntent("annotate", "annotate.live.stop", {}));
     snapshot = transport.getSnapshot();
@@ -749,10 +929,8 @@ test("mock annotate workspace canvas clicks create point, spline, and skeleton o
     );
     transport.dispatch(
       createIntent("annotate", "annotate.workspace.click", {
-        tool: "point",
         capture_x: 244,
         capture_y: 156,
-        default_category_index: 1,
       }),
     );
 
@@ -771,10 +949,8 @@ test("mock annotate workspace canvas clicks create point, spline, and skeleton o
     );
     transport.dispatch(
       createIntent("annotate", "annotate.workspace.click", {
-        tool: "spline",
         capture_x: 520,
         capture_y: 248,
-        default_category_index: 2,
       }),
     );
 
@@ -790,10 +966,8 @@ test("mock annotate workspace canvas clicks create point, spline, and skeleton o
     );
     transport.dispatch(
       createIntent("annotate", "annotate.workspace.click", {
-        tool: "skeleton",
         capture_x: 904,
         capture_y: 332,
-        default_category_index: 0,
       }),
     );
 
@@ -1062,36 +1236,29 @@ test("mock annotate workspace mask brush and fill mutate the selected mask-capab
     transport.dispatch(
       createIntent("annotate", "annotate.workspace.brush", {
         phase: "begin",
-        tool: "mask.paint",
         capture_x: 424,
         capture_y: 338,
         radius: 12,
-        erase: false,
       }),
     );
     transport.dispatch(
       createIntent("annotate", "annotate.workspace.brush", {
         phase: "update",
-        tool: "mask.paint",
         capture_x: 448,
         capture_y: 356,
         radius: 12,
-        erase: false,
       }),
     );
     transport.dispatch(
       createIntent("annotate", "annotate.workspace.brush", {
         phase: "end",
-        tool: "mask.paint",
         capture_x: 448,
         capture_y: 356,
         radius: 12,
-        erase: false,
       }),
     );
     transport.dispatch(
       createIntent("annotate", "annotate.workspace.fill", {
-        tool: "mask.fill",
         capture_x: 470,
         capture_y: 372,
       }),

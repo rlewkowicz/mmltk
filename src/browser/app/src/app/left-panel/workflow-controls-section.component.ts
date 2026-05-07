@@ -21,13 +21,6 @@ import { ValidateWorkflowControlsComponent } from './validate-workflow-controls.
     <section class="panel-section">
       <div class="section-header">
         <h2>Workflow Controls</h2>
-        <button
-          type="button"
-          [disabled]="!panels.canApplyWorkflowSettings()"
-          (click)="panels.applyWorkflowSettings()"
-        >
-          Apply Workflow
-        </button>
       </div>
       @switch (panels.selectedWorkflow()) {
         @case ('train') {

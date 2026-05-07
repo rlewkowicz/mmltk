@@ -4,6 +4,8 @@ import type {
   StateSnapshot,
   Workflow,
 } from "../src/host_api";
+import { HOST_API_CONTRACT_HASH } from "../src/host_api.generated";
+import { assertHostApiIntent } from "./support/host-api-contract-validator";
 
 const kProtocolVersion = 2;
 const kCaptureWidth = 1280;
@@ -402,6 +404,7 @@ function buildSnapshot(state: MockTransportState): StateSnapshot {
   return {
     type: "state.snapshot",
     protocol_version: kProtocolVersion,
+    contract_hash: HOST_API_CONTRACT_HASH,
     state_revision: state.stateRevision,
     active_workflow: state.activeWorkflow,
     workflow_state: {
@@ -485,9 +488,15 @@ function buildSnapshot(state: MockTransportState): StateSnapshot {
       live_preview_controls: {
         fit_to_capture: {
           value: state.fitToCapture,
+          enabled: true,
+          intent: "live.preview.fit_to_capture",
+          payload_key: "enabled",
         },
         full_frame_display: {
           value: state.fullFrameDisplay,
+          enabled: true,
+          intent: "live.preview.full_frame_display",
+          payload_key: "enabled",
         },
       },
       live_runtime: {
@@ -720,12 +729,22 @@ function handleSplineDrag(
   state: MockTransportState,
   payload: Record<string, unknown>,
 ): void {
+  const handle =
+    payload.handle !== null &&
+    typeof payload.handle === "object" &&
+    !Array.isArray(payload.handle)
+      ? (payload.handle as Record<string, unknown>)
+      : {};
   const objectIndex = integerFromValue(
-    payload.object_index,
+    handle.object_index,
     state.selectedObjectIndex,
   );
-  const elementIndex = integerFromValue(payload.element_index, -1);
+  const elementIndex = integerFromValue(handle.element_index, -1);
   const phase = stringFromValue(payload.phase);
+  if (phase === "cancel") {
+    setJobSummary(state, "annotate.workspace.handle_drag cancelled");
+    return;
+  }
   const object = state.objects[objectIndex];
   if (
     object === undefined ||
@@ -760,6 +779,12 @@ function handleBoxDrag(
   const phase = stringFromValue(payload.phase);
   const dragKind = stringFromValue(payload.drag_kind);
   const capturePoint = pointFromPayload(payload, point(0, 0));
+
+  if (phase === "cancel") {
+    state.boxDrag = null;
+    setJobSummary(state, "annotate.workspace.box_drag cancelled");
+    return;
+  }
 
   if (phase === "begin" && (dragKind === "create" || dragKind === "move")) {
     const objectIndex =
@@ -851,6 +876,10 @@ function handleMaskBrush(
   state: MockTransportState,
   payload: Record<string, unknown>,
 ): void {
+  if (stringFromValue(payload.phase) === "cancel") {
+    setJobSummary(state, "annotate.workspace.brush cancelled");
+    return;
+  }
   const selection = selectedBoxPayloadTarget(state, payload);
   if (selection === null) {
     return;
@@ -892,6 +921,46 @@ function handleMaskFill(
     18,
   );
   setJobSummary(state, "annotate.workspace.fill filled selected mask");
+}
+
+function handleWorkspacePointer(
+  state: MockTransportState,
+  payload: Record<string, unknown>,
+): void {
+  const phase = stringFromValue(payload.phase);
+  if (phase === "cancel") {
+    state.boxDrag = null;
+    setJobSummary(state, "annotate.workspace.pointer cancelled interaction");
+    return;
+  }
+  if (payload.drag_kind !== null && payload.drag_kind !== undefined) {
+    handleBoxDrag(state, payload);
+    return;
+  }
+  if (payload.handle !== null && payload.handle !== undefined) {
+    handleSplineDrag(state, payload);
+    return;
+  }
+  const tool = stringFromValue(payload.tool, state.activeTool);
+  if (tool === "mask.paint" || tool === "mask.erase") {
+    handleMaskBrush(state, {
+      ...payload,
+      radius: payload.brush_radius,
+    });
+    return;
+  }
+  if (phase !== "end") {
+    return;
+  }
+  if (tool === "mask.fill") {
+    handleMaskFill(state, payload);
+    return;
+  }
+  if (tool === "mask.color_sample") {
+    handleColorSample(state, payload);
+    return;
+  }
+  handleWorkspaceClick(state, payload);
 }
 
 function applySettingsUpdate(
@@ -990,7 +1059,7 @@ function applyIntent(
       break;
     case "annotate.hold_save":
       nextState.holdSave = booleanFromValue(
-        intent.payload.active,
+        intent.payload.enabled,
         nextState.holdSave,
       );
       setJobSummary(
@@ -1050,6 +1119,9 @@ function applyIntent(
     case "annotate.workspace.brush":
       handleMaskBrush(nextState, intent.payload);
       break;
+    case "annotate.workspace.pointer":
+      handleWorkspacePointer(nextState, intent.payload);
+      break;
     case "annotate.workspace.fill":
       handleMaskFill(nextState, intent.payload);
       break;
@@ -1079,6 +1151,7 @@ export function createMockBrowserHostTransport(): BrowserHostTransport {
       return snapshot;
     },
     dispatch(intent) {
+      assertHostApiIntent(intent);
       state = applyIntent(state, intent);
       snapshot = buildSnapshot(state);
       notify();

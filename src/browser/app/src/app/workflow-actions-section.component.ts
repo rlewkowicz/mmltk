@@ -13,13 +13,6 @@ import { BrowserWorkflowPrimaryActionState } from "./state/browser-workflow-prim
         <h2>Actions</h2>
       </div>
       <div class="action-row">
-        <button
-          type="button"
-          [disabled]="!panels.canApplyWorkflowSettings()"
-          (click)="panels.applyWorkflowSettings()"
-        >
-          Apply Workflow
-        </button>
         <button id="run-primary-action" type="button" (click)="primary.runPrimaryAction()">
           {{ primary.primaryActionLabel() }}
         </button>

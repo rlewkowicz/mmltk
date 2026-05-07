@@ -1,5 +1,6 @@
 #pragma once
 
+#include "mmltk/live/live_pipeline_status.h"
 #include "mmltk/live/live_types.h"
 
 #include <cstdint>
@@ -17,11 +18,16 @@ class LiveManualOverlayWorker;
 class LiveCompositor {
    public:
     using WorkspaceReadyCallback = std::function<void()>;
+    using WorkspacePresentCallback = std::function<void(const WorkspacePresentSnapshot&)>;
 
-    struct Status {
+    struct Status : LivePipelineStatus {
         bool running = false;
         std::uint64_t frames_composited = 0;
+        std::uint64_t frames_composited_after_startup = 0;
         std::uint64_t frames_dropped = 0;
+        std::uint64_t skipped_compositor_presents = 0;
+        int front_slot_index = -1;
+        std::uint64_t front_slot_revision = 0;
         LiveFrameId last_frame_id{};
         bool manual_overlay_active = false;
         bool analysis_overlay_active = false;
@@ -30,7 +36,8 @@ class LiveCompositor {
 
     LiveCompositor(LiveFrameFanout& fanout, LiveAnalyzerWorker* analyzer_worker, LiveManualOverlayWorker* manual_worker,
                    int cuda_device_index, std::uint32_t max_capture_width, std::uint32_t max_capture_height,
-                   std::uint32_t output_slot_count = 3, std::uint32_t raw_base_cache_slot_count = 3);
+                   std::uint32_t output_slot_count = 3, std::uint32_t raw_base_cache_slot_count = 3,
+                   std::shared_ptr<LivePipelineTrace> pipeline_trace = {});
     ~LiveCompositor();
 
     LiveCompositor(const LiveCompositor&) = delete;
@@ -40,9 +47,13 @@ class LiveCompositor {
     void stop();
 
     [[nodiscard]] bool running() const noexcept;
+    [[nodiscard]] WorkspaceSwapchainDescriptor workspace_swapchain_descriptor() const;
+    [[nodiscard]] WorkspacePresentSnapshot latest_workspace_present() const noexcept;
     [[nodiscard]] bool try_acquire_latest_workspace(WorkspaceOutputBundle* out);
     void release_workspace(std::uint32_t slot_index);
     void set_workspace_ready_callback(WorkspaceReadyCallback callback);
+    void set_workspace_present_callback(WorkspacePresentCallback callback);
+    void mark_workspace_slot_in_flight(std::uint32_t slot_index, bool in_flight);
     void set_persistent_analysis_overlay(bool enabled);
     [[nodiscard]] bool persistent_analysis_overlay() const noexcept;
     [[nodiscard]] Status snapshot_status() const;

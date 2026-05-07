@@ -14,6 +14,7 @@ import type {
   IntentMessage,
   StateSnapshot,
 } from "../../src/host_api";
+import { assertHostApiIntent } from "./host-api-contract-validator";
 
 export interface FlushableEffectScheduler {
   flush(): void;
@@ -48,6 +49,7 @@ export class SpyTransport implements BrowserHostTransport {
   }
 
   dispatch(intent: IntentMessage): void {
+    assertHostApiIntent(intent);
     this.dispatched.push(intent);
   }
 
@@ -166,27 +168,30 @@ export class ImmediateEffectScheduler implements FlushableEffectScheduler {
   }
 }
 
-export type AngularServiceHarness = {
+export type AngularServiceHarness<
+  TTransport extends BrowserHostTransport = SpyTransport,
+> = {
   injector: Injector;
-  transport: SpyTransport;
+  transport: TTransport;
   destroy: () => void;
   flush: () => void;
   run<T>(callback: () => T): T;
 };
 
-export function createAngularServiceHarness(
+export function createAngularServiceHarness<
+  TTransport extends BrowserHostTransport = SpyTransport,
+>(
   snapshot: StateSnapshot,
   providers: StaticProvider[],
   options: {
     mode?: BrowserHostTransport["mode"];
+    transport?: TTransport;
   } = {},
-): AngularServiceHarness {
+): AngularServiceHarness<TTransport> {
   const scheduler = new ImmediateEffectScheduler();
-  const transport = new SpyTransport(
-    snapshot,
-    options.mode ?? "mock",
-    scheduler,
-  );
+  const transport =
+    options.transport ??
+    (new SpyTransport(snapshot, options.mode ?? "mock", scheduler) as unknown as TTransport);
   const destroyRef = new TestDestroyRef();
   const injector = Injector.create({
     providers: [

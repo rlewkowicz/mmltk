@@ -104,6 +104,7 @@ void test_catch2_tap_reporter_formats_shared_assertion_details() {
 TEST_CASE("vendored_catch2_reporter_fixture", "[.][core][vendored][reporter_fixture]") {
     const int fixture_value = 1;
     INFO("vendored reporter info");
+    // NOLINTNEXTLINE(bugprone-chained-comparison): Catch2 decomposes REQUIRE through operator<=.
     REQUIRE(fixture_value == 2);
 }
 

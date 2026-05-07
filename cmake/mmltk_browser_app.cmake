@@ -12,10 +12,20 @@ if(BUILD_MMLTK_BROWSER_APP)
     find_program(MMLTK_NODE_EXECUTABLE NAMES node REQUIRED)
     find_program(MMLTK_NPM_EXECUTABLE NAMES npm REQUIRED)
 
+    add_executable(mmltk_browser_host_contract_codegen
+        src/browser/host_api_contract_codegen.cpp
+    )
+    mmltk_target_project_dirs(mmltk_browser_host_contract_codegen)
+    target_link_libraries(mmltk_browser_host_contract_codegen PRIVATE
+        mmltk_build_options
+        mmltk_browser_api_contract
+    )
     set(MMLTK_BROWSER_APP_STAGE_DIR "${CMAKE_BINARY_DIR}/browser_app")
     set(MMLTK_BROWSER_APP_DIST_DIR "${MMLTK_BROWSER_APP_STAGE_DIR}/dist")
     set(MMLTK_BROWSER_APP_BROWSER_DIST_DIR "${MMLTK_BROWSER_APP_DIST_DIR}/browser")
+    set(MMLTK_BROWSER_CONTRACT_OPENAPI_OUT "${MMLTK_BROWSER_APP_STAGE_DIR}/host_api.openapi.json")
     set(MMLTK_BROWSER_APP_DEPS_STAMP "${MMLTK_BROWSER_APP_STAGE_DIR}/.deps.stamp")
+    set(MMLTK_BROWSER_APP_CONTRACT_STAMP "${MMLTK_BROWSER_APP_STAGE_DIR}/.contract.stamp")
     set(MMLTK_BROWSER_APP_SYNC_STAMP "${MMLTK_BROWSER_APP_STAGE_DIR}/.sync.stamp")
     set(MMLTK_BROWSER_APP_CHECK_STAMP "${MMLTK_BROWSER_APP_STAGE_DIR}/.check.stamp")
     set(MMLTK_BROWSER_APP_BUILD_STAMP "${MMLTK_BROWSER_APP_STAGE_DIR}/.build.stamp")
@@ -49,11 +59,27 @@ if(BUILD_MMLTK_BROWSER_APP)
         ${MMLTK_BROWSER_APP_SOURCE_INPUTS}
         ${MMLTK_BROWSER_APP_TEST_INPUTS}
         ${MMLTK_BROWSER_APP_SCRIPT_INPUTS}
+        "${MMLTK_BROWSER_CONTRACT_OPENAPI_OUT}"
     )
     set(MMLTK_BROWSER_APP_DIST_FILES
         "${MMLTK_BROWSER_APP_BROWSER_DIST_DIR}/index.html"
         "${MMLTK_BROWSER_APP_DIST_DIR}/3rdpartylicenses.txt"
         "${MMLTK_BROWSER_APP_DIST_DIR}/prerendered-routes.json"
+    )
+    set(MMLTK_BROWSER_CONTRACT_GENERATED_FILES
+        "${MMLTK_BROWSER_CONTRACT_OPENAPI_OUT}"
+        "${MMLTK_BROWSER_APP_SOURCE_DIR}/src/host_api.generated.ts"
+        "${MMLTK_BROWSER_APP_SOURCE_DIR}/src/workflow_contract.generated.ts"
+        "${CMAKE_SOURCE_DIR}/src/browser/workflow_contract_generated.h"
+    )
+    set(MMLTK_BROWSER_NATIVE_CONTRACT_INPUTS
+        "${CMAKE_SOURCE_DIR}/src/browser/browser_contract_metadata.h"
+        "${CMAKE_SOURCE_DIR}/src/browser/api_contract_dsl.h"
+        "${CMAKE_SOURCE_DIR}/src/browser/host_api_protocol.h"
+        "${CMAKE_SOURCE_DIR}/src/browser/host_api_intents.h"
+        "${CMAKE_SOURCE_DIR}/src/gui/browser_file_dialog_contract.h"
+        "${CMAKE_SOURCE_DIR}/src/gui/browser_settings_contract.h"
+        "${CMAKE_SOURCE_DIR}/src/gui/browser_host_adapters.h"
     )
 
     add_custom_command(
@@ -74,6 +100,23 @@ if(BUILD_MMLTK_BROWSER_APP)
             "${MMLTK_BROWSER_APP_SOURCE_DIR}/package-lock.json"
             "${MMLTK_BROWSER_APP_SOURCE_DIR}/package.json"
         WORKING_DIRECTORY "${MMLTK_BROWSER_APP_STAGE_DIR}"
+        USES_TERMINAL
+        VERBATIM
+    )
+
+    add_custom_command(
+        OUTPUT "${MMLTK_BROWSER_APP_CONTRACT_STAMP}"
+        BYPRODUCTS ${MMLTK_BROWSER_CONTRACT_GENERATED_FILES}
+        COMMAND "$<TARGET_FILE:mmltk_browser_host_contract_codegen>"
+            --write
+            --openapi-out "${MMLTK_BROWSER_CONTRACT_OPENAPI_OUT}"
+            --ts-out-dir "${MMLTK_BROWSER_APP_SOURCE_DIR}/src"
+            --cpp-out "${CMAKE_SOURCE_DIR}/src/browser/workflow_contract_generated.h"
+        COMMAND "${CMAKE_COMMAND}" -E touch "${MMLTK_BROWSER_APP_CONTRACT_STAMP}"
+        DEPENDS
+            mmltk_browser_host_contract_codegen
+            ${MMLTK_BROWSER_NATIVE_CONTRACT_INPUTS}
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         USES_TERMINAL
         VERBATIM
     )
@@ -108,15 +151,24 @@ if(BUILD_MMLTK_BROWSER_APP)
         COMMAND "${CMAKE_COMMAND}" -E copy_directory
             "${MMLTK_BROWSER_APP_SOURCE_DIR}/scripts"
             "${MMLTK_BROWSER_APP_STAGE_DIR}/scripts"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+            "${MMLTK_BROWSER_CONTRACT_OPENAPI_OUT}"
+            "${MMLTK_BROWSER_APP_STAGE_DIR}/host_api.openapi.json"
         COMMAND "${CMAKE_COMMAND}" -E touch "${MMLTK_BROWSER_APP_SYNC_STAMP}"
         DEPENDS
             "${MMLTK_BROWSER_APP_DEPS_STAMP}"
+            "${MMLTK_BROWSER_APP_CONTRACT_STAMP}"
             ${MMLTK_BROWSER_APP_BUILD_INPUTS}
         VERBATIM
     )
 
     add_custom_command(
         OUTPUT "${MMLTK_BROWSER_APP_CHECK_STAMP}"
+        COMMAND "$<TARGET_FILE:mmltk_browser_host_contract_codegen>"
+            --check
+            --openapi-out "${MMLTK_BROWSER_CONTRACT_OPENAPI_OUT}"
+            --ts-out-dir "${MMLTK_BROWSER_APP_SOURCE_DIR}/src"
+            --cpp-out "${CMAKE_SOURCE_DIR}/src/browser/workflow_contract_generated.h"
         COMMAND "${MMLTK_NPM_EXECUTABLE}" run check
         COMMAND "${MMLTK_NPM_EXECUTABLE}" run test
         COMMAND "${CMAKE_COMMAND}" -E touch "${MMLTK_BROWSER_APP_CHECK_STAMP}"

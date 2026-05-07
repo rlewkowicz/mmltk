@@ -32,9 +32,9 @@ export class ExportWorkflowControlsComponent extends WorkflowTextBooleanActionBi
   protected readonly textFields: ReadonlyArray<
     WorkflowTextFieldConfig<ExportTextField>
   > = [
-    { label: "Weights Path", field: "weightsPath", wide: true },
-    { label: "ONNX Path", field: "onnxPath", wide: true },
-    { label: "Output Path", field: "outputPath", wide: true },
+    { label: "Weights Path", field: "weightsPath", wide: true, browseAction: "weightsPath" },
+    { label: "ONNX Path", field: "onnxPath", wide: true, browseAction: "onnxPath" },
+    { label: "Output Path", field: "outputPath", wide: true, browseAction: "outputPath" },
     { label: "Device", field: "deviceId", inputmode: "numeric" },
     { label: "Opset", field: "opsetVersion", inputmode: "numeric" },
   ];
@@ -47,9 +47,5 @@ export class ExportWorkflowControlsComponent extends WorkflowTextBooleanActionBi
   ];
   protected readonly browseActions: ReadonlyArray<
     WorkflowActionButtonConfig<ExportBrowseField>
-  > = [
-    { label: "Weights", action: "weightsPath" },
-    { label: "ONNX", action: "onnxPath" },
-    { label: "Output", action: "outputPath" },
-  ];
+  > = [];
 }

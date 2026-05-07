@@ -24,7 +24,7 @@ namespace {
 #ifdef MMLTK_CEF_WEBGPU_RUNTIME
 constexpr std::string_view kConfiguredCefWebGpuRuntime = MMLTK_CEF_WEBGPU_RUNTIME;
 #else
-constexpr std::string_view kConfiguredCefWebGpuRuntime = "vulkan";
+constexpr std::string_view kConfiguredCefWebGpuRuntime = "auto";
 #endif
 #ifdef MMLTK_CEF_ENABLE_UNSAFE_WEBGPU
 constexpr bool kConfiguredCefEnableUnsafeWebGpu = MMLTK_CEF_ENABLE_UNSAFE_WEBGPU != 0;
@@ -81,11 +81,11 @@ constexpr std::string_view kRendererBridgeGlobalName = "__MMLTK_NATIVE_BRIDGE__"
     return std::string(value);
 }
 
-[[nodiscard]] std::string read_non_empty_env_or(const char* name, std::string fallback) {
+[[nodiscard]] std::string read_non_empty_env_or(const char* name, const std::string_view fallback) {
     if (auto value = read_non_empty_env(name); value.has_value()) {
         return *value;
     }
-    return fallback;
+    return std::string(fallback);
 }
 
 [[nodiscard]] bool parse_bool_text(std::string_view value, bool fallback) {
@@ -110,7 +110,7 @@ constexpr std::string_view kRendererBridgeGlobalName = "__MMLTK_NATIVE_BRIDGE__"
     if (lowered == "auto" || lowered == "default" || lowered == "system") {
         return CefWebGpuRuntime::Auto;
     }
-    return CefWebGpuRuntime::Vulkan;
+    return CefWebGpuRuntime::Auto;
 }
 
 [[nodiscard]] CefRuntimeLaunchConfig resolve_cef_runtime_launch_config() {
@@ -201,6 +201,23 @@ void append_unique_csv_switch_token(const CefRefPtr<CefCommandLine>& command_lin
     command_line->AppendSwitchWithValue(name, join_csv_values(values));
 }
 
+void remove_csv_switch_token(const CefRefPtr<CefCommandLine>& command_line, const char* name, std::string_view token) {
+    if (command_line == nullptr || token.empty() || !command_line->HasSwitch(name)) {
+        return;
+    }
+    std::vector<std::string> values = split_csv_values(command_line->GetSwitchValue(name).ToString());
+    const auto new_end =
+        std::remove_if(values.begin(), values.end(), [token](const std::string& value) { return value == token; });
+    if (new_end == values.end()) {
+        return;
+    }
+    values.erase(new_end, values.end());
+    command_line->RemoveSwitch(name);
+    if (!values.empty()) {
+        command_line->AppendSwitchWithValue(name, join_csv_values(values));
+    }
+}
+
 [[nodiscard]] std::string process_type_name(std::string_view process_type) {
     return process_type.empty() ? "browser" : std::string(process_type);
 }
@@ -229,7 +246,8 @@ void log_cef_runtime_command_line_configuration(const CefRefPtr<CefCommandLine>&
                  "ozone-platform=%s use-angle=%s render-node-override=%s use-gl=%s "
                  "use-vulkan=%s disable-gpu=%s disable-gpu-compositing=%s "
                  "gtk-version=%s disable-software-rasterizer=%s ignore-gpu-blocklist=%s "
-                 "enable-features=%s disable-features=%s\n",
+                 "enable-native-gpu-memory-buffers=%s disable-vulkan-fallback-to-gl-for-testing=%s "
+                 "enable-unsafe-webgpu=%s enable-features=%s disable-features=%s\n",
                  pid, process_name.c_str(), program.c_str(),
                  switch_value_or_marker(command_line, "ozone-platform").c_str(),
                  switch_value_or_marker(command_line, "use-angle").c_str(),
@@ -241,6 +259,9 @@ void log_cef_runtime_command_line_configuration(const CefRefPtr<CefCommandLine>&
                  switch_value_or_marker(command_line, "gtk-version").c_str(),
                  switch_value_or_marker(command_line, "disable-software-rasterizer").c_str(),
                  switch_value_or_marker(command_line, "ignore-gpu-blocklist").c_str(),
+                 switch_value_or_marker(command_line, "enable-native-gpu-memory-buffers").c_str(),
+                 switch_value_or_marker(command_line, "disable-vulkan-fallback-to-gl-for-testing").c_str(),
+                 switch_value_or_marker(command_line, "enable-unsafe-webgpu").c_str(),
                  switch_value_or_marker(command_line, "enable-features").c_str(),
                  switch_value_or_marker(command_line, "disable-features").c_str());
     std::fprintf(stderr, "[mmltk-cef-cmdline-argv] pid=%ld process=%s argv=%s\n", pid, process_name.c_str(),
@@ -271,24 +292,33 @@ void log_cef_runtime_command_line_configuration(const CefRefPtr<CefCommandLine>&
 
 void apply_cef_webgpu_runtime_configuration(const CefRefPtr<CefCommandLine>& command_line,
                                             const CefRuntimeLaunchConfig& config) {
-    command_line->RemoveSwitch("use-angle");
-    command_line->RemoveSwitch("use-gl");
-    command_line->RemoveSwitch("use-vulkan");
-
     append_switch_if_absent(command_line, "disable-software-rasterizer");
     append_switch_if_absent(command_line, "enable-gpu-rasterization");
     append_switch_if_absent(command_line, "enable-zero-copy");
-    append_unique_csv_switch_token(command_line, "disable-features", "Vulkan");
-    append_unique_csv_switch_token(command_line, "disable-features", "DefaultANGLEVulkan");
-    append_unique_csv_switch_token(command_line, "disable-features", "VulkanFromANGLE");
 
     switch (config.webgpu_runtime) {
         case CefWebGpuRuntime::Vulkan:
+            command_line->RemoveSwitch("use-angle");
+            command_line->RemoveSwitch("use-gl");
+            command_line->RemoveSwitch("use-vulkan");
+            remove_csv_switch_token(command_line, "disable-features", "Vulkan");
+            remove_csv_switch_token(command_line, "disable-features", "ForceEnableWebGpuInterop");
             append_switch_if_absent(command_line, "ignore-gpu-blocklist");
+            append_switch_if_absent(command_line, "enable-native-gpu-memory-buffers");
+            command_line->AppendSwitchWithValue("use-vulkan", "native");
+            append_unique_csv_switch_token(command_line, "enable-features", "ForceEnableWebGpuInterop");
             return;
         case CefWebGpuRuntime::Auto:
+            return;
         case CefWebGpuRuntime::OpenGles:
+            command_line->RemoveSwitch("use-angle");
+            command_line->RemoveSwitch("use-gl");
+            command_line->RemoveSwitch("use-vulkan");
             command_line->RemoveSwitch("ignore-gpu-blocklist");
+            append_unique_csv_switch_token(command_line, "disable-features", "Vulkan");
+            append_unique_csv_switch_token(command_line, "disable-features", "DefaultANGLEVulkan");
+            append_unique_csv_switch_token(command_line, "disable-features", "VulkanFromANGLE");
+            append_unique_csv_switch_token(command_line, "disable-features", "ForceEnableWebGpuInterop");
             command_line->AppendSwitchWithValue("use-gl", "angle");
             command_line->AppendSwitchWithValue("use-angle", "gles");
             return;
@@ -384,11 +414,21 @@ void apply_cef_runtime_command_line_configuration(const CefRefPtr<CefCommandLine
     command_line->RemoveSwitch("ui-toolkit");
     append_switch_with_value_if_absent(command_line, "gtk-version", "3");
     append_switch_if_absent(command_line, "disable-gtk-ime");
+    append_switch_if_absent(command_line, "disable-renderer-accessibility");
     append_switch_with_value_if_absent(command_line, "autoplay-policy", "no-user-gesture-required");
     append_switch_if_absent(command_line, "no-sandbox");
     append_switch_if_absent(command_line, "test-type");
     append_path_switch_from_env(command_line, "resources-dir-path", "MMLTK_CEF_RESOURCES_DIR");
     append_path_switch_from_env(command_line, "locales-dir-path", "MMLTK_CEF_LOCALES_DIR");
+    append_path_switch_from_env(command_line, "log-file", "MMLTK_CEF_LOG_FILE");
+    if (process_type.empty()) {
+        if (auto remote_debugging_port = read_non_empty_env("MMLTK_CEF_REMOTE_DEBUGGING_PORT");
+            remote_debugging_port.has_value()) {
+            append_switch_with_value_if_absent(command_line, "remote-debugging-port", *remote_debugging_port);
+        }
+    }
+    append_switch_with_value_if_absent(command_line, "log-severity",
+                                       cef_verbose_logging_enabled() ? "info" : "warning");
 
     append_switch_if_absent(command_line, "disable-background-networking");
     append_switch_if_absent(command_line, "disable-sync");
@@ -493,6 +533,10 @@ void apply_cef_runtime_command_line_configuration(const CefRefPtr<CefCommandLine
         append_switch_with_value_if_absent(command_line, "v", read_non_empty_env_or("MMLTK_CEF_LOG_VERBOSITY", "0"));
         append_switch_with_value_if_absent(command_line, "vmodule",
                                            read_non_empty_env_or("MMLTK_CEF_VMODULE",
+                                                                 "workspace_gpu_bridge*=4,"
+                                                                 "webgpu*=3,"
+                                                                 "gpu_device*=3,"
+                                                                 "dawn*=2,"
                                                                  "frame_sink_video_capturer*=3,"
                                                                  "video_capture*=3,"
                                                                  "gpu_memory_buffer*=3,"

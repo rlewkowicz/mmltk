@@ -1,0 +1,1093 @@
+--- cef/libcef/browser/views/browser_view_impl.cc
++++ cef/libcef/browser/views/browser_view_impl.cc
+@@ -9,6 +9,7 @@
+ 
+ #include "cef/libcef/browser/browser_event_util.h"
+ #include "cef/libcef/browser/browser_host_base.h"
++#include "cef/libcef/browser/workspace_gpu_bridge_surface_service.h"
+ #include "cef/libcef/browser/chrome/views/chrome_browser_view.h"
+ #include "cef/libcef/browser/context.h"
+ #include "cef/libcef/browser/request_context_impl.h"
+@@ -18,6 +19,7 @@
+ #include "chrome/browser/profiles/profile.h"
+ #include "components/input/native_web_keyboard_event.h"
+ #include "ui/content_accelerators/accelerator_util.h"
++#include "ui/views/widget/widget.h"
+ 
+ namespace {
+ 
+@@ -187,10 +189,21 @@
+     base::RepeatingClosure on_bounds_changed) {
+   browser_ = browser;
+   on_bounds_changed_ = on_bounds_changed;
++
++  if (browser_ && root_view()) {
++    if (views::Widget* widget = root_view()->GetWidget()) {
++      CefWorkspaceGpuBridgeSurfaceService::GetInstance().BindCompositor(
++          browser_->browser_id(), widget->GetCompositor(), widget->GetLayer());
++    }
++  }
+ }
+ 
+ void CefBrowserViewImpl::BrowserDestroyed(CefBrowserHostBase* browser) {
+   DCHECK_EQ(browser, browser_);
++  if (browser_) {
++    CefWorkspaceGpuBridgeSurfaceService::GetInstance().ClearCompositorBinding(
++        browser_->browser_id());
++  }
+   browser_ = nullptr;
+ 
+   // If this BrowserView belonged to a Widget then we expect to have received a
+@@ -343,6 +356,11 @@
+ 
+   // May call Widget::ThemeChanged().
+   cef_widget_->AddAssociatedProfile(profile_);
++
++  if (browser_) {
++    CefWorkspaceGpuBridgeSurfaceService::GetInstance().BindCompositor(
++        browser_->browser_id(), widget->GetCompositor(), widget->GetLayer());
++  }
+ }
+ 
+ void CefBrowserViewImpl::RemovedFromWidget() {
+@@ -499,6 +517,11 @@
+     return;
+   }
+ 
++  if (browser_) {
++    CefWorkspaceGpuBridgeSurfaceService::GetInstance().ClearCompositorBinding(
++        browser_->browser_id());
++  }
++
+   // May call Widget::ThemeChanged().
+   cef_widget_->RemoveAssociatedProfile(profile_);
+   cef_widget_ = nullptr;
+--- cef/libcef/browser/workspace_gpu_bridge_surface_service.cc
++++ cef/libcef/browser/workspace_gpu_bridge_surface_service.cc
+@@ -5,13 +5,17 @@
+ #include "cef/libcef/browser/workspace_gpu_bridge_surface_service.h"
+ 
+ #include "cef/libcef/common/workspace_gpu_bridge_export.h"
++#include "cef/libcef/browser/thread_util.h"
+ 
+ #include <fcntl.h>
+ #include <unistd.h>
+ 
++#include <atomic>
+ #include <cstdint>
++#include <memory>
+ #include <optional>
+ #include <utility>
++#include <vector>
+ 
+ #include "base/functional/bind.h"
+ #include "base/files/scoped_file.h"
+@@ -24,6 +28,7 @@
+ #include "base/task/sequenced_task_runner.h"
+ #include "base/time/time.h"
+ #include "components/viz/common/gpu/raster_context_provider.h"
++#include "components/viz/common/resources/transferable_resource.h"
+ #include "components/viz/common/resources/shared_image_format.h"
+ #include "content/browser/compositor/image_transport_factory.h"
+ #include "gpu/command_buffer/client/client_shared_image.h"
+@@ -34,8 +39,12 @@
+ #include "third_party/skia/include/core/SkAlphaType.h"
+ #include "third_party/skia/include/gpu/ganesh/GrTypes.h"
+ #include "ui/compositor/compositor.h"
++#include "ui/compositor/layer.h"
++#include "ui/compositor/layer_type.h"
+ #include "ui/gfx/color_space.h"
++#include "ui/gfx/geometry/rect.h"
+ #include "ui/gfx/geometry/size.h"
++#include "ui/gfx/gpu_fence.h"
+ #include "ui/gfx/gpu_memory_buffer_handle.h"
+ #include "ui/gfx/native_pixmap_handle.h"
+ 
+@@ -291,6 +300,245 @@
+   return true;
+ }
+ 
++struct ParsedSwapchainSlot {
++  uint32_t slot_index = 0;
++  uint64_t slot_revision = 0;
++  std::string source_json;
++};
++
++struct ParsedSwapchain {
++  uint64_t generation = 0;
++  uint32_t width = 0;
++  uint32_t height = 0;
++  std::vector<ParsedSwapchainSlot> slots;
++};
++
++bool ParseSwapchainJson(std::string_view swapchain_json,
++                        ParsedSwapchain* swapchain,
++                        std::string* result_code,
++                        std::string* result_detail) {
++  std::optional<base::Value> parsed =
++      base::JSONReader::Read(swapchain_json,
++                             base::JSON_PARSE_CHROMIUM_EXTENSIONS);
++  if (!parsed || !parsed->is_dict()) {
++    SetResult(result_code, result_detail, "invalid_swapchain_metadata",
++              "workspace GPU bridge swapchain JSON must be an object");
++    return false;
++  }
++  const base::DictValue& root = parsed->GetDict();
++  const std::optional<uint32_t> width =
++      root.Find("width") ? ParseUint32(*root.Find("width")) : std::nullopt;
++  const std::optional<uint32_t> height =
++      root.Find("height") ? ParseUint32(*root.Find("height")) : std::nullopt;
++  const std::optional<uint64_t> generation =
++      root.Find("generation") ? ParseUint64(*root.Find("generation"))
++                              : std::nullopt;
++  const base::ListValue* slots = root.FindList("slots");
++  if (!width.has_value() || !height.has_value() || *width == 0U ||
++      *height == 0U || !generation.has_value() || !slots || slots->empty()) {
++    SetResult(result_code, result_detail, "invalid_swapchain_metadata",
++              "workspace GPU bridge swapchain requires width, height, "
++              "generation, and at least one slot");
++    return false;
++  }
++
++  ParsedSwapchain next;
++  next.generation = *generation;
++  next.width = *width;
++  next.height = *height;
++  next.slots.reserve(slots->size());
++  for (const base::Value& slot_value : *slots) {
++    if (!slot_value.is_dict()) {
++      SetResult(result_code, result_detail, "invalid_swapchain_metadata",
++                "workspace GPU bridge swapchain slot must be an object");
++      return false;
++    }
++    const base::DictValue& slot = slot_value.GetDict();
++    const std::optional<uint32_t> slot_index =
++        slot.Find("slot_index") ? ParseUint32(*slot.Find("slot_index"))
++                                : std::nullopt;
++    const std::optional<uint64_t> slot_revision =
++        slot.Find("revision") ? ParseUint64(*slot.Find("revision"))
++                              : std::optional<uint64_t>(0U);
++    if (!slot_index.has_value() || !slot_revision.has_value()) {
++      SetResult(result_code, result_detail, "invalid_swapchain_metadata",
++                "workspace GPU bridge swapchain slot requires slot_index");
++      return false;
++    }
++    std::string source_json;
++    if (!base::JSONWriter::Write(slot_value, &source_json) ||
++        source_json.empty()) {
++      SetResult(result_code, result_detail, "invalid_swapchain_metadata",
++                "workspace GPU bridge could not serialize swapchain slot "
++                "metadata");
++      return false;
++    }
++    next.slots.push_back(
++        ParsedSwapchainSlot{*slot_index, *slot_revision, source_json});
++  }
++
++  *swapchain = std::move(next);
++  return true;
++}
++
++bool ShouldLogCadence(uint64_t count) {
++  return count <= 3U || count % 300U == 0U;
++}
++
++void DestroyWorkspaceLayer(std::unique_ptr<ui::Layer> layer) {
++  if (!layer) {
++    return;
++  }
++  if (ui::Layer* parent = layer->parent()) {
++    parent->Remove(layer.get());
++  }
++}
++
++uint32_t NextWorkspaceTransferableResourceId() {
++  constexpr uint32_t kFirstResourceId = 1U;
++  const uint32_t reserved_start = viz::kVizReservedRangeStartId.GetUnsafeValue();
++  static std::atomic<uint32_t> next_id{kFirstResourceId};
++  for (;;) {
++    uint32_t id = next_id.load(std::memory_order_relaxed);
++    if (id == 0U || id >= reserved_start) {
++      next_id.compare_exchange_weak(id, kFirstResourceId,
++                                    std::memory_order_relaxed,
++                                    std::memory_order_relaxed);
++      continue;
++    }
++    uint32_t next = id + 1U;
++    if (next == 0U || next >= reserved_start) {
++      next = kFirstResourceId;
++    }
++    if (next_id.compare_exchange_weak(id, next, std::memory_order_relaxed,
++                                      std::memory_order_relaxed)) {
++      return id;
++    }
++  }
++}
++
++bool SwapchainHasPendingDisplayReads(
++    const CefWorkspaceGpuBridgeSurfaceService::SwapchainState& state) {
++  for (const auto& slot_pair : state.slots) {
++    if (slot_pair.second.display_read_pending) {
++      return true;
++    }
++  }
++  return false;
++}
++
++bool ClearPendingSwapchainResource(
++    CefWorkspaceGpuBridgeSurfaceService::SwapchainState* state,
++    uint64_t generation,
++    uint32_t slot_index,
++    uint32_t resource_id,
++    uint64_t* released_revision) {
++  if (!state || state->generation != generation) {
++    return false;
++  }
++  auto slot_it = state->slots.find(slot_index);
++  if (slot_it == state->slots.end() ||
++      !slot_it->second.display_read_pending ||
++      slot_it->second.outstanding_resource_id != resource_id) {
++    return false;
++  }
++  if (released_revision) {
++    *released_revision = slot_it->second.outstanding_revision;
++  }
++  slot_it->second.display_read_pending = false;
++  slot_it->second.outstanding_resource_id = 0U;
++  slot_it->second.outstanding_revision = 0U;
++  return true;
++}
++
++bool ValidateProducerReadiness(
++    const CefWorkspaceGpuBridgeSurfaceService::ProducerReadiness& configured,
++    uint32_t ready_sync_kind,
++    uint64_t ready_sync_handle,
++    uint64_t ready_sync_value,
++    std::string* result_code,
++    std::string* result_detail) {
++  constexpr uint32_t kSyncKindCudaEvent = 1U;
++  constexpr uint32_t kSyncKindNativeFenceFd = 3U;
++  if ((ready_sync_kind != kSyncKindCudaEvent &&
++       ready_sync_kind != kSyncKindNativeFenceFd) ||
++      ready_sync_handle == 0U) {
++    SetResult(result_code, result_detail, "missing_sync_metadata",
++              "workspace GPU bridge present requires CUDA ready metadata or "
++              "a native acquire fence for the front swapchain slot");
++    return false;
++  }
++  if (ready_sync_kind != kSyncKindNativeFenceFd &&
++      configured.ready_sync_kind != 0U &&
++      (configured.ready_sync_kind != ready_sync_kind ||
++       configured.ready_sync_handle != ready_sync_handle)) {
++    SetResult(result_code, result_detail, "stale_ready_sync",
++              "workspace GPU bridge present readiness does not match the "
++              "configured swapchain slot");
++    return false;
++  }
++  (void)ready_sync_value;
++  return true;
++}
++
++std::unique_ptr<gfx::GpuFence> MakeProducerAcquireFence(
++    uint32_t ready_sync_kind,
++    uint64_t ready_sync_handle,
++    std::string* result_code,
++    std::string* result_detail) {
++  constexpr uint32_t kSyncKindNativeFenceFd = 3U;
++  if (ready_sync_kind != kSyncKindNativeFenceFd) {
++    return nullptr;
++  }
++  if (ready_sync_handle == 0U ||
++      ready_sync_handle >
++          static_cast<uint64_t>(std::numeric_limits<int>::max())) {
++    SetResult(result_code, result_detail, "invalid_sync_metadata",
++              "workspace GPU bridge present carried an invalid native fence fd");
++    return nullptr;
++  }
++  const int duplicated_fd =
++      ::fcntl(static_cast<int>(ready_sync_handle), F_DUPFD_CLOEXEC, 3);
++  if (duplicated_fd < 0) {
++    SetResult(result_code, result_detail, "invalid_sync_metadata",
++              "workspace GPU bridge present could not duplicate the native "
++              "acquire fence fd");
++    return nullptr;
++  }
++  gfx::GpuFenceHandle fence_handle;
++  fence_handle.Adopt(base::ScopedFD(duplicated_fd));
++  return std::make_unique<gfx::GpuFence>(std::move(fence_handle));
++}
++
++gpu::SyncToken NotifyExternalProducerUpdate(
++    scoped_refptr<gpu::ClientSharedImage> shared_image,
++    gpu::SharedImageInterface* shared_image_interface,
++    std::unique_ptr<gfx::GpuFence> acquire_fence) {
++  gpu::SyncToken producer_update_sync_token;
++  if (acquire_fence) {
++    shared_image_interface->UpdateSharedImage(
++        gpu::SyncToken(), std::move(acquire_fence), shared_image->mailbox());
++    producer_update_sync_token = shared_image_interface->GenUnverifiedSyncToken();
++  } else {
++    producer_update_sync_token = shared_image->BackingWasExternallyUpdated(
++        shared_image->creation_sync_token());
++  }
++  if (producer_update_sync_token.HasData()) {
++    shared_image_interface->VerifySyncToken(producer_update_sync_token);
++  }
++  return producer_update_sync_token;
++}
++
++gpu::SharedImageUsageSet WorkspaceSharedImageUsageForBrowserImport(
++    bool require_webgpu_read) {
++  if (require_webgpu_read) {
++    return gpu::SharedImageUsageSet({gpu::SHARED_IMAGE_USAGE_WEBGPU_READ,
++                                     gpu::SHARED_IMAGE_USAGE_DISPLAY_READ});
++  }
++  return gpu::SharedImageUsageSet({gpu::SHARED_IMAGE_USAGE_DISPLAY_READ,
++                                   gpu::SHARED_IMAGE_USAGE_GLES2_READ});
++}
++
+ base::ListValue MailboxBytesToList(const gpu::Mailbox& mailbox) {
+   base::ListValue bytes;
+   for (int index = 0; index < GL_MAILBOX_SIZE_CHROMIUM; ++index) {
+@@ -380,7 +628,8 @@
+                                    std::string_view surface_id,
+                                    std::string_view revision,
+                                    std::string* result_code,
+-                                   std::string* result_detail) {
++                                   std::string* result_detail,
++                                   bool require_webgpu_read) {
+   DmaBufWorkspaceSource source;
+   if (!ParseDmaBufWorkspaceSource(publication_source_json, &source,
+                                   result_code, result_detail)) {
+@@ -423,8 +672,7 @@
+                 base::checked_cast<int>(source.height)),
+       gfx::ColorSpace::CreateSRGB(), kTopLeft_GrSurfaceOrigin,
+       kOpaque_SkAlphaType,
+-      gpu::SharedImageUsageSet({gpu::SHARED_IMAGE_USAGE_WEBGPU_READ,
+-                                gpu::SHARED_IMAGE_USAGE_DISPLAY_READ}),
++      WorkspaceSharedImageUsageForBrowserImport(require_webgpu_read),
+       "mmltk workspace DMA-BUF");
+   scoped_refptr<gpu::ClientSharedImage> shared_image =
+       shared_image_interface->CreateSharedImage(
+@@ -524,7 +772,8 @@
+   std::optional<Entry> maybe_entry =
+       CreateExportedSharedImageForDmaBuf(publication_source_json,
+                                          surface_id, revision, &export_code,
+-                                         &export_detail);
++                                         &export_detail,
++                                         /*require_webgpu_read=*/true);
+   if (!maybe_entry.has_value()) {
+     LOG(WARNING) << "workspace GPU bridge browser export rejected surface "
+                  << surface_id << " revision " << revision << ": "
+@@ -642,6 +891,491 @@
+   it->second.renderer_dissociated = false;
+ }
+ 
++void CefWorkspaceGpuBridgeSurfaceService::RetireActiveSwapchainLocked() {
++  if (!workspace_swapchain_configured_ && workspace_swapchain_.slots.empty()) {
++    return;
++  }
++  const uint64_t generation = workspace_swapchain_.generation;
++  const bool pending_display_reads =
++      SwapchainHasPendingDisplayReads(workspace_swapchain_);
++  workspace_swapchain_configured_ = false;
++  front_slot_present_log_count_ = 0U;
++  if (pending_display_reads) {
++    retiring_swapchains_.push_back(std::move(workspace_swapchain_));
++    LOG(INFO) << "workspace GPU bridge deferred swapchain cleanup generation "
++              << generation << " retiring_count "
++              << retiring_swapchains_.size();
++  } else {
++    LOG(INFO) << "workspace GPU bridge completed swapchain cleanup generation "
++              << generation;
++  }
++  workspace_swapchain_ = SwapchainState{};
++}
++
++void CefWorkspaceGpuBridgeSurfaceService::PruneRetiredSwapchainsLocked() {
++  for (auto it = retiring_swapchains_.begin();
++       it != retiring_swapchains_.end();) {
++    if (SwapchainHasPendingDisplayReads(*it)) {
++      ++it;
++      continue;
++    }
++    LOG(INFO) << "workspace GPU bridge completed deferred swapchain cleanup "
++              << "generation " << it->generation;
++    it = retiring_swapchains_.erase(it);
++  }
++}
++
++void CefWorkspaceGpuBridgeSurfaceService::
++    OnWorkspaceTransferableResourceReleased(uint64_t generation,
++                                            uint32_t slot_index,
++                                            uint32_t resource_id,
++                                            const gpu::SyncToken& sync_token,
++                                            bool lost_resource) {
++  uint64_t released_revision = 0U;
++  bool released = false;
++  {
++    base::AutoLock hold(lock_);
++    released = ClearPendingSwapchainResource(
++        &workspace_swapchain_, generation, slot_index, resource_id,
++        &released_revision);
++    if (!released) {
++      for (SwapchainState& retiring_swapchain : retiring_swapchains_) {
++        released = ClearPendingSwapchainResource(
++            &retiring_swapchain, generation, slot_index, resource_id,
++            &released_revision);
++        if (released) {
++          break;
++        }
++      }
++    }
++    if (released) {
++      PruneRetiredSwapchainsLocked();
++    }
++  }
++  LOG(INFO) << "workspace GPU bridge compositor released resource generation "
++            << generation << " slot " << slot_index << " revision "
++            << released_revision << " resource_id " << resource_id
++            << " matched " << released << " sync_has_data "
++            << sync_token.HasData() << " sync_verified "
++            << sync_token.verified_flush() << " lost_resource "
++            << lost_resource;
++}
++
++bool CefWorkspaceGpuBridgeSurfaceService::ConfigureSwapchain(
++    std::string_view surface_id,
++    std::string_view swapchain_json,
++    CefString* result_code,
++    CefString* result_detail) {
++  if (!CEF_CURRENTLY_ON_UIT()) {
++    SetResult(result_code, result_detail, "ui_thread_required",
++              "workspace GPU bridge swapchain configuration must run on the "
++              "CEF UI thread");
++    return false;
++  }
++  if (!IsWorkspaceSurfaceId(surface_id) || swapchain_json.empty()) {
++    SetResult(result_code, result_detail, "invalid_surface",
++              "workspace GPU bridge swapchain configuration requires the "
++              "workspace surface id and swapchain metadata");
++    return false;
++  }
++
++  std::string parse_code;
++  std::string parse_detail;
++  ParsedSwapchain parsed;
++  if (!ParseSwapchainJson(swapchain_json, &parsed, &parse_code,
++                          &parse_detail)) {
++    SetResult(result_code, result_detail,
++              parse_code.empty() ? "invalid_swapchain_metadata" : parse_code,
++              parse_detail);
++    LOG(WARNING) << "workspace GPU bridge swapchain configuration rejected "
++                 << surface_id << ": " << parse_code << ": "
++                 << parse_detail;
++    return false;
++  }
++
++  SwapchainState next_state;
++  next_state.generation = parsed.generation;
++  next_state.width = parsed.width;
++  next_state.height = parsed.height;
++  for (const ParsedSwapchainSlot& parsed_slot : parsed.slots) {
++    DmaBufWorkspaceSource source;
++    std::string slot_code;
++    std::string slot_detail;
++    if (!ParseDmaBufWorkspaceSource(parsed_slot.source_json, &source,
++                                    &slot_code, &slot_detail)) {
++      SetResult(result_code, result_detail,
++                slot_code.empty() ? "invalid_dmabuf_metadata" : slot_code,
++                slot_detail);
++      LOG(WARNING) << "workspace GPU bridge swapchain slot rejected "
++                   << surface_id << " slot " << parsed_slot.slot_index << ": "
++                   << slot_code << ": " << slot_detail;
++      return false;
++    }
++    if (source.width != parsed.width || source.height != parsed.height) {
++      SetResult(result_code, result_detail, "invalid_swapchain_metadata",
++                "workspace GPU bridge swapchain slot dimensions must match "
++                "the configured workspace dimensions");
++      LOG(WARNING) << "workspace GPU bridge swapchain slot dimension mismatch "
++                   << surface_id << " slot " << parsed_slot.slot_index
++                   << " slot_size " << source.width << "x" << source.height
++                   << " swapchain_size " << parsed.width << "x"
++                   << parsed.height;
++      return false;
++    }
++
++    const std::string slot_revision =
++        "slot:" + base::NumberToString(parsed_slot.slot_index);
++    std::optional<Entry> maybe_entry = CreateExportedSharedImageForDmaBuf(
++        parsed_slot.source_json, surface_id, slot_revision, &slot_code,
++        &slot_detail, /*require_webgpu_read=*/false);
++    if (!maybe_entry.has_value()) {
++      SetResult(result_code, result_detail,
++                slot_code.empty() ? "shared_image_creation_failure" : slot_code,
++                slot_detail.empty()
++                    ? "workspace GPU bridge failed to import swapchain slot"
++                    : slot_detail);
++      LOG(WARNING) << "workspace GPU bridge swapchain slot import failed "
++                   << surface_id << " slot " << parsed_slot.slot_index << ": "
++                   << slot_code << ": " << slot_detail;
++      return false;
++    }
++
++    SwapchainSlotEntry slot_entry;
++    slot_entry.entry = std::move(*maybe_entry);
++    slot_entry.slot_index = parsed_slot.slot_index;
++    slot_entry.slot_revision = parsed_slot.slot_revision;
++    slot_entry.width = source.width;
++    slot_entry.height = source.height;
++    next_state.slots.insert_or_assign(parsed_slot.slot_index,
++                                      std::move(slot_entry));
++    LOG(INFO) << "workspace GPU bridge imported persistent swapchain slot "
++              << surface_id << " slot " << parsed_slot.slot_index
++              << " generation " << parsed.generation << " size "
++              << source.width << "x" << source.height << " modifier "
++              << source.drm_modifier << " stride " << source.stride_bytes;
++  }
++  if (next_state.slots.size() != parsed.slots.size()) {
++    SetResult(result_code, result_detail, "invalid_swapchain_metadata",
++              "workspace GPU bridge swapchain slot indexes must be unique");
++    return false;
++  }
++
++  std::unique_ptr<ui::Layer> retired_layer;
++  {
++    base::AutoLock hold(lock_);
++    retired_layer = std::move(workspace_layer_);
++    RetireActiveSwapchainLocked();
++    workspace_swapchain_ = std::move(next_state);
++    workspace_swapchain_configured_ = true;
++    front_slot_present_log_count_ = 0U;
++    PruneRetiredSwapchainsLocked();
++  }
++  DestroyWorkspaceLayer(std::move(retired_layer));
++  SetResult(result_code, result_detail, "ok", "configured workspace swapchain");
++  LOG(INFO) << "workspace GPU bridge configured swapchain " << surface_id
++            << " generation " << parsed.generation << " size " << parsed.width
++            << "x" << parsed.height << " slots " << parsed.slots.size();
++  return true;
++}
++
++bool CefWorkspaceGpuBridgeSurfaceService::PresentFrontSlot(
++    std::string_view surface_id,
++    uint32_t slot_index,
++    uint64_t revision,
++    uint64_t swapchain_generation,
++    int32_t bounds_x,
++    int32_t bounds_y,
++    int32_t bounds_width,
++    int32_t bounds_height,
++    int32_t damage_x,
++    int32_t damage_y,
++    int32_t damage_width,
++    int32_t damage_height,
++    uint32_t ready_sync_kind,
++    uint64_t ready_sync_handle,
++    uint64_t ready_sync_value,
++    CefString* result_code,
++    CefString* result_detail) {
++  if (!CEF_CURRENTLY_ON_UIT()) {
++    SetResult(result_code, result_detail, "ui_thread_required",
++              "workspace GPU bridge front-slot present must run on the CEF "
++              "UI thread");
++    return false;
++  }
++  if (!IsWorkspaceSurfaceId(surface_id) || revision == 0U || bounds_width <= 0 ||
++      bounds_height <= 0) {
++    SetResult(result_code, result_detail, "invalid_surface",
++              "workspace GPU bridge present requires workspace surface id, "
++              "revision, and non-empty workspace bounds");
++    return false;
++  }
++
++  const gfx::Rect bounds_rect(bounds_x, bounds_y, bounds_width, bounds_height);
++  gfx::Rect damage_rect(damage_x, damage_y, damage_width, damage_height);
++  if (damage_rect.IsEmpty()) {
++    damage_rect = bounds_rect;
++  }
++
++  scoped_refptr<gpu::ClientSharedImage> shared_image;
++  ProducerReadiness producer_readiness;
++  ui::Compositor* compositor = nullptr;
++  ui::Layer* root_layer = nullptr;
++  ui::Layer* workspace_layer = nullptr;
++  uint32_t slot_width = 0;
++  uint32_t slot_height = 0;
++  uint32_t present_resource_id = 0;
++  uint64_t present_generation = 0;
++  uint64_t present_log_count = 0;
++  {
++    base::AutoLock hold(lock_);
++    if (!workspace_swapchain_configured_) {
++      SetResult(result_code, result_detail, "swapchain_not_configured",
++                "workspace GPU bridge present requires a configured "
++                "swapchain");
++      return false;
++    }
++    SwapchainState& state = workspace_swapchain_;
++    if (swapchain_generation != 0U && swapchain_generation != state.generation) {
++      SetResult(result_code, result_detail, "stale_swapchain_generation",
++                "workspace GPU bridge present generation does not match the "
++                "configured swapchain");
++      return false;
++    }
++    const auto slot_it = state.slots.find(slot_index);
++    if (slot_it == state.slots.end()) {
++      SetResult(result_code, result_detail, "invalid_swapchain_slot",
++                "workspace GPU bridge present referenced an unknown "
++                "swapchain slot");
++      return false;
++    }
++    if (slot_it->second.display_read_pending) {
++      SetResult(result_code, result_detail, "slot_display_busy",
++                "workspace GPU bridge present slot is still held by the "
++                "compositor");
++      LOG(WARNING) << "workspace GPU bridge front slot busy " << surface_id
++                   << " slot " << slot_index << " generation "
++                   << state.generation << " outstanding_resource_id "
++                   << slot_it->second.outstanding_resource_id
++                   << " outstanding_revision "
++                   << slot_it->second.outstanding_revision;
++      return false;
++    }
++    shared_image = slot_it->second.entry.shared_image;
++    producer_readiness = slot_it->second.entry.producer_readiness;
++    slot_width = slot_it->second.width;
++    slot_height = slot_it->second.height;
++    present_generation = state.generation;
++    compositor = compositor_;
++    root_layer = compositor_root_layer_;
++    present_log_count = ++front_slot_present_log_count_;
++  }
++
++  auto* transport_factory = content::ImageTransportFactory::GetInstance();
++  auto* context_factory =
++      transport_factory ? transport_factory->GetContextFactory() : nullptr;
++  scoped_refptr<viz::RasterContextProvider> context_provider =
++      context_factory ? context_factory->SharedMainThreadRasterContextProvider()
++                      : nullptr;
++  gpu::SharedImageInterface* shared_image_interface =
++      context_provider ? context_provider->SharedImageInterface() : nullptr;
++  if (!shared_image || !shared_image_interface) {
++    SetResult(result_code, result_detail, "shared_image_creation_failure",
++              "workspace GPU bridge present has no SharedImage interface");
++    return false;
++  }
++
++  std::string readiness_code;
++  std::string readiness_detail;
++  if (!ValidateProducerReadiness(producer_readiness, ready_sync_kind,
++                                 ready_sync_handle, ready_sync_value,
++                                 &readiness_code, &readiness_detail)) {
++    SetResult(result_code, result_detail, readiness_code, readiness_detail);
++    return false;
++  }
++
++  std::unique_ptr<gfx::GpuFence> acquire_fence = MakeProducerAcquireFence(
++      ready_sync_kind, ready_sync_handle, &readiness_code, &readiness_detail);
++  if (!readiness_code.empty()) {
++    SetResult(result_code, result_detail, readiness_code, readiness_detail);
++    return false;
++  }
++
++  gpu::SyncToken producer_update_sync_token =
++      NotifyExternalProducerUpdate(shared_image, shared_image_interface,
++                                   std::move(acquire_fence));
++
++  const gfx::Size texture_size(bounds_rect.width(), bounds_rect.height());
++  {
++    base::AutoLock hold(lock_);
++    if (!workspace_swapchain_configured_ ||
++        workspace_swapchain_.generation != present_generation) {
++      SetResult(result_code, result_detail, "stale_swapchain_generation",
++                "workspace GPU bridge present generation was replaced before "
++                "the compositor resource was submitted");
++      return false;
++    }
++    auto slot_it = workspace_swapchain_.slots.find(slot_index);
++    if (slot_it == workspace_swapchain_.slots.end()) {
++      SetResult(result_code, result_detail, "invalid_swapchain_slot",
++                "workspace GPU bridge present slot was removed before the "
++                "compositor resource was submitted");
++      return false;
++    }
++    if (slot_it->second.display_read_pending) {
++      SetResult(result_code, result_detail, "slot_display_busy",
++                "workspace GPU bridge present slot became busy before the "
++                "compositor resource was submitted");
++      LOG(WARNING) << "workspace GPU bridge front slot busy before submit "
++                   << surface_id << " slot " << slot_index << " generation "
++                   << workspace_swapchain_.generation
++                   << " outstanding_resource_id "
++                   << slot_it->second.outstanding_resource_id
++                   << " outstanding_revision "
++                   << slot_it->second.outstanding_revision;
++      return false;
++    }
++    present_resource_id = NextWorkspaceTransferableResourceId();
++    slot_it->second.display_read_pending = true;
++    slot_it->second.outstanding_resource_id = present_resource_id;
++    slot_it->second.outstanding_revision = revision;
++    workspace_swapchain_.front_slot_index = slot_index;
++    workspace_swapchain_.front_revision = revision;
++    if (!workspace_layer_) {
++      workspace_layer_ = std::make_unique<ui::Layer>(ui::LAYER_TEXTURED);
++      workspace_layer_->SetName("mmltk workspace native swapchain");
++      workspace_layer_->SetFillsBoundsOpaquely(true);
++      workspace_layer_->SetFillsBoundsCompletely(true);
++    }
++    workspace_layer = workspace_layer_.get();
++  }
++  if (workspace_layer) {
++    if (root_layer && workspace_layer->parent() != root_layer) {
++      if (ui::Layer* parent = workspace_layer->parent()) {
++        parent->Remove(workspace_layer);
++      }
++      root_layer->Add(workspace_layer);
++    }
++    workspace_layer->SetVisible(root_layer != nullptr);
++    workspace_layer->SetBounds(bounds_rect);
++    viz::TransferableResource resource = viz::TransferableResource::Make(
++        shared_image, viz::TransferableResource::ResourceSource::kUI,
++        producer_update_sync_token);
++    resource.id = viz::ResourceId(present_resource_id);
++    resource.synchronization_type =
++        viz::TransferableResource::SynchronizationType::kSyncToken;
++    workspace_layer->SetTransferableResource(
++        resource,
++        base::BindOnce(
++            &CefWorkspaceGpuBridgeSurfaceService::
++                OnWorkspaceTransferableResourceReleased,
++            base::Unretained(this), present_generation, slot_index,
++            present_resource_id),
++        texture_size);
++    gfx::Rect layer_damage = damage_rect;
++    layer_damage.Offset(-bounds_rect.x(), -bounds_rect.y());
++    workspace_layer->SchedulePaint(layer_damage.IsEmpty()
++                                       ? gfx::Rect(texture_size)
++                                       : layer_damage);
++  }
++  if (compositor) {
++    compositor->ScheduleRedrawRect(damage_rect);
++  }
++
++  if (ShouldLogCadence(present_log_count)) {
++    LOG(INFO) << "workspace GPU bridge presented front slot " << surface_id
++              << " slot " << slot_index << " revision " << revision
++              << " generation " << present_generation << " bounds "
++              << bounds_rect.ToString() << " damage " << damage_rect.ToString()
++              << " compositor_bound " << static_cast<bool>(compositor)
++              << " root_layer_bound " << static_cast<bool>(root_layer)
++              << " sync_has_data " << producer_update_sync_token.HasData()
++              << " sync_verified "
++              << producer_update_sync_token.verified_flush()
++              << " resource_id " << present_resource_id
++              << " ready_sync_kind " << ready_sync_kind
++              << " ready_sync_handle " << ready_sync_handle
++              << " ready_sync_value " << ready_sync_value << " slot_size "
++              << slot_width << "x" << slot_height;
++  }
++  SetResult(result_code, result_detail, "ok", "presented workspace front slot");
++  return true;
++}
++
++bool CefWorkspaceGpuBridgeSurfaceService::DestroySwapchain(
++    std::string_view surface_id,
++    CefString* result_code,
++    CefString* result_detail) {
++  if (!CEF_CURRENTLY_ON_UIT()) {
++    SetResult(result_code, result_detail, "ui_thread_required",
++              "workspace GPU bridge swapchain destruction must run on the "
++              "CEF UI thread");
++    return false;
++  }
++  if (!IsWorkspaceSurfaceId(surface_id)) {
++    SetResult(result_code, result_detail, "invalid_surface",
++              "workspace GPU bridge destroy requires the workspace surface id");
++    return false;
++  }
++  bool erased = false;
++  std::unique_ptr<ui::Layer> detached_layer;
++  {
++    base::AutoLock hold(lock_);
++    erased = workspace_swapchain_configured_ ||
++             !workspace_swapchain_.slots.empty();
++    detached_layer = std::move(workspace_layer_);
++    RetireActiveSwapchainLocked();
++    PruneRetiredSwapchainsLocked();
++  }
++  DestroyWorkspaceLayer(std::move(detached_layer));
++  SetResult(result_code, result_detail, "ok", "destroyed workspace swapchain");
++  LOG(INFO) << "workspace GPU bridge destroyed swapchain " << surface_id
++            << " existed " << erased;
++  return true;
++}
++
++void CefWorkspaceGpuBridgeSurfaceService::BindCompositor(
++    int browser_id,
++    ui::Compositor* compositor,
++    ui::Layer* root_layer) {
++  CEF_REQUIRE_UIT_RETURN_VOID();
++  base::AutoLock hold(lock_);
++  compositor_browser_id_ = browser_id;
++  compositor_ = compositor;
++  compositor_root_layer_ = root_layer;
++  if (workspace_layer_ && root_layer && workspace_layer_->parent() != root_layer) {
++    if (ui::Layer* parent = workspace_layer_->parent()) {
++      parent->Remove(workspace_layer_.get());
++    }
++    root_layer->Add(workspace_layer_.get());
++  }
++  LOG(INFO) << "workspace GPU bridge bound compositor browser " << browser_id
++            << " compositor " << compositor << " root_layer " << root_layer;
++}
++
++void CefWorkspaceGpuBridgeSurfaceService::ClearCompositorBinding(
++    int browser_id) {
++  CEF_REQUIRE_UIT_RETURN_VOID();
++  bool retired_swapchain = false;
++  std::unique_ptr<ui::Layer> detached_layer;
++  {
++    base::AutoLock hold(lock_);
++    if (compositor_browser_id_ != browser_id) {
++      return;
++    }
++    retired_swapchain = workspace_swapchain_configured_ ||
++                        !workspace_swapchain_.slots.empty();
++    detached_layer = std::move(workspace_layer_);
++    RetireActiveSwapchainLocked();
++    PruneRetiredSwapchainsLocked();
++    compositor_ = nullptr;
++    compositor_root_layer_ = nullptr;
++    compositor_browser_id_ = 0;
++  }
++  DestroyWorkspaceLayer(std::move(detached_layer));
++  LOG(INFO) << "workspace GPU bridge cleared compositor binding browser "
++            << browser_id << " retired_swapchain " << retired_swapchain;
++}
++
+ extern "C" CEF_EXPORT bool mmltk_cef_workspace_gpu_bridge_export_shared_image(
+     const char* surface_id,
+     size_t surface_id_length,
+@@ -669,6 +1403,72 @@
+       exported_shared_image_json_out, result_code, result_detail);
+ }
+ 
++extern "C" CEF_EXPORT bool mmltk_cef_workspace_gpu_bridge_configure_swapchain(
++    const char* surface_id,
++    size_t surface_id_length,
++    const char* swapchain_json,
++    size_t swapchain_json_length,
++    CefString* result_code,
++    CefString* result_detail) noexcept {
++  if (!surface_id || surface_id_length == 0U || !swapchain_json ||
++      swapchain_json_length == 0U) {
++    SetResult(result_code, result_detail, "invalid_surface",
++              "workspace GPU bridge configure swapchain requires surface id "
++              "and swapchain metadata");
++    return false;
++  }
++  return CefWorkspaceGpuBridgeSurfaceService::GetInstance().ConfigureSwapchain(
++      std::string_view(surface_id, surface_id_length),
++      std::string_view(swapchain_json, swapchain_json_length), result_code,
++      result_detail);
++}
++
++extern "C" CEF_EXPORT bool mmltk_cef_workspace_gpu_bridge_present_front_slot(
++    const char* surface_id,
++    size_t surface_id_length,
++    uint32_t slot_index,
++    uint64_t revision,
++    uint64_t swapchain_generation,
++    int32_t bounds_x,
++    int32_t bounds_y,
++    int32_t bounds_width,
++    int32_t bounds_height,
++    int32_t damage_x,
++    int32_t damage_y,
++    int32_t damage_width,
++    int32_t damage_height,
++    uint32_t ready_sync_kind,
++    uint64_t ready_sync_handle,
++    uint64_t ready_sync_value,
++    CefString* result_code,
++    CefString* result_detail) noexcept {
++  if (!surface_id || surface_id_length == 0U) {
++    SetResult(result_code, result_detail, "invalid_surface",
++              "workspace GPU bridge present front slot requires surface id");
++    return false;
++  }
++  return CefWorkspaceGpuBridgeSurfaceService::GetInstance().PresentFrontSlot(
++      std::string_view(surface_id, surface_id_length), slot_index, revision,
++      swapchain_generation, bounds_x, bounds_y, bounds_width, bounds_height,
++      damage_x, damage_y, damage_width, damage_height, ready_sync_kind,
++      ready_sync_handle, ready_sync_value, result_code, result_detail);
++}
++
++extern "C" CEF_EXPORT bool mmltk_cef_workspace_gpu_bridge_destroy_swapchain(
++    const char* surface_id,
++    size_t surface_id_length,
++    CefString* result_code,
++    CefString* result_detail) noexcept {
++  if (!surface_id || surface_id_length == 0U) {
++    SetResult(result_code, result_detail, "invalid_surface",
++              "workspace GPU bridge destroy swapchain requires surface id");
++    return false;
++  }
++  return CefWorkspaceGpuBridgeSurfaceService::GetInstance().DestroySwapchain(
++      std::string_view(surface_id, surface_id_length), result_code,
++      result_detail);
++}
++
+ extern "C" CEF_EXPORT bool mmltk_cef_workspace_gpu_bridge_release_surface(
+     const char* surface_id,
+     size_t surface_id_length,
+--- cef/libcef/browser/workspace_gpu_bridge_surface_service.h
++++ cef/libcef/browser/workspace_gpu_bridge_surface_service.h
+@@ -9,21 +9,31 @@
+ #include <cmath>
+ #include <cstdint>
+ #include <limits>
++#include <memory>
+ #include <optional>
+ #include <string>
+ #include <string_view>
++#include <vector>
+ 
+ #include "base/containers/flat_map.h"
++#include "base/memory/raw_ptr.h"
+ #include "base/memory/scoped_refptr.h"
+ #include "base/synchronization/lock.h"
+ #include "cef/include/internal/cef_string.h"
+ #include "cef/libcef/common/mojom/cef.mojom.h"
+ #include "content/public/browser/render_frame_host.h"
++#include "ui/compositor/layer.h"
+ 
+ namespace gpu {
+ class ClientSharedImage;
++struct SyncToken;
+ }  // namespace gpu
+ 
++namespace ui {
++class Compositor;
++class Layer;
++}  // namespace ui
++
+ class CefWorkspaceGpuBridgeSurfaceService {
+  public:
+   static CefWorkspaceGpuBridgeSurfaceService& GetInstance();
+@@ -51,6 +61,36 @@
+                                  std::string_view surface_id,
+                                  std::string_view revision);
+ 
++  bool ConfigureSwapchain(std::string_view surface_id,
++                          std::string_view swapchain_json,
++                          CefString* result_code,
++                          CefString* result_detail);
++  bool PresentFrontSlot(std::string_view surface_id,
++                        uint32_t slot_index,
++                        uint64_t revision,
++                        uint64_t swapchain_generation,
++                        int32_t bounds_x,
++                        int32_t bounds_y,
++                        int32_t bounds_width,
++                        int32_t bounds_height,
++                        int32_t damage_x,
++                        int32_t damage_y,
++                        int32_t damage_width,
++                        int32_t damage_height,
++                        uint32_t ready_sync_kind,
++                        uint64_t ready_sync_handle,
++                        uint64_t ready_sync_value,
++                        CefString* result_code,
++                        CefString* result_detail);
++  bool DestroySwapchain(std::string_view surface_id,
++                        CefString* result_code,
++                        CefString* result_detail);
++
++  void BindCompositor(int browser_id,
++                      ui::Compositor* compositor,
++                      ui::Layer* root_layer);
++  void ClearCompositorBinding(int browser_id);
++
+   struct ProducerReadiness {
+     uint32_t ready_sync_kind = 0;
+     uint64_t ready_sync_handle = 0;
+@@ -66,6 +106,26 @@
+     bool browser_released = false;
+   };
+ 
++  struct SwapchainSlotEntry {
++    Entry entry;
++    uint32_t slot_index = 0;
++    uint64_t slot_revision = 0;
++    uint32_t width = 0;
++    uint32_t height = 0;
++    uint32_t outstanding_resource_id = 0;
++    uint64_t outstanding_revision = 0;
++    bool display_read_pending = false;
++  };
++
++  struct SwapchainState {
++    uint64_t generation = 0;
++    uint32_t width = 0;
++    uint32_t height = 0;
++    uint32_t front_slot_index = 0;
++    uint64_t front_revision = 0;
++    base::flat_map<uint32_t, SwapchainSlotEntry> slots;
++  };
++
+  public:
+   CefWorkspaceGpuBridgeSurfaceService() = default;
+ 
+@@ -78,8 +138,24 @@
+   void EraseBrowserReleasedUnassociated(std::string surface_id,
+                                         std::string revision);
+ 
++  void RetireActiveSwapchainLocked();
++  void PruneRetiredSwapchainsLocked();
++  void OnWorkspaceTransferableResourceReleased(uint64_t generation,
++                                               uint32_t slot_index,
++                                               uint32_t resource_id,
++                                               const gpu::SyncToken& sync_token,
++                                               bool lost_resource);
++
+   base::Lock lock_;
+   base::flat_map<std::string, Entry> entries_ GUARDED_BY(lock_);
++  SwapchainState workspace_swapchain_ GUARDED_BY(lock_);
++  bool workspace_swapchain_configured_ GUARDED_BY(lock_) = false;
++  std::vector<SwapchainState> retiring_swapchains_ GUARDED_BY(lock_);
++  std::unique_ptr<ui::Layer> workspace_layer_ GUARDED_BY(lock_);
++  raw_ptr<ui::Compositor> compositor_ GUARDED_BY(lock_) = nullptr;
++  raw_ptr<ui::Layer> compositor_root_layer_ GUARDED_BY(lock_) = nullptr;
++  int compositor_browser_id_ GUARDED_BY(lock_) = 0;
++  uint64_t front_slot_present_log_count_ GUARDED_BY(lock_) = 0;
+ };
+ 
+ #endif  // CEF_LIBCEF_BROWSER_WORKSPACE_GPU_BRIDGE_SURFACE_SERVICE_H_
+--- cef/libcef/common/workspace_gpu_bridge_export.h
++++ cef/libcef/common/workspace_gpu_bridge_export.h
+@@ -18,6 +18,21 @@
+     size_t publication_source_json_length,
+     CefString* exported_shared_image_json_out,
+     CefString* result_code, CefString* result_detail) noexcept;
++extern "C" CEF_EXPORT bool mmltk_cef_workspace_gpu_bridge_configure_swapchain(
++    const char* surface_id, size_t surface_id_length,
++    const char* swapchain_json, size_t swapchain_json_length,
++    CefString* result_code, CefString* result_detail) noexcept;
++extern "C" CEF_EXPORT bool mmltk_cef_workspace_gpu_bridge_present_front_slot(
++    const char* surface_id, size_t surface_id_length, uint32_t slot_index,
++    uint64_t revision, uint64_t swapchain_generation, int32_t bounds_x,
++    int32_t bounds_y, int32_t bounds_width, int32_t bounds_height,
++    int32_t damage_x, int32_t damage_y, int32_t damage_width,
++    int32_t damage_height, uint32_t ready_sync_kind,
++    uint64_t ready_sync_handle, uint64_t ready_sync_value,
++    CefString* result_code, CefString* result_detail) noexcept;
++extern "C" CEF_EXPORT bool mmltk_cef_workspace_gpu_bridge_destroy_swapchain(
++    const char* surface_id, size_t surface_id_length,
++    CefString* result_code, CefString* result_detail) noexcept;
+ extern "C" CEF_EXPORT bool
+ mmltk_cef_workspace_gpu_bridge_renderer_helper_present() noexcept;
+ extern "C" CEF_EXPORT bool mmltk_cef_workspace_gpu_bridge_import_texture(

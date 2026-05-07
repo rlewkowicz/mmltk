@@ -1,0 +1,13 @@
+diff --git gpu/command_buffer/service/shared_image/ozone_image_backing.cc gpu/command_buffer/service/shared_image/ozone_image_backing.cc
+--- gpu/command_buffer/service/shared_image/ozone_image_backing.cc
++++ gpu/command_buffer/service/shared_image/ozone_image_backing.cc
+@@ -116,6 +116,9 @@ void OzoneImageBacking::Update(std::unique_ptr<gfx::GpuFence> in_fence) {
+   if (in_fence) {
+     external_write_fence_ = in_fence->GetGpuFenceHandle().Clone();
+   }
++  // External updates publish initialized DMA-BUF contents for read-only WebGPU
++  // mailbox access.
++  SetCleared();
+ }
+ 
+ scoped_refptr<gfx::NativePixmap> OzoneImageBacking::GetNativePixmap() {

@@ -18,7 +18,7 @@ import { BrowserWorkspaceStateService } from "../state/browser-workspace.service
           <dd>{{ diagnostics().bridge }}</dd>
         </div>
         <div>
-          <dt>Surface Bridge</dt>
+          <dt>Composition</dt>
           <dd>{{ diagnostics().composition }}</dd>
         </div>
         <div>
@@ -26,15 +26,15 @@ import { BrowserWorkspaceStateService } from "../state/browser-workspace.service
           <dd>{{ diagnostics().workspacePath }}</dd>
         </div>
         <div>
-          <dt>Zero-Copy</dt>
-          <dd>{{ diagnostics().zeroCopy }}</dd>
+          <dt>Presentation</dt>
+          <dd>{{ diagnostics().presentation }}</dd>
         </div>
         <div>
           <dt>Overlay</dt>
           <dd>{{ diagnostics().overlay }}</dd>
         </div>
       </dl>
-      <p class="section-copy">{{ runtime.transportStatus().detail }}</p>
+      <p class="section-copy">{{ diagnostics().transportDetail }}</p>
       <p class="section-copy">{{ compositionLayoutDetail() }}</p>
 
       <h2>Workspace Surface</h2>
@@ -68,19 +68,21 @@ export class RightPanelRuntimeDiagnosticsSectionComponent {
   protected readonly workspace = inject(BrowserWorkspaceStateService);
   protected readonly diagnostics = computed(() => {
     const workspaceDiagnostics = this.workspace.workspaceDiagnostics();
-    const transportStatusItems = this.runtime.transportStatus().statusItems;
-    const workspaceBridge = this.runtime.runtimeCapabilityStatus().find(
-      (item) => item.key === "workspace_surface_bridge",
-    );
+    const nativePresentedLive =
+      workspaceDiagnostics.framePathLabel === "native-presented live workspace";
+    const transportStatus = this.runtime.transportStatus();
     return {
-      bridge: this.runtime.transportStatus().runtimeLabel,
-      composition:
-        `${workspaceBridge?.summary ?? this.workspace.workspace().gpuStatus} · ${this.workspace.rendererStatus()}`,
+      bridge: transportStatus.runtimeLabel,
+      composition: `${workspaceDiagnostics.framePathLabel} · ${this.workspace.rendererStatus()}`,
       workspacePath: workspaceDiagnostics.framePathLabel,
-      zeroCopy:
-        transportStatusItems.find((item) => item.key === "workspace_surface_zero_copy")
-          ?.summary ?? "workspace zero-copy pending",
+      presentation: nativePresentedLive
+        ? "CEF native front-slot present"
+        : workspaceDiagnostics.framePathLabel,
       overlay: workspaceDiagnostics.overlayPathLabel,
+      transportDetail: nativePresentedLive
+        ? (transportStatus.statusItems.find((item) => item.key === "transport")?.detail ??
+          transportStatus.detail)
+        : transportStatus.detail,
     };
   });
   protected readonly surfaceMetadataCopy = computed(
@@ -92,10 +94,7 @@ export class RightPanelRuntimeDiagnosticsSectionComponent {
   );
   protected readonly compositionLayoutDetail = computed(() => {
     const details = [
-      this.runtime.runtimeCapabilityStatus().find((item) => item.key === "workspace_surface_bridge")
-        ?.detail,
-      this.runtime.transportStatus().statusItems.find((item) => item.key === "workspace_surface_zero_copy")
-        ?.detail,
+      this.workspace.workspaceDiagnostics().detail,
       this.workspace.workspaceViewportDetail(),
     ].filter((detail): detail is string => typeof detail === "string" && detail.trim().length > 0);
 

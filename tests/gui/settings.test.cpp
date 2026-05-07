@@ -1,3 +1,4 @@
+#include "gui/default_state.h"
 #include "gui/gui_settings.h"
 #include "gui/view_state.h"
 
@@ -132,6 +133,45 @@ void test_ui_settings_round_trip() {
     assert(loaded_ui.crop_corner_hit_size == 24.0f);
     assert(loaded_ui.crop_handle_radius == 7.5f);
     assert(loaded_ui.density == UiDensity::Comfortable);
+}
+
+void test_fresh_defaults_use_capture_only_annotate() {
+    std::string selected_preset;
+    TrainViewState train;
+    ValidateViewState validate;
+    PredictViewState predict;
+    AnnotateViewState annotate;
+    ExportViewState export_state;
+
+    apply_default_gui_state(selected_preset, train, validate, predict, annotate, export_state);
+
+    assert(predict.model_input == ModelInputMode::Weights);
+    assert(!predict.weights_path.empty());
+    assert(annotate.model_input == ModelInputMode::None);
+    assert(annotate.weights_path.empty());
+    assert(annotate.onnx_path.empty());
+    assert(annotate.tensorrt_path.empty());
+}
+
+void test_model_input_load_normalizes_invalid_values_by_workflow() {
+    UiSettingsState ui;
+    TrainViewState train;
+    ValidateViewState validate;
+    PredictViewState predict;
+    AnnotateViewState annotate;
+    ExportViewState export_state;
+    GuiSettingsSnapshot snapshot = make_snapshot(ui, train, validate, predict, annotate, export_state);
+
+    nlohmann::json saved = snapshot_gui_settings(snapshot);
+    saved["workflows"]["predict"]["predict"]["model_input"] = 99;
+    saved["workflows"]["annotate"]["annotate"]["model_input"] = 99;
+    saved["workflows"]["annotate"]["model_artifacts"]["weights_path"] = "/explicit/annotate.pt";
+
+    apply_gui_settings(saved, snapshot);
+
+    assert(predict.model_input == ModelInputMode::Weights);
+    assert(annotate.model_input == ModelInputMode::None);
+    assert(annotate.weights_path == "/explicit/annotate.pt");
 }
 
 void test_persistence_migrates_schema2_to_schema3() {
@@ -346,6 +386,8 @@ void test_persistence_coalesces_to_latest_snapshot() {
 }  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_ui_settings_round_trip);
+MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_fresh_defaults_use_capture_only_annotate);
+MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_model_input_load_normalizes_invalid_values_by_workflow);
 MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_persistence_migrates_schema2_to_schema3);
 MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_persistence_rejects_unsupported_schema_and_malformed_files);
 MMLTK_REGISTER_TEST_CASE("[gui][settings]", test_persistence_coalesces_to_latest_snapshot);

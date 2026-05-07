@@ -43,7 +43,7 @@ if(BUILD_MMLTK_BROWSER_HOST)
         auto)
     option(MMLTK_CEF_ENABLE_UNSAFE_WEBGPU
         "Enable Chromium's unsafe WebGPU switch for the CEF browser host"
-        OFF)
+        ON)
     option(MMLTK_CEF_FORCE_HIGH_PERFORMANCE_GPU
         "Request Chromium's high-performance GPU selection for the CEF browser host"
         OFF)
@@ -163,6 +163,7 @@ if(BUILD_MMLTK_BROWSER_HOST)
             mmltk_runtime
             mmltk_rfdetr_native
             mmltk_logging
+            mmltk_browser_api_contract
         PRIVATE
             cli11
             nlohmann_json
@@ -240,6 +241,7 @@ if(BUILD_MMLTK_BROWSER_HOST)
     mmltk_target_project_dirs(mmltk_browser_helper)
     target_include_directories(mmltk_browser_helper SYSTEM PRIVATE
         "${MMLTK_CEF_ROOT}"
+        ${CUDAToolkit_INCLUDE_DIRS}
     )
     target_compile_definitions(mmltk_browser_helper PRIVATE
         MMLTK_CEF_WEBGPU_RUNTIME="${MMLTK_CEF_WEBGPU_RUNTIME}"
@@ -252,6 +254,8 @@ if(BUILD_MMLTK_BROWSER_HOST)
     target_link_libraries(mmltk_browser_helper PRIVATE
         mmltk_cef_shared
         libcef_dll_wrapper
+        mmltk_browser_api_contract
+        mmltk_logging
         nlohmann_json
         spdlog
         ${CMAKE_DL_LIBS}

@@ -74,7 +74,6 @@ export type FieldVm = LabeledValueField;
 
 export interface WorkspaceVm {
   title: string;
-  gpuStatus: string;
 }
 
 export interface WorkspaceDiagnosticsVm {
@@ -270,8 +269,8 @@ export class BrowserShellStore {
   });
   readonly shellSettingsNote = computed(() =>
     this.shellSettingsDirty()
-      ? "shell settings draft staged"
-      : "shell settings synchronized",
+      ? "UI settings pending"
+      : "UI settings ready",
   );
   readonly workflowStateJson = computed(() =>
     JSON.stringify(this.snapshot().workflow_state, null, 2),
@@ -511,6 +510,7 @@ export class BrowserShellStore {
   }
 
   reloadAnnotateSetupFrame(): IntentMessage | null {
+    this.flushAnnotateActionDrafts();
     return dispatchIntentAction(
       this.dispatchIntent,
       this.annotateControls().setupFrame.reload,
@@ -518,6 +518,7 @@ export class BrowserShellStore {
   }
 
   previousAnnotateSetupFrame(): IntentMessage | null {
+    this.flushAnnotateActionDrafts();
     return dispatchIntentAction(
       this.dispatchIntent,
       this.annotateControls().setupFrame.previous,
@@ -525,6 +526,7 @@ export class BrowserShellStore {
   }
 
   nextAnnotateSetupFrame(): IntentMessage | null {
+    this.flushAnnotateActionDrafts();
     return dispatchIntentAction(
       this.dispatchIntent,
       this.annotateControls().setupFrame.next,
@@ -532,6 +534,7 @@ export class BrowserShellStore {
   }
 
   startAnnotateLive(): IntentMessage | null {
+    this.flushAnnotateActionDrafts();
     return dispatchIntentAction(
       this.dispatchIntent,
       this.annotateControls().liveAnnotate.start,
@@ -539,6 +542,7 @@ export class BrowserShellStore {
   }
 
   stopAnnotateLive(): IntentMessage | null {
+    this.flushAnnotateActionDrafts();
     return dispatchIntentAction(
       this.dispatchIntent,
       this.annotateControls().liveAnnotate.stop,
@@ -546,6 +550,7 @@ export class BrowserShellStore {
   }
 
   requestAnnotateSaveNow(): IntentMessage | null {
+    this.flushAnnotateActionDrafts();
     return dispatchIntentAction(
       this.dispatchIntent,
       this.annotateControls().save.saveNow,
@@ -586,6 +591,7 @@ export class BrowserShellStore {
 
   runPrimaryAction(): void {
     const workflow = this.selectedWorkflow();
+    this.workflowDrafts.applySource();
     this.workflowDrafts.applyWorkflowSettingsIfDirty();
     if (workflow === "train") {
       this.runTrainPrimaryAction();
@@ -941,30 +947,15 @@ export class BrowserShellStore {
     return isLivePredictPrimaryActionActive(this.liveStatus());
   }
 
+  private flushAnnotateActionDrafts(): void {
+    this.workflowDrafts.applySource();
+    this.workflowDrafts.applyWorkflowSettingsIfDirty();
+  }
+
   private buildWorkflowControlsStatus(
     workflow: Workflow,
   ): CapabilityStatusViewState[] {
-    const dirty =
-      workflow === "train"
-        ? this.trainDraftDirty()
-        : workflow === "validate"
-          ? this.validateDraftDirty()
-          : workflow === "predict" || workflow === "live"
-            ? this.predictDraftDirty()
-            : workflow === "annotate"
-              ? this.annotateDraftDirty()
-              : this.exportDraftDirty();
-    const items: CapabilityStatusViewState[] = [
-      {
-        key: "draft",
-        label: "Draft",
-        status: dirty ? "active" : "ready",
-        summary: dirty ? "workflow draft staged" : "workflow draft synchronized",
-        detail: dirty
-          ? "Apply Workflow or the primary action to send settings.update."
-          : "Workflow draft matches the current host snapshot.",
-      },
-    ];
+    const items: CapabilityStatusViewState[] = [];
     switch (workflow) {
       case "train":
         items.push(this.trainWorkflowControlStatus());

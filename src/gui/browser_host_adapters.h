@@ -1,5 +1,6 @@
 #pragma once
 
+#include "gui/browser_file_dialog_contract.h"
 #include "browser/host_api_intents.h"
 #include "gui/browser_frame_slot_contract.h"
 #include "gui/train_command.h"
@@ -87,6 +88,19 @@ struct BrowserBannerState {
     std::string message;
 };
 
+struct BrowserLivePreviewPublicationCountersState {
+    std::uint64_t attempted_workspace_acquisitions = 0;
+    std::uint64_t startup_workspace_acquisition_misses = 0;
+    std::uint64_t post_startup_workspace_acquisition_misses = 0;
+    std::uint64_t retained_surfaces = 0;
+    std::uint64_t rejected_stale_frames = 0;
+    std::uint64_t cef_export_failures = 0;
+    std::uint64_t renderer_releases = 0;
+    std::uint64_t native_release_failures = 0;
+    std::uint64_t renderer_import_failures = 0;
+    std::uint64_t renderer_release_rejections = 0;
+};
+
 struct BrowserLivePreviewState {
     bool initialized = false;
     bool has_frame = false;
@@ -98,11 +112,30 @@ struct BrowserLivePreviewState {
     std::string static_source_name;
     std::string error;
     bool interop_failed = false;
+    std::string last_failure_reason;
+    std::string last_failure_detail;
+    std::string last_failure_revision;
+    std::string last_failure_stage;
+    std::optional<mmltk::live::LiveFrameId> last_failure_live_frame_id;
+    std::optional<std::uint32_t> last_failure_cuda_device;
+    std::string last_failure_result_code;
+    std::string last_failure_result_detail;
+    BrowserLivePreviewPublicationCountersState publication_counters{};
 };
 
 struct BrowserLiveControllerState {
     bool present = false;
     bool running = false;
+    std::string last_error;
+};
+
+struct BrowserLiveFanoutState {
+    bool running = false;
+    std::uint64_t frames_fanned_out = 0;
+    std::uint64_t skipped_detect_publishes = 0;
+    std::uint64_t skipped_output_publishes = 0;
+    std::uint64_t release_backlog = 0;
+    std::uint64_t acquire_misses = 0;
     std::string last_error;
 };
 
@@ -127,15 +160,34 @@ struct BrowserLiveManualOverlayState {
 struct BrowserLiveCompositorState {
     bool running = false;
     std::uint64_t frames_composited = 0;
+    std::uint64_t frames_composited_after_startup = 0;
     std::uint64_t frames_dropped = 0;
+    std::uint64_t skipped_compositor_presents = 0;
+    int front_slot_index = -1;
+    std::uint64_t front_slot_revision = 0;
     std::optional<mmltk::live::LiveFrameId> last_frame_id;
     bool manual_overlay_active = false;
     bool analysis_overlay_active = false;
     std::string last_error;
 };
 
+struct BrowserLiveSingleBufferDiagnosticState {
+    bool enabled = false;
+    std::uint32_t frame_count = 0;
+    std::uint64_t frame_budget_ns = 0;
+    std::uint64_t drawn_frames = 0;
+    std::uint32_t consecutive_miss_limit = 1;
+    bool completed = false;
+    bool analyzer_disabled = false;
+    bool failed = false;
+    std::string failure_stage;
+    std::uint64_t failure_frame = 0;
+    std::uint64_t failure_latency_us = 0;
+};
+
 struct BrowserLiveRuntimeState {
     std::string active_mode = "none";
+    std::string startup_state = "idle";
     bool starting = false;
     bool stopping = false;
     bool show_running_section = false;
@@ -145,42 +197,13 @@ struct BrowserLiveRuntimeState {
     BrowserRuntimeCapabilities runtime_capabilities{};
     BrowserLivePreviewState preview{};
     BrowserLiveControllerState controller{};
+    BrowserLiveFanoutState fanout{};
     BrowserLiveAnalyzerState analyzer{};
     BrowserLiveManualOverlayState manual_overlay{};
     BrowserLiveCompositorState compositor{};
+    BrowserLiveSingleBufferDiagnosticState single_buffer_diagnostic{};
     std::string start_error;
     std::string action_error;
-};
-
-enum class BrowserFileDialogBinding : std::uint8_t {
-    Unknown = 0,
-    TrainTrainCompiledPath,
-    TrainValCompiledPath,
-    TrainTestCompiledPath,
-    TrainWeights,
-    TrainResumePath,
-    TrainOutputDir,
-    PredictSingleImage,
-    PredictImageFolder,
-    PredictWeights,
-    PredictOnnx,
-    PredictTensorRt,
-    PredictOutputPath,
-    AnnotateSingleImage,
-    AnnotateImageFolder,
-    AnnotateWeights,
-    AnnotateOnnx,
-    AnnotateTensorRt,
-    AnnotateOutputDir,
-    ValidateCompiledPath,
-    ValidateSourceRoot,
-    ValidateOnnx,
-    ValidateTensorRt,
-    ValidateSaveEngine,
-    ValidateReportJson,
-    ExportWeights,
-    ExportOnnx,
-    ExportOutputPath,
 };
 
 template <typename Value>
@@ -245,6 +268,10 @@ void apply_browser_file_dialog_selection(BrowserFileDialogBinding binding, std::
                                                            std::span<const int> configured_device_ids,
                                                            std::string_view error, bool refresh_running);
 [[nodiscard]] nlohmann::json live_runtime_state_to_json(const BrowserLiveRuntimeState& state);
+[[nodiscard]] const char* browser_live_display_startup_state(bool capture_running, std::string_view surface_revision,
+                                                             std::string_view renderer_imported_revision,
+                                                             std::string_view renderer_submitted_revision,
+                                                             std::string_view renderer_drawn_revision) noexcept;
 [[nodiscard]] nlohmann::json make_predict_start_settings_patch(const PredictStartIntent& intent);
 [[nodiscard]] nlohmann::json make_annotate_save_settings_patch(const AnnotateSaveIntent& intent);
 [[nodiscard]] BrowserFileDialogBinding file_dialog_binding_from_id(std::string_view dialog_id) noexcept;

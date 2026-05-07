@@ -1,10 +1,11 @@
-import { deepEqual, equal, ok } from "node:assert/strict";
+import { deepEqual, equal, ok, throws } from "node:assert/strict";
 import { test } from "node:test";
 
 import type { StateSnapshot } from "../src/host_api";
 import {
   annotateBrowseRequestForField,
   annotateDraftFromSnapshot,
+  annotateModelInputOptions,
   buildAnnotateSettingsPatch,
   buildExportSettingsPatch,
   buildPredictSettingsPatch,
@@ -26,13 +27,16 @@ import {
   trainDraftFromSnapshot,
   validateBrowseRequestForField,
   validateDraftFromSnapshot,
+  type SourceBrowseRequest,
   type SourceDraft,
 } from "../src/app/state/browser-shell.store.helpers";
+import { FILE_DIALOG_CONTRACT } from "../src/workflow_contract.generated";
 import {
   makeBrowserTestAnnotation,
   makeBrowserTestSnapshot,
   makeBrowserTestSource,
 } from "./support/browser-test-fixtures";
+import { assertHostApiSettingsPatch } from "./support/host-api-contract-validator";
 
 function makeSnapshot(): StateSnapshot {
   return makeBrowserTestSnapshot({
@@ -102,6 +106,10 @@ function makeSourceDraft(overrides: Partial<SourceDraft> = {}): SourceDraft {
   };
 }
 
+function throwsHostApiSettingsPatch(patch: unknown): void {
+  throws(() => assertHostApiSettingsPatch(patch));
+}
+
 test("sourceDraftFromSnapshot prefers workflow source records", () => {
   const annotateDraft = sourceDraftFromSnapshot(makeSnapshot(), "annotate");
   deepEqual(annotateDraft, makeSourceDraft());
@@ -124,7 +132,9 @@ test("buildSourceSettingsPatch targets predict state for live workflow", () => {
     v4l2BufferCount: "6",
   };
 
-  deepEqual(buildSourceSettingsPatch("live", draft, makeSnapshot()), {
+  const patch = buildSourceSettingsPatch("live", draft, makeSnapshot());
+  assertHostApiSettingsPatch(patch);
+  deepEqual(patch, {
     workflows: {
       predict: {
         source: {
@@ -138,6 +148,48 @@ test("buildSourceSettingsPatch targets predict state for live workflow", () => {
           compiled_path: "",
           single_image_path: "/tmp/live-source.png",
           image_directory: "",
+        },
+      },
+    },
+  });
+});
+
+test("buildSourceSettingsPatch omits unsupported compiled path for annotate", () => {
+  const draft: SourceDraft = {
+    kind: "video_stream",
+    locator: "",
+    recursive: false,
+    deviceIndex: "1",
+    captureWidth: "1280",
+    captureHeight: "720",
+    captureFps: "60",
+    v4l2BufferCount: "4",
+  };
+
+  const patch = buildSourceSettingsPatch("annotate", draft, makeSnapshot());
+  assertHostApiSettingsPatch(patch);
+  deepEqual(patch, {
+    workflows: {
+      annotate: {
+        source: {
+          kind: 3,
+          recursive: false,
+          device_index: 1,
+          capture_width: 1280,
+          capture_height: 720,
+          capture_fps: 60,
+          v4l2_buffer_count: 4,
+          single_image_path: "",
+          image_directory: "",
+        },
+      },
+    },
+  });
+  throwsHostApiSettingsPatch({
+    workflows: {
+      annotate: {
+        source: {
+          compiled_path: "/tmp/invalid.bin",
         },
       },
     },
@@ -208,6 +260,73 @@ test("shell settings helpers normalize density and clamp ui scale", () => {
   );
 });
 
+test("workflow draft helpers keep ImGui defaults before backend hydration", () => {
+  const snapshot = makeBrowserTestSnapshot({
+    workflow_state: {},
+    source: makeBrowserTestSource({ kind: "single_image", locator: "" }),
+  });
+
+  const predictSource = sourceDraftFromSnapshot(snapshot, "predict");
+  equal(predictSource.kind, "compiled_dataset");
+  equal(predictSource.locator, "./compiled-seg-medium-synth/val.bin");
+  equal(predictSource.captureWidth, "1920");
+  equal(predictSource.captureFps, "120");
+
+  const annotateSource = sourceDraftFromSnapshot(snapshot, "annotate");
+  equal(annotateSource.kind, "image_folder");
+  equal(annotateSource.locator, "");
+
+  const train = trainDraftFromSnapshot(snapshot);
+  equal(train.trainCompiledPath, "./compiled-seg-medium-synth/train.bin");
+  equal(train.valCompiledPath, "./compiled-seg-medium-synth/val.bin");
+  equal(
+    train.weightsPath,
+    "./engines/output-seg-medium/train-local/checkpoint_best_regular.pt",
+  );
+  equal(train.outputDir, "./engines/output-seg-medium/train-local");
+  equal(train.valBatchSize, "8");
+  equal(train.evalMaxDets, "200");
+  equal(train.prefetchFactor, "3");
+  equal(train.workers, "16");
+  equal(train.lanes, "3");
+  equal(train.progressBar, true);
+  deepEqual(train.remoteFamilies, {
+    a100: true,
+    b200: true,
+    h100: true,
+    h200: true,
+    l_series: true,
+  });
+
+  const validate = validateDraftFromSnapshot(snapshot);
+  equal(validate.compiledPath, "./compiled-seg-medium-synth/val.bin");
+  equal(validate.reportJsonPath, "./rfdetr-validation-report.json");
+  equal(validate.evalOrder, "onnx,tensorrt");
+  equal(validate.resolution, "432");
+  equal(validate.alignmentImages, "16");
+  equal(validate.evalMaxDets, "200");
+  equal(validate.prefetchFactor, "2");
+
+  const predict = predictDraftFromSnapshot(snapshot, "predict");
+  equal(
+    predict.weightsPath,
+    "./engines/output-seg-medium/train-local/checkpoint_best_regular.pt",
+  );
+  equal(predict.outputPath, "./predictions.json");
+  equal(predict.batchSize, "4");
+  equal(predict.maxDetsPerImage, "200");
+
+  const annotate = annotateDraftFromSnapshot(snapshot);
+  equal(annotate.weightsPath, "");
+  equal(annotate.outputDir, "./annotated-scenes");
+  equal(annotate.modelInput, "none");
+  equal(annotate.maxDetsPerImage, "200");
+  equal(annotateModelInputOptions()[0]?.value, "none");
+
+  const exportDraft = exportDraftFromSnapshot(snapshot);
+  equal(exportDraft.outputPath, "./rfdetr-engine.trt");
+});
+
 test("annotate source kinds preserve unsupported current state when needed", () => {
   const options = sourceKindOptions("annotate", "compiled_dataset");
   equal(options[0]?.value, "compiled_dataset");
@@ -216,7 +335,6 @@ test("annotate source kinds preserve unsupported current state when needed", () 
 
 test("train workflow helpers build nested settings patches and browse requests", () => {
   const draft = trainDraftFromSnapshot(makeSnapshot());
-  draft.selectedPreset = "rf-detr-seg-large";
   draft.trainCompiledPath = "/datasets/new/train.mmltk";
   draft.valCompiledPath = "/datasets/new/val.mmltk";
   draft.testCompiledPath = "/datasets/new/test.mmltk";
@@ -246,7 +364,6 @@ test("train workflow helpers build nested settings patches and browse requests",
   draft.remoteLaunchTemplate = "vast launch --template angular";
 
   deepEqual(buildTrainSettingsPatch(draft, makeSnapshot()), {
-    selected_preset: "rf-detr-seg-large",
     workflows: {
       train: {
         dataset_paths: {
@@ -273,9 +390,9 @@ test("train workflow helpers build nested settings patches and browse requests",
           val_batch_size: 4,
           epochs: 32,
           grad_accum_steps: 1,
-          eval_max_dets: 500,
+          eval_max_dets: 200,
           print_freq: 100,
-          prefetch_factor: 2,
+          prefetch_factor: 3,
           optimizer: 0,
           momentum: 0.95,
           lr: 0.0001,
@@ -375,7 +492,6 @@ test("validate workflow helpers target validation sections and dialog ids", () =
 
 test("predict workflow helpers reuse predict settings for live", () => {
   const draft = predictDraftFromSnapshot(makeSnapshot(), "live");
-  draft.selectedPreset = "rf-detr-live";
   draft.weightsPath = "/models/live/model.pt";
   draft.onnxPath = "/models/live/model.onnx";
   draft.tensorrtPath = "/models/live/model.engine";
@@ -395,7 +511,6 @@ test("predict workflow helpers reuse predict settings for live", () => {
   draft.compileMode = "full";
 
   deepEqual(buildPredictSettingsPatch("live", draft, makeSnapshot()), {
-    selected_preset: "rf-detr-live",
     workflows: {
       predict: {
         model_artifacts: {
@@ -502,4 +617,79 @@ test("annotate and export helpers build route-specific patches and browse ids", 
     },
   });
   equal(exportBrowseRequestForField("outputPath", exportDraft).mode, "save_file");
+});
+
+test("generated file dialog contract maps to Angular browse request helpers", () => {
+  const snapshot = makeSnapshot();
+  const trainDraft = trainDraftFromSnapshot(snapshot);
+  const validateDraft = validateDraftFromSnapshot(snapshot);
+  const predictDraft = predictDraftFromSnapshot(snapshot, "predict");
+  const annotateDraft = annotateDraftFromSnapshot(snapshot);
+  const exportDraft = exportDraftFromSnapshot(snapshot);
+  const requests: SourceBrowseRequest[] = [];
+
+  requests.push(
+    sourceBrowseRequestForDraft(
+      "predict",
+      makeSourceDraft({ kind: "single_image", locator: "/tmp/predict.png" }),
+    )!,
+    sourceBrowseRequestForDraft(
+      "predict",
+      makeSourceDraft({ kind: "image_folder", locator: "/tmp/predict-images" }),
+    )!,
+    sourceBrowseRequestForDraft(
+      "annotate",
+      makeSourceDraft({ kind: "single_image", locator: "/tmp/annotate.png" }),
+    )!,
+    sourceBrowseRequestForDraft("annotate", makeSourceDraft())!,
+  );
+  for (const field of [
+    "trainCompiledPath",
+    "valCompiledPath",
+    "testCompiledPath",
+    "weightsPath",
+    "resumePath",
+    "outputDir",
+  ] as const) {
+    requests.push(trainBrowseRequestForField(field, trainDraft));
+  }
+  for (const field of [
+    "weightsPath",
+    "onnxPath",
+    "tensorrtPath",
+    "outputPath",
+  ] as const) {
+    requests.push(predictBrowseRequestForField("predict", field, predictDraft));
+  }
+  for (const field of [
+    "weightsPath",
+    "onnxPath",
+    "tensorrtPath",
+    "outputDir",
+  ] as const) {
+    requests.push(annotateBrowseRequestForField(field, annotateDraft));
+  }
+  for (const field of [
+    "compiledPath",
+    "sourceDir",
+    "onnxPath",
+    "tensorrtPath",
+    "saveEnginePath",
+    "reportJsonPath",
+  ] as const) {
+    requests.push(validateBrowseRequestForField(field, validateDraft));
+  }
+  for (const field of ["weightsPath", "onnxPath", "outputPath"] as const) {
+    requests.push(exportBrowseRequestForField(field, exportDraft));
+  }
+
+  const requestsById = new Map(requests.map((request) => [request.dialogId, request]));
+  equal(requestsById.size, FILE_DIALOG_CONTRACT.length);
+  for (const dialog of FILE_DIALOG_CONTRACT) {
+    const request = requestsById.get(dialog.id);
+    ok(request, `missing browse request for ${dialog.id}`);
+    equal(request.mode, dialog.mode);
+    equal(request.title, dialog.title);
+    deepEqual(request.filters, dialog.filters);
+  }
 });

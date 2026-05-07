@@ -55,7 +55,8 @@ struct ReadyWatcherScriptOptions {
     });
     return value;
   };
-  let lastNavigatorGpuState = null;
+  let lastNavigatorGpuAvailable = null;
+  let lastWorkspaceGpuBridgeCapabilitySignature = null;
 )JS";
     if (options.send_ready_once) {
         script += "  let readyCallbacksSent = false;\n";
@@ -152,28 +153,70 @@ struct ReadyWatcherScriptOptions {
       navigator.gpu !== null;
     const workspaceGpuBridge =
       typeof root.__MMLTK_WORKSPACE_GPU_BRIDGE__ === "object" &&
-      root.__MMLTK_WORKSPACE_GPU_BRIDGE__ !== null &&
-      typeof root.__MMLTK_WORKSPACE_GPU_BRIDGE__.acquireCurrentSurface === "function" &&
-      typeof root.__MMLTK_WORKSPACE_GPU_BRIDGE__.importTexture === "function" &&
-      typeof root.__MMLTK_WORKSPACE_GPU_BRIDGE__.releaseSurface === "function"
+      root.__MMLTK_WORKSPACE_GPU_BRIDGE__ !== null
         ? root.__MMLTK_WORKSPACE_GPU_BRIDGE__
         : null;
-    if (lastNavigatorGpuState === navigatorGpuAvailable) {
-      if (workspaceGpuBridge !== null) {
-        return;
+    let workspaceGpuBridgeStatus = "unavailable";
+    let workspaceGpuBridgeDetail =
+      "__MMLTK_WORKSPACE_GPU_BRIDGE__ is not installed";
+    if (workspaceGpuBridge !== null) {
+      if (typeof workspaceGpuBridge.acquireCurrentSurface !== "function") {
+        workspaceGpuBridgeDetail =
+          "__MMLTK_WORKSPACE_GPU_BRIDGE__.acquireCurrentSurface is absent";
+      } else if (typeof workspaceGpuBridge.importTexture !== "function") {
+        workspaceGpuBridgeDetail =
+          "__MMLTK_WORKSPACE_GPU_BRIDGE__.importTexture is absent";
+      } else if (typeof workspaceGpuBridge.releaseSurface !== "function") {
+        workspaceGpuBridgeDetail =
+          "__MMLTK_WORKSPACE_GPU_BRIDGE__.releaseSurface is absent";
+      } else if (typeof workspaceGpuBridge.releaseRendererTexture !== "function") {
+        workspaceGpuBridgeDetail =
+          "__MMLTK_WORKSPACE_GPU_BRIDGE__.releaseRendererTexture is absent";
+      } else {
+        workspaceGpuBridgeStatus = "unknown";
+        workspaceGpuBridgeDetail =
+          "Workspace GPU bridge functions are installed; native helper capability is pending.";
       }
     }
-    lastNavigatorGpuState = navigatorGpuAvailable;
-    const workspaceGpuBridgeAvailable = workspaceGpuBridge !== null;
+    const workspaceGpuBridgeCapabilitySignature =
+      `${workspaceGpuBridgeStatus}|${workspaceGpuBridgeDetail}`;
+    if (
+      lastNavigatorGpuAvailable === navigatorGpuAvailable &&
+      lastWorkspaceGpuBridgeCapabilitySignature ===
+        workspaceGpuBridgeCapabilitySignature
+    ) {
+      return;
+    }
+    lastNavigatorGpuAvailable = navigatorGpuAvailable;
+    lastWorkspaceGpuBridgeCapabilitySignature =
+      workspaceGpuBridgeCapabilitySignature;
     const capabilityMessage = {
       type: "host.runtime.capabilities",
       navigator_gpu: navigatorGpuAvailable,
-      workspace_surface_bridge: workspaceGpuBridgeAvailable
-        ? "available"
-        : "unavailable",
-      workspace_surface_zero_copy: workspaceGpuBridgeAvailable
-        ? "unknown"
-        : "unavailable",
+      workspace_surface_bridge: workspaceGpuBridgeStatus,
+      workspace_surface_zero_copy: "unknown",
+      capabilities: {
+        workspace_surface_bridge: {
+          status:
+            workspaceGpuBridgeStatus === "available"
+              ? "ready"
+              : workspaceGpuBridgeStatus === "unavailable"
+                ? "blocked"
+                : "pending",
+          summary:
+            workspaceGpuBridgeStatus === "available"
+              ? "workspace surface bridge ready"
+              : workspaceGpuBridgeStatus === "unavailable"
+                ? "workspace surface bridge unavailable"
+                : "workspace surface bridge pending",
+          detail: workspaceGpuBridgeDetail,
+        },
+        workspace_surface_zero_copy: {
+          status: "pending",
+          summary: "workspace zero-copy pending",
+          detail: "No live workspace surface publication has been exported yet.",
+        },
+      },
     };
     try {
       bridge.postMessage(
@@ -196,6 +239,30 @@ struct ReadyWatcherScriptOptions {
         notifyReady();
       },
     });
+  };
+
+  const watchRootProperty = (name) => {
+    const descriptor = Object.getOwnPropertyDescriptor(root, name);
+    if (descriptor && descriptor.configurable === false) {
+      return;
+    }
+    let value =
+      descriptor && Object.prototype.hasOwnProperty.call(descriptor, "value")
+        ? descriptor.value
+        : root[name];
+    try {
+      Object.defineProperty(root, name, {
+        configurable: true,
+        enumerable: descriptor ? descriptor.enumerable : false,
+        get() {
+          return value;
+        },
+        set(nextValue) {
+          value = nextValue;
+          notifyReady();
+        },
+      });
+    } catch (_) {}
   };
 )JS";
     if (options.wrap_deliver_snapshot) {
@@ -346,6 +413,7 @@ struct ReadyWatcherScriptOptions {
 
   watchBridgeProperty("setBridgeState");
   watchBridgeProperty("reportError");
+  watchRootProperty("__MMLTK_WORKSPACE_GPU_BRIDGE__");
   queueImeContext();
   notifyReady();
 })();
@@ -377,7 +445,7 @@ struct IsOptional<std::optional<T>> : std::true_type {};
 
 [[nodiscard]] inline nlohmann::json bridge_state_to_json(const mmltk::browser::BrowserBridgeState& state) {
     const mmltk::browser::BrowserRuntimeCapabilities& runtime_capabilities = state.runtime_capabilities;
-    return {
+    nlohmann::json json = {
         {"phase", mmltk::browser::browser_bridge_phase_name(state.phase)},
         {"connected", state.connected},
         {"lastError", state.last_error},
@@ -391,6 +459,10 @@ struct IsOptional<std::optional<T>> : std::true_type {};
           {"workspaceSurfaceZeroCopy",
            mmltk::browser::browser_runtime_capability_status_name(runtime_capabilities.workspace_surface_zero_copy)}}},
     };
+    if (state.capabilities.is_object() && !state.capabilities.empty()) {
+        json["capabilities"] = state.capabilities;
+    }
+    return json;
 }
 
 template <typename Buffer>
@@ -489,6 +561,7 @@ inline void clear_delivery_state(bool& page_callbacks_ready, std::string& delive
     bridge_state.last_success_revision.reset();
     bridge_state.last_error.clear();
     bridge_state.phase = mmltk::browser::BrowserBridgePhase::Polling;
+    bridge_state.capabilities = nlohmann::json::object();
     std::forward<ResetRuntimeCapabilityProbeFn>(reset_runtime_capability_probe)();
     queue_bridge_state(bridge_state_dirty);
 }
@@ -632,7 +705,8 @@ inline void complete_pending_bridge_dispatch(const PendingBridgeDispatch& dispat
 
 [[nodiscard]] inline std::string bridge_dispatch_script(const std::string* bridge_json,
                                                         const std::string* snapshot_json,
-                                                        const std::string* error_text);
+                                                        const std::string* error_text,
+                                                        const std::string* surface_ready_json = nullptr);
 
 template <typename ExecuteScriptFn>
 inline void flush_pending_bridge_messages(mmltk::browser::BrowserBridgeState& bridge_state, bool& bridge_state_dirty,
@@ -653,7 +727,7 @@ inline void flush_pending_bridge_messages(mmltk::browser::BrowserBridgeState& br
     std::forward<ExecuteScriptFn>(execute_script)(
         bridge_dispatch_script(dispatch->send_bridge ? &dispatch->bridge_json : nullptr,
                                dispatch->send_snapshot ? &current_snapshot_json : nullptr,
-                               dispatch->send_error ? &pending_error_text : nullptr));
+                               dispatch->send_error ? &pending_error_text : nullptr, nullptr));
     complete_pending_bridge_dispatch(*dispatch, current_snapshot_json, delivered_bridge_state_json, bridge_state_dirty,
                                      delivered_snapshot_json, snapshot_dirty, pending_error_text, error_dirty);
 }
@@ -838,7 +912,8 @@ inline void publish_runtime_capabilities(const mmltk::browser::BrowserRuntimeCap
 
 [[nodiscard]] inline std::string bridge_dispatch_script(const std::string* bridge_json,
                                                         const std::string* snapshot_json,
-                                                        const std::string* error_text) {
+                                                        const std::string* error_text,
+                                                        const std::string* surface_ready_json) {
     std::string script =
         "(() => {const root=globalThis;"
         "const bridgeDescriptor=Object.getOwnPropertyDescriptor(root,"
@@ -861,6 +936,12 @@ inline void publish_runtime_capabilities(const mmltk::browser::BrowserRuntimeCap
         script += "const reportError=bridge&&bridge.reportError;";
         script += "if(typeof reportError==='function'){reportError(";
         script += nlohmann::json(*error_text).dump();
+        script += ");}";
+    }
+    if (surface_ready_json != nullptr) {
+        script += "const deliverSurfaceReady=bridge&&bridge.deliverSurfaceReady;";
+        script += "if(typeof deliverSurfaceReady==='function'){deliverSurfaceReady(";
+        script += nlohmann::json(*surface_ready_json).dump();
         script += ");}";
     }
     script += "})();";
@@ -900,11 +981,28 @@ inline void publish_runtime_capabilities(const mmltk::browser::BrowserRuntimeCap
            capabilities.workspace_surface_bridge != mmltk::browser::BrowserRuntimeCapabilityStatus::Unknown;
 }
 
+[[nodiscard]] inline bool apply_capability_contracts_from_message(
+    const nlohmann::json& message, mmltk::browser::BrowserBridgeState& bridge_state) {
+    const auto capabilities_it = message.find("capabilities");
+    if (capabilities_it == message.end()) {
+        return false;
+    }
+    if (!capabilities_it->is_object()) {
+        throw std::runtime_error("browser runtime capabilities contracts must be an object");
+    }
+    if (bridge_state.capabilities == *capabilities_it) {
+        return false;
+    }
+    bridge_state.capabilities = *capabilities_it;
+    return true;
+}
+
 template <typename RefreshBeforeVerifyFn, typename OnCapabilityChangedFn, typename VerifyRuntimeCapabilitiesFn,
           typename MaybeCompleteRuntimeCapabilityGateFn>
 inline void handle_runtime_capabilities_message(
     const nlohmann::json& message, bool& runtime_capabilities_reported, const bool runtime_capability_gate_passed,
     const bool& quit_requested, mmltk::browser::BrowserRuntimeCapabilities& reported_runtime_capabilities,
+    mmltk::browser::BrowserBridgeState& bridge_state,
     RefreshBeforeVerifyFn&& refresh_before_verify, OnCapabilityChangedFn&& on_capability_changed,
     VerifyRuntimeCapabilitiesFn&& verify_runtime_capabilities_or_abort,
     MaybeCompleteRuntimeCapabilityGateFn&& maybe_complete_runtime_capability_gate) {
@@ -924,9 +1022,11 @@ inline void handle_runtime_capabilities_message(
     if (workspace_surface_zero_copy.has_value()) {
         reported_runtime_capabilities.workspace_surface_zero_copy = *workspace_surface_zero_copy;
     }
+    const bool capability_contract_changed = apply_capability_contracts_from_message(message, bridge_state);
     runtime_capabilities_reported = runtime_capabilities_complete(reported_runtime_capabilities);
     const bool capability_changed =
-        !runtime_capabilities_reported || !(previous_capabilities == reported_runtime_capabilities);
+        capability_contract_changed || !runtime_capabilities_reported ||
+        !(previous_capabilities == reported_runtime_capabilities);
     std::forward<RefreshBeforeVerifyFn>(refresh_before_verify)();
     if (runtime_capability_gate_passed) {
         std::forward<VerifyRuntimeCapabilitiesFn>(verify_runtime_capabilities_or_abort)();
@@ -1052,7 +1152,7 @@ inline void handle_bridge_message_payload(
         [&](const nlohmann::json& runtime_capabilities_message) {
             handle_runtime_capabilities_message(
                 runtime_capabilities_message, runtime_capabilities_reported, runtime_capability_gate_passed,
-                quit_requested, reported_runtime_capabilities, refresh_before_verify_fn,
+                quit_requested, reported_runtime_capabilities, bridge_state, refresh_before_verify_fn,
                 [&] {
                     queue_bridge_state_helper_fn();
                     refresh_on_capability_changed_fn();

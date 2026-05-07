@@ -30,4 +30,8 @@ inline void log_live_worker_message(const char* logger_name, const char* level, 
         std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());
 }
 
+[[nodiscard]] inline bool live_should_log_periodic_frame(const std::uint64_t count) noexcept {
+    return count <= 3U || count % 300U == 0U;
+}
+
 }  // namespace mmltk::live

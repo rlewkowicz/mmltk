@@ -13,6 +13,18 @@
 
 #include <vector>
 
+#define CATCH_REPORTER_BENCHMARK_OVERRIDES()                 \
+    void benchmarkPreparing(StringRef name) override;         \
+    void benchmarkStarting(BenchmarkInfo const&) override;    \
+    void benchmarkEnded(BenchmarkStats<> const&) override;    \
+    void benchmarkFailed(StringRef error) override
+
+#define CATCH_REPORTER_LISTING_OVERRIDES()                                             \
+    void listReporters(std::vector<ReporterDescription> const& descriptions) override; \
+    void listListeners(std::vector<ListenerDescription> const& descriptions) override; \
+    void listTests(std::vector<TestCaseHandle> const& tests) override;                 \
+    void listTags(std::vector<TagInfo> const& tags) override
+
 namespace Catch {
 
 class StreamingReporterBase : public ReporterBase {

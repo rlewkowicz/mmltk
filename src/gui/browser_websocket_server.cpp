@@ -131,7 +131,7 @@ struct BrowserWebSocketServer::Impl {
         broadcast(std::move(message));
     }
 
-    void publish_error(std::string message) {
+    void publish_error(const std::string& message) {
         broadcast(websocket_error_message(message));
     }
 
@@ -286,8 +286,8 @@ void BrowserWebSocketServer::publish_surface_ready(std::string message) {
     impl_->publish_surface_ready(std::move(message));
 }
 
-void BrowserWebSocketServer::publish_error(std::string message) {
-    impl_->publish_error(std::move(message));
+void BrowserWebSocketServer::publish_error(const std::string& message) {
+    impl_->publish_error(message);
 }
 
 }  // namespace mmltk::gui

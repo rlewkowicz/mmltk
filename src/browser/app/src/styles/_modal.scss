@@ -12,7 +12,7 @@
 }
 
 .settings-modal {
-  @include panel-surface($padding: 1rem);
+  @include panel-surface($padding: space-token(xl));
 
   position: relative;
   inset: auto;
@@ -34,14 +34,15 @@
 }
 
 .settings-modal__section {
-  margin-top: 1rem;
-  padding-top: 0.85rem;
+  margin-top: space-token(md);
+  padding-top: space-token(md);
   border-top: 1px solid var(--panel-border);
 
   h3 {
-    @include uppercase-label($size: 0.86rem, $color: var(--accent-2));
-
     margin: 0;
+    color: var(--text-0);
+    font-size: 1rem;
+    font-weight: 650;
   }
 }
 

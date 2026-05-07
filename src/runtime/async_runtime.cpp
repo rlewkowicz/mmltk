@@ -69,6 +69,7 @@ void UiCallbackQueue::wake() noexcept {
     try {
         (*callback)();
     } catch (...) {
+        return;
     }
 }
 

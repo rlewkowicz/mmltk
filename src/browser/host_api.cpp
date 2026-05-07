@@ -1,16 +1,18 @@
 #include "browser/host_api.h"
+#include "browser/browser_contract_metadata.h"
+#include "gui/browser_file_dialog_contract.h"
+#define MMLTK_BROWSER_SETTINGS_CONTRACT_METADATA_ONLY 1
+#include "gui/browser_settings_contract.h"
+#undef MMLTK_BROWSER_SETTINGS_CONTRACT_METADATA_ONLY
 
+#include <algorithm>
 #include <array>
 #include <initializer_list>
 #include <stdexcept>
 #include <type_traits>
-#include <unordered_map>
 #include <utility>
 
 namespace mmltk::browser {
-
-static_assert(kRoutedIntentPayloadAlternativeCount == 29U,
-              "Update host_api intent routing for RoutedIntentPayload ABI changes.");
 
 namespace {
 
@@ -59,67 +61,163 @@ void validate_protocol_version(const std::uint32_t protocol_version) {
     throw std::runtime_error("invalid browser host api " + std::string(kind) + ": " + std::string(value));
 }
 
-template <typename Enum>
-struct BrowserEnumFactoryItem {
-    std::string_view name;
-    Enum value;
-};
-
-template <typename Enum, std::size_t N>
-[[nodiscard]] std::string_view enum_factory_name(const Enum value,
-                                                 const std::array<BrowserEnumFactoryItem<Enum>, N>& factory) noexcept {
-    for (const BrowserEnumFactoryItem<Enum>& item : factory) {
-        if (item.value == value) {
-            return item.name;
+[[nodiscard]] consteval auto sorted_settings_patch_value_types() {
+    auto values = kBrowserSettingsPatchValueTypes;
+    for (std::size_t i = 1U; i < values.size(); ++i) {
+        const BrowserSettingsPatchValueTypeSpec current = values[i];
+        std::size_t j = i;
+        while (j > 0U && current.path < values[j - 1U].path) {
+            values[j] = values[j - 1U];
+            --j;
         }
+        values[j] = current;
     }
-    return factory.front().name;
+    return values;
 }
 
-template <typename Enum, std::size_t N>
-[[nodiscard]] Enum enum_factory_value(const char* kind, const std::string_view name,
-                                      const std::array<BrowserEnumFactoryItem<Enum>, N>& factory) {
-    for (const BrowserEnumFactoryItem<Enum>& item : factory) {
-        if (item.name == name) {
-            return item.value;
-        }
+inline constexpr auto kNativeSettingsPatchValueTypesByPath = sorted_settings_patch_value_types();
+
+[[nodiscard]] consteval auto sorted_settings_patch_paths() {
+    std::array<std::string_view, kNativeSettingsPatchValueTypesByPath.size()> paths{};
+    for (std::size_t i = 0U; i < kNativeSettingsPatchValueTypesByPath.size(); ++i) {
+        paths[i] = kNativeSettingsPatchValueTypesByPath[i].path;
     }
-    throw_invalid_enum(kind, name);
+    return paths;
 }
 
-constexpr std::array<BrowserEnumFactoryItem<Workflow>, 6> kWorkflowFactory{{
-    {"train", Workflow::Train},
-    {"validate", Workflow::Validate},
-    {"predict", Workflow::Predict},
-    {"annotate", Workflow::Annotate},
-    {"export", Workflow::Export},
-    {"live", Workflow::Live},
-}};
-constexpr std::array<BrowserEnumFactoryItem<SourceKind>, 4> kSourceKindFactory{{
-    {"compiled_dataset", SourceKind::CompiledDataset},
-    {"single_image", SourceKind::SingleImage},
-    {"image_folder", SourceKind::ImageFolder},
-    {"video_stream", SourceKind::VideoStream},
-}};
-constexpr std::array<BrowserEnumFactoryItem<BrowserHostBackend>, 2> kBrowserHostBackendFactory{{
-    {"unknown", BrowserHostBackend::Unknown},
-    {"cef", BrowserHostBackend::Cef},
-}};
-constexpr std::array<BrowserEnumFactoryItem<BrowserRuntimeCapabilityStatus>, 3> kBrowserRuntimeCapabilityStatusFactory{{
-    {"unknown", BrowserRuntimeCapabilityStatus::Unknown},
-    {"available", BrowserRuntimeCapabilityStatus::Available},
-    {"unavailable", BrowserRuntimeCapabilityStatus::Unavailable},
-}};
-constexpr std::array<BrowserEnumFactoryItem<BrowserBridgePhase>, 3> kBrowserBridgePhaseFactory{{
-    {"idle", BrowserBridgePhase::Idle},
-    {"polling", BrowserBridgePhase::Polling},
-    {"dispatch", BrowserBridgePhase::Dispatch},
-}};
-constexpr std::array<BrowserEnumFactoryItem<FileDialogMode>, 3> kFileDialogModeFactory{{
-    {"open_file", FileDialogMode::OpenFile},
-    {"open_folder", FileDialogMode::OpenFolder},
-    {"save_file", FileDialogMode::SaveFile},
-}};
+inline constexpr auto kNativeSettingsPatchPathsByPath = sorted_settings_patch_paths();
+
+template <std::size_t N>
+[[nodiscard]] consteval auto sorted_string_views(std::array<std::string_view, N> values) {
+    for (std::size_t i = 1U; i < values.size(); ++i) {
+        const std::string_view current = values[i];
+        std::size_t j = i;
+        while (j > 0U && current < values[j - 1U]) {
+            values[j] = values[j - 1U];
+            --j;
+        }
+        values[j] = current;
+    }
+    return values;
+}
+
+[[nodiscard]] consteval auto sorted_workflow_ids() {
+    std::array<std::string_view, api::enum_traits<Workflow>::values().size()> values{};
+    std::size_t index = 0U;
+    for (const auto item : api::enum_traits<Workflow>::values()) {
+        values[index++] = item.name;
+    }
+    return sorted_string_views(values);
+}
+
+inline constexpr auto kNativeWorkflowIdsByName = sorted_workflow_ids();
+
+[[nodiscard]] consteval auto sorted_preset_names() {
+    std::array<std::string_view, contract::kPresets.size()> values{};
+    for (std::size_t i = 0U; i < contract::kPresets.size(); ++i) {
+        values[i] = contract::kPresets[i].preset_name;
+    }
+    return sorted_string_views(values);
+}
+
+inline constexpr auto kNativePresetNamesByName = sorted_preset_names();
+
+[[nodiscard]] consteval auto default_routed_intent_names_by_payload_index() {
+    std::array<std::string_view, kRoutedIntentPayloadAlternativeCount> names{};
+    std::size_t index = 0U;
+    auto append_names = [&]<typename... Payloads>(api::type_list<Payloads...>) {
+        ((names[index++] = Payloads::api_intent().id), ...);
+    };
+    append_names(BrowserIntentPayloadTypes{});
+    return names;
+}
+
+inline constexpr auto kDefaultRoutedIntentNamesByPayloadIndex = default_routed_intent_names_by_payload_index();
+
+template <std::size_t N>
+[[nodiscard]] bool sorted_string_views_contains(const std::array<std::string_view, N>& values,
+                                                const std::string_view needle) noexcept {
+    return std::binary_search(values.begin(), values.end(), needle);
+}
+
+[[nodiscard]] bool numeric_enum_schema_contains_value(const BrowserNumericEnumSchemaSpec& schema,
+                                                      const nlohmann::json& value) noexcept {
+    if (const auto* signed_value = value.get_ptr<const nlohmann::json::number_integer_t*>()) {
+        for (std::size_t i = 0U; i < schema.value_count; ++i) {
+            if (static_cast<nlohmann::json::number_integer_t>(schema.values[i]) == *signed_value) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (const auto* unsigned_value = value.get_ptr<const nlohmann::json::number_unsigned_t*>()) {
+        for (std::size_t i = 0U; i < schema.value_count; ++i) {
+            if (schema.values[i] >= 0 &&
+                static_cast<nlohmann::json::number_unsigned_t>(schema.values[i]) == *unsigned_value) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+[[nodiscard]] bool settings_patch_path_is_known_prefix_or_leaf(const std::string_view path) noexcept {
+    if (path.empty()) {
+        return true;
+    }
+    const auto found =
+        std::lower_bound(kNativeSettingsPatchPathsByPath.begin(), kNativeSettingsPatchPathsByPath.end(), path);
+    return found != kNativeSettingsPatchPathsByPath.end() &&
+           (*found == path ||
+            (found->size() > path.size() && found->substr(0, path.size()) == path && (*found)[path.size()] == '.'));
+}
+
+[[nodiscard]] bool settings_patch_path_is_known_leaf(const std::string_view path) noexcept {
+    return sorted_string_views_contains(kNativeSettingsPatchPathsByPath, path);
+}
+
+[[nodiscard]] std::string_view settings_patch_value_type(const std::string_view path) noexcept {
+    const auto found =
+        std::lower_bound(kNativeSettingsPatchValueTypesByPath.begin(), kNativeSettingsPatchValueTypesByPath.end(), path,
+                         [](const BrowserSettingsPatchValueTypeSpec& value_type, const std::string_view needle) {
+                             return value_type.path < needle;
+                         });
+    return found != kNativeSettingsPatchValueTypesByPath.end() && found->path == path ? found->value_type
+                                                                                      : std::string_view{};
+}
+
+[[nodiscard]] bool workflow_id_is_known(const std::string_view value) noexcept {
+    return sorted_string_views_contains(kNativeWorkflowIdsByName, value);
+}
+
+[[nodiscard]] bool preset_name_is_known(const std::string_view value) noexcept {
+    return sorted_string_views_contains(kNativePresetNamesByName, value);
+}
+
+[[nodiscard]] bool settings_numeric_enum_value_is_allowed(const std::string_view value_type,
+                                                          const nlohmann::json& value) noexcept {
+    if (value.get_ptr<const nlohmann::json::number_integer_t*>() == nullptr &&
+        value.get_ptr<const nlohmann::json::number_unsigned_t*>() == nullptr) {
+        return false;
+    }
+    for (const BrowserNumericEnumSchemaSpec& schema : kBrowserSettingsNumericEnumSchemas) {
+        if (schema.value_type != value_type) {
+            continue;
+        }
+        return numeric_enum_schema_contains_value(schema, value);
+    }
+    return false;
+}
+
+[[nodiscard]] bool settings_numeric_enum_value_type_is_known(const std::string_view value_type) noexcept {
+    for (const BrowserNumericEnumSchemaSpec& schema : kBrowserSettingsNumericEnumSchemas) {
+        if (schema.value_type == value_type) {
+            return true;
+        }
+    }
+    return false;
+}
 
 [[noreturn]] void throw_invalid_intent(const std::string_view intent_name) {
     throw std::runtime_error("invalid browser host api intent: " + std::string(intent_name));
@@ -149,37 +247,6 @@ bool parse_required_bool(const std::string_view intent_name, const nlohmann::jso
     return value_it->get<bool>();
 }
 
-AnnotateSetupAction parse_annotate_setup_action(const std::string_view intent_name, const nlohmann::json& payload) {
-    const auto action_it = payload.find("action");
-    if (action_it == payload.end() || !action_it->is_string()) {
-        throw_intent_payload_error(intent_name, "payload.action must be a string");
-    }
-
-    const std::string action = action_it->get<std::string>();
-    if (action == "start_live" || action == "start-live" || action == "start_live_annotate" ||
-        action == "start-live-annotate") {
-        return AnnotateSetupAction::StartLive;
-    }
-    if (action == "stop_live" || action == "stop-live" || action == "stop_live_annotate" ||
-        action == "stop-live-annotate") {
-        return AnnotateSetupAction::StopLive;
-    }
-    if (action == "reload_frame" || action == "reload-frame" || action == "reload_current_frame" ||
-        action == "reload-current-frame") {
-        return AnnotateSetupAction::ReloadFrame;
-    }
-    if (action == "prev_frame" || action == "prev-frame" || action == "previous_frame" || action == "previous-frame") {
-        return AnnotateSetupAction::PrevFrame;
-    }
-    if (action == "next_frame" || action == "next-frame") {
-        return AnnotateSetupAction::NextFrame;
-    }
-
-    throw_intent_payload_error(intent_name,
-                               "payload.action must be `start_live`, `stop_live`, `reload_frame`, "
-                               "`prev_frame`, or `next_frame`");
-}
-
 AnnotateWorkspacePhase parse_annotate_workspace_phase(const std::string_view intent_name,
                                                       const nlohmann::json& payload) {
     const auto phase_it = payload.find("phase");
@@ -197,7 +264,10 @@ AnnotateWorkspacePhase parse_annotate_workspace_phase(const std::string_view int
     if (phase == "end") {
         return AnnotateWorkspacePhase::End;
     }
-    throw_intent_payload_error(intent_name, "payload.phase must be `begin`, `update`, or `end`");
+    if (phase == "cancel") {
+        return AnnotateWorkspacePhase::Cancel;
+    }
+    throw_intent_payload_error(intent_name, "payload.phase must be `begin`, `update`, `end`, or `cancel`");
 }
 
 AnnotateHandleRole parse_annotate_handle_role(const std::string_view intent_name, const nlohmann::json& payload) {
@@ -249,56 +319,23 @@ AnnotateWorkspaceHandleRef parse_annotate_workspace_handle_ref(const std::string
     return handle;
 }
 
-TrainStopIntent parse_train_stop_intent(const nlohmann::json& payload) {
-    TrainStopIntent routed;
-    get_optional(payload, "force", routed.force);
-    return routed;
-}
-
-TrainRemoteQueryIntent parse_train_remote_query_intent(const nlohmann::json&) {
-    return TrainRemoteQueryIntent{};
-}
-
-TrainLocalGpuRefreshIntent parse_train_local_gpu_refresh_intent(const nlohmann::json&) {
-    return TrainLocalGpuRefreshIntent{};
-}
-
-TrainRemoteOfferArmIntent parse_train_remote_offer_arm_intent(const std::string_view intent_name,
-                                                              const nlohmann::json& payload) {
-    const auto offer_id_it = payload.find("offer_id");
-    if (offer_id_it == payload.end() || !offer_id_it->is_number_integer()) {
-        throw_intent_payload_error(intent_name, "payload.offer_id must be an integer");
-    }
-
-    TrainRemoteOfferArmIntent routed;
-    routed.offer_id = offer_id_it->get<int>();
-    return routed;
-}
-
-TrainRemoteOfferClearIntent parse_train_remote_offer_clear_intent(const nlohmann::json&) {
-    return TrainRemoteOfferClearIntent{};
-}
-
 TrainRemoteStartIntent parse_train_remote_start_intent(const nlohmann::json& payload) {
     return TrainRemoteStartIntent{payload};
 }
 
-TrainRemoteStopIntent parse_train_remote_stop_intent(const nlohmann::json&) {
-    return TrainRemoteStopIntent{};
-}
-
 PredictStartIntent parse_predict_start_intent(const nlohmann::json& payload) {
     PredictStartIntent routed;
-    routed.options = payload;
-    if (const auto it = routed.options.find("selected_preset"); it != routed.options.end() && !it->is_null()) {
-        routed.selected_preset = it->get<std::string>();
-        routed.options.erase(it);
+    routed.options = nlohmann::json::object();
+    for (auto it = payload.begin(); it != payload.end(); ++it) {
+        if (it.key() == "selected_preset") {
+            if (!it->is_null()) {
+                routed.selected_preset = it->get<std::string>();
+            }
+            continue;
+        }
+        routed.options[it.key()] = *it;
     }
     return routed;
-}
-
-PredictStopIntent parse_predict_stop_intent(const nlohmann::json&) {
-    return PredictStopIntent{};
 }
 
 ValidateStartIntent parse_validate_start_intent(const nlohmann::json& payload) {
@@ -314,60 +351,13 @@ AnnotateSaveIntent parse_annotate_save_intent(const nlohmann::json& payload) {
 }
 
 AnnotateSetupIntent parse_annotate_setup_intent(const std::string_view intent_name, const nlohmann::json& payload) {
-    if (intent_name == "annotate.live.start") {
-        return AnnotateSetupIntent{AnnotateSetupAction::StartLive};
+    for (const auto action : AnnotateSetupIntent::api_intent_actions()) {
+        if (action.id == intent_name) {
+            return AnnotateSetupIntent{action.action};
+        }
     }
-    if (intent_name == "annotate.live.stop") {
-        return AnnotateSetupIntent{AnnotateSetupAction::StopLive};
-    }
-    if (intent_name == "annotate.setup_frame.reload" || intent_name == "annotate.frame.reload") {
-        return AnnotateSetupIntent{AnnotateSetupAction::ReloadFrame};
-    }
-    if (intent_name == "annotate.setup_frame.prev" || intent_name == "annotate.frame.prev") {
-        return AnnotateSetupIntent{AnnotateSetupAction::PrevFrame};
-    }
-    if (intent_name == "annotate.setup_frame.next" || intent_name == "annotate.frame.next") {
-        return AnnotateSetupIntent{AnnotateSetupAction::NextFrame};
-    }
-    return AnnotateSetupIntent{
-        parse_annotate_setup_action(intent_name, payload),
-    };
-}
-
-AnnotateHoldSaveIntent parse_annotate_hold_save_intent(const std::string_view intent_name,
-                                                       const nlohmann::json& payload) {
-    AnnotateHoldSaveIntent routed;
-    if (payload.contains("enabled")) {
-        routed.enabled = parse_required_bool(intent_name, payload, "enabled");
-        return routed;
-    }
-    if (payload.contains("active")) {
-        routed.enabled = parse_required_bool(intent_name, payload, "active");
-        return routed;
-    }
-    if (payload.contains("hold_save")) {
-        routed.enabled = parse_required_bool(intent_name, payload, "hold_save");
-        return routed;
-    }
-    throw_intent_payload_error(intent_name, "payload.enabled, payload.active, or payload.hold_save is required");
-}
-
-AnnotateBrushRadiusIntent parse_annotate_brush_radius_intent(const std::string_view intent_name,
-                                                             const nlohmann::json& payload) {
-    AnnotateBrushRadiusIntent routed;
-    if (payload.contains("radius")) {
-        routed.radius = parse_required_int(intent_name, payload, "radius");
-    } else if (payload.contains("brush_radius")) {
-        routed.radius = parse_required_int(intent_name, payload, "brush_radius");
-    } else {
-        throw_intent_payload_error(intent_name,
-                                   "payload.radius or payload.brush_radius is "
-                                   "required");
-    }
-    if (routed.radius <= 0) {
-        throw_intent_payload_error(intent_name, "payload.radius must be greater than zero");
-    }
-    return routed;
+    (void)payload;
+    throw_invalid_intent(intent_name);
 }
 
 AnnotateSidebarIntent parse_annotate_sidebar_intent(const std::string_view intent_name, const nlohmann::json& payload) {
@@ -520,15 +510,6 @@ AnnotateSidebarIntent parse_annotate_sidebar_intent(const std::string_view inten
     throw_intent_payload_error(intent_name, "payload.action is not supported");
 }
 
-AnnotateWorkspaceClickIntent parse_annotate_workspace_click_intent(const std::string_view intent_name,
-                                                                   const nlohmann::json& payload) {
-    AnnotateWorkspaceClickIntent routed;
-    routed.capture_x = parse_required_int(intent_name, payload, "capture_x");
-    routed.capture_y = parse_required_int(intent_name, payload, "capture_y");
-    get_optional(payload, "double_click", routed.double_click);
-    return routed;
-}
-
 AnnotateBoxDragKind parse_annotate_box_drag_kind(const std::string_view intent_name, const nlohmann::json& payload) {
     const auto drag_kind_it = payload.find("drag_kind");
     if (drag_kind_it == payload.end() || !drag_kind_it->is_string()) {
@@ -542,16 +523,16 @@ AnnotateBoxDragKind parse_annotate_box_drag_kind(const std::string_view intent_n
     if (drag_kind == "move") {
         return AnnotateBoxDragKind::Move;
     }
-    if (drag_kind == "resize_top_left" || drag_kind == "resize-top-left") {
+    if (drag_kind == "resize_top_left") {
         return AnnotateBoxDragKind::ResizeTopLeft;
     }
-    if (drag_kind == "resize_top_right" || drag_kind == "resize-top-right") {
+    if (drag_kind == "resize_top_right") {
         return AnnotateBoxDragKind::ResizeTopRight;
     }
-    if (drag_kind == "resize_bottom_left" || drag_kind == "resize-bottom-left") {
+    if (drag_kind == "resize_bottom_left") {
         return AnnotateBoxDragKind::ResizeBottomLeft;
     }
-    if (drag_kind == "resize_bottom_right" || drag_kind == "resize-bottom-right") {
+    if (drag_kind == "resize_bottom_right") {
         return AnnotateBoxDragKind::ResizeBottomRight;
     }
 
@@ -606,35 +587,6 @@ AnnotateWorkspaceHandleDragIntent parse_annotate_workspace_handle_drag_intent(co
     return routed;
 }
 
-AnnotateWorkspaceBrushIntent parse_annotate_workspace_brush_intent(const std::string_view intent_name,
-                                                                   const nlohmann::json& payload) {
-    AnnotateWorkspaceBrushIntent routed;
-    routed.phase = parse_annotate_workspace_phase(intent_name, payload);
-    routed.capture_x = parse_required_int(intent_name, payload, "capture_x");
-    routed.capture_y = parse_required_int(intent_name, payload, "capture_y");
-    routed.radius = parse_required_int(intent_name, payload, "radius");
-    if (routed.radius <= 0) {
-        throw_intent_payload_error(intent_name, "payload.radius must be greater than zero");
-    }
-    return routed;
-}
-
-AnnotateWorkspaceFillIntent parse_annotate_workspace_fill_intent(const std::string_view intent_name,
-                                                                 const nlohmann::json& payload) {
-    return AnnotateWorkspaceFillIntent{
-        parse_required_int(intent_name, payload, "capture_x"),
-        parse_required_int(intent_name, payload, "capture_y"),
-    };
-}
-
-AnnotateWorkspaceColorSampleIntent parse_annotate_workspace_color_sample_intent(const std::string_view intent_name,
-                                                                                const nlohmann::json& payload) {
-    return AnnotateWorkspaceColorSampleIntent{
-        parse_required_int(intent_name, payload, "capture_x"),
-        parse_required_int(intent_name, payload, "capture_y"),
-    };
-}
-
 ToolSelectIntent parse_tool_select_intent(const std::string_view intent_name, const nlohmann::json& payload) {
     const auto tool_it = payload.find("tool");
     if (tool_it == payload.end() || !tool_it->is_string()) {
@@ -643,91 +595,146 @@ ToolSelectIntent parse_tool_select_intent(const std::string_view intent_name, co
 
     ToolSelectIntent routed;
     tool_it->get_to(routed.tool);
-    routed.options = payload;
-    routed.options.erase("tool");
+    routed.options = nlohmann::json::object();
+    for (auto it = payload.begin(); it != payload.end(); ++it) {
+        if (it.key() != "tool") {
+            routed.options[it.key()] = *it;
+        }
+    }
     return routed;
 }
 
 LivePreviewControlIntent parse_live_preview_control_intent(const std::string_view intent_name,
                                                            const nlohmann::json& payload) {
     LivePreviewControlIntent routed;
-    if (intent_name == "live.preview.fit_to_capture") {
-        if (payload.contains("enabled")) {
-            routed.fit_to_capture = parse_required_bool(intent_name, payload, "enabled");
-            return routed;
+    const bool enabled = parse_required_bool(intent_name, payload, "enabled");
+    for (const auto target : LivePreviewControlIntent::api_intent_targets()) {
+        if (target.id != intent_name) {
+            continue;
         }
-        if (payload.contains("value")) {
-            routed.fit_to_capture = parse_required_bool(intent_name, payload, "value");
-            return routed;
+        switch (target.target) {
+            case LivePreviewControlTarget::FitToCapture:
+                routed.fit_to_capture = enabled;
+                return routed;
+            case LivePreviewControlTarget::CropOverlayMode:
+                routed.crop_overlay_mode = enabled;
+                return routed;
         }
-        routed.fit_to_capture = parse_required_bool(intent_name, payload, "fit_to_capture");
-        return routed;
     }
-    if (intent_name == "live.preview.full_frame_display" || intent_name == "live.preview.full_frame" ||
-        intent_name == "live.preview.crop_overlay_mode") {
-        if (payload.contains("enabled")) {
-            routed.crop_overlay_mode = parse_required_bool(intent_name, payload, "enabled");
-            return routed;
-        }
-        if (payload.contains("value")) {
-            routed.crop_overlay_mode = parse_required_bool(intent_name, payload, "value");
-            return routed;
-        }
-        if (payload.contains("full_frame")) {
-            routed.crop_overlay_mode = parse_required_bool(intent_name, payload, "full_frame");
-            return routed;
-        }
-        routed.crop_overlay_mode = parse_required_bool(intent_name, payload, "crop_overlay_mode");
-        return routed;
+    throw_invalid_intent(intent_name);
+}
+
+void validate_settings_patch_value(const std::string_view intent_name, const nlohmann::json& value, std::string& path) {
+    if (!settings_patch_path_is_known_prefix_or_leaf(path)) {
+        throw_intent_payload_error(intent_name, "unsupported settings patch path `" + path + "`");
     }
 
-    if (const auto fit_it = payload.find("fit_to_capture"); fit_it != payload.end() && !fit_it->is_null()) {
-        if (!fit_it->is_boolean()) {
-            throw_intent_payload_error(intent_name, "payload.fit_to_capture must be a boolean");
+    if (value.is_object()) {
+        const std::size_t parent_size = path.size();
+        for (auto it = value.begin(); it != value.end(); ++it) {
+            if (path.size() != 0U) {
+                path.push_back('.');
+            }
+            path += it.key();
+            validate_settings_patch_value(intent_name, *it, path);
+            path.resize(parent_size);
         }
-        routed.fit_to_capture = fit_it->get<bool>();
+        return;
     }
 
-    std::optional<bool> crop_overlay_mode;
-    if (const auto crop_it = payload.find("crop_overlay_mode"); crop_it != payload.end() && !crop_it->is_null()) {
-        if (!crop_it->is_boolean()) {
-            throw_intent_payload_error(intent_name, "payload.crop_overlay_mode must be a boolean");
-        }
-        crop_overlay_mode = crop_it->get<bool>();
+    if (!settings_patch_path_is_known_leaf(path)) {
+        throw_intent_payload_error(intent_name, "unsupported settings patch leaf `" + path + "`");
     }
 
-    if (const auto full_frame_it = payload.find("full_frame");
-        full_frame_it != payload.end() && !full_frame_it->is_null()) {
-        if (!full_frame_it->is_boolean()) {
-            throw_intent_payload_error(intent_name, "payload.full_frame must be a boolean");
-        }
-        const bool full_frame = full_frame_it->get<bool>();
-        if (crop_overlay_mode.has_value() && crop_overlay_mode.value() != full_frame) {
-            throw_intent_payload_error(intent_name, "payload.full_frame must match payload.crop_overlay_mode");
-        }
-        crop_overlay_mode = full_frame;
+    const std::string_view value_type = settings_patch_value_type(path);
+    if (value_type.empty()) {
+        throw_intent_payload_error(intent_name, "unsupported settings patch value type for `" + path + "`");
     }
 
-    routed.crop_overlay_mode = crop_overlay_mode;
-    if (!routed.fit_to_capture.has_value() && !routed.crop_overlay_mode.has_value()) {
-        throw_intent_payload_error(intent_name,
-                                   "payload.fit_to_capture, payload.crop_overlay_mode, or "
-                                   "payload.full_frame is required");
+    if (value_type == "workflow") {
+        if (!value.is_string() || !workflow_id_is_known(value.get<std::string>())) {
+            throw_intent_payload_error(intent_name, "payload.patch.current_view must be a generated workflow id");
+        }
+        return;
     }
-    return routed;
+
+    if (value_type == "preset") {
+        if (!value.is_string() || !preset_name_is_known(value.get<std::string>())) {
+            throw_intent_payload_error(intent_name, "payload.patch.selected_preset must be a generated RF-DETR preset");
+        }
+        return;
+    }
+
+    if (value_type == "string") {
+        if (!value.is_string()) {
+            throw_intent_payload_error(intent_name, "payload.patch." + path + " must be a string");
+        }
+        return;
+    }
+
+    if (value_type == "number") {
+        if (!value.is_number()) {
+            throw_intent_payload_error(intent_name, "payload.patch." + path + " must be a number");
+        }
+        return;
+    }
+
+    if (settings_numeric_enum_value_type_is_known(value_type)) {
+        if (!settings_numeric_enum_value_is_allowed(value_type, value)) {
+            throw_intent_payload_error(
+                intent_name, "payload.patch." + path + " must be a generated `" + std::string(value_type) + "` value");
+        }
+        return;
+    }
+
+    if (value_type == "boolean") {
+        if (!value.is_boolean()) {
+            throw_intent_payload_error(intent_name, "payload.patch." + path + " must be a boolean");
+        }
+        return;
+    }
+
+    if (value_type == "number_array") {
+        if (!value.is_array()) {
+            throw_intent_payload_error(intent_name, "payload.patch." + path + " must be a numeric array");
+        }
+        for (const nlohmann::json& entry : value) {
+            if (!entry.is_number()) {
+                throw_intent_payload_error(intent_name, "payload.patch." + path + " must be a numeric array");
+            }
+        }
+        return;
+    }
+
+    if (value_type == "boolean_array") {
+        if (!value.is_array()) {
+            throw_intent_payload_error(intent_name, "payload.patch." + path + " must be a boolean array");
+        }
+        for (const nlohmann::json& entry : value) {
+            if (!entry.is_boolean()) {
+                throw_intent_payload_error(intent_name, "payload.patch." + path + " must be a boolean array");
+            }
+        }
+        return;
+    }
+
+    throw_intent_payload_error(intent_name, "unsupported settings patch value type `" + std::string{value_type} + "`");
 }
 
 SettingsUpdateIntent parse_settings_update_intent(const std::string_view intent_name, const nlohmann::json& payload) {
     SettingsUpdateIntent routed;
+    std::string path;
     const auto patch_it = payload.find("patch");
     if (patch_it != payload.end()) {
         if (!patch_it->is_object()) {
             throw_intent_payload_error(intent_name, "payload.patch must be a JSON object");
         }
         routed.patch = *patch_it;
+        validate_settings_patch_value(intent_name, routed.patch, path);
         return routed;
     }
     routed.patch = payload;
+    validate_settings_patch_value(intent_name, routed.patch, path);
     return routed;
 }
 
@@ -749,48 +756,6 @@ CropCommitIntent parse_crop_commit_intent(const std::string_view intent_name, co
     return routed;
 }
 
-FileDialogRequestIntent parse_file_dialog_request_intent(const std::string_view intent_name,
-                                                         const nlohmann::json& payload) {
-    FileDialogRequestIntent routed;
-
-    const auto dialog_id_it = payload.find("dialog_id");
-    if (dialog_id_it == payload.end() || !dialog_id_it->is_string()) {
-        throw_intent_payload_error(intent_name, "payload.dialog_id must be a string");
-    }
-    dialog_id_it->get_to(routed.dialog_id);
-
-    const auto mode_it = payload.find("mode");
-    if (mode_it == payload.end() || !mode_it->is_string()) {
-        throw_intent_payload_error(intent_name, "payload.mode must be a string");
-    }
-    routed.mode = file_dialog_mode_from_name(mode_it->get<std::string>());
-
-    get_optional(payload, "title", routed.title);
-    get_optional(payload, "default_path", routed.default_path);
-    if (const auto filters_it = payload.find("filters"); filters_it != payload.end()) {
-        if (!filters_it->is_array()) {
-            throw_intent_payload_error(intent_name, "payload.filters must be an array");
-        }
-        routed.filters.reserve(filters_it->size());
-        for (const nlohmann::json& filter_json : *filters_it) {
-            if (!filter_json.is_object()) {
-                throw_intent_payload_error(intent_name, "payload.filters entries must be objects");
-            }
-            FileDialogFilter filter;
-            get_optional(filter_json, "name", filter.name);
-            if (const auto patterns_it = filter_json.find("patterns"); patterns_it != filter_json.end()) {
-                if (!patterns_it->is_array()) {
-                    throw_intent_payload_error(intent_name, "payload.filters[].patterns must be an array");
-                }
-                filter.patterns = patterns_it->get<std::vector<std::string>>();
-            }
-            routed.filters.push_back(std::move(filter));
-        }
-    }
-
-    return routed;
-}
-
 ViewportCommitIntent parse_viewport_commit_intent(const std::string_view intent_name, const nlohmann::json& payload) {
     ViewportCommitIntent routed;
     get_optional(payload, "center_x", routed.center_x);
@@ -805,272 +770,333 @@ ViewportCommitIntent parse_viewport_commit_intent(const std::string_view intent_
     return routed;
 }
 
-using WorkflowMask = std::uint32_t;
-using RoutedIntentPayloadFactory = RoutedIntentPayload (*)(std::string_view intent_name, const nlohmann::json& payload);
+[[nodiscard]] TrainStartIntent parse_native_intent_payload(std::type_identity<TrainStartIntent>, std::string_view,
+                                                           const nlohmann::json& payload) {
+    return parse_train_start_intent(payload);
+}
 
-struct IntentRouteSpec {
-    WorkflowMask workflows = 0U;
-    const char* workflow_error = nullptr;
-    RoutedIntentPayloadFactory make_payload = nullptr;
+[[nodiscard]] TrainRemoteStartIntent parse_native_intent_payload(std::type_identity<TrainRemoteStartIntent>,
+                                                                 std::string_view, const nlohmann::json& payload) {
+    return parse_train_remote_start_intent(payload);
+}
+
+[[nodiscard]] PredictStartIntent parse_native_intent_payload(std::type_identity<PredictStartIntent>, std::string_view,
+                                                             const nlohmann::json& payload) {
+    return parse_predict_start_intent(payload);
+}
+
+[[nodiscard]] ValidateStartIntent parse_native_intent_payload(std::type_identity<ValidateStartIntent>, std::string_view,
+                                                              const nlohmann::json& payload) {
+    return parse_validate_start_intent(payload);
+}
+
+[[nodiscard]] ExportStartIntent parse_native_intent_payload(std::type_identity<ExportStartIntent>, std::string_view,
+                                                            const nlohmann::json& payload) {
+    return parse_export_start_intent(payload);
+}
+
+[[nodiscard]] AnnotateSaveIntent parse_native_intent_payload(std::type_identity<AnnotateSaveIntent>, std::string_view,
+                                                             const nlohmann::json& payload) {
+    return parse_annotate_save_intent(payload);
+}
+
+[[nodiscard]] AnnotateSetupIntent parse_native_intent_payload(std::type_identity<AnnotateSetupIntent>,
+                                                              const std::string_view intent_name,
+                                                              const nlohmann::json& payload) {
+    return parse_annotate_setup_intent(intent_name, payload);
+}
+
+[[nodiscard]] AnnotateSidebarIntent parse_native_intent_payload(std::type_identity<AnnotateSidebarIntent>,
+                                                                const std::string_view intent_name,
+                                                                const nlohmann::json& payload) {
+    return parse_annotate_sidebar_intent(intent_name, payload);
+}
+
+[[nodiscard]] AnnotateWorkspaceBoxDragIntent parse_native_intent_payload(
+    std::type_identity<AnnotateWorkspaceBoxDragIntent>, const std::string_view intent_name,
+    const nlohmann::json& payload) {
+    return parse_annotate_workspace_box_drag_intent(intent_name, payload);
+}
+
+[[nodiscard]] AnnotateWorkspaceHandleDragIntent parse_native_intent_payload(
+    std::type_identity<AnnotateWorkspaceHandleDragIntent>, const std::string_view intent_name,
+    const nlohmann::json& payload) {
+    return parse_annotate_workspace_handle_drag_intent(intent_name, payload);
+}
+
+[[nodiscard]] ToolSelectIntent parse_native_intent_payload(std::type_identity<ToolSelectIntent>,
+                                                           const std::string_view intent_name,
+                                                           const nlohmann::json& payload) {
+    return parse_tool_select_intent(intent_name, payload);
+}
+
+[[nodiscard]] LivePreviewControlIntent parse_native_intent_payload(std::type_identity<LivePreviewControlIntent>,
+                                                                   const std::string_view intent_name,
+                                                                   const nlohmann::json& payload) {
+    return parse_live_preview_control_intent(intent_name, payload);
+}
+
+[[nodiscard]] SettingsUpdateIntent parse_native_intent_payload(std::type_identity<SettingsUpdateIntent>,
+                                                               const std::string_view intent_name,
+                                                               const nlohmann::json& payload) {
+    return parse_settings_update_intent(intent_name, payload);
+}
+
+[[nodiscard]] CropCommitIntent parse_native_intent_payload(std::type_identity<CropCommitIntent>,
+                                                           const std::string_view intent_name,
+                                                           const nlohmann::json& payload) {
+    return parse_crop_commit_intent(intent_name, payload);
+}
+
+[[nodiscard]] ViewportCommitIntent parse_native_intent_payload(std::type_identity<ViewportCommitIntent>,
+                                                               const std::string_view intent_name,
+                                                               const nlohmann::json& payload) {
+    return parse_viewport_commit_intent(intent_name, payload);
+}
+
+template <typename Payload>
+[[nodiscard]] Payload parse_typed_intent_payload(const std::string_view intent_name, const nlohmann::json& payload) {
+    if constexpr (requires { parse_native_intent_payload(std::type_identity<Payload>{}, intent_name, payload); }) {
+        return parse_native_intent_payload(std::type_identity<Payload>{}, intent_name, payload);
+    } else {
+        Payload routed{};
+        api::from_json_reflected(payload, routed);
+        return routed;
+    }
+}
+
+struct NativeIntentRouteEntry {
+    std::string_view id;
+    std::array<Workflow, 6U> workflows{};
+    std::size_t workflow_count = 0U;
+    RoutedIntentPayload (*parse)(std::string_view, const nlohmann::json&) = nullptr;
 };
 
-[[nodiscard]] constexpr WorkflowMask workflow_mask(const Workflow workflow) noexcept {
-    return 1U << static_cast<std::uint32_t>(workflow);
-}
-
-[[nodiscard]] constexpr bool workflow_allowed(const WorkflowMask mask, const Workflow workflow) noexcept {
-    return (mask & workflow_mask(workflow)) != 0U;
-}
-
-template <auto Parser>
-[[nodiscard]] RoutedIntentPayload make_routed_payload(const std::string_view intent_name,
-                                                      const nlohmann::json& payload) {
-    if constexpr (std::is_invocable_v<decltype(Parser), std::string_view, const nlohmann::json&>) {
-        return Parser(intent_name, payload);
-    } else {
-        return Parser(payload);
+[[nodiscard]] bool workflow_allowed(const NativeIntentRouteEntry& route, const Workflow workflow) noexcept {
+    for (std::size_t i = 0U; i < route.workflow_count; ++i) {
+        const Workflow allowed_workflow = route.workflows[i];
+        if (allowed_workflow == workflow) {
+            return true;
+        }
     }
+    return false;
 }
 
-template <auto Parser>
-[[nodiscard]] constexpr IntentRouteSpec route_spec(const WorkflowMask workflows, const char* workflow_error) noexcept {
-    return IntentRouteSpec{workflows, workflow_error, make_routed_payload<Parser>};
+template <typename Payload>
+[[nodiscard]] RoutedIntentPayload parse_payload_variant(const std::string_view intent_name,
+                                                        const nlohmann::json& payload) {
+    return RoutedIntentPayload{parse_typed_intent_payload<Payload>(intent_name, payload)};
 }
 
-[[nodiscard]] const IntentRouteSpec& find_intent_route_spec(const std::string_view intent_name) {
-    constexpr WorkflowMask kTrain = workflow_mask(Workflow::Train);
-    constexpr WorkflowMask kValidate = workflow_mask(Workflow::Validate);
-    constexpr WorkflowMask kPredict = workflow_mask(Workflow::Predict);
-    constexpr WorkflowMask kAnnotate = workflow_mask(Workflow::Annotate);
-    constexpr WorkflowMask kExport = workflow_mask(Workflow::Export);
-    constexpr WorkflowMask kLive = workflow_mask(Workflow::Live);
-    constexpr WorkflowMask kPredictOrLive = kPredict | kLive;
-    constexpr WorkflowMask kPredictAnnotateOrLive = kPredict | kAnnotate | kLive;
-    constexpr WorkflowMask kAnyWorkflow = kTrain | kValidate | kPredict | kAnnotate | kExport | kLive;
-    constexpr const char* kTrainWorkflow = "workflow must be `train`";
-    constexpr const char* kPredictLiveWorkflow = "workflow must be `predict` or `live`";
-    constexpr const char* kValidateWorkflow = "workflow must be `validate`";
-    constexpr const char* kExportWorkflow = "workflow must be `export`";
-    constexpr const char* kAnnotateWorkflow = "workflow must be `annotate`";
-    constexpr const char* kLiveWorkflow = "workflow must be `live`";
-    constexpr const char* kPredictAnnotateLiveWorkflow = "workflow must be `predict`, `annotate`, or `live`";
-
-    static const std::unordered_map<std::string_view, IntentRouteSpec> kFactory{
-        {"train.start", route_spec<&parse_train_start_intent>(kTrain, kTrainWorkflow)},
-        {"train.stop", route_spec<&parse_train_stop_intent>(kTrain, kTrainWorkflow)},
-        {"train.remote.query", route_spec<&parse_train_remote_query_intent>(kTrain, kTrainWorkflow)},
-        {"train.local_gpu.refresh", route_spec<&parse_train_local_gpu_refresh_intent>(kTrain, kTrainWorkflow)},
-        {"train.remote.offer.arm", route_spec<&parse_train_remote_offer_arm_intent>(kTrain, kTrainWorkflow)},
-        {"train.remote.offer.clear", route_spec<&parse_train_remote_offer_clear_intent>(kTrain, kTrainWorkflow)},
-        {"train.remote.start", route_spec<&parse_train_remote_start_intent>(kTrain, kTrainWorkflow)},
-        {"train.remote.stop", route_spec<&parse_train_remote_stop_intent>(kTrain, kTrainWorkflow)},
-        {"predict.start", route_spec<&parse_predict_start_intent>(kPredictOrLive, kPredictLiveWorkflow)},
-        {"predict.stop", route_spec<&parse_predict_stop_intent>(kPredictOrLive, kPredictLiveWorkflow)},
-        {"validate.start", route_spec<&parse_validate_start_intent>(kValidate, kValidateWorkflow)},
-        {"export.start", route_spec<&parse_export_start_intent>(kExport, kExportWorkflow)},
-        {"annotate.save", route_spec<&parse_annotate_save_intent>(kAnnotate, kAnnotateWorkflow)},
-        {"annotate.save_now", route_spec<&parse_annotate_save_intent>(kAnnotate, kAnnotateWorkflow)},
-        {"annotate.setup", route_spec<&parse_annotate_setup_intent>(kAnnotate, kAnnotateWorkflow)},
-        {"annotate.live.start", route_spec<&parse_annotate_setup_intent>(kAnnotate, kAnnotateWorkflow)},
-        {"annotate.live.stop", route_spec<&parse_annotate_setup_intent>(kAnnotate, kAnnotateWorkflow)},
-        {"annotate.setup_frame.reload", route_spec<&parse_annotate_setup_intent>(kAnnotate, kAnnotateWorkflow)},
-        {"annotate.setup_frame.prev", route_spec<&parse_annotate_setup_intent>(kAnnotate, kAnnotateWorkflow)},
-        {"annotate.setup_frame.next", route_spec<&parse_annotate_setup_intent>(kAnnotate, kAnnotateWorkflow)},
-        {"annotate.frame.reload", route_spec<&parse_annotate_setup_intent>(kAnnotate, kAnnotateWorkflow)},
-        {"annotate.frame.prev", route_spec<&parse_annotate_setup_intent>(kAnnotate, kAnnotateWorkflow)},
-        {"annotate.frame.next", route_spec<&parse_annotate_setup_intent>(kAnnotate, kAnnotateWorkflow)},
-        {"annotate.hold_save", route_spec<&parse_annotate_hold_save_intent>(kAnnotate, kAnnotateWorkflow)},
-        {"annotate.hold_save.update", route_spec<&parse_annotate_hold_save_intent>(kAnnotate, kAnnotateWorkflow)},
-        {"annotate.brush_radius", route_spec<&parse_annotate_brush_radius_intent>(kAnnotate, kAnnotateWorkflow)},
-        {"annotate.brush_radius.update", route_spec<&parse_annotate_brush_radius_intent>(kAnnotate, kAnnotateWorkflow)},
-        {"annotate.sidebar", route_spec<&parse_annotate_sidebar_intent>(kAnnotate, kAnnotateWorkflow)},
-        {"annotate.workspace.click", route_spec<&parse_annotate_workspace_click_intent>(kAnnotate, kAnnotateWorkflow)},
-        {"annotate.workspace.box_drag",
-         route_spec<&parse_annotate_workspace_box_drag_intent>(kAnnotate, kAnnotateWorkflow)},
-        {"annotate.workspace.handle_drag",
-         route_spec<&parse_annotate_workspace_handle_drag_intent>(kAnnotate, kAnnotateWorkflow)},
-        {"annotate.workspace.brush", route_spec<&parse_annotate_workspace_brush_intent>(kAnnotate, kAnnotateWorkflow)},
-        {"annotate.workspace.fill", route_spec<&parse_annotate_workspace_fill_intent>(kAnnotate, kAnnotateWorkflow)},
-        {"annotate.workspace.color_sample",
-         route_spec<&parse_annotate_workspace_color_sample_intent>(kAnnotate, kAnnotateWorkflow)},
-        {"tool.select", route_spec<&parse_tool_select_intent>(kPredictAnnotateOrLive, kPredictAnnotateLiveWorkflow)},
-        {"live.preview.update", route_spec<&parse_live_preview_control_intent>(kLive, kLiveWorkflow)},
-        {"live.preview.controls", route_spec<&parse_live_preview_control_intent>(kLive, kLiveWorkflow)},
-        {"live.preview.fit_to_capture", route_spec<&parse_live_preview_control_intent>(kLive, kLiveWorkflow)},
-        {"live.preview.full_frame_display", route_spec<&parse_live_preview_control_intent>(kLive, kLiveWorkflow)},
-        {"live.preview.full_frame", route_spec<&parse_live_preview_control_intent>(kLive, kLiveWorkflow)},
-        {"live.preview.crop_overlay_mode", route_spec<&parse_live_preview_control_intent>(kLive, kLiveWorkflow)},
-        {"crop.commit", route_spec<&parse_crop_commit_intent>(kPredictAnnotateOrLive, kPredictAnnotateLiveWorkflow)},
-        {"viewport.commit",
-         route_spec<&parse_viewport_commit_intent>(kPredictAnnotateOrLive, kPredictAnnotateLiveWorkflow)},
-        {"settings.update", route_spec<&parse_settings_update_intent>(kAnyWorkflow, nullptr)},
-        {"file_dialog.request", route_spec<&parse_file_dialog_request_intent>(kAnyWorkflow, nullptr)},
-        {"file-dialog.request", route_spec<&parse_file_dialog_request_intent>(kAnyWorkflow, nullptr)},
-    };
-    const auto spec = kFactory.find(intent_name);
-    if (spec == kFactory.end()) {
-        throw_invalid_intent(intent_name);
+template <typename Payload, typename Descriptor>
+[[nodiscard]] constexpr NativeIntentRouteEntry native_route_entry(const Descriptor& descriptor) {
+    NativeIntentRouteEntry entry;
+    entry.id = descriptor.id;
+    entry.workflow_count = descriptor.workflows.workflows.size();
+    for (std::size_t i = 0U; i < entry.workflow_count; ++i) {
+        entry.workflows[i] = descriptor.workflows.workflows[i];
     }
-    return spec->second;
+    entry.parse = &parse_payload_variant<Payload>;
+    return entry;
+}
+
+template <typename Payload, std::size_t N>
+constexpr void append_native_route_entries(std::array<NativeIntentRouteEntry, N>& routes, std::size_t& index) {
+    std::apply([&](const auto&... descriptors) { ((routes[index++] = native_route_entry<Payload>(descriptors)), ...); },
+               api::payload_intent_descriptors<Payload>::values());
+}
+
+template <typename TypeList>
+struct NativeIntentRouteBuilder;
+
+template <typename... Payloads>
+struct NativeIntentRouteBuilder<api::type_list<Payloads...>> {
+    [[nodiscard]] static consteval auto routes() {
+        std::array<NativeIntentRouteEntry, api::intent_metadata<BrowserIntentPayloadTypes>::intent_count()> out{};
+        std::size_t index = 0U;
+        (append_native_route_entries<Payloads>(out, index), ...);
+        for (std::size_t i = 1U; i < out.size(); ++i) {
+            const NativeIntentRouteEntry current = out[i];
+            std::size_t j = i;
+            while (j > 0U && current.id < out[j - 1U].id) {
+                out[j] = out[j - 1U];
+                --j;
+            }
+            out[j] = current;
+        }
+        return out;
+    }
+};
+
+inline constexpr auto kNativeIntentRoutes = NativeIntentRouteBuilder<BrowserIntentPayloadTypes>::routes();
+
+[[nodiscard]] bool route_native_intent(const std::string_view intent_name, const Workflow workflow,
+                                       const nlohmann::json& payload, RoutedIntentPayload& routed_payload) {
+    const auto found = std::lower_bound(
+        kNativeIntentRoutes.begin(), kNativeIntentRoutes.end(), intent_name,
+        [](const NativeIntentRouteEntry& route, const std::string_view needle) { return route.id < needle; });
+    if (found == kNativeIntentRoutes.end() || found->id != intent_name) {
+        return false;
+    }
+    if (!workflow_allowed(*found, workflow)) {
+        throw_intent_payload_error(intent_name,
+                                   "intent is not allowed for workflow `" + std::string(workflow_name(workflow)) + "`");
+    }
+    routed_payload = found->parse(intent_name, payload);
+    return true;
+}
+
+[[nodiscard]] const BrowserNativeFileDialogContractSpec* file_dialog_contract_for_id(
+    const std::string_view dialog_id) noexcept {
+    const auto found =
+        std::lower_bound(kBrowserNativeFileDialogsById.begin(), kBrowserNativeFileDialogsById.end(), dialog_id,
+                         [](const BrowserNativeFileDialogContractSpec& spec, const std::string_view needle) {
+                             return spec.id < needle;
+                         });
+    return found != kBrowserNativeFileDialogsById.end() && found->id == dialog_id ? &*found : nullptr;
+}
+
+[[nodiscard]] Workflow file_dialog_owner_workflow(const Workflow workflow) noexcept {
+    return workflow == Workflow::Live ? Workflow::Predict : workflow;
+}
+
+void validate_file_dialog_request(const std::string_view intent_name, const Workflow workflow,
+                                  const FileDialogRequestIntent& request) {
+    const BrowserNativeFileDialogContractSpec* spec = file_dialog_contract_for_id(request.dialog_id);
+    if (spec == nullptr) {
+        throw_intent_payload_error(intent_name, "payload.dialog_id is not a generated file dialog id");
+    }
+    if (spec->workflow != file_dialog_owner_workflow(workflow)) {
+        throw_intent_payload_error(
+            intent_name, "payload.dialog_id is not owned by workflow `" + std::string(workflow_name(workflow)) + "`");
+    }
+    if (spec->mode != request.mode) {
+        throw_intent_payload_error(
+            intent_name, "payload.mode does not match generated file dialog mode for `" + request.dialog_id + "`");
+    }
+    if (spec->field != std::string_view{request.target_field}) {
+        throw_intent_payload_error(
+            intent_name,
+            "payload.target_field does not match generated file dialog target for `" + request.dialog_id + "`");
+    }
 }
 
 }  // namespace
 
 std::string_view workflow_name(const Workflow workflow) noexcept {
-    return enum_factory_name(workflow, kWorkflowFactory);
+    return api::enum_name(workflow);
 }
 
 Workflow workflow_from_name(const std::string_view name) {
-    return enum_factory_value("workflow", name, kWorkflowFactory);
+    try {
+        return api::enum_from_name<Workflow>(name);
+    } catch (const std::runtime_error&) {
+        throw_invalid_enum("workflow", name);
+    }
 }
 
 std::string_view source_kind_name(const SourceKind kind) noexcept {
-    return enum_factory_name(kind, kSourceKindFactory);
+    return api::enum_name(kind);
 }
 
 SourceKind source_kind_from_name(const std::string_view name) {
-    return enum_factory_value("source kind", name, kSourceKindFactory);
+    try {
+        return api::enum_from_name<SourceKind>(name);
+    } catch (const std::runtime_error&) {
+        throw_invalid_enum("source kind", name);
+    }
 }
 
 std::string_view browser_host_backend_name(const BrowserHostBackend backend) noexcept {
-    return enum_factory_name(backend, kBrowserHostBackendFactory);
+    return api::enum_name(backend);
 }
 
 BrowserHostBackend browser_host_backend_from_name(const std::string_view name) {
-    return enum_factory_value("browser host backend", name, kBrowserHostBackendFactory);
+    try {
+        return api::enum_from_name<BrowserHostBackend>(name);
+    } catch (const std::runtime_error&) {
+        throw_invalid_enum("browser host backend", name);
+    }
 }
 
 std::string_view browser_runtime_capability_status_name(const BrowserRuntimeCapabilityStatus status) noexcept {
-    return enum_factory_name(status, kBrowserRuntimeCapabilityStatusFactory);
+    return api::enum_name(status);
 }
 
 BrowserRuntimeCapabilityStatus browser_runtime_capability_status_from_name(const std::string_view name) {
-    return enum_factory_value("browser runtime capability status", name, kBrowserRuntimeCapabilityStatusFactory);
+    try {
+        return api::enum_from_name<BrowserRuntimeCapabilityStatus>(name);
+    } catch (const std::runtime_error&) {
+        throw_invalid_enum("browser runtime capability status", name);
+    }
 }
 
 std::string_view browser_bridge_phase_name(const BrowserBridgePhase phase) noexcept {
-    return enum_factory_name(phase, kBrowserBridgePhaseFactory);
+    return api::enum_name(phase);
 }
 
 BrowserBridgePhase browser_bridge_phase_from_name(const std::string_view name) {
-    return enum_factory_value("browser bridge phase", name, kBrowserBridgePhaseFactory);
+    try {
+        return api::enum_from_name<BrowserBridgePhase>(name);
+    } catch (const std::runtime_error&) {
+        throw_invalid_enum("browser bridge phase", name);
+    }
 }
 
 std::string_view file_dialog_mode_name(const FileDialogMode mode) noexcept {
-    return enum_factory_name(mode, kFileDialogModeFactory);
+    return api::enum_name(mode);
 }
 
 FileDialogMode file_dialog_mode_from_name(const std::string_view name) {
-    return enum_factory_value("file dialog mode", name, kFileDialogModeFactory);
+    try {
+        return api::enum_from_name<FileDialogMode>(name);
+    } catch (const std::runtime_error&) {
+        throw_invalid_enum("file dialog mode", name);
+    }
 }
 
 void to_json(nlohmann::json& j, const CaptureRegion& region) {
-    j = nlohmann::json{
-        {"x", region.x},
-        {"y", region.y},
-        {"width", region.width},
-        {"height", region.height},
-    };
+    api::to_json_reflected(j, region);
 }
 
 void from_json(const nlohmann::json& j, CaptureRegion& region) {
-    j.at("x").get_to(region.x);
-    j.at("y").get_to(region.y);
-    j.at("width").get_to(region.width);
-    j.at("height").get_to(region.height);
+    api::from_json_reflected(j, region);
 }
 
 void to_json(nlohmann::json& j, const JobLogEntry& entry) {
-    j = nlohmann::json{
-        {"sequence", entry.sequence},
-        {"level", entry.level},
-        {"message", entry.message},
-    };
+    api::to_json_reflected(j, entry);
 }
 
 void from_json(const nlohmann::json& j, JobLogEntry& entry) {
-    j.at("sequence").get_to(entry.sequence);
-    j.at("level").get_to(entry.level);
-    j.at("message").get_to(entry.message);
+    api::from_json_reflected(j, entry);
 }
 
 void to_json(nlohmann::json& j, const JobState& state) {
-    j = nlohmann::json{
-        {"running", state.running},         {"label", state.label},
-        {"summary", state.summary},         {"error", state.error},
-        {"output_tail", state.output_tail}, {"recent_logs", state.recent_logs},
-    };
+    api::to_json_reflected(j, state);
 }
 
 void from_json(const nlohmann::json& j, JobState& state) {
-    get_optional(j, "running", state.running);
-    get_optional(j, "label", state.label);
-    get_optional(j, "summary", state.summary);
-    get_optional(j, "error", state.error);
-    get_optional(j, "output_tail", state.output_tail);
-    get_optional(j, "recent_logs", state.recent_logs);
+    api::from_json_reflected(j, state);
 }
 
 void to_json(nlohmann::json& j, const SourceMetadata& metadata) {
-    j = nlohmann::json{
-        {"kind", source_kind_name(metadata.kind)}, {"locator", metadata.locator},
-        {"recursive", metadata.recursive},         {"device_index", metadata.device_index},
-        {"capture_width", metadata.capture_width}, {"capture_height", metadata.capture_height},
-        {"capture_fps", metadata.capture_fps},     {"v4l2_buffer_count", metadata.v4l2_buffer_count},
-        {"has_crop", metadata.has_crop},           {"crop", metadata.crop},
-    };
+    api::to_json_reflected(j, metadata);
 }
 
 void from_json(const nlohmann::json& j, SourceMetadata& metadata) {
-    metadata.kind = source_kind_from_name(j.at("kind").get<std::string>());
-    get_optional(j, "locator", metadata.locator);
-    get_optional(j, "recursive", metadata.recursive);
-    get_optional(j, "device_index", metadata.device_index);
-    get_optional(j, "capture_width", metadata.capture_width);
-    get_optional(j, "capture_height", metadata.capture_height);
-    get_optional(j, "capture_fps", metadata.capture_fps);
-    get_optional(j, "v4l2_buffer_count", metadata.v4l2_buffer_count);
-    get_optional(j, "has_crop", metadata.has_crop);
-    if (j.contains("crop")) {
-        j.at("crop").get_to(metadata.crop);
-    }
+    api::from_json_reflected(j, metadata);
 }
 
 void to_json(nlohmann::json& j, const AnnotationDocumentState& state) {
-    j = nlohmann::json{
-        {"document_generation", state.document_generation},
-        {"session_revision", state.session_revision},
-        {"capture_width", state.capture_width},
-        {"capture_height", state.capture_height},
-        {"instance_count", state.instance_count},
-        {"selected_instance",
-         state.selected_instance.has_value() ? nlohmann::json(*state.selected_instance) : nlohmann::json(nullptr)},
-    };
+    api::to_json_reflected(j, state);
 }
 
 void from_json(const nlohmann::json& j, AnnotationDocumentState& state) {
-    get_optional(j, "document_generation", state.document_generation);
-    get_optional(j, "session_revision", state.session_revision);
-    get_optional(j, "capture_width", state.capture_width);
-    get_optional(j, "capture_height", state.capture_height);
-    get_optional(j, "instance_count", state.instance_count);
-    if (j.contains("selected_instance") && !j.at("selected_instance").is_null()) {
-        state.selected_instance = j.at("selected_instance").get<std::uint32_t>();
-    } else {
-        state.selected_instance.reset();
-    }
+    api::from_json_reflected(j, state);
 }
 
 void to_json(nlohmann::json& j, const WorkspaceSurfaceInfo& surface_info) {
-    j = nlohmann::json{
-        {"surfaceId", surface_info.surface_id},
-        {"revision", surface_info.revision},
-        {"width", surface_info.width},
-        {"height", surface_info.height},
-        {"textureFormat", surface_info.texture_format},
-        {"opaque", surface_info.opaque},
-        {"upright", surface_info.upright},
-    };
+    api::to_json_reflected(j, surface_info);
 }
 
 void from_json(const nlohmann::json& j, WorkspaceSurfaceInfo& surface_info) {
@@ -1085,13 +1111,7 @@ void from_json(const nlohmann::json& j, WorkspaceSurfaceInfo& surface_info) {
 }
 
 void to_json(nlohmann::json& j, const BrowserRuntimeCapabilities& capabilities) {
-    j = nlohmann::json{
-        {"host_backend", browser_host_backend_name(capabilities.host_backend)},
-        {"navigator_gpu", browser_runtime_capability_status_name(capabilities.navigator_gpu)},
-        {"workspace_surface_bridge", browser_runtime_capability_status_name(capabilities.workspace_surface_bridge)},
-        {"workspace_surface_zero_copy",
-         browser_runtime_capability_status_name(capabilities.workspace_surface_zero_copy)},
-    };
+    api::to_json_reflected(j, capabilities);
 }
 
 void from_json(const nlohmann::json& j, BrowserRuntimeCapabilities& capabilities) {
@@ -1115,6 +1135,7 @@ void to_json(nlohmann::json& j, const StateSnapshot& snapshot) {
     j = nlohmann::json{
         {"type", kStateSnapshotMessageType},
         {"protocol_version", snapshot.protocol_version},
+        {"contract_hash", snapshot.contract_hash},
         {"state_revision", snapshot.state_revision},
         {"active_workflow", workflow_name(snapshot.active_workflow)},
         {"workflow_state", snapshot.workflow_state},
@@ -1136,6 +1157,8 @@ void from_json(const nlohmann::json& j, StateSnapshot& snapshot) {
     }
 
     get_optional(j, "protocol_version", snapshot.protocol_version);
+    snapshot.contract_hash = std::string(kBrowserUiContractHash);
+    get_optional(j, "contract_hash", snapshot.contract_hash);
     get_optional(j, "state_revision", snapshot.state_revision);
     snapshot.active_workflow = workflow_from_name(j.at("active_workflow").get<std::string>());
     if (j.contains("workflow_state")) {
@@ -1190,55 +1213,31 @@ void from_json(const nlohmann::json& j, IntentMessage& intent) {
 }
 
 std::string_view routed_intent_name(const RoutedIntentPayload& payload) noexcept {
-    static constexpr std::array<std::string_view, kRoutedIntentPayloadAlternativeCount> kNames{
-        "train.start",
-        "train.stop",
-        "train.remote.query",
-        "train.local_gpu.refresh",
-        "train.remote.offer.arm",
-        "train.remote.offer.clear",
-        "train.remote.start",
-        "train.remote.stop",
-        "predict.start",
-        "predict.stop",
-        "validate.start",
-        "export.start",
-        "annotate.save",
-        "annotate.setup",
-        "annotate.hold_save",
-        "annotate.brush_radius",
-        "annotate.sidebar",
-        "annotate.workspace.click",
-        "annotate.workspace.box_drag",
-        "annotate.workspace.handle_drag",
-        "annotate.workspace.brush",
-        "annotate.workspace.fill",
-        "annotate.workspace.color_sample",
-        "tool.select",
-        "live.preview.update",
-        "settings.update",
-        "crop.commit",
-        "file_dialog.request",
-        "viewport.commit",
-    };
     const std::size_t index = payload.index();
-    return index < kNames.size() ? kNames[index] : std::string_view{};
+    return index < kDefaultRoutedIntentNamesByPayloadIndex.size() ? kDefaultRoutedIntentNamesByPayloadIndex[index]
+                                                                  : std::string_view{};
+}
+
+std::string_view routed_intent_name(const RoutedIntent& routed) noexcept {
+    return routed.intent.empty() ? routed_intent_name(routed.payload) : std::string_view{routed.intent};
 }
 
 RoutedIntent route_intent(const IntentMessage& intent) {
     validate_protocol_version(intent.protocol_version);
     const std::string_view intent_name = intent.intent;
-    const IntentRouteSpec& spec = find_intent_route_spec(intent_name);
-    if (!workflow_allowed(spec.workflows, intent.workflow)) {
-        throw_intent_payload_error(intent_name, spec.workflow_error);
-    }
     const nlohmann::json& payload = require_object_payload(intent);
 
     RoutedIntent routed;
     routed.protocol_version = intent.protocol_version;
     routed.request_id = intent.request_id;
     routed.workflow = intent.workflow;
-    routed.payload = spec.make_payload(intent_name, payload);
+    routed.intent = intent.intent;
+    if (!route_native_intent(intent_name, intent.workflow, payload, routed.payload)) {
+        throw_invalid_intent(intent_name);
+    }
+    if (const auto* file_dialog = std::get_if<FileDialogRequestIntent>(&routed.payload); file_dialog != nullptr) {
+        validate_file_dialog_request(intent_name, intent.workflow, *file_dialog);
+    }
     return routed;
 }
 

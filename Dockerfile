@@ -11,7 +11,7 @@ ARG MMLTK_CUDA_ARCHITECTURES="86;87;89;90;100;103;110;120;121"
 ARG MMLTK_BUILD_TESTS=ON
 ARG MMLTK_CEF_DEV_PACKAGES="libasound2-dev libatk-bridge2.0-dev libatk1.0-dev libcups2-dev libdbus-1-dev libdrm-dev libegl-dev libgbm-dev libglib2.0-dev libgtk-4-dev libnspr4-dev libnss3-dev libwayland-dev libxkbcommon-dev"
 ARG MMLTK_CEF_WEBGPU_RUNTIME=auto
-ARG MMLTK_CEF_ENABLE_UNSAFE_WEBGPU=OFF
+ARG MMLTK_CEF_ENABLE_UNSAFE_WEBGPU=ON
 ARG MMLTK_CEF_FORCE_HIGH_PERFORMANCE_GPU=OFF
 ARG MMLTK_CLANG_VERSION=18
 ARG MMLTK_ENABLE_TIME_TRACE=OFF
@@ -402,7 +402,7 @@ ARG MMLTK_CUDA_VERSION=13.0
 ARG MMLTK_CONTAINER_WORKTREE=/src
 ARG MMLTK_CEF_RUNTIME_PACKAGES="libgtk-3-0 libgtk-4-1"
 ARG MMLTK_CEF_WEBGPU_RUNTIME=auto
-ARG MMLTK_CEF_ENABLE_UNSAFE_WEBGPU=OFF
+ARG MMLTK_CEF_ENABLE_UNSAFE_WEBGPU=ON
 ARG MMLTK_CEF_FORCE_HIGH_PERFORMANCE_GPU=OFF
 ARG MMLTK_TIME_TRACE_EXPORT_DIR=/opt/mmltk-time-trace
 
@@ -425,6 +425,7 @@ RUN apt-get update \
         libgbm1 \
         libgl1 \
         libgfortran5 \
+        libglib2.0-bin \
         ${MMLTK_CEF_RUNTIME_PACKAGES} \
         libnspr4 \
         libnss3 \
@@ -436,6 +437,7 @@ RUN apt-get update \
         libu2f-udev \
         libva2 \
         libvulkan1 \
+        vulkan-validationlayers \
         libwayland-client0 \
         libwayland-cursor0 \
         libwayland-egl1 \
@@ -458,7 +460,11 @@ RUN apt-get update \
         libxss1 \
         libxtst6 \
         xdg-utils \
+        zenity \
     && rm -rf /var/lib/apt/lists/*
+
+RUN command -v gdbus >/dev/null \
+ && command -v zenity >/dev/null
 
 RUN mkdir -p /usr/lib/x86_64-linux-gnu/gbm \
  && ln -sf /usr/lib64/gbm/nvidia-drm_gbm.so \

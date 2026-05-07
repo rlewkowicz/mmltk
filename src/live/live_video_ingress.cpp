@@ -1,5 +1,6 @@
 #include "mmltk/live/live_video_ingress.h"
 
+#include "mmltk/live/live_pipeline_trace.h"
 #include <frameshow/status.hpp>
 
 #include <chrono>
@@ -41,6 +42,33 @@ std::uint64_t generate_session_nonce() {
     return nonce;
 }
 
+std::uint64_t steady_now_ns() {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
+std::uint32_t trace_cuda_device_index(const frameshow::CaptureConfig& config) noexcept {
+    return config.cuda_device_index >= 0 ? static_cast<std::uint32_t>(config.cuda_device_index)
+                                         : kLivePipelineUnknownCudaDevice;
+}
+
+std::uint64_t frame_budget_ns(const frameshow::CaptureConfig& config) noexcept {
+    return config.fps > 0U ? 1000000000ULL / static_cast<std::uint64_t>(config.fps) : 0U;
+}
+
+void warn_if_ingress_over_budget(const frameshow::CaptureConfig& config, const char* stage, const LiveFrameId& frame_id,
+                                 const std::uint64_t latency_ns) {
+    const std::uint64_t budget_ns = frame_budget_ns(config);
+    if (budget_ns == 0U || latency_ns <= budget_ns) {
+        return;
+    }
+    log_live_ingress_message("warn", std::string(stage) +
+                                         " exceeded frame interval: frame=" + std::to_string(frame_id.sequence) +
+                                         " latency_us=" + std::to_string(latency_ns / 1000U) +
+                                         " budget_us=" + std::to_string(budget_ns / 1000U));
+}
+
 LiveCaptureRegion to_live_region(const frameshow::CaptureRegion& region) {
     return LiveCaptureRegion{region.x, region.y, region.width, region.height};
 }
@@ -78,7 +106,8 @@ SourceFrameView source_view_from_inference_frame(const frameshow::InferenceFrame
 
 }  // namespace
 
-LiveVideoIngress::LiveVideoIngress(frameshow::CaptureConfig config) : config_(std::move(config)) {}
+LiveVideoIngress::LiveVideoIngress(frameshow::CaptureConfig config, std::shared_ptr<LivePipelineTrace> pipeline_trace)
+    : config_(std::move(config)), pipeline_trace_(std::move(pipeline_trace)) {}
 
 LiveVideoIngress::~LiveVideoIngress() {
     try {
@@ -103,6 +132,10 @@ void LiveVideoIngress::start() {
     session_nonce_.store(generate_session_nonce(), std::memory_order_release);
     session_ = std::move(session);
     running_.store(true, std::memory_order_release);
+    if (pipeline_trace_ != nullptr) {
+        pipeline_trace_->record(LivePipelineStage::IngressDequeue, LiveFrameId{session_nonce(), 0U}, steady_now_ns(),
+                                0U, trace_cuda_device_index(config_));
+    }
     log_live_ingress_message(
         "info", "started capture on " + config_.device_path + " region=" + std::to_string(config_.initial_region.x) +
                     "," + std::to_string(config_.initial_region.y) + "," +
@@ -123,10 +156,19 @@ void LiveVideoIngress::stop() {
     }
 
     const frameshow::Status status = session->stop();
+    const frameshow::CaptureStats stats = session->snapshot_stats();
     if (!status.ok()) {
         throw status_error("failed to stop live ingress", status);
     }
-    log_live_ingress_message("info", "stopped capture on " + config_.device_path);
+    log_live_ingress_message(
+        "info", "stopped capture on " + config_.device_path + " queued=" + std::to_string(stats.queued_v4l2_buffers) +
+                    " dequeued=" + std::to_string(stats.dequeued_v4l2_buffers) +
+                    " inference_published=" + std::to_string(stats.inference_frames_published) +
+                    " preview_published=" + std::to_string(stats.preview_frames_published) +
+                    " dropped=" + std::to_string(stats.frames_dropped) +
+                    " inference_backpressure=" + std::to_string(stats.inference_backpressure_drops) +
+                    " preview_backpressure=" + std::to_string(stats.preview_backpressure_drops) +
+                    " requeue_failures=" + std::to_string(stats.requeue_failures));
 }
 
 bool LiveVideoIngress::running() const noexcept {
@@ -148,15 +190,7 @@ bool LiveVideoIngress::try_acquire_latest_source(SourceFrameView* out) {
 
     frameshow::InferenceFrameView frame{};
     const frameshow::Status status = session_->try_acquire_latest_inference_frame(&frame);
-    if (status.code == frameshow::StatusCode::kNotReady) {
-        return false;
-    }
-    if (!status.ok()) {
-        throw status_error("failed to acquire latest live source frame", status);
-    }
-
-    *out = source_view_from_inference_frame(frame, session_nonce_.load(std::memory_order_acquire));
-    return true;
+    return publish_acquired_source(status, frame, out);
 }
 
 bool LiveVideoIngress::wait_acquire_latest_source(SourceFrameView* out, const std::atomic<bool>& stop_requested) {
@@ -178,6 +212,11 @@ bool LiveVideoIngress::wait_acquire_latest_source(SourceFrameView* out, const st
 
     frameshow::InferenceFrameView frame{};
     const frameshow::Status status = session->wait_acquire_latest_inference_frame(&frame, stop_requested);
+    return publish_acquired_source(status, frame, out);
+}
+
+bool LiveVideoIngress::publish_acquired_source(const frameshow::Status& status,
+                                               const frameshow::InferenceFrameView& frame, SourceFrameView* out) {
     if (status.code == frameshow::StatusCode::kNotReady) {
         return false;
     }
@@ -186,6 +225,17 @@ bool LiveVideoIngress::wait_acquire_latest_source(SourceFrameView* out, const st
     }
 
     *out = source_view_from_inference_frame(frame, session_nonce_.load(std::memory_order_acquire));
+    if (pipeline_trace_ != nullptr) {
+        const std::uint64_t dequeue_ns = out->capture_ns != 0U ? out->capture_ns : steady_now_ns();
+        const std::uint64_t ready_ns = out->ready_ns != 0U ? out->ready_ns : steady_now_ns();
+        pipeline_trace_->record(LivePipelineStage::IngressDequeue, out->frame_id, dequeue_ns, out->capture_ns,
+                                trace_cuda_device_index(config_));
+        pipeline_trace_->record(LivePipelineStage::IngressH2dReady, out->frame_id, ready_ns, out->capture_ns,
+                                trace_cuda_device_index(config_));
+        const std::uint64_t h2d_latency_ns =
+            out->capture_ns != 0U && ready_ns >= out->capture_ns ? ready_ns - out->capture_ns : 0U;
+        warn_if_ingress_over_budget(config_, "ingress.h2d_ready", out->frame_id, h2d_latency_ns);
+    }
     return true;
 }
 
@@ -197,6 +247,11 @@ void LiveVideoIngress::notify_source_waiters() noexcept {
 }
 
 void LiveVideoIngress::release_source(std::uint32_t buffer_index) {
+    release_source(buffer_index, LiveFrameId{session_nonce(), 0U}, 0U);
+}
+
+void LiveVideoIngress::release_source(const std::uint32_t buffer_index, const LiveFrameId& frame_id,
+                                      const std::uint64_t capture_ns) {
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
     if (!session_) {
         throw std::runtime_error("live ingress cannot release a source buffer without an active session");
@@ -204,6 +259,10 @@ void LiveVideoIngress::release_source(std::uint32_t buffer_index) {
     const frameshow::Status status = session_->release_inference_frame(buffer_index);
     if (!status.ok()) {
         throw status_error("failed to release live source frame", status);
+    }
+    if (pipeline_trace_ != nullptr) {
+        pipeline_trace_->record(LivePipelineStage::FanoutReleaseSource, frame_id, steady_now_ns(), capture_ns,
+                                trace_cuda_device_index(config_));
     }
 }
 
@@ -236,8 +295,25 @@ frameshow::CaptureFormatInfo LiveVideoIngress::snapshot_format() const {
     return session_ ? session_->snapshot_format() : frameshow::CaptureFormatInfo{};
 }
 
-std::string LiveVideoIngress::last_error() const {
+frameshow::CaptureStats LiveVideoIngress::snapshot_stats() const {
     std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    return session_ ? session_->snapshot_stats() : frameshow::CaptureStats{};
+}
+
+std::string LiveVideoIngress::last_error() const {
+    return last_error_impl(true);
+}
+
+std::string LiveVideoIngress::last_error_without_trace() const {
+    return last_error_impl(false);
+}
+
+std::string LiveVideoIngress::last_error_impl(const bool record_status_probe) const {
+    std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+    if (record_status_probe && pipeline_trace_ != nullptr) {
+        pipeline_trace_->record(LivePipelineStage::IngressDequeue, LiveFrameId{session_nonce(), 0U}, steady_now_ns(),
+                                0U, trace_cuda_device_index(config_));
+    }
     return session_ ? session_->last_error() : std::string{};
 }
 

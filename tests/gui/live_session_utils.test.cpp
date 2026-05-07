@@ -1,11 +1,17 @@
 #include "gui/live_session_utils.h"
+#include "gui/browser_live_publication.h"
 
+#include "mmltk/live/live_pipeline_trace.h"
 #include "support/catch2_compat.hpp"
+
+#include <string>
 
 namespace {
 
 using mmltk::gui::AnnotationBox;
 using mmltk::gui::AnnotationFrame;
+using mmltk::gui::AnnotateViewState;
+using mmltk::gui::ModelInputMode;
 using mmltk::gui::SourceKind;
 using mmltk::gui::SourceSelectionState;
 using mmltk::live::LiveFrameId;
@@ -152,6 +158,202 @@ void test_annotation_save_matching_prefers_canonical_live_frame_identity() {
     assert(mmltk::gui::annotation_frame_matches_saved_identity(plain, 17U, std::nullopt));
 }
 
+void test_annotate_live_session_config_accepts_video_source_without_model() {
+    AnnotateViewState annotate;
+    annotate.model_input = ModelInputMode::None;
+    annotate.weights_path.clear();
+    annotate.onnx_path.clear();
+    annotate.tensorrt_path.clear();
+    annotate.device_id = 2;
+    annotate.source.kind = SourceKind::VideoStream;
+    annotate.source.device_index = 1;
+    annotate.source.capture_width = 1280;
+    annotate.source.capture_height = 720;
+    annotate.source.capture_fps = 60;
+    annotate.source.v4l2_buffer_count = 4;
+
+    const mmltk::live::LiveSessionConfig config = mmltk::gui::build_annotation_live_session_config(annotate);
+
+    assert(config.capture.device_path == "/dev/video1");
+    assert(config.capture.cuda_device_index == 2);
+    assert(config.capture.width == 1280U);
+    assert(config.capture.height == 720U);
+    assert(config.capture.fps == 60U);
+    assert(config.capture.v4l2_buffer_count == 4U);
+    assert(config.capture.preview_buffer_count == 1U);
+    assert(config.detect_slot_count == 2U);
+    assert(config.output_slot_count == 4U);
+    assert(config.cuda_device_index == 2);
+    assert(config.capture.initial_region.x == 0U);
+    assert(config.capture.initial_region.y == 0U);
+    assert(config.capture.initial_region.width == 1280U);
+    assert(config.capture.initial_region.height == 720U);
+}
+
+void test_single_buffer_live_diagnostic_forces_one_capture_buffer_without_hiding_extra_slots() {
+    mmltk::live::LiveSessionConfig config;
+    config.capture.v4l2_buffer_count = 6U;
+    config.output_slot_count = 4U;
+
+    mmltk::live::enable_single_buffer_diagnostic(config, 12U, 16'000'000U, 2U);
+
+    assert(config.single_buffer_diagnostic.enabled);
+    assert(config.single_buffer_diagnostic.frame_count == 12U);
+    assert(config.single_buffer_diagnostic.frame_budget_ns == 16'000'000U);
+    assert(config.single_buffer_diagnostic.consecutive_miss_limit == 2U);
+    assert(config.single_buffer_diagnostic.disable_analyzer);
+    assert(config.capture.v4l2_buffer_count == 1U);
+    assert(config.output_slot_count == 4U);
+}
+
+void test_single_buffer_live_diagnostic_trace_fails_on_consecutive_budget_misses_and_completes_frame_bound() {
+    mmltk::live::LivePipelineTrace trace;
+    trace.configure_single_buffer_diagnostic(16'000'000U, 3U, 2U);
+
+    trace.record(mmltk::live::LivePipelineStage::CompositorPublishWorkspace, LiveFrameId{5U, 1U}, 18'000'000U,
+                 1'000'000U, 0U, 1001U);
+    mmltk::live::LivePipelineTraceSnapshot snapshot = trace.snapshot();
+    assert(snapshot.diagnostic_enabled);
+    assert(snapshot.diagnostic_frame_budget_us == 16'000U);
+    assert(snapshot.diagnostic_frame_limit == 3U);
+    assert(snapshot.diagnostic_consecutive_misses == 1U);
+    assert(!snapshot.diagnostic_failed);
+
+    trace.record(mmltk::live::LivePipelineStage::CefPresentFrontSlot, LiveFrameId{5U, 1U}, 20'000'000U, 20'000'000U,
+                 0U, 1002U);
+    snapshot = trace.snapshot();
+    assert(!snapshot.diagnostic_failed);
+    assert(snapshot.diagnostic_consecutive_misses == 1U);
+    assert(snapshot.diagnostic_drawn_frames == 1U);
+
+    trace.record(mmltk::live::LivePipelineStage::CompositorPublishWorkspace, LiveFrameId{5U, 2U}, 36'000'000U,
+                 18'000'000U, 0U, 1002U);
+    snapshot = trace.snapshot();
+    assert(snapshot.diagnostic_failed);
+    assert(snapshot.diagnostic_failure_event.stage == mmltk::live::LivePipelineStage::CompositorPublishWorkspace);
+    assert(snapshot.diagnostic_failure_event.frame_id.sequence == 2U);
+    assert(snapshot.diagnostic_failure_event.surface_revision == 1002U);
+    assert(snapshot.diagnostic_failure_event.latency_us == 18'000U);
+    assert(snapshot.diagnostic_drawn_frames == 1U);
+    assert(!snapshot.diagnostic_completed);
+
+    trace.record(mmltk::live::LivePipelineStage::CefPresentFrontSlot, LiveFrameId{5U, 2U}, 40'000'000U, 40'000'000U,
+                 0U, 1002U);
+    trace.record(mmltk::live::LivePipelineStage::CompositorPublishWorkspace, LiveFrameId{5U, 3U}, 41'000'000U,
+                 41'000'000U, 0U, 1003U);
+    trace.record(mmltk::live::LivePipelineStage::CefPresentFrontSlot, LiveFrameId{5U, 3U}, 42'000'000U, 42'000'000U,
+                 0U, 1004U);
+    snapshot = trace.snapshot();
+    assert(snapshot.diagnostic_drawn_frames == 3U);
+    assert(snapshot.diagnostic_completed);
+    assert(snapshot.diagnostic_consecutive_misses == 0U);
+
+    mmltk::live::LivePipelineTrace native_present_trace;
+    native_present_trace.configure_single_buffer_diagnostic(5'000'000U, 1U, 1U);
+    native_present_trace.record(mmltk::live::LivePipelineStage::CefPresentFrontSlot, LiveFrameId{6U, 1U}, 8'500'000U,
+                                1'000'000U);
+    snapshot = native_present_trace.snapshot();
+    assert(snapshot.diagnostic_failed);
+    assert(snapshot.diagnostic_completed);
+    assert(snapshot.diagnostic_failure_event.stage == mmltk::live::LivePipelineStage::CefPresentFrontSlot);
+    assert(snapshot.diagnostic_failure_event.latency_us == 7'500U);
+}
+
+void test_live_pipeline_trace_splits_startup_and_post_startup_acquisition_misses() {
+    mmltk::live::LivePipelineTrace trace;
+
+    trace.note_acquire_miss();
+    mmltk::live::LivePipelineTraceSnapshot snapshot = trace.snapshot();
+    assert(snapshot.acquire_misses == 1U);
+    assert(snapshot.startup_acquire_misses == 1U);
+    assert(snapshot.post_startup_acquire_misses == 0U);
+
+    trace.mark_first_workspace_publication_ready();
+    trace.note_acquire_miss();
+    snapshot = trace.snapshot();
+    assert(snapshot.acquire_misses == 2U);
+    assert(snapshot.startup_acquire_misses == 1U);
+    assert(snapshot.post_startup_acquire_misses == 1U);
+}
+
+void test_browser_live_workspace_acquisition_miss_decision_records_only_real_failures() {
+    mmltk::live::LiveSessionStatus startup_status;
+    const mmltk::gui::BrowserLiveWorkspaceAcquisitionMissDecision startup_decision =
+        mmltk::gui::browser_live_workspace_acquisition_miss_decision(startup_status, 3U);
+    assert(!startup_decision.record_failure);
+    assert(startup_decision.failure.transient_startup_miss);
+    assert(startup_decision.failure.result_detail.find("before first publication") != std::string::npos);
+
+    mmltk::live::LivePipelineTrace trace;
+    trace.record(mmltk::live::LivePipelineStage::CompositorPublishWorkspace, LiveFrameId{10U, 12U}, 1000U, 0U, 2U,
+                 733U);
+    trace.mark_first_workspace_publication_ready();
+    mmltk::live::LiveSessionStatus post_startup_status;
+    post_startup_status.pipeline = trace.snapshot();
+    post_startup_status.first_workspace_publication_ready =
+        post_startup_status.pipeline.first_workspace_publication_ready;
+
+    const mmltk::gui::BrowserLiveWorkspaceAcquisitionMissDecision post_startup_decision =
+        mmltk::gui::browser_live_workspace_acquisition_miss_decision(post_startup_status, 3U);
+    assert(!post_startup_decision.record_failure);
+    assert(!post_startup_decision.failure.transient_startup_miss);
+    assert(!post_startup_decision.failure.explicit_failure);
+    assert(post_startup_decision.failure.stage == mmltk::live::LivePipelineStage::CompositorPublishWorkspace);
+    assert(post_startup_decision.failure.live_frame_id.has_value());
+    assert(post_startup_decision.failure.live_frame_id->sequence == 12U);
+    assert(post_startup_decision.failure.cuda_device_index == 2U);
+    assert(post_startup_decision.failure.revision == "733");
+    assert(post_startup_decision.failure.result_detail.find("stage=compositor.publish_workspace") != std::string::npos);
+    assert(post_startup_decision.failure.result_detail.find("cuda_device=2") != std::string::npos);
+    assert(post_startup_decision.failure.result_detail.find("revision=733") != std::string::npos);
+    assert(post_startup_decision.failure.result_detail.find("after first publication") != std::string::npos);
+    assert(post_startup_decision.failure.result_detail.find("controller has not published a workspace") ==
+           std::string::npos);
+
+    mmltk::live::LivePipelineTrace startup_error_trace;
+    startup_error_trace.record(mmltk::live::LivePipelineStage::CompositorPublishWorkspace, LiveFrameId{10U, 13U},
+                               1000U, 0U, 2U, 734U);
+    mmltk::live::LiveSessionStatus startup_error_status;
+    startup_error_status.pipeline = startup_error_trace.snapshot();
+    startup_error_status.last_error = "capture device stalled";
+    startup_error_status.first_workspace_publication_ready = false;
+    const mmltk::gui::BrowserLiveWorkspaceAcquisitionMissDecision startup_error_decision =
+        mmltk::gui::browser_live_workspace_acquisition_miss_decision(startup_error_status, 3U);
+    assert(startup_error_decision.record_failure);
+    assert(!startup_error_decision.failure.transient_startup_miss);
+    assert(startup_error_decision.failure.explicit_failure);
+    assert(startup_error_decision.failure.result_detail.find("capture device stalled") != std::string::npos);
+}
+
+void test_browser_live_startup_deadline_no_workspace_output_context_is_stage_specific() {
+    mmltk::live::LivePipelineTrace trace;
+    trace.record(mmltk::live::LivePipelineStage::CompositorPublishWorkspace, LiveFrameId{10U, 12U}, 1'000U, 0U, 1U,
+                 12U);
+
+    mmltk::live::LiveSessionStatus status;
+    status.pipeline = trace.snapshot();
+    status.compositor.last_frame_id = LiveFrameId{10U, 12U};
+    status.first_workspace_publication_ready = false;
+
+    const mmltk::gui::BrowserLiveWorkspaceAcquisitionMissDecision decision =
+        mmltk::gui::browser_live_workspace_acquisition_miss_decision(status, 1U, "startup deadline missed");
+    assert(std::string(mmltk::gui::kBrowserLiveNoWorkspaceOutputResultCode) == "no_workspace_output");
+    assert(decision.record_failure);
+    assert(!decision.failure.transient_startup_miss);
+    assert(decision.failure.explicit_failure);
+    assert(decision.failure.stage == mmltk::live::LivePipelineStage::CompositorPublishWorkspace);
+    assert(decision.failure.live_frame_id.has_value());
+    assert(decision.failure.live_frame_id->sequence == 12U);
+    assert(decision.failure.cuda_device_index == 1U);
+    assert(decision.failure.revision == "12");
+    assert(decision.failure.result_detail.find("stage=compositor.publish_workspace") != std::string::npos);
+    assert(decision.failure.result_detail.find("frame=12") != std::string::npos);
+    assert(decision.failure.result_detail.find("cuda_device=1") != std::string::npos);
+    assert(decision.failure.result_detail.find("revision=12") != std::string::npos);
+    assert(decision.failure.result_detail.find("startup deadline missed") != std::string::npos);
+    assert(decision.failure.result_detail.find("controller has not published a workspace") == std::string::npos);
+}
+
 }  // namespace
 
 MMLTK_REGISTER_TEST_CASE("[gui][live_session_utils]", test_seed_runtime_crop_from_source_uses_persisted_crop);
@@ -166,3 +368,19 @@ MMLTK_REGISTER_TEST_CASE("[gui][live_session_utils]",
                          test_runtime_crop_box_for_ui_state_defaults_to_full_capture_and_clamps_runtime_state);
 MMLTK_REGISTER_TEST_CASE("[gui][live_session_utils]",
                          test_annotation_save_matching_prefers_canonical_live_frame_identity);
+MMLTK_REGISTER_TEST_CASE("[gui][live_session_utils]",
+                         test_annotate_live_session_config_accepts_video_source_without_model);
+MMLTK_REGISTER_TEST_CASE("[gui][live_session_utils]",
+                         test_single_buffer_live_diagnostic_forces_one_capture_buffer_without_hiding_extra_slots);
+MMLTK_REGISTER_TEST_CASE(
+    "[gui][live_session_utils]",
+    test_single_buffer_live_diagnostic_trace_fails_on_consecutive_budget_misses_and_completes_frame_bound);
+MMLTK_REGISTER_TEST_CASE(
+    "[gui][live_session_utils]",
+    test_live_pipeline_trace_splits_startup_and_post_startup_acquisition_misses);
+MMLTK_REGISTER_TEST_CASE(
+    "[gui][live_session_utils]",
+    test_browser_live_workspace_acquisition_miss_decision_records_only_real_failures);
+MMLTK_REGISTER_TEST_CASE(
+    "[gui][live_session_utils]",
+    test_browser_live_startup_deadline_no_workspace_output_context_is_stage_specific);

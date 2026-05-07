@@ -254,7 +254,6 @@ export class BrowserTrainWorkflowState {
 
   updateTextField(
     field:
-      | "selectedPreset"
       | "trainCompiledPath"
       | "valCompiledPath"
       | "testCompiledPath"

@@ -3,6 +3,8 @@
 #include "canvas_layers.h"
 
 #include <algorithm>
+#include <stdexcept>
+#include <string>
 
 namespace mmltk::gui {
 
@@ -179,6 +181,33 @@ bool annotation_frame_matches_saved_identity(const AnnotationFrame& frame, const
                *frame.live_frame_id == *saved_live_frame_id;
     }
     return frame.frame_id == saved_frame_id;
+}
+
+mmltk::live::LiveSessionConfig build_annotation_live_session_config(const AnnotateViewState& annotate) {
+    if (annotate.source.kind != SourceKind::VideoStream) {
+        throw std::runtime_error("annotation live capture requires a video source");
+    }
+
+    mmltk::live::LiveSessionConfig session_config;
+    session_config.capture.device_path = "/dev/video" + std::to_string(std::max(0, annotate.source.device_index));
+    session_config.capture.cuda_device_index = annotate.device_id;
+    session_config.capture.width = static_cast<std::uint32_t>(std::max(1, annotate.source.capture_width));
+    session_config.capture.height = static_cast<std::uint32_t>(std::max(1, annotate.source.capture_height));
+    session_config.capture.fps = static_cast<std::uint32_t>(std::max(1, annotate.source.capture_fps));
+    session_config.capture.v4l2_buffer_count =
+        static_cast<std::uint32_t>(std::max(1, annotate.source.v4l2_buffer_count));
+    session_config.capture.preview_buffer_count = 1U;
+    const mmltk::live::LiveCaptureRegion initial_region = full_capture_region_for_source(annotate.source);
+    session_config.capture.initial_region = frameshow::CaptureRegion{
+        initial_region.x,
+        initial_region.y,
+        initial_region.width,
+        initial_region.height,
+    };
+    session_config.detect_slot_count = 2U;
+    session_config.output_slot_count = 4U;
+    session_config.cuda_device_index = annotate.device_id;
+    return session_config;
 }
 
 }  // namespace mmltk::gui

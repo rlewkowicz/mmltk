@@ -2,9 +2,11 @@
 
 #include "annotation_core.h"
 #include "source_selection.h"
+#include "view_state.h"
 
 #include "mmltk/live/crop_state.h"
 #include "mmltk/live/live_capture_region.h"
+#include "mmltk/live/live_session_controller.h"
 
 #include <cstdint>
 #include <optional>
@@ -31,5 +33,6 @@ AnnotationBox runtime_crop_box_for_ui_state(const mmltk::live::UiCropState& ui_c
 bool annotation_frames_match_for_save(const AnnotationFrame& lhs, const AnnotationFrame& rhs);
 bool annotation_frame_matches_saved_identity(const AnnotationFrame& frame, std::uint64_t saved_frame_id,
                                              const std::optional<mmltk::live::LiveFrameId>& saved_live_frame_id);
+mmltk::live::LiveSessionConfig build_annotation_live_session_config(const AnnotateViewState& annotate);
 
 }  // namespace mmltk::gui

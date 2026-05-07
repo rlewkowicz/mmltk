@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -109,6 +110,39 @@ void draw_selection_handles(const OverlayTarget& target, const ManualOverlayInst
     mmltk::rfdetr::launch_draw_selection_handles_rgba_pitched(target.data, target.pitch, target.width, target.height,
                                                               selected.box.x1, selected.box.y1, selected.box.x2,
                                                               selected.box.y2, 4, target.stream);
+}
+
+void draw_brush_preview(const OverlayTarget& target, const ManualOverlayBrushPreview& brush_preview,
+                        PinnedUploadBuffer<int>& host_points_upload, DeviceUploadBuffer<int>& device_points_upload) {
+    static constexpr int kBrushPreviewSegments = 64;
+    static constexpr double kTwoPi = 6.28318530717958647692;
+    static constexpr std::size_t kBrushPreviewValueCount = static_cast<std::size_t>(kBrushPreviewSegments) * 2U;
+
+    ensure_pinned_upload_capacity<int>(kBrushPreviewValueCount, &host_points_upload,
+                                       "cudaHostAlloc for manual overlay brush preview upload");
+    ensure_device_upload_capacity<int>(kBrushPreviewValueCount, &device_points_upload,
+                                       "cudaMalloc for manual overlay brush preview upload");
+
+    int* points_xy = host_points_upload.data();
+    const double radius = static_cast<double>(std::max(1, brush_preview.radius));
+    for (int index = 0; index < kBrushPreviewSegments; ++index) {
+        const double theta = kTwoPi * static_cast<double>(index) / static_cast<double>(kBrushPreviewSegments);
+        points_xy[index * 2] = static_cast<int>(std::lround(static_cast<double>(brush_preview.capture_x) +
+                                                            std::cos(theta) * radius));
+        points_xy[index * 2 + 1] = static_cast<int>(std::lround(static_cast<double>(brush_preview.capture_y) +
+                                                                std::sin(theta) * radius));
+    }
+
+    ensure_cuda_ok(cudaMemcpyAsync(device_ptr_as_void(device_points_upload.data()), points_xy,
+                                   kBrushPreviewValueCount * sizeof(int), cudaMemcpyHostToDevice, target.stream),
+                   "cudaMemcpyAsync for manual overlay brush preview upload");
+    const std::uint8_t r = brush_preview.erase ? 255U : 128U;
+    const std::uint8_t g = brush_preview.erase ? 128U : 255U;
+    const std::uint8_t b = brush_preview.erase ? 128U : 170U;
+    mmltk::rfdetr::launch_draw_polyline_rgba_pitched(
+        target.data, target.pitch, target.width, target.height,
+        reinterpret_cast<const int*>(device_ptr_as_void(device_points_upload.data())), kBrushPreviewSegments, true, r,
+        g, b, 2, target.stream);
 }
 
 }  // namespace
@@ -389,6 +423,11 @@ struct LiveManualOverlayWorker::Impl {
                     ensure_cuda_ok(cudaPeekAtLastError(), "launch_draw_selection_handles_rgba_pitched");
                     has_content = true;
                 }
+            }
+            if (snapshot.brush_preview.has_value()) {
+                draw_brush_preview(target, *snapshot.brush_preview, host_points_upload, device_points_upload);
+                ensure_cuda_ok(cudaPeekAtLastError(), "launch_draw_polyline_rgba_pitched for brush preview");
+                has_content = true;
             }
 
             ensure_cuda_ok(cudaEventRecord(slot->ready_event.get(), target.stream),

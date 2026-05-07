@@ -1,5 +1,6 @@
 #pragma once
 
+#include "mmltk/live/live_pipeline_status.h"
 #include "mmltk/live/live_types.h"
 
 #include <atomic>
@@ -15,14 +16,17 @@ class UiCropState;
 class LiveFrameFanout {
    public:
     LiveFrameFanout(LiveVideoIngress& ingress, const UiCropState& ui_crop_state, std::uint32_t detect_slot_count,
-                    std::uint32_t output_slot_count);
+                    std::uint32_t output_slot_count, std::shared_ptr<LivePipelineTrace> pipeline_trace = {});
     ~LiveFrameFanout();
 
     LiveFrameFanout(const LiveFrameFanout&) = delete;
     LiveFrameFanout& operator=(const LiveFrameFanout&) = delete;
 
-    struct Status {
+    struct Status : LivePipelineStatus {
         bool running = false;
+        std::uint64_t frames_fanned_out = 0;
+        std::uint64_t skipped_detect_publishes = 0;
+        std::uint64_t skipped_output_publishes = 0;
         std::string last_error;
     };
 

@@ -14,6 +14,7 @@ import type {
   StateSnapshot,
   Workflow,
 } from "../../host_api";
+import { HOST_API_CONTRACT_HASH } from "../../host_api.generated";
 import {
   runtimeWorkspaceSurfaceBridgeViability,
 } from "../../runtime_frame_contract";
@@ -50,12 +51,27 @@ function resolvedRuntimeCapabilities(
   snapshotCapabilities: BrowserRuntimeCapabilities,
   bridgeCapabilities: BrowserRuntimeCapabilities | undefined,
 ): BrowserRuntimeCapabilities {
-  return bridgeCapabilities === undefined
-    ? snapshotCapabilities
-    : {
-        ...snapshotCapabilities,
-        ...bridgeCapabilities,
-      };
+  if (bridgeCapabilities === undefined) {
+    return snapshotCapabilities;
+  }
+  return {
+    host_backend:
+      bridgeCapabilities.host_backend === "unknown"
+        ? snapshotCapabilities.host_backend
+        : bridgeCapabilities.host_backend,
+    navigator_gpu:
+      bridgeCapabilities.navigator_gpu === "unknown"
+        ? snapshotCapabilities.navigator_gpu
+        : bridgeCapabilities.navigator_gpu,
+    workspace_surface_bridge:
+      (bridgeCapabilities.workspace_surface_bridge ?? "unknown") === "unknown"
+        ? snapshotCapabilities.workspace_surface_bridge
+        : bridgeCapabilities.workspace_surface_bridge,
+    workspace_surface_zero_copy:
+      (bridgeCapabilities.workspace_surface_zero_copy ?? "unknown") === "unknown"
+        ? snapshotCapabilities.workspace_surface_zero_copy
+        : bridgeCapabilities.workspace_surface_zero_copy,
+  };
 }
 
 function capabilityStateFromRuntimeStatus(
@@ -158,9 +174,6 @@ function workspaceSurfaceBridgeStatusItem(
               "The native runtime has not kept the workspace surface bridge available.",
           };
 
-  if (fallback.status !== "ready" && fallback.status !== "active") {
-    return fallback;
-  }
   return statusItemFromContract(
     bridgeState,
     [
@@ -372,6 +385,15 @@ export class BrowserHostRuntimeState {
       this.runtimeCapabilities(),
     ),
   );
+  readonly contractHashMatched = computed(
+    () => this.snapshot().contract_hash === HOST_API_CONTRACT_HASH,
+  );
+  readonly contractMismatchDetail = computed(() => {
+    const backendHash = this.snapshot().contract_hash.trim();
+    return backendHash.length === 0
+      ? "The backend did not publish a browser UI contract hash."
+      : `Backend contract ${backendHash} does not match UI contract ${HOST_API_CONTRACT_HASH}.`;
+  });
 
   constructor() {
     this.bindTransport(this.transport());

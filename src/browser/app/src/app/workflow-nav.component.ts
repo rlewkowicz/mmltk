@@ -9,24 +9,28 @@ import type { Workflow } from '../host_api';
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <nav class="workflow-bar" aria-label="Workflow selection">
-      @for (workflow of store.workflows; track workflow.id) {
+      <div class="workflow-page-buttons">
+        @for (workflow of store.workflows; track workflow.id) {
+          <button
+            type="button"
+            (click)="selectWorkflow(workflow.id)"
+            [attr.data-active]="store.selectedWorkflow() === workflow.id"
+            [title]="workflow.description"
+          >
+            {{ workflow.label }}
+          </button>
+        }
+      </div>
+      <div class="workflow-settings-group">
         <button
           type="button"
-          (pointerdown)="store.activateWorkflow(workflow.id)"
-          (click)="selectWorkflow(workflow.id)"
-          [attr.data-active]="store.selectedWorkflow() === workflow.id"
-          [title]="workflow.description"
+          class="workflow-settings-button"
+          [attr.data-active]="store.settingsOpen()"
+          (click)="store.openSettings()"
         >
-          {{ workflow.label }}
+          Settings
         </button>
-      }
-      <button
-        type="button"
-        [attr.data-active]="store.settingsOpen()"
-        (click)="store.openSettings()"
-      >
-        SETTINGS
-      </button>
+      </div>
     </nav>
   `,
 })

@@ -4,6 +4,7 @@ import type { AnnotationOverlayPrimitive } from "./app/workspace/annotation-scen
 
 export interface WorkspaceRenderInput {
   workflow: Workflow;
+  nativePresentedLive: boolean;
   canvasWidth: number;
   canvasHeight: number;
   captureWidth: number;

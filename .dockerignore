@@ -55,8 +55,10 @@ __pycache__/
 *.json
 *.jsonl
 !CMakePresets.json
+!src/browser/app/angular.json
 !src/browser/app/package.json
 !src/browser/app/package-lock.json
+!src/browser/app/tsconfig.app.json
 !src/browser/app/tsconfig.json
 !src/browser/app/tsconfig.tests.json
 

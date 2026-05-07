@@ -12,14 +12,17 @@ import { WorkflowNavComponent } from './workflow-nav.component';
   imports: [RouterOutlet, SettingsModalComponent, TopbarComponent, WorkflowNavComponent],
   template: `
     <div class="shell">
-      <app-topbar />
-      <app-workflow-nav />
-      <router-outlet />
-      <app-settings-modal />
-      <footer class="statusbar">
-        <span id="active-workflow">{{ store.footerWorkflow() }}</span>
-        <span id="last-intent">last intent: <strong>{{ store.lastIntentLabel() }}</strong></span>
-      </footer>
+      @if (!store.contractHashMatched()) {
+        <main class="contract-error">
+          <h1>Browser UI contract mismatch</h1>
+          <p>{{ store.contractMismatchDetail() }}</p>
+        </main>
+      } @else {
+        <app-topbar />
+        <app-workflow-nav />
+        <router-outlet />
+        <app-settings-modal />
+      }
     </div>
   `,
 })

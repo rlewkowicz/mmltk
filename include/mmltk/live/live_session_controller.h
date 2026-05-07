@@ -27,14 +27,35 @@ struct LiveSessionConfig {
     std::uint32_t raw_base_cache_slot_count = 3;
     int cuda_device_index = 0;
     bool persistent_analysis_overlay = false;
+
+    struct SingleBufferDiagnostic {
+        bool enabled = false;
+        std::uint32_t frame_count = 0;
+        std::uint64_t frame_budget_ns = 0;
+        std::uint32_t consecutive_miss_limit = 1;
+        bool disable_analyzer = true;
+    } single_buffer_diagnostic{};
 };
 
-struct LiveSessionStatus {
+inline void enable_single_buffer_diagnostic(LiveSessionConfig& config, std::uint32_t frame_count,
+                                            std::uint64_t frame_budget_ns,
+                                            std::uint32_t consecutive_miss_limit = 1U) noexcept {
+    config.single_buffer_diagnostic.enabled = true;
+    config.single_buffer_diagnostic.frame_count = frame_count;
+    config.single_buffer_diagnostic.frame_budget_ns = frame_budget_ns;
+    config.single_buffer_diagnostic.consecutive_miss_limit = consecutive_miss_limit == 0U ? 1U : consecutive_miss_limit;
+    config.single_buffer_diagnostic.disable_analyzer = true;
+    config.capture.v4l2_buffer_count = 1U;
+}
+
+struct LiveSessionStatus : LivePipelineStatus {
     bool running = false;
     std::string last_error;
+    LiveFrameFanout::Status fanout{};
     LiveAnalyzerWorker::Status analyzer{};
     LiveManualOverlayWorker::Status manual{};
     LiveCompositor::Status compositor{};
+    LiveSessionConfig::SingleBufferDiagnostic single_buffer_diagnostic{};
 };
 
 class LiveSessionController {
@@ -50,10 +71,16 @@ class LiveSessionController {
     [[nodiscard]] bool running() const noexcept;
     [[nodiscard]] std::string last_error() const;
     [[nodiscard]] LiveSessionStatus snapshot_status() const;
+    void record_pipeline_stage(LivePipelineStage stage, const LiveFrameId& frame_id, std::uint64_t surface_revision = 0,
+                               std::uint64_t latency_base_ns = 0) noexcept;
 
+    [[nodiscard]] WorkspaceSwapchainDescriptor workspace_swapchain_descriptor() const;
+    [[nodiscard]] WorkspacePresentSnapshot latest_workspace_present() const noexcept;
     [[nodiscard]] bool try_acquire_latest_workspace(WorkspaceOutputBundle* out);
     void release_workspace(std::uint32_t slot_index);
     void set_workspace_ready_callback(LiveCompositor::WorkspaceReadyCallback callback);
+    void set_workspace_present_callback(LiveCompositor::WorkspacePresentCallback callback);
+    void mark_workspace_slot_in_flight(std::uint32_t slot_index, bool in_flight);
 
     [[nodiscard]] bool try_acquire_latest_detect(DetectBundle* out);
     void release_detect(std::uint32_t slot_index);

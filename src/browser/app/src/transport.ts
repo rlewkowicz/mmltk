@@ -17,9 +17,13 @@ import {
   ownWindowPropertyValue,
   workspaceSurfaceInfoFromValue,
 } from "./app_shared";
+import {
+  HOST_API_CONTRACT_HASH,
+  HOST_API_PROTOCOL_VERSION,
+} from "./host_api.generated";
 import { kUnknownBrowserRuntimeCapabilities } from "./runtime_frame_contract";
 
-const kProtocolVersion = 2;
+const kProtocolVersion = HOST_API_PROTOCOL_VERSION;
 
 const nativeTransportCache = new WeakMap<Window, BrowserHostTransport>();
 const websocketTransportCache = new WeakMap<Window, BrowserHostTransport>();
@@ -48,22 +52,27 @@ function makeRegion(
   return { x, y, width, height };
 }
 
+export function makeIdleBrowserHostJob(): StateSnapshot["job"] {
+  return {
+    running: false,
+    label: "idle",
+    summary: "",
+    error: "",
+    output_tail: "",
+    recent_logs: [],
+  };
+}
+
 function makeNativePlaceholderSnapshot(): StateSnapshot {
   return {
     type: "state.snapshot",
     protocol_version: kProtocolVersion,
+    contract_hash: HOST_API_CONTRACT_HASH,
     state_revision: 0,
-    active_workflow: "predict",
+    active_workflow: "train",
     workflow_state: {},
     settings_state: {},
-    job: {
-      running: false,
-      label: "connecting",
-      summary: "Waiting for native browser bridge snapshot",
-      error: "",
-      output_tail: "",
-      recent_logs: [],
-    },
+    job: makeIdleBrowserHostJob(),
     source: {
       kind: "single_image",
       locator: "",
@@ -434,6 +443,67 @@ function createBridgeTransportSession(initialBridgeState: Partial<BrowserHostBri
   };
 }
 
+type BridgeTransportSession = ReturnType<typeof createBridgeTransportSession>;
+
+function installNativeBridgeDeliveryHandlers(
+  nativeBridge: BrowserHostNativeBridge,
+  session: BridgeTransportSession,
+): void {
+  const {
+    applyBridgeState,
+    applySnapshot,
+    markBridgeError,
+    markBridgeReady,
+  } = session.controller;
+
+  nativeBridge.deliverSnapshot = (jsonText: string): void => {
+    try {
+      const parsed = JSON.parse(jsonText) as unknown;
+      if (!isStateSnapshot(parsed)) {
+        markBridgeError("native bridge delivered unsupported snapshot", session.bridgeState.phase, true);
+        return;
+      }
+      applySnapshot(parsed);
+      markBridgeReady(parsed.state_revision);
+    } catch {
+      markBridgeError("native bridge delivered malformed snapshot JSON", session.bridgeState.phase, true);
+    }
+  };
+
+  nativeBridge.deliverSurfaceReady = (jsonText: string): void => {
+    try {
+      const surfaceReady = parseSurfaceReadyMessage(JSON.parse(jsonText) as unknown);
+      if (surfaceReady === null) {
+        markBridgeError("native bridge delivered unsupported surface message", session.bridgeState.phase, true);
+        return;
+      }
+      applySnapshot({
+        ...session.snapshot,
+        workspace_surface: surfaceReady.surface,
+      });
+      markBridgeReady(session.snapshot.state_revision);
+    } catch {
+      markBridgeError("native bridge delivered malformed surface JSON", session.bridgeState.phase, true);
+    }
+  };
+
+  nativeBridge.setBridgeState = (jsonText: string): void => {
+    const parsedBridgeState = parseBridgeStateJsonText(jsonText, session.bridgeState);
+    if (parsedBridgeState === null) {
+      markBridgeError("native bridge delivered malformed bridge state", session.bridgeState.phase, true);
+      return;
+    }
+    if (parsedBridgeState.hasRuntimeCapabilities) {
+      session.pinBridgeRuntimeCapabilities();
+    }
+    applyBridgeState(parsedBridgeState.state);
+  };
+
+  nativeBridge.reportError = (messageText: string): void => {
+    markBridgeError(messageText, session.bridgeState.phase, true);
+  };
+}
+
 function resolveNativeBridge(
   hostWindow: Window | undefined,
 ): BrowserHostNativeBridge | null {
@@ -618,8 +688,7 @@ function createNativeBridgeTransport(
     phase: "polling",
     connected: true,
   });
-  const { applyBridgeState, applySnapshot, markBridgeError, markBridgeReady } =
-    session.controller;
+  const { applyBridgeState, markBridgeError } = session.controller;
 
   const postBridgeMessage = (
     messageText: string,
@@ -647,46 +716,7 @@ function createNativeBridgeTransport(
     }
   };
 
-  nativeBridge.deliverSnapshot = (jsonText: string) => {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(jsonText);
-    } catch {
-      markBridgeError("browser bridge delivered malformed snapshot JSON", "polling", true);
-      return;
-    }
-    if (!isStateSnapshot(parsed)) {
-      markBridgeError("browser bridge delivered malformed snapshot JSON", "polling", true);
-      return;
-    }
-
-    applySnapshot(parsed);
-    markBridgeReady(parsed.state_revision);
-  };
-
-  nativeBridge.setBridgeState = (jsonText: string) => {
-    const parsedBridgeState = parseBridgeStateJsonText(jsonText, session.bridgeState);
-    if (parsedBridgeState === null) {
-      markBridgeError(
-        "browser bridge delivered malformed bridge state JSON",
-        session.bridgeState.phase,
-        true,
-      );
-      return;
-    }
-    if (parsedBridgeState.hasRuntimeCapabilities) {
-      session.pinBridgeRuntimeCapabilities();
-    }
-    applyBridgeState(parsedBridgeState.state);
-  };
-
-  nativeBridge.reportError = (messageText: string) => {
-    const errorText = String(messageText ?? "").trim();
-    if (errorText.length === 0) {
-      return;
-    }
-    markBridgeError(errorText, session.bridgeState.phase, true);
-  };
+  installNativeBridgeDeliveryHandlers(nativeBridge, session);
 
   const transport: BrowserHostTransport = {
     mode: "native",
@@ -724,20 +754,84 @@ function makeWebSocketRuntimeCapabilitiesMessage(
           hostWindow,
           "__MMLTK_WORKSPACE_GPU_BRIDGE__",
         );
-  const workspaceGpuBridgeAvailable =
-    isRecord(workspaceGpuBridge) &&
-    typeof workspaceGpuBridge.acquireCurrentSurface === "function" &&
-    typeof workspaceGpuBridge.importTexture === "function" &&
-    typeof workspaceGpuBridge.releaseSurface === "function";
+  let workspaceSurfaceBridge: BrowserRuntimeCapabilityStatus = "unavailable";
+  let workspaceSurfaceBridgeDetail =
+    "__MMLTK_WORKSPACE_GPU_BRIDGE__ is not installed";
+  if (isRecord(workspaceGpuBridge)) {
+    if (typeof workspaceGpuBridge.acquireCurrentSurface !== "function") {
+      workspaceSurfaceBridgeDetail =
+        "__MMLTK_WORKSPACE_GPU_BRIDGE__.acquireCurrentSurface is absent";
+    } else if (typeof workspaceGpuBridge.importTexture !== "function") {
+      workspaceSurfaceBridgeDetail =
+        "__MMLTK_WORKSPACE_GPU_BRIDGE__.importTexture is absent";
+    } else if (typeof workspaceGpuBridge.releaseSurface !== "function") {
+      workspaceSurfaceBridgeDetail =
+        "__MMLTK_WORKSPACE_GPU_BRIDGE__.releaseSurface is absent";
+    } else if (typeof workspaceGpuBridge.releaseRendererTexture !== "function") {
+      workspaceSurfaceBridgeDetail =
+        "__MMLTK_WORKSPACE_GPU_BRIDGE__.releaseRendererTexture is absent";
+    } else {
+      workspaceSurfaceBridge = "unknown";
+      workspaceSurfaceBridgeDetail =
+        "Workspace GPU bridge functions are installed; native helper capability is pending.";
+    }
+  }
   return JSON.stringify({
     type: "host.runtime.capabilities",
     navigator_gpu: navigatorGpuAvailable,
-    workspace_surface_bridge: workspaceGpuBridgeAvailable
-      ? "available"
-      : "unavailable",
-    workspace_surface_zero_copy: workspaceGpuBridgeAvailable
-      ? "unknown"
-      : "unavailable",
+    workspace_surface_bridge: workspaceSurfaceBridge,
+    workspace_surface_zero_copy: "unknown",
+    capabilities: {
+      workspace_surface_bridge: {
+        status:
+          workspaceSurfaceBridge === "unavailable" ? "blocked" : "pending",
+        summary:
+          workspaceSurfaceBridge === "unavailable"
+            ? "workspace surface bridge unavailable"
+            : "workspace surface bridge pending",
+        detail: workspaceSurfaceBridgeDetail,
+      },
+      workspace_surface_zero_copy: {
+        status: "pending",
+        summary: "workspace zero-copy pending",
+        detail: "No live workspace surface publication has been exported yet.",
+      },
+    },
+  });
+}
+
+function watchWebSocketWorkspaceGpuBridge(
+  hostWindow: Window,
+  onChanged: () => void,
+): void {
+  const propertyName = "__MMLTK_WORKSPACE_GPU_BRIDGE__";
+  const descriptor = Object.getOwnPropertyDescriptor(hostWindow, propertyName);
+  if (descriptor?.configurable === false) {
+    return;
+  }
+  let value =
+    descriptor !== undefined && "value" in descriptor
+      ? descriptor.value
+      : undefined;
+  const readValue = () => {
+    if (descriptor !== undefined && typeof descriptor.get === "function") {
+      return descriptor.get.call(hostWindow);
+    }
+    return value;
+  };
+  const writeValue = (nextValue: unknown) => {
+    if (descriptor !== undefined && typeof descriptor.set === "function") {
+      descriptor.set.call(hostWindow, nextValue);
+    } else {
+      value = nextValue;
+    }
+    onChanged();
+  };
+  Object.defineProperty(hostWindow, propertyName, {
+    configurable: true,
+    enumerable: descriptor?.enumerable ?? false,
+    get: readValue,
+    set: writeValue,
   });
 }
 
@@ -750,10 +844,20 @@ function createWebSocketBridgeTransport(
     connected: false,
   });
   let socket: WebSocket | null = null;
+  let lastRuntimeCapabilitiesMessage = "";
   const pendingMessages: string[] = [];
 
-  const { applyBridgeState, applySnapshot, markBridgeError, markBridgeReady } =
-    session.controller;
+  const {
+    applyBridgeState,
+    applySnapshot,
+    markBridgeError,
+    markBridgeReady,
+  } = session.controller;
+  const nativeBridge = resolveNativeBridge(hostWindow);
+
+  if (nativeBridge !== null) {
+    installNativeBridgeDeliveryHandlers(nativeBridge, session);
+  }
 
   const sendText = (messageText: string) => {
     if (socket !== null && socket.readyState === WebSocket.OPEN) {
@@ -761,6 +865,15 @@ function createWebSocketBridgeTransport(
       return;
     }
     pendingMessages.push(messageText);
+  };
+
+  const sendRuntimeCapabilities = () => {
+    const messageText = makeWebSocketRuntimeCapabilitiesMessage(hostWindow);
+    if (messageText === lastRuntimeCapabilitiesMessage) {
+      return;
+    }
+    lastRuntimeCapabilitiesMessage = messageText;
+    sendText(messageText);
   };
 
   const flushPendingMessages = () => {
@@ -848,7 +961,7 @@ function createWebSocketBridgeTransport(
         }),
       );
       sendText(JSON.stringify({ type: "host.callbacks.ready" }));
-      sendText(makeWebSocketRuntimeCapabilitiesMessage(hostWindow));
+      sendRuntimeCapabilities();
       flushPendingMessages();
     });
     socket.addEventListener("message", (event: MessageEvent) => {
@@ -864,6 +977,7 @@ function createWebSocketBridgeTransport(
     });
   };
 
+  watchWebSocketWorkspaceGpuBridge(hostWindow, sendRuntimeCapabilities);
   connect();
 
   return {

@@ -16,6 +16,8 @@ export class BrowserShellChromeState {
   readonly workflows: readonly WorkflowNavItem[] = workflowNavItems;
   readonly snapshot = this.runtime.snapshot;
   readonly transportStatus = this.runtime.transportStatus;
+  readonly contractHashMatched = this.runtime.contractHashMatched;
+  readonly contractMismatchDetail = this.runtime.contractMismatchDetail;
   readonly selectedWorkflow = this.workflowRoute.selectedWorkflow;
   readonly settingsOpen = signal(false);
   readonly lastIntentLabel = computed(() => {
@@ -29,8 +31,7 @@ export class BrowserShellChromeState {
   );
 
   activateWorkflow(workflow: Workflow): void {
-    this.workflowRoute.routeWorkflow.set(workflow);
-    this.source.sync(true);
+    this.setRouteWorkflow(workflow);
     if (this.snapshot().active_workflow === workflow) {
       this.pendingViewIntentWorkflow = null;
       return;
@@ -43,6 +44,11 @@ export class BrowserShellChromeState {
       });
       this.pendingViewIntentWorkflow = workflow;
     }
+  }
+
+  setRouteWorkflow(workflow: Workflow): void {
+    this.workflowRoute.routeWorkflow.set(workflow);
+    this.source.sync(true);
   }
 
   openSettings(): void {

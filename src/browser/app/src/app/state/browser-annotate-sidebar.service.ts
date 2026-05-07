@@ -17,6 +17,7 @@ import type {
   AnnotateSidebarState,
   IntentMessage,
 } from "../../host_api";
+import { hostWorkspaceBoxDragKind } from "../host-annotation-intent";
 import { BrowserHostRuntimeState } from "./browser-host-runtime.service";
 import { BrowserWorkflowRouteState } from "./browser-workflow-route.service";
 
@@ -289,12 +290,18 @@ export class BrowserAnnotateSidebarState {
   }
 
   dispatchWorkspaceCanvasClick(payload: Record<string, unknown>): IntentMessage | null {
-    return this.dispatchWorkspaceIntent("annotate.workspace.click", payload);
+    return this.dispatchWorkspaceIntent("annotate.workspace.click", {
+      capture_x: payload.capture_x,
+      capture_y: payload.capture_y,
+      ...(payload.double_click === undefined ? {} : { double_click: payload.double_click }),
+    });
   }
 
   dispatchWorkspaceHandleDrag(payload: Record<string, unknown>): IntentMessage | null {
     return this.dispatchWorkspaceIntent("annotate.workspace.handle_drag", {
-      ...payload,
+      phase: payload.phase,
+      capture_x: payload.capture_x,
+      capture_y: payload.capture_y,
       handle: {
         object_index: payload.object_index,
         element_index: payload.element_index,
@@ -304,21 +311,42 @@ export class BrowserAnnotateSidebarState {
   }
 
   dispatchWorkspaceBoxDrag(payload: Record<string, unknown>): IntentMessage | null {
-    return this.dispatchWorkspaceIntent("annotate.workspace.box_drag", payload);
+    return this.dispatchWorkspaceIntent("annotate.workspace.box_drag", {
+      phase: payload.phase,
+      capture_x: payload.capture_x,
+      capture_y: payload.capture_y,
+      drag_kind: hostWorkspaceBoxDragKind(payload.drag_kind),
+      object_index: payload.object_index,
+    });
   }
 
   dispatchWorkspaceBrush(payload: Record<string, unknown>): IntentMessage | null {
-    return this.dispatchWorkspaceIntent("annotate.workspace.brush", payload);
+    return this.dispatchWorkspaceIntent("annotate.workspace.brush", {
+      phase: payload.phase,
+      capture_x: payload.capture_x,
+      capture_y: payload.capture_y,
+      radius: payload.radius,
+    });
+  }
+
+  dispatchWorkspacePointer(payload: Record<string, unknown>): IntentMessage | null {
+    return this.dispatchWorkspaceIntent("annotate.workspace.pointer", payload);
   }
 
   dispatchWorkspaceFill(payload: Record<string, unknown>): IntentMessage | null {
-    return this.dispatchWorkspaceIntent("annotate.workspace.fill", payload);
+    return this.dispatchWorkspaceIntent("annotate.workspace.fill", {
+      capture_x: payload.capture_x,
+      capture_y: payload.capture_y,
+    });
   }
 
   dispatchWorkspaceColorSample(
     payload: Record<string, unknown>,
   ): IntentMessage | null {
-    return this.dispatchWorkspaceIntent("annotate.workspace.color_sample", payload);
+    return this.dispatchWorkspaceIntent("annotate.workspace.color_sample", {
+      capture_x: payload.capture_x,
+      capture_y: payload.capture_y,
+    });
   }
 
   private dispatchSidebar(

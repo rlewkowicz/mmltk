@@ -61,6 +61,9 @@ export class RightPanelLiveStatusSectionComponent {
 
   protected liveTransitionLabel(): string {
     const runtime = this.store.liveStatus().runtime;
+    if (runtime.activeMode === "annotate" && runtime.startupState !== "idle") {
+      return runtime.startupState;
+    }
     if (runtime.starting) {
       return "starting";
     }
@@ -80,6 +83,9 @@ export class RightPanelLiveStatusSectionComponent {
     }
     if (preview.fitToCapture) {
       return "fit to capture";
+    }
+    if (preview.displayStartupState !== "idle") {
+      return preview.displayStartupState;
     }
     return preview.hasFrame ? "cropped preview" : "no preview";
   }

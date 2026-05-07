@@ -11,10 +11,10 @@ import { BrowserShellSettingsState } from "./state/browser-shell-settings.servic
   imports: [FormsModule],
   template: `
     @if (chrome.settingsOpen()) {
-      <section class="modal-backdrop" role="presentation" (click)="chrome.closeSettings()">
+      <section class="modal-backdrop" role="presentation" (click)="closeSettings()">
         <dialog class="settings-modal" open aria-labelledby="settings-title" (click)="$event.stopPropagation()">
           <div class="section-header settings-modal__header">
-            <button type="button" class="button-compact" (click)="chrome.closeSettings()">Close</button>
+            <button type="button" class="button-compact" (click)="closeSettings()">Close</button>
             <h2 id="settings-title">Settings</h2>
           </div>
 
@@ -133,22 +133,9 @@ import { BrowserShellSettingsState } from "./state/browser-shell-settings.servic
             </div>
           </section>
 
-          <section class="settings-modal__section">
-            <h3>Preview</h3>
-            <p class="section-copy">{{ settings.shellSettingsNote() }}</p>
-            <pre class="console-block">SourceSansPro-Regular / SourceCodePro-Semibold</pre>
-          </section>
-
           <div class="action-row">
             <button type="button" (click)="settings.reset()">Reset UI</button>
-            <button
-              type="button"
-              [disabled]="!settings.canApplyShellSettings()"
-              (click)="settings.apply()"
-            >
-              Apply UI
-            </button>
-            <button type="button" (click)="chrome.closeSettings()">Close</button>
+            <button type="button" (click)="closeSettings()">Close</button>
           </div>
         </dialog>
       </section>
@@ -158,4 +145,9 @@ import { BrowserShellSettingsState } from "./state/browser-shell-settings.servic
 export class SettingsModalComponent {
   protected readonly chrome = inject(BrowserShellChromeState);
   protected readonly settings = inject(BrowserShellSettingsState);
+
+  protected closeSettings(): void {
+    this.settings.apply();
+    this.chrome.closeSettings();
+  }
 }

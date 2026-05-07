@@ -1,4 +1,5 @@
 #include "browser/host_api.h"
+#include "browser/host_api_dispatch.h"
 #include "gui/browser_host_adapters.h"
 #include "gui/annotation/common.h"
 #include "gui/annotation/controller.h"
@@ -11,6 +12,7 @@
 #include "gui/browser_host_helpers.h"
 #include "mmltk/live/live_types.h"
 #include "mmltk/live/manual_overlay_document.h"
+#include "mmltk/rfdetr/model_config.h"
 #include "support/filesystem_test_utils.hpp"
 #include "support/catch2_compat.hpp"
 
@@ -52,9 +54,6 @@ template <typename T>
     }
     return *value;
 }
-
-static_assert(kRoutedIntentPayloadAlternativeCount == 29U,
-              "Update browser host API tests for RoutedIntentPayload ABI changes.");
 
 mmltk::gui::GuiSettingsSnapshot make_gui_snapshot(mmltk::gui::View current_view, const std::string& selected_preset,
                                                   mmltk::gui::UiSettingsState& ui, mmltk::gui::TrainViewState& train,
@@ -375,7 +374,7 @@ void test_state_snapshot_round_trips_through_json() {
           {"save",
            {{"save_now", {{"enabled", true}, {"intent", "annotate.save_now"}}},
             {"hold_save",
-             {{"enabled", true}, {"value", false}, {"payload_key", "active"}, {"intent", "annotate.hold_save"}}}}},
+             {{"enabled", true}, {"value", false}, {"payload_key", "enabled"}, {"intent", "annotate.hold_save"}}}}},
           {"brush",
            {{"radius",
              {{"value", 16},
@@ -473,7 +472,7 @@ void test_state_snapshot_round_trips_through_json() {
     assert(round_trip.workflow_state.at("annotate_runtime_controls").at("save").at("save_now").at("intent") ==
            "annotate.save_now");
     assert(round_trip.workflow_state.at("annotate_runtime_controls").at("save").at("hold_save").at("payload_key") ==
-           "active");
+           "enabled");
     assert(
         round_trip.workflow_state.at("annotate_workspace_scene").at("selected_dense_mask").at("capture_box").at("x1") ==
         144);
@@ -568,6 +567,24 @@ void test_browser_runtime_capabilities_round_trip_accepts_cef_backend() {
     assert(round_trip.workspace_surface_zero_copy == BrowserRuntimeCapabilityStatus::Unavailable);
 }
 
+void test_browser_runtime_capabilities_round_trip_separates_bridge_from_zero_copy_proof() {
+    BrowserRuntimeCapabilities capabilities;
+    capabilities.host_backend = BrowserHostBackend::Cef;
+    capabilities.navigator_gpu = BrowserRuntimeCapabilityStatus::Available;
+    capabilities.workspace_surface_bridge = BrowserRuntimeCapabilityStatus::Available;
+    capabilities.workspace_surface_zero_copy = BrowserRuntimeCapabilityStatus::Unknown;
+
+    const nlohmann::json json = capabilities;
+    assert(json.at("workspace_surface_bridge") == "available");
+    assert(json.at("workspace_surface_zero_copy") == "unknown");
+
+    const BrowserRuntimeCapabilities round_trip = json.get<BrowserRuntimeCapabilities>();
+    assert(round_trip.host_backend == BrowserHostBackend::Cef);
+    assert(round_trip.navigator_gpu == BrowserRuntimeCapabilityStatus::Available);
+    assert(round_trip.workspace_surface_bridge == BrowserRuntimeCapabilityStatus::Available);
+    assert(round_trip.workspace_surface_zero_copy == BrowserRuntimeCapabilityStatus::Unknown);
+}
+
 void test_intent_round_trips_through_json() {
     IntentMessage intent = make_intent_message(Workflow::Predict, "predict.start",
                                                nlohmann::json{
@@ -629,6 +646,7 @@ void test_route_predict_start_intent_preserves_request_metadata_and_options() {
     assert(routed.protocol_version == kHostApiProtocolVersion);
     assert(routed.request_id == 91U);
     assert(routed.workflow == Workflow::Predict);
+    assert(routed.intent == "predict.start");
     assert(routed_intent_name(routed.payload) == "predict.start");
     assert(std::holds_alternative<PredictStartIntent>(routed.payload));
 
@@ -768,6 +786,34 @@ void test_route_settings_update_applies_json_merge_patch_to_gui_snapshot() {
     assert(fixture.snapshot.workflows.predict != nullptr);
     assert(fixture.snapshot.workflows.predict->output_path == "/tmp/updated.json");
     assert(fixture.snapshot.workflows.predict->threshold == 0.4F);
+
+    const nlohmann::json annotate_video_patch = {
+        {"workflows",
+         {{"annotate",
+           {{"source",
+             {{"kind", static_cast<int>(mmltk::gui::SourceKind::VideoStream)},
+              {"recursive", false},
+              {"device_index", 1},
+              {"capture_width", 1280},
+              {"capture_height", 720},
+              {"capture_fps", 60},
+              {"v4l2_buffer_count", 4},
+              {"single_image_path", ""},
+              {"image_directory", ""}}},
+            {"annotate", {{"model_input", static_cast<int>(ModelInputMode::None)}}}}}}},
+    };
+    const IntentMessage annotate_video_intent =
+        make_intent_message(Workflow::Annotate, "settings.update", nlohmann::json{{"patch", annotate_video_patch}});
+    const RoutedIntent annotate_video_routed = route_intent(annotate_video_intent);
+    apply_settings_update(std::get<SettingsUpdateIntent>(annotate_video_routed.payload), fixture.snapshot);
+    assert(fixture.snapshot.workflows.annotate != nullptr);
+    assert(fixture.snapshot.workflows.annotate->source.kind == mmltk::gui::SourceKind::VideoStream);
+    assert(fixture.snapshot.workflows.annotate->source.device_index == 1);
+    assert(fixture.snapshot.workflows.annotate->source.capture_width == 1280);
+    assert(fixture.snapshot.workflows.annotate->source.capture_height == 720);
+    assert(fixture.snapshot.workflows.annotate->source.capture_fps == 60);
+    assert(fixture.snapshot.workflows.annotate->source.v4l2_buffer_count == 4);
+    assert(fixture.snapshot.workflows.annotate->model_input == ModelInputMode::None);
 }
 
 void test_route_crop_commit_updates_source_selection_state() {
@@ -808,7 +854,8 @@ void test_route_file_dialog_and_viewport_commit_intents() {
     const IntentMessage file_dialog_intent =
         make_intent_message(Workflow::Annotate, "file_dialog.request",
                             nlohmann::json{
-                                {"dialog_id", "project-open"},
+                                {"dialog_id", "annotate.source.image_folder"},
+                                {"target_field", "source.imageDirectory"},
                                 {"mode", "open_folder"},
                                 {"title", "Choose Project"},
                                 {"default_path", "/tmp/project"},
@@ -818,7 +865,8 @@ void test_route_file_dialog_and_viewport_commit_intents() {
     const RoutedIntent file_dialog_routed = route_intent(file_dialog_intent);
     assert(std::holds_alternative<FileDialogRequestIntent>(file_dialog_routed.payload));
     const auto& dialog = std::get<FileDialogRequestIntent>(file_dialog_routed.payload);
-    assert(dialog.dialog_id == "project-open");
+    assert(dialog.dialog_id == "annotate.source.image_folder");
+    assert(dialog.target_field == "source.imageDirectory");
     assert(dialog.mode == FileDialogMode::OpenFolder);
     assert(dialog.title == "Choose Project");
     assert(dialog.default_path == "/tmp/project");
@@ -973,7 +1021,7 @@ void test_route_annotate_workspace_intents() {
     const IntentMessage box_drag_intent = make_intent_message(Workflow::Annotate, "annotate.workspace.box_drag",
                                                               nlohmann::json{
                                                                   {"phase", "begin"},
-                                                                  {"drag_kind", "resize-bottom-right"},
+                                                                  {"drag_kind", "resize_bottom_right"},
                                                                   {"object_index", 7},
                                                                   {"capture_x", 12},
                                                                   {"capture_y", 14},
@@ -1051,7 +1099,7 @@ void test_route_annotate_and_live_native_shell_control_intents() {
     const IntentMessage annotate_save_now_intent = make_intent_message(Workflow::Annotate, "annotate.save_now");
     const RoutedIntent annotate_save_now_routed = route_intent(annotate_save_now_intent);
     assert(std::holds_alternative<AnnotateSaveIntent>(annotate_save_now_routed.payload));
-    assert(routed_intent_name(annotate_save_now_routed.payload) == "annotate.save");
+    assert(routed_intent_name(annotate_save_now_routed) == "annotate.save_now");
 
     const IntentMessage predict_stop_intent = make_intent_message(Workflow::Live, "predict.stop");
     const RoutedIntent predict_stop_routed = route_intent(predict_stop_intent);
@@ -1062,7 +1110,8 @@ void test_route_annotate_and_live_native_shell_control_intents() {
 
     const RoutedIntent annotate_setup_routed = route_intent(annotate_setup_intent);
     assert(std::holds_alternative<AnnotateSetupIntent>(annotate_setup_routed.payload));
-    assert(routed_intent_name(annotate_setup_routed.payload) == "annotate.setup");
+    assert(annotate_setup_routed.intent == "annotate.setup_frame.next");
+    assert(routed_intent_name(annotate_setup_routed) == "annotate.setup_frame.next");
     const auto& annotate_setup = std::get<AnnotateSetupIntent>(annotate_setup_routed.payload);
     assert(annotate_setup.action == AnnotateSetupAction::NextFrame);
 
@@ -1071,6 +1120,23 @@ void test_route_annotate_and_live_native_shell_control_intents() {
     assert(std::holds_alternative<AnnotateSetupIntent>(annotate_live_start_routed.payload));
     assert(std::get<AnnotateSetupIntent>(annotate_live_start_routed.payload).action == AnnotateSetupAction::StartLive);
 
+    const IntentMessage workspace_acquire_failed_intent =
+        make_intent_message(Workflow::Live, "workspace.acquire_failed",
+                            nlohmann::json{
+                                {"surface_id", "workspace"},
+                                {"revision", ""},
+                                {"operation", "acquireCurrentSurface"},
+                                {"result_code", "no_published_live_surface"},
+                                {"result_detail", "no published live workspace surface"},
+                            });
+    const RoutedIntent workspace_acquire_failed_routed = route_intent(workspace_acquire_failed_intent);
+    assert(std::holds_alternative<WorkspaceRendererEventIntent>(workspace_acquire_failed_routed.payload));
+    assert(routed_intent_name(workspace_acquire_failed_routed) == "workspace.acquire_failed");
+    const auto& workspace_acquire_failed =
+        std::get<WorkspaceRendererEventIntent>(workspace_acquire_failed_routed.payload);
+    assert(workspace_acquire_failed.operation == "acquireCurrentSurface");
+    assert(workspace_acquire_failed.result_code == "no_published_live_surface");
+
     const IntentMessage annotate_live_stop_intent = make_intent_message(Workflow::Annotate, "annotate.live.stop");
     const RoutedIntent annotate_live_stop_routed = route_intent(annotate_live_stop_intent);
     assert(std::holds_alternative<AnnotateSetupIntent>(annotate_live_stop_routed.payload));
@@ -1078,7 +1144,7 @@ void test_route_annotate_and_live_native_shell_control_intents() {
 
     const IntentMessage hold_save_intent = make_intent_message(Workflow::Annotate, "annotate.hold_save",
                                                                nlohmann::json{
-                                                                   {"active", true},
+                                                                   {"enabled", true},
                                                                });
 
     const RoutedIntent hold_save_routed = route_intent(hold_save_intent);
@@ -1105,7 +1171,7 @@ void test_route_annotate_and_live_native_shell_control_intents() {
 
     const RoutedIntent fit_to_capture_routed = route_intent(fit_to_capture_intent);
     assert(std::holds_alternative<LivePreviewControlIntent>(fit_to_capture_routed.payload));
-    assert(routed_intent_name(fit_to_capture_routed.payload) == "live.preview.update");
+    assert(routed_intent_name(fit_to_capture_routed.payload) == "live.preview.fit_to_capture");
     const auto& fit_to_capture = std::get<LivePreviewControlIntent>(fit_to_capture_routed.payload);
     assert(fit_to_capture.fit_to_capture == false);
     assert(!fit_to_capture.crop_overlay_mode.has_value());
@@ -1116,6 +1182,7 @@ void test_route_annotate_and_live_native_shell_control_intents() {
                                                                   });
     const RoutedIntent live_preview_routed = route_intent(live_preview_intent);
     assert(std::holds_alternative<LivePreviewControlIntent>(live_preview_routed.payload));
+    assert(routed_intent_name(live_preview_routed) == "live.preview.full_frame_display");
     const auto& live_preview = std::get<LivePreviewControlIntent>(live_preview_routed.payload);
     assert(!live_preview.fit_to_capture.has_value());
     assert(live_preview.crop_overlay_mode == true);
@@ -1227,32 +1294,215 @@ void test_route_train_local_gpu_refresh_intent() {
     assert(routed_intent_name(routed.payload) == "train.local_gpu.refresh");
 }
 
-void test_file_dialog_binding_resolves_known_browser_dialog_ids() {
-    assert(file_dialog_binding_from_id("train.dataset.train_compiled_path") ==
-           BrowserFileDialogBinding::TrainTrainCompiledPath);
-    assert(file_dialog_binding_from_id("train.dataset.val_compiled_path") ==
-           BrowserFileDialogBinding::TrainValCompiledPath);
-    assert(file_dialog_binding_from_id("train.dataset.test_compiled_path") ==
-           BrowserFileDialogBinding::TrainTestCompiledPath);
-    assert(file_dialog_binding_from_id("train.model.weights") == BrowserFileDialogBinding::TrainWeights);
-    assert(file_dialog_binding_from_id("train.training.resume_path") == BrowserFileDialogBinding::TrainResumePath);
-    assert(file_dialog_binding_from_id("train.training.output_dir") == BrowserFileDialogBinding::TrainOutputDir);
-    assert(file_dialog_binding_from_id("predict.source.file") == BrowserFileDialogBinding::PredictSingleImage);
-    assert(file_dialog_binding_from_id("predict.output_path") == BrowserFileDialogBinding::PredictOutputPath);
-    assert(file_dialog_binding_from_id("annotate.source.folder") == BrowserFileDialogBinding::AnnotateImageFolder);
-    assert(file_dialog_binding_from_id("annotate.output_dir") == BrowserFileDialogBinding::AnnotateOutputDir);
-    assert(file_dialog_binding_from_id("validate.dataset.compiled_path") ==
-           BrowserFileDialogBinding::ValidateCompiledPath);
-    assert(file_dialog_binding_from_id("validate.dataset.source_dir") == BrowserFileDialogBinding::ValidateSourceRoot);
-    assert(file_dialog_binding_from_id("validate.model.onnx") == BrowserFileDialogBinding::ValidateOnnx);
-    assert(file_dialog_binding_from_id("validate.model.tensorrt") == BrowserFileDialogBinding::ValidateTensorRt);
-    assert(file_dialog_binding_from_id("validate.output.save_engine_path") ==
-           BrowserFileDialogBinding::ValidateSaveEngine);
-    assert(file_dialog_binding_from_id("validate.report_json_path") == BrowserFileDialogBinding::ValidateReportJson);
-    assert(file_dialog_binding_from_id("export.model.weights") == BrowserFileDialogBinding::ExportWeights);
-    assert(file_dialog_binding_from_id("export.model.onnx") == BrowserFileDialogBinding::ExportOnnx);
-    assert(file_dialog_binding_from_id("export.output_path") == BrowserFileDialogBinding::ExportOutputPath);
-    assert(file_dialog_binding_from_id("unknown.binding") == BrowserFileDialogBinding::Unknown);
+void test_generated_browser_contract_dialog_ids_are_bound() {
+    mmltk::gui::TrainViewState train;
+    mmltk::gui::PredictViewState predict;
+    mmltk::gui::AnnotateViewState annotate;
+    mmltk::gui::ValidateViewState validate;
+    mmltk::gui::ExportViewState export_state;
+    const BrowserFileDialogStateAccess access{
+        &train, &predict, &annotate, &validate, &export_state,
+    };
+
+    for (const BrowserNativeFileDialogContractSpec& dialog : kBrowserNativeFileDialogsById) {
+        assert(!dialog.title.empty());
+        assert(dialog.filter_pattern_count <= dialog.filter_patterns.size());
+        for (std::size_t pattern_index = 0U; pattern_index < dialog.filter_pattern_count; ++pattern_index) {
+            assert(!dialog.filter_patterns[pattern_index].empty());
+        }
+        const BrowserFileDialogBinding binding = file_dialog_binding_from_id(dialog.id);
+        assert(binding == dialog.binding);
+        assert(browser_file_dialog_target(binding, access).path != nullptr);
+        const std::string picked_path = "/tmp/generated-dialog-" + std::string{dialog.id};
+        apply_browser_file_dialog_selection(binding, picked_path, access);
+        assert(browser_file_dialog_initial_path(binding, access) == picked_path);
+    }
+}
+
+void test_generated_browser_contract_presets_match_rfdetr_catalog() {
+    const auto& presets = mmltk::rfdetr::model_presets();
+    assert(presets.size() == contract::kPresets.size());
+    for (const auto& native_preset : contract::kPresets) {
+        const auto found = std::find_if(presets.begin(), presets.end(), [native_preset](const auto& preset) {
+            return preset.preset_name == native_preset.preset_name;
+        });
+        assert(found != presets.end());
+    }
+}
+
+void test_native_browser_contract_metadata_covers_dtos_and_dispatch() {
+    static_assert(kRoutedIntentPayloadAlternativeCount == BrowserIntentPayloadTypes::size);
+
+    const nlohmann::json capture_schema = api::schema_for<CaptureRegion>();
+    assert(capture_schema.at("properties").contains("x"));
+    assert(capture_schema.at("properties").contains("height"));
+
+    const nlohmann::json train_stop_schema = api::schema_for<TrainStopIntent>();
+    assert(train_stop_schema.at("properties").contains("force"));
+
+    const IntentMessage intent = make_intent_message(Workflow::Train, "train.stop", nlohmann::json{{"force", true}});
+    const RoutedIntent routed = route_intent(intent);
+    bool train_stop_handler_invoked = false;
+    auto handler = [&](const RoutedIntent& dispatched, const auto& payload) {
+        using Payload = std::decay_t<decltype(payload)>;
+        if constexpr (std::is_same_v<Payload, TrainStopIntent>) {
+            train_stop_handler_invoked = dispatched.workflow == Workflow::Train && payload.force;
+        }
+    };
+    BrowserIntentDispatchFactory<BrowserIntentPayloadTypes, decltype(handler)>::dispatch(routed, handler);
+    assert(train_stop_handler_invoked);
+}
+
+[[nodiscard]] nlohmann::json representative_file_dialog_payload(const Workflow workflow) {
+    const Workflow owner_workflow = workflow == Workflow::Live ? Workflow::Predict : workflow;
+    const auto found = std::find_if(kBrowserNativeFileDialogsById.begin(), kBrowserNativeFileDialogsById.end(),
+                                    [owner_workflow](const BrowserNativeFileDialogContractSpec& dialog) {
+                                        return dialog.workflow == owner_workflow;
+                                    });
+    assert(found != kBrowserNativeFileDialogsById.end());
+    return nlohmann::json{
+        {"dialog_id", found->id}, {"target_field", found->field},       {"mode", file_dialog_mode_name(found->mode)},
+        {"title", found->title},  {"filters", nlohmann::json::array()},
+    };
+}
+
+template <typename Payload>
+[[nodiscard]] nlohmann::json representative_payload(const std::string_view intent_id, const Workflow workflow) {
+    if constexpr (std::is_same_v<Payload, TrainStartIntent> || std::is_same_v<Payload, TrainRemoteStartIntent> ||
+                  std::is_same_v<Payload, ValidateStartIntent> || std::is_same_v<Payload, ExportStartIntent> ||
+                  std::is_same_v<Payload, AnnotateSaveIntent>) {
+        return nlohmann::json{{"options", nlohmann::json::object()}};
+    } else if constexpr (std::is_same_v<Payload, TrainStopIntent>) {
+        return nlohmann::json{{"force", false}};
+    } else if constexpr (std::is_same_v<Payload, TrainRemoteOfferArmIntent>) {
+        return nlohmann::json{{"offer_id", 1}};
+    } else if constexpr (std::is_same_v<Payload, PredictStartIntent>) {
+        return nlohmann::json{{"selected_preset", "rf-detr-seg-medium"}};
+    } else if constexpr (std::is_same_v<Payload, AnnotateHoldSaveIntent>) {
+        return nlohmann::json{{"enabled", true}};
+    } else if constexpr (std::is_same_v<Payload, AnnotateBrushRadiusIntent>) {
+        return nlohmann::json{{"radius", 3}};
+    } else if constexpr (std::is_same_v<Payload, AnnotateSidebarIntent>) {
+        return nlohmann::json{{"action", "select_object"}, {"object_index", 0}};
+    } else if constexpr (std::is_same_v<Payload, AnnotateWorkspaceClickIntent> ||
+                         std::is_same_v<Payload, AnnotateWorkspaceFillIntent> ||
+                         std::is_same_v<Payload, AnnotateWorkspaceColorSampleIntent>) {
+        return nlohmann::json{{"capture_x", 12}, {"capture_y", 14}};
+    } else if constexpr (std::is_same_v<Payload, AnnotateWorkspaceBoxDragIntent>) {
+        return nlohmann::json{{"phase", "begin"}, {"drag_kind", "create"}, {"capture_x", 12}, {"capture_y", 14}};
+    } else if constexpr (std::is_same_v<Payload, AnnotateWorkspaceHandleDragIntent>) {
+        return nlohmann::json{{"phase", "begin"},
+                              {"handle", {{"object_index", 0}, {"element_index", 0}, {"role", "point"}}},
+                              {"capture_x", 12},
+                              {"capture_y", 14}};
+    } else if constexpr (std::is_same_v<Payload, AnnotateWorkspaceBrushIntent>) {
+        return nlohmann::json{{"phase", "begin"}, {"capture_x", 12}, {"capture_y", 14}, {"radius", 3}};
+    } else if constexpr (std::is_same_v<Payload, AnnotateWorkspacePointerIntent>) {
+        return nlohmann::json{{"phase", "begin"},
+                              {"pointer_id", 1},
+                              {"button", 0},
+                              {"buttons", 1},
+                              {"canvas_x", 10.0},
+                              {"canvas_y", 11.0},
+                              {"capture_x", 12},
+                              {"capture_y", 14},
+                              {"tool", "box"},
+                              {"brush_radius", 3},
+                              {"drag_kind", "create"}};
+    } else if constexpr (std::is_same_v<Payload, ToolSelectIntent>) {
+        return nlohmann::json{{"tool", "select"}};
+    } else if constexpr (std::is_same_v<Payload, LivePreviewControlIntent>) {
+        return nlohmann::json{{"enabled", intent_id == "live.preview.fit_to_capture"}};
+    } else if constexpr (std::is_same_v<Payload, WorkspaceRendererEventIntent>) {
+        return nlohmann::json{{"surface_id", "workspace"},
+                              {"revision", "representative"},
+                              {"operation", "drawSurface"},
+                              {"result_code", "ok"},
+                              {"result_detail", ""}};
+    } else if constexpr (std::is_same_v<Payload, WorkspaceBoundsIntent>) {
+        return nlohmann::json{{"canvas_device", {{"x", 0}, {"y", 0}, {"width", 1280}, {"height", 720}}},
+                              {"canvas_css", {{"x", 0.0}, {"y", 0.0}, {"width", 640.0}, {"height", 360.0}}},
+                              {"viewport_device", {{"x", 32}, {"y", 16}, {"width", 960}, {"height", 540}}},
+                              {"viewport_css", {{"x", 16.0}, {"y", 8.0}, {"width", 480.0}, {"height", 270.0}}},
+                              {"device_pixel_ratio", 2.0}};
+    } else if constexpr (std::is_same_v<Payload, SettingsUpdateIntent>) {
+        return nlohmann::json{{"patch", {{"current_view", workflow_name(workflow)}}}};
+    } else if constexpr (std::is_same_v<Payload, CropCommitIntent>) {
+        return nlohmann::json{{"has_crop", false}};
+    } else if constexpr (std::is_same_v<Payload, FileDialogRequestIntent>) {
+        return representative_file_dialog_payload(workflow);
+    } else if constexpr (std::is_same_v<Payload, ViewportCommitIntent>) {
+        return nlohmann::json{{"center_x", 10.0}, {"center_y", 20.0}, {"zoom", 1.5}};
+    } else {
+        return nlohmann::json::object();
+    }
+}
+
+template <typename Payload, typename Descriptor>
+void assert_descriptor_routes_to_payload(const Descriptor& descriptor) {
+    for (const Workflow workflow : descriptor.workflows.workflows) {
+        IntentMessage intent;
+        intent.workflow = workflow;
+        intent.intent = descriptor.id;
+        intent.payload = representative_payload<Payload>(descriptor.id, workflow);
+
+        const RoutedIntent routed = route_intent(intent);
+        assert(routed.workflow == workflow);
+        assert(routed.intent == descriptor.id);
+        assert(std::holds_alternative<Payload>(routed.payload));
+        assert(routed_intent_name(routed) == descriptor.id);
+    }
+}
+
+template <typename Payload>
+void assert_payload_descriptors_route() {
+    std::apply([](const auto&... descriptors) { (assert_descriptor_routes_to_payload<Payload>(descriptors), ...); },
+               api::payload_intent_descriptors<Payload>::values());
+}
+
+template <typename TypeList>
+struct BrowserIntentMetadataRoundtrip;
+
+template <typename... Payloads>
+struct BrowserIntentMetadataRoundtrip<api::type_list<Payloads...>> {
+    static void run() {
+        (assert_payload_descriptors_route<Payloads>(), ...);
+    }
+};
+
+void test_native_contract_metadata_routes_representative_intent_corpus() {
+    BrowserIntentMetadataRoundtrip<BrowserIntentPayloadTypes>::run();
+}
+
+void test_route_intent_rejects_noncanonical_aliases() {
+    constexpr std::array<std::string_view, 10U> kAliases{{
+        "file-dialog.request",
+        "annotate.setup",
+        "annotate.frame.reload",
+        "annotate.frame.prev",
+        "annotate.frame.next",
+        "annotate.hold_save.update",
+        "annotate.brush_radius.update",
+        "live.preview.update",
+        "live.preview.controls",
+        "live.preview.full_frame",
+    }};
+
+    for (const std::string_view alias : kAliases) {
+        bool threw = false;
+        try {
+            const std::string alias_name(alias);
+            IntentMessage intent = make_intent_message(Workflow::Annotate, alias_name.c_str());
+            if (alias.starts_with("live.")) {
+                intent.workflow = Workflow::Live;
+            }
+            intent.payload = nlohmann::json::object();
+            (void)route_intent(intent);
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        assert(threw);
+    }
 }
 
 void test_route_intent_validation_rejects_invalid_workflow_and_payloads() {
@@ -1304,6 +1554,62 @@ void test_route_intent_validation_rejects_invalid_workflow_and_payloads() {
         protocol_threw = true;
     }
     assert(protocol_threw);
+
+    bool settings_preset_threw = false;
+    try {
+        IntentMessage invalid_settings_preset;
+        invalid_settings_preset.workflow = Workflow::Predict;
+        invalid_settings_preset.intent = "settings.update";
+        invalid_settings_preset.payload = nlohmann::json{
+            {"patch", {{"selected_preset", "rf-detr-missing"}}},
+        };
+        (void)route_intent(invalid_settings_preset);
+    } catch (const std::runtime_error&) {
+        settings_preset_threw = true;
+    }
+    assert(settings_preset_threw);
+
+    bool settings_unknown_path_threw = false;
+    try {
+        IntentMessage invalid_settings_path;
+        invalid_settings_path.workflow = Workflow::Predict;
+        invalid_settings_path.intent = "settings.update";
+        invalid_settings_path.payload = nlohmann::json{
+            {"patch", {{"workflows", {{"predict", {{"predict", {{"not_a_field", 0.4}}}}}}}}},
+        };
+        (void)route_intent(invalid_settings_path);
+    } catch (const std::runtime_error&) {
+        settings_unknown_path_threw = true;
+    }
+    assert(settings_unknown_path_threw);
+
+    bool settings_annotate_compiled_path_threw = false;
+    try {
+        IntentMessage invalid_annotate_source;
+        invalid_annotate_source.workflow = Workflow::Annotate;
+        invalid_annotate_source.intent = "settings.update";
+        invalid_annotate_source.payload = nlohmann::json{
+            {"patch", {{"workflows", {{"annotate", {{"source", {{"compiled_path", "/tmp/forbidden.bin"}}}}}}}}},
+        };
+        (void)route_intent(invalid_annotate_source);
+    } catch (const std::runtime_error&) {
+        settings_annotate_compiled_path_threw = true;
+    }
+    assert(settings_annotate_compiled_path_threw);
+
+    bool settings_value_type_threw = false;
+    try {
+        IntentMessage invalid_settings_value_type;
+        invalid_settings_value_type.workflow = Workflow::Predict;
+        invalid_settings_value_type.intent = "settings.update";
+        invalid_settings_value_type.payload = nlohmann::json{
+            {"patch", {{"workflows", {{"predict", {{"predict", {{"threshold", "0.4"}}}}}}}}},
+        };
+        (void)route_intent(invalid_settings_value_type);
+    } catch (const std::runtime_error&) {
+        settings_value_type_threw = true;
+    }
+    assert(settings_value_type_threw);
 
     bool annotate_sidebar_threw = false;
     try {
@@ -1477,6 +1783,22 @@ void test_route_intent_validation_rejects_invalid_workflow_and_payloads() {
         live_preview_conflict_threw = true;
     }
     assert(live_preview_conflict_threw);
+
+    bool file_dialog_target_threw = false;
+    try {
+        IntentMessage invalid_file_dialog;
+        invalid_file_dialog.workflow = Workflow::Annotate;
+        invalid_file_dialog.intent = "file_dialog.request";
+        invalid_file_dialog.payload = nlohmann::json{
+            {"dialog_id", "annotate.source.image_folder"},
+            {"target_field", "weightsPath"},
+            {"mode", "open_folder"},
+        };
+        (void)route_intent(invalid_file_dialog);
+    } catch (const std::runtime_error&) {
+        file_dialog_target_threw = true;
+    }
+    assert(file_dialog_target_threw);
 }
 
 void test_gui_source_selection_maps_to_browser_source_metadata() {
@@ -1610,9 +1932,29 @@ void test_live_runtime_state_to_json_surfaces_preview_and_pipeline_status() {
     state.preview.static_source_name.clear();
     state.preview.error.clear();
     state.preview.interop_failed = false;
+    state.preview.last_failure_reason = "no_workspace_output";
+    state.preview.last_failure_detail =
+        "stage=compositor.publish_workspace frame=12 cuda_device=1 revision=12 detail=startup deadline missed";
+    state.preview.last_failure_revision = "12";
+    state.preview.last_failure_stage = "compositor.publish_workspace";
+    state.preview.last_failure_live_frame_id = mmltk::live::LiveFrameId{10U, 12U};
+    state.preview.last_failure_cuda_device = 1U;
+    state.preview.last_failure_result_code = "no_workspace_output";
+    state.preview.last_failure_result_detail = state.preview.last_failure_detail;
+    state.preview.publication_counters.attempted_workspace_acquisitions = 4U;
+    state.preview.publication_counters.startup_workspace_acquisition_misses = 2U;
+    state.preview.publication_counters.post_startup_workspace_acquisition_misses = 1U;
+    state.preview.publication_counters.retained_surfaces = 1U;
     state.controller.present = true;
     state.controller.running = true;
     state.controller.last_error = "controller warning";
+    state.fanout.running = true;
+    state.fanout.frames_fanned_out = 119U;
+    state.fanout.skipped_detect_publishes = 3U;
+    state.fanout.skipped_output_publishes = 4U;
+    state.fanout.release_backlog = 1U;
+    state.fanout.acquire_misses = 5U;
+    state.fanout.last_error = "fanout warning";
     state.analyzer.attached = true;
     state.analyzer.model_hot = true;
     state.analyzer.running = true;
@@ -1627,11 +1969,26 @@ void test_live_runtime_state_to_json_surfaces_preview_and_pipeline_status() {
     state.manual_overlay.last_error = "manual warning";
     state.compositor.running = true;
     state.compositor.frames_composited = 118U;
+    state.compositor.frames_composited_after_startup = 117U;
     state.compositor.frames_dropped = 2U;
+    state.compositor.skipped_compositor_presents = 6U;
+    state.compositor.front_slot_index = 2;
+    state.compositor.front_slot_revision = 12U;
     state.compositor.last_frame_id = mmltk::live::LiveFrameId{10U, 12U};
     state.compositor.manual_overlay_active = true;
     state.compositor.analysis_overlay_active = false;
     state.compositor.last_error = "compositor warning";
+    state.single_buffer_diagnostic.enabled = true;
+    state.single_buffer_diagnostic.frame_count = 8U;
+    state.single_buffer_diagnostic.frame_budget_ns = 16'000'000U;
+    state.single_buffer_diagnostic.drawn_frames = 8U;
+    state.single_buffer_diagnostic.consecutive_miss_limit = 2U;
+    state.single_buffer_diagnostic.completed = true;
+    state.single_buffer_diagnostic.analyzer_disabled = true;
+    state.single_buffer_diagnostic.failed = true;
+    state.single_buffer_diagnostic.failure_stage = "cef.present_front_slot";
+    state.single_buffer_diagnostic.failure_frame = 12U;
+    state.single_buffer_diagnostic.failure_latency_us = 17000U;
     state.start_error = "start failed";
     state.action_error = "stop failed";
 
@@ -1650,14 +2007,86 @@ void test_live_runtime_state_to_json_surfaces_preview_and_pipeline_status() {
     assert(runtime.at("preview").at("displayed_region").at("x") == 4U);
     assert(runtime.at("preview").at("live_frame_id").at("sequence") == 11U);
     assert(runtime.at("preview").at("interop_failed") == false);
+    assert(runtime.at("preview").at("last_failure_reason") == "no_workspace_output");
+    assert(runtime.at("preview").at("last_failure_detail")
+               .get<std::string>()
+               .find("controller has not published a workspace") == std::string::npos);
+    assert(runtime.at("preview").at("last_failure_revision") == "12");
+    assert(runtime.at("preview").at("last_failure_stage") == "compositor.publish_workspace");
+    assert(runtime.at("preview").at("last_failure_live_frame_id").at("sequence") == 12U);
+    assert(runtime.at("preview").at("last_failure_cuda_device") == 1U);
+    assert(runtime.at("preview").at("last_failure_result_code") == "no_workspace_output");
+    assert(runtime.at("preview").at("last_failure_result_detail")
+               .get<std::string>()
+               .find("stage=compositor.publish_workspace") != std::string::npos);
+    assert(runtime.at("preview").at("publication_counters").at("attempted_workspace_acquisitions") == 4U);
+    assert(runtime.at("preview").at("publication_counters").at("startup_workspace_acquisition_misses") == 2U);
+    assert(runtime.at("preview").at("publication_counters").at("post_startup_workspace_acquisition_misses") == 1U);
+    assert(runtime.at("preview").at("publication_counters").at("retained_surfaces") == 1U);
     assert(runtime.at("controller").at("present") == true);
+    assert(runtime.at("fanout").at("frames_fanned_out") == 119U);
+    assert(runtime.at("fanout").at("skipped_detect_publishes") == 3U);
+    assert(runtime.at("fanout").at("skipped_output_publishes") == 4U);
+    assert(runtime.at("fanout").at("release_backlog") == 1U);
+    assert(runtime.at("fanout").at("acquire_misses") == 5U);
     assert(runtime.at("analyzer").at("backend_name") == "tensorrt");
     assert(runtime.at("analyzer").at("frames_analyzed") == 120U);
     assert(runtime.at("manual_overlay").at("last_generation") == 9U);
+    assert(runtime.at("compositor").at("frames_composited_after_startup") == 117U);
     assert(runtime.at("compositor").at("frames_dropped") == 2U);
+    assert(runtime.at("compositor").at("skipped_compositor_presents") == 6U);
+    assert(runtime.at("compositor").at("front_slot_index") == 2);
+    assert(runtime.at("compositor").at("front_slot_revision") == 12U);
     assert(runtime.at("compositor").at("last_frame_id").at("sequence") == 12U);
+    assert(runtime.at("single_buffer_diagnostic").at("enabled") == true);
+    assert(runtime.at("single_buffer_diagnostic").at("frame_count") == 8U);
+    assert(runtime.at("single_buffer_diagnostic").at("frame_budget_ns") == 16'000'000U);
+    assert(runtime.at("single_buffer_diagnostic").at("drawn_frames") == 8U);
+    assert(runtime.at("single_buffer_diagnostic").at("consecutive_miss_limit") == 2U);
+    assert(runtime.at("single_buffer_diagnostic").at("completed") == true);
+    assert(runtime.at("single_buffer_diagnostic").at("analyzer_disabled") == true);
+    assert(runtime.at("single_buffer_diagnostic").at("failed") == true);
+    assert(runtime.at("single_buffer_diagnostic").at("failure_stage") == "cef.present_front_slot");
+    assert(runtime.at("single_buffer_diagnostic").at("failure_frame") == 12U);
+    assert(runtime.at("single_buffer_diagnostic").at("failure_latency_us") == 17000U);
     assert(runtime.at("start_error") == "start failed");
     assert(runtime.at("action_error") == "stop failed");
+}
+
+void test_browser_live_display_startup_state_requires_current_drawn_revision() {
+    assert(std::string_view(browser_live_display_startup_state(false, "", "", "", "")) == "idle");
+    assert(std::string_view(browser_live_display_startup_state(true, "", "", "", "")) == "capture running");
+
+    const std::string current_revision = "401";
+    std::string imported_revision;
+    std::string submitted_revision;
+    std::string drawn_revision;
+    assert(std::string_view(browser_live_display_startup_state(true, current_revision, imported_revision,
+                                                               submitted_revision, drawn_revision)) ==
+           "surface published");
+
+    imported_revision = current_revision;
+    assert(std::string_view(browser_live_display_startup_state(true, current_revision, imported_revision,
+                                                               submitted_revision, drawn_revision)) ==
+           "texture imported");
+
+    submitted_revision.clear();
+    drawn_revision = "400";
+    assert(std::string_view(browser_live_display_startup_state(true, current_revision, imported_revision,
+                                                               submitted_revision, drawn_revision)) ==
+           "texture imported");
+
+    submitted_revision = current_revision;
+    drawn_revision.clear();
+    assert(std::string_view(browser_live_display_startup_state(true, current_revision, imported_revision,
+                                                               submitted_revision, drawn_revision)) ==
+           "draw submitted");
+
+    submitted_revision.clear();
+    drawn_revision = current_revision;
+    assert(std::string_view(browser_live_display_startup_state(true, current_revision, imported_revision,
+                                                               submitted_revision, drawn_revision)) ==
+           "draw submitted");
 }
 
 void test_apply_routed_settings_update_updates_bound_gui_state() {
@@ -2453,6 +2882,8 @@ void test_browser_host_helper_resolves_explicit_browser_root() {
 
 MMLTK_REGISTER_TEST_CASE("[gui][browser_host_api]", test_state_snapshot_round_trips_through_json);
 MMLTK_REGISTER_TEST_CASE("[gui][browser_host_api]", test_browser_runtime_capabilities_round_trip_accepts_cef_backend);
+MMLTK_REGISTER_TEST_CASE("[gui][browser_host_api]",
+                         test_browser_runtime_capabilities_round_trip_separates_bridge_from_zero_copy_proof);
 MMLTK_REGISTER_TEST_CASE("[gui][browser_host_api]", test_intent_round_trips_through_json);
 MMLTK_REGISTER_TEST_CASE("[gui][browser_host_api]", test_state_and_intent_type_validation_is_strict);
 MMLTK_REGISTER_TEST_CASE("[gui][browser_host_api]",
@@ -2471,7 +2902,11 @@ MMLTK_REGISTER_TEST_CASE("[gui][browser_host_api]", test_route_train_start_and_s
 MMLTK_REGISTER_TEST_CASE("[gui][browser_host_api]", test_route_train_remote_query_and_offer_intents);
 MMLTK_REGISTER_TEST_CASE("[gui][browser_host_api]", test_route_train_local_gpu_refresh_intent);
 MMLTK_REGISTER_TEST_CASE("[gui][browser_host_api]", test_route_validate_and_export_start_intents);
-MMLTK_REGISTER_TEST_CASE("[gui][browser_host_api]", test_file_dialog_binding_resolves_known_browser_dialog_ids);
+MMLTK_REGISTER_TEST_CASE("[gui][browser_host_api]", test_generated_browser_contract_dialog_ids_are_bound);
+MMLTK_REGISTER_TEST_CASE("[gui][browser_host_api]", test_generated_browser_contract_presets_match_rfdetr_catalog);
+MMLTK_REGISTER_TEST_CASE("[gui][browser_host_api]", test_native_browser_contract_metadata_covers_dtos_and_dispatch);
+MMLTK_REGISTER_TEST_CASE("[gui][browser_host_api]", test_native_contract_metadata_routes_representative_intent_corpus);
+MMLTK_REGISTER_TEST_CASE("[gui][browser_host_api]", test_route_intent_rejects_noncanonical_aliases);
 MMLTK_REGISTER_TEST_CASE("[gui][browser_host_api]", test_route_intent_validation_rejects_invalid_workflow_and_payloads);
 MMLTK_REGISTER_TEST_CASE("[gui][browser_host_api]", test_gui_source_selection_maps_to_browser_source_metadata);
 MMLTK_REGISTER_TEST_CASE("[gui][browser_host_api]", test_manual_overlay_snapshot_maps_to_annotation_document_state);
@@ -2484,6 +2919,8 @@ MMLTK_REGISTER_TEST_CASE("[gui][browser_host_api]",
                          test_state_snapshot_round_trips_live_runtime_metadata_with_workspace_surface);
 MMLTK_REGISTER_TEST_CASE("[gui][browser_host_api]",
                          test_live_runtime_state_to_json_surfaces_preview_and_pipeline_status);
+MMLTK_REGISTER_TEST_CASE("[gui][browser_host_api]",
+                         test_browser_live_display_startup_state_requires_current_drawn_revision);
 MMLTK_REGISTER_TEST_CASE("[gui][browser_host_api]", test_apply_routed_settings_update_updates_bound_gui_state);
 MMLTK_REGISTER_TEST_CASE("[gui][browser_host_api]", test_apply_routed_crop_commit_updates_workflow_source_selection);
 MMLTK_REGISTER_TEST_CASE("[gui][browser_host_api]", test_apply_routed_tool_select_updates_annotation_session);

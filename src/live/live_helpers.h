@@ -6,10 +6,18 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <EGL/egl.h>
+#include <EGL/eglext.h>
+#include <cudaEGL.h>
+
+struct gbm_bo;
+struct gbm_device;
 
 namespace mmltk::live {
 
@@ -18,6 +26,8 @@ inline void ensure_cuda_ok(const cudaError_t status, const char* context) {
         throw std::runtime_error(std::string(context) + ": " + cudaGetErrorString(status));
     }
 }
+
+void ensure_cuda_driver_ok(CUresult status, const char* context);
 
 inline bool event_ready(const cudaEvent_t event, const char* context = "cudaEventQuery") {
     if (event == nullptr) {
@@ -269,6 +279,184 @@ class PitchedDeviceBuffer {
 using BgrPitchedDeviceBuffer = PitchedDeviceBuffer<Bgr24Pixel>;
 using RgbaPitchedDeviceBuffer = PitchedDeviceBuffer<Rgba32Pixel>;
 
+struct GpuInteropAllocationProfile {
+    enum class Mode : std::uint8_t {
+        ExplicitModifier = 0,
+        ImplicitModifier = 1,
+    };
+
+    Mode mode = Mode::ImplicitModifier;
+    std::uint32_t usage_flags = 0;
+    std::uint64_t modifier = kWorkspaceDmaBufDrmFormatModInvalid;
+    DmaBufModifierMode modifier_mode = DmaBufModifierMode::Unknown;
+    const char* label = "";
+};
+
+class LinuxGpuInteropDevice {
+   public:
+    LinuxGpuInteropDevice() = default;
+    ~LinuxGpuInteropDevice();
+
+    LinuxGpuInteropDevice(const LinuxGpuInteropDevice&) = delete;
+    LinuxGpuInteropDevice& operator=(const LinuxGpuInteropDevice&) = delete;
+
+    LinuxGpuInteropDevice(LinuxGpuInteropDevice&& other) noexcept;
+    LinuxGpuInteropDevice& operator=(LinuxGpuInteropDevice&& other) noexcept;
+
+    void ensure_open(int cuda_device_index, const char* context);
+    void reset() noexcept;
+
+    [[nodiscard]] gbm_device* get() const noexcept {
+        return device_;
+    }
+    [[nodiscard]] int fd() const noexcept {
+        return fd_;
+    }
+    [[nodiscard]] int cuda_device_index() const noexcept {
+        return cuda_device_index_;
+    }
+    [[nodiscard]] const std::string& render_node_path() const noexcept {
+        return render_node_path_;
+    }
+    [[nodiscard]] const std::string& gbm_backend_name() const noexcept {
+        return gbm_backend_name_;
+    }
+    [[nodiscard]] EGLDisplay egl_display() const noexcept {
+        return egl_display_;
+    }
+    [[nodiscard]] PFNEGLCREATEIMAGEKHRPROC egl_create_image() const noexcept {
+        return egl_create_image_;
+    }
+    [[nodiscard]] PFNEGLDESTROYIMAGEKHRPROC egl_destroy_image() const noexcept {
+        return egl_destroy_image_;
+    }
+    [[nodiscard]] const std::vector<std::uint64_t>& dma_buf_modifiers() const noexcept {
+        return dma_buf_modifiers_;
+    }
+    [[nodiscard]] bool has_dma_buf_import_modifiers() const noexcept {
+        return has_dma_buf_import_modifiers_;
+    }
+    [[nodiscard]] bool omit_modifier_attrs_for_implicit_imports() const noexcept {
+        return omit_modifier_attrs_for_implicit_imports_;
+    }
+    [[nodiscard]] const std::optional<GpuInteropAllocationProfile>& cached_allocation_profile() const noexcept {
+        return cached_allocation_profile_;
+    }
+    void cache_allocation_profile(GpuInteropAllocationProfile profile) {
+        cached_allocation_profile_ = profile;
+    }
+    [[nodiscard]] bool empty() const noexcept {
+        return device_ == nullptr;
+    }
+
+   private:
+    void clear_after_move() noexcept;
+
+    int fd_ = -1;
+    int cuda_device_index_ = -1;
+    std::string render_node_path_;
+    std::string gbm_backend_name_;
+    gbm_device* device_ = nullptr;
+    EGLDisplay egl_display_ = EGL_NO_DISPLAY;
+    EGLContext egl_context_ = EGL_NO_CONTEXT;
+    PFNEGLCREATEIMAGEKHRPROC egl_create_image_ = nullptr;
+    PFNEGLDESTROYIMAGEKHRPROC egl_destroy_image_ = nullptr;
+    PFNEGLQUERYDMABUFFORMATSEXTPROC egl_query_dma_buf_formats_ = nullptr;
+    PFNEGLQUERYDMABUFMODIFIERSEXTPROC egl_query_dma_buf_modifiers_ = nullptr;
+    std::vector<std::uint64_t> dma_buf_modifiers_;
+    bool has_dma_buf_import_modifiers_ = false;
+    bool omit_modifier_attrs_for_implicit_imports_ = true;
+    std::optional<GpuInteropAllocationProfile> cached_allocation_profile_;
+};
+
+class DmaBufCudaRgbaSurface {
+   public:
+    DmaBufCudaRgbaSurface() = default;
+    ~DmaBufCudaRgbaSurface();
+
+    DmaBufCudaRgbaSurface(const DmaBufCudaRgbaSurface&) = delete;
+    DmaBufCudaRgbaSurface& operator=(const DmaBufCudaRgbaSurface&) = delete;
+
+    DmaBufCudaRgbaSurface(DmaBufCudaRgbaSurface&& other) noexcept;
+    DmaBufCudaRgbaSurface& operator=(DmaBufCudaRgbaSurface&& other) noexcept;
+
+    void ensure_dimensions(LinuxGpuInteropDevice& interop_device, int cuda_device_index, std::uint32_t width,
+                           std::uint32_t height, const char* context);
+    void reset() noexcept;
+
+    [[nodiscard]] CUdeviceptr data() const noexcept {
+        return device_ptr_;
+    }
+    [[nodiscard]] std::size_t pitch_bytes() const noexcept {
+        return stride_bytes_;
+    }
+    [[nodiscard]] std::uint32_t width() const noexcept {
+        return width_;
+    }
+    [[nodiscard]] std::uint32_t height() const noexcept {
+        return height_;
+    }
+    [[nodiscard]] int fd() const noexcept {
+        return fd_;
+    }
+    [[nodiscard]] int duplicate_fd(const char* context) const;
+    [[nodiscard]] WorkspaceDmaBufImage dmabuf_image(std::uint32_t published_width,
+                                                    std::uint32_t published_height) const;
+    [[nodiscard]] bool empty() const noexcept {
+        return cuda_resource_ == nullptr;
+    }
+    [[nodiscard]] bool is_pitch_frame() const noexcept {
+        return frame_type_ == CU_EGL_FRAME_TYPE_PITCH && device_ptr_ != 0;
+    }
+    [[nodiscard]] bool is_array_frame() const noexcept {
+        return frame_type_ == CU_EGL_FRAME_TYPE_ARRAY && surface_object_ != 0;
+    }
+    [[nodiscard]] cudaSurfaceObject_t surface_object() const noexcept {
+        return static_cast<cudaSurfaceObject_t>(surface_object_);
+    }
+    [[nodiscard]] CUarray array() const noexcept {
+        return array_;
+    }
+    [[nodiscard]] std::uint32_t channel_count() const noexcept {
+        return channel_count_;
+    }
+    [[nodiscard]] CUarray_format cuda_format() const noexcept {
+        return cuda_format_;
+    }
+    [[nodiscard]] CUeglFrameType frame_type() const noexcept {
+        return frame_type_;
+    }
+    [[nodiscard]] DmaBufModifierMode modifier_mode() const noexcept {
+        return modifier_mode_;
+    }
+
+   private:
+    void initialize(LinuxGpuInteropDevice& interop_device, const GpuInteropAllocationProfile& profile,
+                    std::uint32_t width, std::uint32_t height, const char* context);
+    void clear_after_move() noexcept;
+
+    gbm_bo* bo_ = nullptr;
+    EGLDisplay egl_display_ = EGL_NO_DISPLAY;
+    PFNEGLDESTROYIMAGEKHRPROC egl_destroy_image_ = nullptr;
+    EGLImageKHR egl_image_ = EGL_NO_IMAGE_KHR;
+    CUgraphicsResource cuda_resource_ = nullptr;
+    CUsurfObject surface_object_ = 0;
+    CUarray array_ = nullptr;
+    CUdeviceptr device_ptr_ = 0;
+    int fd_ = -1;
+    std::uint32_t width_ = 0;
+    std::uint32_t height_ = 0;
+    std::size_t stride_bytes_ = 0;
+    std::uint64_t offset_ = 0;
+    std::uint64_t allocation_size_ = 0;
+    std::uint32_t drm_format_ = 0;
+    std::uint64_t drm_modifier_ = 0;
+    DmaBufModifierMode modifier_mode_ = DmaBufModifierMode::Unknown;
+    CUeglFrameType frame_type_ = CU_EGL_FRAME_TYPE_PITCH;
+    std::uint32_t channel_count_ = 0;
+    CUarray_format cuda_format_ = CU_AD_FORMAT_UNSIGNED_INT8;
+};
+
 class CudaStreamHandle {
    public:
     CudaStreamHandle() = default;
@@ -378,6 +566,26 @@ bool try_acquire_published_slot(Slot& slot, Output* out, BuildOutput&& build_out
     return true;
 }
 
+template <typename Slot, typename Output, typename BuildOutput, typename ReadyEventAccessor>
+bool try_acquire_ready_published_slot(Slot& slot, Output* out, BuildOutput&& build_output,
+                                      ReadyEventAccessor&& ready_event_of, const char* event_context) {
+    if (slot.state.load(std::memory_order_acquire) != to_slot_state_value(SlotState::kPublished)) {
+        return false;
+    }
+    if (!event_ready(ready_event_of(slot), event_context)) {
+        return false;
+    }
+
+    std::uint32_t expected = to_slot_state_value(SlotState::kPublished);
+    if (!slot.state.compare_exchange_strong(expected, to_slot_state_value(SlotState::kAcquired),
+                                            std::memory_order_acq_rel)) {
+        return false;
+    }
+
+    *out = build_output(slot);
+    return true;
+}
+
 template <typename Slot>
 void release_acquired_slot(Slot& slot, const char* context) {
     std::uint32_t expected = to_slot_state_value(SlotState::kAcquired);
@@ -401,6 +609,29 @@ bool try_acquire_latest_published_slot(std::vector<std::unique_ptr<Slot>>& slots
             continue;
         }
         if (try_acquire_published_slot(*slot, out, build_output)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+template <typename Slot, typename Output, typename BuildOutput, typename ReadyEventAccessor>
+bool try_acquire_latest_ready_published_slot(std::vector<std::unique_ptr<Slot>>& slots,
+                                             const std::atomic<int>& latest_index, Output* out,
+                                             BuildOutput&& build_output, ReadyEventAccessor&& ready_event_of,
+                                             const char* event_context) {
+    const int latest = latest_index.load(std::memory_order_acquire);
+    if (latest >= 0 && latest < static_cast<int>(slots.size()) &&
+        try_acquire_ready_published_slot(*slots[static_cast<std::size_t>(latest)], out, build_output, ready_event_of,
+                                         event_context)) {
+        return true;
+    }
+
+    for (auto& slot : slots) {
+        if (static_cast<int>(slot->slot_index) == latest) {
+            continue;
+        }
+        if (try_acquire_ready_published_slot(*slot, out, build_output, ready_event_of, event_context)) {
             return true;
         }
     }

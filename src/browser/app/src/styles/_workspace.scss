@@ -2,23 +2,27 @@
 @use "mixins" as *;
 
 .workspace {
-  @include stack(1rem);
+  @include stack(space-token(md));
 }
 
 .workspace-frame {
+  --workspace-canvas-min-height: 480px;
+
   position: relative;
-  min-height: 480px;
+  min-height: var(--workspace-canvas-min-height);
   overflow: hidden;
   border: 1px solid var(--panel-border-strong);
   border-radius: radius-token(md);
   background: var(--workspace-frame-bg);
+  box-shadow: var(--shadow);
 }
 
-#workspace-canvas {
+#workspace-canvas,
+.workspace-canvas {
   display: block;
   width: 100%;
   height: 100%;
-  min-height: 480px;
+  min-height: var(--workspace-canvas-min-height, 480px);
   cursor: grab;
   touch-action: none;
 
@@ -48,6 +52,22 @@
   display: flex;
   flex-wrap: wrap;
   gap: space-token(md);
+}
+
+.workspace-status {
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+.pill {
+  min-width: 0;
+  max-width: 100%;
+
+  span,
+  strong {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
 }
 
 .console-block {

@@ -57,7 +57,7 @@ index b229de2731dc6a86b9909322c0d0e94e8f2e7eb7..1d55f8ee98f93d77252badbb9fc8f670
  import("//testing/test.gni")
  import("//third_party/blink/renderer/bindings/bindings.gni")
  import("//third_party/blink/renderer/config.gni")
-@@ -73,6 +74,17 @@ component("controller") {
+@@ -73,6 +74,15 @@ component("controller") {
      "performance_manager/v8_worker_memory_reporter.h",
    ]
  
@@ -65,8 +65,6 @@ index b229de2731dc6a86b9909322c0d0e94e8f2e7eb7..1d55f8ee98f93d77252badbb9fc8f670
 +    sources += [
 +      "//cef/libcef/renderer/blink_glue.cc",
 +      "//cef/libcef/renderer/blink_glue.h",
-+      "//cef/libcef/renderer/workspace_gpu_bridge.cc",
-+      "//cef/libcef/renderer/workspace_gpu_bridge.h",
 +    ]
 +    configs += [ "//cef/libcef/features:config" ]
 +    deps += [ "//cef/libcef/features:deps" ]

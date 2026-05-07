@@ -8,6 +8,14 @@ declare global {
     message: string;
   }
 
+  interface GPUError {
+    readonly message: string;
+  }
+
+  interface GPUUncapturedErrorEvent extends Event {
+    readonly error: GPUError;
+  }
+
   interface GPUTexture {
     createView(): GPUTextureView;
     destroy(): void;
@@ -37,6 +45,7 @@ declare global {
 
   interface GPUCommandEncoder {
     beginRenderPass(descriptor: unknown): GPURenderPassEncoder;
+    copyTextureToTexture(source: unknown, destination: unknown, copySize: unknown): void;
     finish(): GPUCommandBuffer;
   }
 
@@ -82,6 +91,10 @@ declare global {
   interface GPUDevice {
     lost: Promise<GPUDeviceLostInfo>;
     queue: GPUQueue;
+    addEventListener(
+      type: "uncapturederror",
+      listener: (event: GPUUncapturedErrorEvent) => void,
+    ): void;
     createShaderModule(descriptor: unknown): GPUShaderModule;
     createRenderPipeline(descriptor: unknown): GPURenderPipeline;
     createBuffer(descriptor: unknown): GPUBuffer;

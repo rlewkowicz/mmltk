@@ -1,0 +1,14 @@
+diff --git content/browser/renderer_host/render_widget_host_view_aura.cc content/browser/renderer_host/render_widget_host_view_aura.cc
+index 0db43bb27e2ab..6e7f745e8a069 100644
+--- content/browser/renderer_host/render_widget_host_view_aura.cc
++++ content/browser/renderer_host/render_widget_host_view_aura.cc
+@@ -554,7 +554,8 @@ gfx::NativeViewAccessible RenderWidgetHostViewAura::GetNativeViewAccessible() {
+     return manager->GetBrowserAccessibilityRoot()->GetNativeViewAccessible();
+ #endif
+ 
+-  NOTIMPLEMENTED_LOG_ONCE();
++  // Linux/Wayland has no platform native accessible object here. Return the
++  // null native accessible quietly instead of logging a live-capture warning.
+   return static_cast<gfx::NativeViewAccessible>(nullptr);
+ }
+ 

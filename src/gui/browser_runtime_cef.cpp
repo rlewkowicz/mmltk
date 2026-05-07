@@ -16,6 +16,8 @@
 #include "gui/cef_subprocess_app.h"
 #include "gui/cef_views/cef_app_runner.h"
 #include "gui/cef_views/cef_browser_shell.h"
+#include "live/live_worker_logging.h"
+#include "mmltk/live/live_pipeline_trace.h"
 #include "mmltk_logging.h"
 
 #include "include/base/cef_bind.h"
@@ -48,6 +50,7 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
@@ -63,6 +66,7 @@
 #include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -73,6 +77,7 @@ namespace mmltk::gui {
 namespace {
 
 constexpr auto kRuntimeCapabilityProbeTimeout = std::chrono::seconds(2);
+constexpr auto kNativePresentSlotBusyRetryDelay = std::chrono::milliseconds(50);
 constexpr int kMainWindowWidth = 1600;
 constexpr int kMainWindowHeight = 1000;
 constexpr int kPopupWindowWidth = 1200;
@@ -103,6 +108,31 @@ using namespace runtime_shared;
     return std::string(value);
 }
 
+[[nodiscard]] std::string cef_ascii_lowercase_copy(std::string_view value) {
+    std::string lower(value);
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return lower;
+}
+
+[[nodiscard]] bool cef_parse_bool_text(std::string_view value, bool fallback) {
+    const std::string lowered = cef_ascii_lowercase_copy(value);
+    if (lowered == "1" || lowered == "true" || lowered == "yes" || lowered == "on") {
+        return true;
+    }
+    if (lowered == "0" || lowered == "false" || lowered == "no" || lowered == "off") {
+        return false;
+    }
+    return fallback;
+}
+
+[[nodiscard]] bool cef_verbose_logging_enabled() {
+    if (const auto value = read_non_empty_env("MMLTK_CEF_VERBOSE_LOGGING"); value.has_value()) {
+        return cef_parse_bool_text(*value, false);
+    }
+    return false;
+}
+
 [[nodiscard]] std::filesystem::path resolve_cef_root_cache_path() {
     if (const std::optional<std::string> configured_root = read_non_empty_env("MMLTK_CEF_ROOT_CACHE_PATH");
         configured_root.has_value()) {
@@ -114,6 +144,13 @@ using namespace runtime_shared;
     }
 
     return (std::filesystem::temp_directory_path() / "mmltk" / "cef_user_data").lexically_normal();
+}
+
+[[nodiscard]] std::filesystem::path resolve_cef_log_file_path(const std::filesystem::path& cef_root_cache_path) {
+    if (const auto configured_log_file = read_non_empty_env("MMLTK_CEF_LOG_FILE"); configured_log_file.has_value()) {
+        return std::filesystem::path(*configured_log_file).lexically_normal();
+    }
+    return (cef_root_cache_path / "chrome_debug.log").lexically_normal();
 }
 
 [[nodiscard]] mmltk::browser::BrowserRuntimeCapabilities configured_runtime_capabilities() {
@@ -143,6 +180,67 @@ struct CefBundlePaths {
 
 [[nodiscard]] std::string app_origin() {
     return runtime_shared::app_origin(kAppScheme, kAppHost);
+}
+
+[[nodiscard]] std::string workspace_gpu_bridge_publication_key(const std::string_view surface_id,
+                                                               const std::string_view revision) {
+    return std::string(surface_id) + '\n' + std::string(revision);
+}
+
+[[nodiscard]] bool should_log_cadence(const std::uint64_t count) noexcept {
+    return count <= 3U || count % 300U == 0U;
+}
+
+[[nodiscard]] std::int32_t cef_rect_int(const double value) noexcept {
+    if (!std::isfinite(value)) {
+        return 0;
+    }
+    constexpr double kMin = static_cast<double>(std::numeric_limits<std::int32_t>::min());
+    constexpr double kMax = static_cast<double>(std::numeric_limits<std::int32_t>::max());
+    return static_cast<std::int32_t>(std::clamp(std::llround(value), static_cast<long long>(kMin),
+                                               static_cast<long long>(kMax)));
+}
+
+[[nodiscard]] std::int32_t cef_rect_size(const double value) noexcept {
+    if (!std::isfinite(value) || value <= 0.0) {
+        return 0;
+    }
+    constexpr double kMax = static_cast<double>(std::numeric_limits<std::int32_t>::max());
+    return static_cast<std::int32_t>(std::clamp(std::llround(value), 0LL, static_cast<long long>(kMax)));
+}
+
+[[nodiscard]] WorkspaceGpuBridgePresentRects workspace_present_rects(
+    const mmltk::browser::WorkspaceBoundsIntent& bounds, const mmltk::live::WorkspacePresentSnapshot& present) {
+    const mmltk::browser::WorkspaceSurfaceRect& viewport = bounds.viewport_css;
+    WorkspaceGpuBridgePresentRects rects;
+    rects.bounds_x = cef_rect_int(viewport.x);
+    rects.bounds_y = cef_rect_int(viewport.y);
+    rects.bounds_width = cef_rect_size(viewport.width);
+    rects.bounds_height = cef_rect_size(viewport.height);
+
+    const mmltk::live::LiveCaptureRegion& dirty = present.dirty_rect;
+    const bool dirty_valid = dirty.width > 0U && dirty.height > 0U && present.dims.width > 0U && present.dims.height > 0U;
+    if (!dirty_valid) {
+        rects.damage_x = rects.bounds_x;
+        rects.damage_y = rects.bounds_y;
+        rects.damage_width = rects.bounds_width;
+        rects.damage_height = rects.bounds_height;
+        return rects;
+    }
+
+    const double scale_x = viewport.width / static_cast<double>(present.dims.width);
+    const double scale_y = viewport.height / static_cast<double>(present.dims.height);
+    rects.damage_x = cef_rect_int(viewport.x + static_cast<double>(dirty.x) * scale_x);
+    rects.damage_y = cef_rect_int(viewport.y + static_cast<double>(dirty.y) * scale_y);
+    rects.damage_width = cef_rect_size(static_cast<double>(dirty.width) * scale_x);
+    rects.damage_height = cef_rect_size(static_cast<double>(dirty.height) * scale_y);
+    if (rects.damage_width <= 0 || rects.damage_height <= 0) {
+        rects.damage_x = rects.bounds_x;
+        rects.damage_y = rects.bounds_y;
+        rects.damage_width = rects.bounds_width;
+        rects.damage_height = rects.bounds_height;
+    }
+    return rects;
 }
 
 [[nodiscard]] std::string browser_entry_uri(const BrowserHostAssetPaths& assets,
@@ -313,7 +411,7 @@ class EmbeddedCefBrowserRuntime::Impl {
     void on_load_error(const CefRefPtr<CefBrowser>& browser, std::string_view error_text, std::string_view failed_url,
                        int error_code);
     void on_renderer_message(const CefRefPtr<CefBrowser>& browser, const std::string& message_text);
-    void on_websocket_message(std::string message_text);
+    void on_websocket_message(const std::string& message_text);
     void on_renderer_error(const CefRefPtr<CefBrowser>& browser, const std::string& message_text);
     void on_workspace_gpu_bridge_release(const CefRefPtr<CefBrowser>& browser, std::string_view surface_id,
                                          std::string_view revision);
@@ -336,6 +434,12 @@ class EmbeddedCefBrowserRuntime::Impl {
     void refresh_snapshot_runtime_capabilities(mmltk::browser::StateSnapshot& snapshot);
     void refresh_snapshot();
     void sync_workspace_gpu_bridge_publication();
+    [[nodiscard]] bool sync_workspace_native_presented_swapchain();
+    void clear_workspace_gpu_bridge_renderer_publication();
+    void destroy_workspace_native_presented_swapchain(std::string_view reason);
+    void track_workspace_gpu_bridge_publication(const WorkspaceGpuBridgeSurfacePublication& publication);
+    void release_tracked_workspace_gpu_bridge_publication(std::string_view surface_id, std::string_view revision);
+    void release_all_tracked_workspace_gpu_bridge_publications();
     void flush_pending_messages();
     [[nodiscard]] bool is_main_browser(const CefRefPtr<CefBrowser>& browser) const noexcept;
 
@@ -379,9 +483,19 @@ class EmbeddedCefBrowserRuntime::Impl {
     std::optional<RelaunchRequest> last_relaunch_request_;
     std::optional<std::chrono::steady_clock::time_point> runtime_capability_deadline_;
     std::optional<WorkspaceGpuBridgeSurfacePublication> delivered_workspace_gpu_bridge_publication_;
+    std::unordered_set<std::string> tracked_workspace_gpu_bridge_publication_keys_;
     std::optional<std::chrono::steady_clock::time_point> startup_checkpoint_deadline_;
     std::uint64_t surface_ready_log_count_ = 0;
     std::uint64_t surface_release_log_count_ = 0;
+    std::uint64_t native_present_log_count_ = 0;
+    std::uint64_t native_present_missing_bounds_log_count_ = 0;
+    std::uint64_t native_present_stale_log_count_ = 0;
+    std::uint64_t native_present_error_log_count_ = 0;
+    std::uint64_t native_present_slot_busy_log_count_ = 0;
+    std::uint64_t native_swapchain_configured_generation_ = 0;
+    std::uint64_t native_swapchain_last_present_revision_ = 0;
+    std::chrono::steady_clock::time_point native_present_slot_busy_retry_after_{};
+    bool native_swapchain_configured_ = false;
     std::shared_ptr<EventPumpWakeState> event_pump_wake_state_ = std::make_shared<EventPumpWakeState>();
     std::mutex asset_cache_mutex_;
     std::unordered_map<int, CefRefPtr<CefBrowser>> live_browsers_;
@@ -415,6 +529,8 @@ class CefRuntimeClient : public CefClient, public CefDisplayHandler, public CefL
     void OnLoadEnd(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, int httpStatusCode) override;
     void OnLoadError(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, ErrorCode errorCode,
                      const CefString& errorText, const CefString& failedUrl) override;
+    bool OnConsoleMessage(CefRefPtr<CefBrowser> browser, cef_log_severity_t level, const CefString& message,
+                          const CefString& source, int line) override;
     bool OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame> frame, CefProcessId source_process,
                                   CefRefPtr<CefProcessMessage> message) override;
 
@@ -513,6 +629,11 @@ bool EmbeddedCefBrowserRuntime::Impl::initialize(const int argc, char** argv) {
     const std::filesystem::path cef_root_cache_path = resolve_cef_root_cache_path();
     std::error_code cache_dir_error;
     (void)std::filesystem::create_directories(cef_root_cache_path, cache_dir_error);
+    const std::filesystem::path cef_log_file_path = resolve_cef_log_file_path(cef_root_cache_path);
+    std::error_code log_dir_error;
+    if (const std::filesystem::path cef_log_dir = cef_log_file_path.parent_path(); !cef_log_dir.empty()) {
+        (void)std::filesystem::create_directories(cef_log_dir, log_dir_error);
+    }
     CefString(&settings.root_cache_path) = cef_root_cache_path.string();
     CefString(&settings.cache_path) = cef_root_cache_path.string();
     const std::filesystem::path helper_path =
@@ -523,10 +644,13 @@ bool EmbeddedCefBrowserRuntime::Impl::initialize(const int argc, char** argv) {
     (void)::setenv("MMLTK_CEF_RUNTIME_ROOT", cef_runtime_root.c_str(), 1);
     (void)::setenv("MMLTK_CEF_RESOURCES_DIR", cef_resources_dir.c_str(), 1);
     (void)::setenv("MMLTK_CEF_LOCALES_DIR", cef_locales_dir.c_str(), 1);
+    const std::string cef_log_file = cef_log_file_path.string();
+    (void)::setenv("MMLTK_CEF_LOG_FILE", cef_log_file.c_str(), 1);
     CefString(&settings.browser_subprocess_path) = helper_path.string();
     CefString(&settings.resources_dir_path) = cef_resources_dir;
     CefString(&settings.locales_dir_path) = cef_locales_dir;
-    settings.log_severity = LOGSEVERITY_WARNING;
+    CefString(&settings.log_file) = cef_log_file;
+    settings.log_severity = cef_verbose_logging_enabled() ? LOGSEVERITY_INFO : LOGSEVERITY_WARNING;
 
     const auto logger = mmltk::logging::logger("gui");
     const CefRuntimeLaunchConfig& launch_config = cef_runtime_launch_config();
@@ -539,9 +663,20 @@ bool EmbeddedCefBrowserRuntime::Impl::initialize(const int argc, char** argv) {
     if (const auto loaded_libcef = loaded_cef_library_path(); loaded_libcef.has_value()) {
         logger->info("embedded CEF loaded libcef `{}`", *loaded_libcef);
     }
+    logger->info(
+        "embedded CEF compositor startup: windowless_rendering_enabled={} multi_threaded_message_loop={} "
+        "external_message_pump={} ozone_platform=wayland webgpu_runtime={} unsafe_webgpu={} "
+        "force_high_performance_gpu={} gpu_switches_logged_by_command_line_hook=true",
+        settings.windowless_rendering_enabled, settings.multi_threaded_message_loop, settings.external_message_pump,
+        cef_webgpu_runtime_name(launch_config.webgpu_runtime), launch_config.enable_unsafe_webgpu,
+        launch_config.force_high_performance_gpu);
     logger->info("embedded CEF root cache path `{}`", cef_root_cache_path.string());
+    logger->info("embedded CEF log file path `{}`", cef_log_file);
     if (cache_dir_error) {
         logger->warn("embedded CEF root cache directory create failed: {}", cache_dir_error.message());
+    }
+    if (log_dir_error) {
+        logger->warn("embedded CEF log directory create failed: {}", log_dir_error.message());
     }
 
     application_cef_ = new CefApplication(this);
@@ -558,9 +693,9 @@ bool EmbeddedCefBrowserRuntime::Impl::initialize(const int argc, char** argv) {
     install_evented_work_wake_callback();
     if (!websocket_server_.start({.on_message = [this](std::string message_text) {
             CefPostTask(TID_UI, base::BindOnce(
-                                    [](EmbeddedCefBrowserRuntime::Impl* runtime, std::string payload) {
+                                    [](EmbeddedCefBrowserRuntime::Impl* runtime, const std::string& payload) {
                                         if (runtime != nullptr) {
-                                            runtime->on_websocket_message(std::move(payload));
+                                            runtime->on_websocket_message(payload);
                                         }
                                     },
                                     this, std::move(message_text)));
@@ -608,6 +743,8 @@ void EmbeddedCefBrowserRuntime::Impl::shutdown() {
     }
 
     if (cef_initialized_) {
+        destroy_workspace_native_presented_swapchain("runtime_shutdown");
+        release_all_tracked_workspace_gpu_bridge_publications();
         app_.release_all_workspace_surface_publications();
         if (!browsers_closed) {
             mmltk::logging::logger("gui")->error(
@@ -781,6 +918,8 @@ void EmbeddedCefBrowserRuntime::Impl::on_before_close(const CefRefPtr<CefBrowser
     const bool was_main = is_main_browser(browser);
     live_browsers_.erase(browser->GetIdentifier());
     if (was_main) {
+        destroy_workspace_native_presented_swapchain("browser_before_close");
+        release_all_tracked_workspace_gpu_bridge_publications();
         workspace_gpu_bridge_state_synced_ = false;
         delivered_workspace_gpu_bridge_publication_.reset();
         browser_ = nullptr;
@@ -797,6 +936,8 @@ void EmbeddedCefBrowserRuntime::Impl::on_load_start(const CefRefPtr<CefBrowser>&
     }
 
     note_startup_checkpoint("main-frame load start");
+    destroy_workspace_native_presented_swapchain("main_frame_load_start");
+    release_all_tracked_workspace_gpu_bridge_publications();
     app_.release_all_workspace_surface_publications();
     runtime_shared::clear_delivery_state(
         page_callbacks_ready_, delivered_snapshot_json_, delivered_bridge_state_json_, pending_error_text_,
@@ -841,7 +982,7 @@ void EmbeddedCefBrowserRuntime::Impl::on_renderer_message(const CefRefPtr<CefBro
     pump_evented_work();
 }
 
-void EmbeddedCefBrowserRuntime::Impl::on_websocket_message(std::string message_text) {
+void EmbeddedCefBrowserRuntime::Impl::on_websocket_message(const std::string& message_text) {
     CEF_REQUIRE_UI_THREAD();
     if (shutdown_) {
         return;
@@ -924,19 +1065,19 @@ void EmbeddedCefBrowserRuntime::Impl::install_evented_work_wake_callback() {
         }
 
         const bool posted = CefPostTask(
-            TID_UI,
-            base::BindOnce(
-                [](std::weak_ptr<EventPumpWakeState> posted_weak_state, EmbeddedCefBrowserRuntime::Impl* runtime) {
-                    const std::shared_ptr<EventPumpWakeState> posted_state = posted_weak_state.lock();
-                    if (!posted_state || !posted_state->alive.load(std::memory_order_acquire)) {
-                        return;
-                    }
-                    posted_state->queued.store(false, std::memory_order_release);
-                    if (runtime != nullptr) {
-                        runtime->pump_evented_work();
-                    }
-                },
-                weak_state, this));
+            TID_UI, base::BindOnce(
+                        [](const std::weak_ptr<EventPumpWakeState>& posted_weak_state,
+                           EmbeddedCefBrowserRuntime::Impl* runtime) {
+                            const std::shared_ptr<EventPumpWakeState> posted_state = posted_weak_state.lock();
+                            if (!posted_state || !posted_state->alive.load(std::memory_order_acquire)) {
+                                return;
+                            }
+                            posted_state->queued.store(false, std::memory_order_release);
+                            if (runtime != nullptr) {
+                                runtime->pump_evented_work();
+                            }
+                        },
+                        weak_state, this));
         if (!posted) {
             state->queued.store(false, std::memory_order_release);
         }
@@ -1039,6 +1180,8 @@ void EmbeddedCefBrowserRuntime::Impl::request_quit(const bool force_close) {
     CEF_REQUIRE_UI_THREAD();
     if (!quit_requested_) {
         quit_requested_ = true;
+        destroy_workspace_native_presented_swapchain("runtime_quit");
+        release_all_tracked_workspace_gpu_bridge_publications();
         app_.release_all_workspace_surface_publications();
     }
     if (!live_browsers_.empty()) {
@@ -1072,6 +1215,213 @@ void EmbeddedCefBrowserRuntime::Impl::refresh_snapshot() {
         current_snapshot_json_, current_snapshot_revision_, snapshot_dirty_, delivered_snapshot_json_);
 }
 
+void EmbeddedCefBrowserRuntime::Impl::track_workspace_gpu_bridge_publication(
+    const WorkspaceGpuBridgeSurfacePublication& publication) {
+    tracked_workspace_gpu_bridge_publication_keys_.insert(
+        workspace_gpu_bridge_publication_key(publication.surface_info.surface_id, publication.surface_info.revision));
+}
+
+void EmbeddedCefBrowserRuntime::Impl::release_tracked_workspace_gpu_bridge_publication(
+    const std::string_view surface_id, const std::string_view revision) {
+    if (surface_id.empty() || revision.empty()) {
+        return;
+    }
+    const std::string key = workspace_gpu_bridge_publication_key(surface_id, revision);
+    if (tracked_workspace_gpu_bridge_publication_keys_.erase(key) == 0U) {
+        return;
+    }
+    release_workspace_gpu_bridge_publication(surface_id, revision);
+    if (delivered_workspace_gpu_bridge_publication_.has_value() &&
+        delivered_workspace_gpu_bridge_publication_->surface_info.surface_id == surface_id &&
+        delivered_workspace_gpu_bridge_publication_->surface_info.revision == revision) {
+        delivered_workspace_gpu_bridge_publication_.reset();
+        workspace_gpu_bridge_state_synced_ = false;
+    }
+}
+
+void EmbeddedCefBrowserRuntime::Impl::release_all_tracked_workspace_gpu_bridge_publications() {
+    for (const std::string& key : tracked_workspace_gpu_bridge_publication_keys_) {
+        const std::size_t separator = key.find('\n');
+        if (separator == std::string::npos) {
+            continue;
+        }
+        release_workspace_gpu_bridge_publication(std::string_view(key).substr(0U, separator),
+                                                 std::string_view(key).substr(separator + 1U));
+    }
+    tracked_workspace_gpu_bridge_publication_keys_.clear();
+    delivered_workspace_gpu_bridge_publication_.reset();
+    workspace_gpu_bridge_state_synced_ = false;
+}
+
+void EmbeddedCefBrowserRuntime::Impl::clear_workspace_gpu_bridge_renderer_publication() {
+    if (!tracked_workspace_gpu_bridge_publication_keys_.empty() ||
+        delivered_workspace_gpu_bridge_publication_.has_value()) {
+        release_all_tracked_workspace_gpu_bridge_publications();
+    }
+    if (!workspace_gpu_bridge_state_synced_) {
+        send_workspace_gpu_bridge_publication(browser_, std::nullopt);
+        delivered_workspace_gpu_bridge_publication_.reset();
+        workspace_gpu_bridge_state_synced_ = true;
+    }
+}
+
+void EmbeddedCefBrowserRuntime::Impl::destroy_workspace_native_presented_swapchain(const std::string_view reason) {
+    CEF_REQUIRE_UI_THREAD();
+    if (!native_swapchain_configured_) {
+        native_swapchain_configured_generation_ = 0U;
+        native_swapchain_last_present_revision_ = 0U;
+        return;
+    }
+
+    const WorkspaceGpuBridgeCefResult result =
+        destroy_cef_workspace_gpu_bridge_swapchain(kBrowserWorkspaceSurfaceId);
+    if (result.ok) {
+        mmltk::logging::logger("gui")->info(
+            "workspace GPU bridge native swapchain destroyed: generation={} reason={} detail={}",
+            native_swapchain_configured_generation_, reason, result.message("ok"));
+    } else {
+        mmltk::logging::logger("gui")->warn(
+            "workspace GPU bridge native swapchain destroy rejected: generation={} reason={} detail={}",
+            native_swapchain_configured_generation_, reason, result.message("swapchain_destroy_failed"));
+    }
+    native_swapchain_configured_ = false;
+    native_swapchain_configured_generation_ = 0U;
+    native_swapchain_last_present_revision_ = 0U;
+    native_present_log_count_ = 0U;
+    native_present_slot_busy_log_count_ = 0U;
+    native_present_slot_busy_retry_after_ = {};
+}
+
+bool EmbeddedCefBrowserRuntime::Impl::sync_workspace_native_presented_swapchain() {
+    CEF_REQUIRE_UI_THREAD();
+    const BrowserWorkspaceNativePresentState state = app_.browser_workspace_native_present_state();
+    if (state.swapchain_descriptor == nullptr) {
+        destroy_workspace_native_presented_swapchain("native_present_state_inactive");
+        return false;
+    }
+
+    clear_workspace_gpu_bridge_renderer_publication();
+    if (!state.ready()) {
+        return true;
+    }
+    if (!cef_workspace_gpu_bridge_swapchain_present_supported()) {
+        native_present_error_log_count_ += 1U;
+        if (should_log_cadence(native_present_error_log_count_)) {
+            mmltk::logging::logger("gui")->warn(
+                "workspace GPU bridge native present unavailable: CEF swapchain C ABI helpers are absent");
+        }
+        app_.record_workspace_surface_bridge_error(
+            "workspace GPU bridge native-present C ABI helpers are unavailable");
+        return true;
+    }
+    if (!state.bounds.has_value()) {
+        native_present_missing_bounds_log_count_ += 1U;
+        const bool log_this_skip = should_log_cadence(native_present_missing_bounds_log_count_);
+        if (log_this_skip) {
+            mmltk::logging::logger("gui")->warn(
+                "workspace GPU bridge native present skipped: missing browser workspace bounds generation={} "
+                "revision={} slot={}",
+                state.latest_present.swapchain_generation, state.latest_present.revision,
+                state.latest_present.front_slot_index);
+            app_.record_workspace_surface_bridge_error(
+                "workspace GPU bridge native present is waiting for workspace bounds");
+        }
+        return true;
+    }
+
+    const mmltk::live::WorkspaceSwapchainDescriptor& descriptor = *state.swapchain_descriptor;
+    if (!native_swapchain_configured_ || native_swapchain_configured_generation_ != descriptor.generation) {
+        if (native_swapchain_configured_) {
+            destroy_workspace_native_presented_swapchain("generation_replacement");
+        }
+        const WorkspaceGpuBridgeCefResult configure_result = configure_cef_workspace_gpu_bridge_swapchain(
+            kBrowserWorkspaceSurfaceId, descriptor, state.cuda_device_index);
+        if (!configure_result.ok) {
+            native_present_error_log_count_ += 1U;
+            if (should_log_cadence(native_present_error_log_count_)) {
+                mmltk::logging::logger("gui")->warn(
+                    "workspace GPU bridge native swapchain configure rejected: generation={} slots={} detail={}",
+                    descriptor.generation, descriptor.slots.size(), configure_result.message("configure_failed"));
+            }
+            app_.record_workspace_surface_bridge_error("workspace GPU bridge native swapchain configure failed: " +
+                                                       configure_result.message("configure_failed"));
+            return true;
+        }
+        native_swapchain_configured_ = true;
+        native_swapchain_configured_generation_ = descriptor.generation;
+        native_swapchain_last_present_revision_ = 0U;
+        mmltk::logging::logger("gui")->info(
+            "workspace GPU bridge native swapchain configured: generation={} slots={} dimensions={}x{} detail={}",
+            descriptor.generation, descriptor.slots.size(), descriptor.width, descriptor.height,
+            configure_result.message("ok"));
+    }
+
+    const mmltk::live::WorkspacePresentSnapshot& present = state.latest_present;
+    if (present.revision <= native_swapchain_last_present_revision_) {
+        native_present_stale_log_count_ += 1U;
+        if (should_log_cadence(native_present_stale_log_count_)) {
+            mmltk::logging::logger("gui")->info(
+                "workspace GPU bridge native present skipped stale revision: revision={} last={} generation={} slot={}",
+                present.revision, native_swapchain_last_present_revision_, present.swapchain_generation,
+                present.front_slot_index);
+        }
+        return true;
+    }
+
+    const WorkspaceGpuBridgePresentRects rects = workspace_present_rects(state.bounds->bounds, present);
+    const auto now = std::chrono::steady_clock::now();
+    if (native_present_slot_busy_retry_after_ != std::chrono::steady_clock::time_point{} &&
+        now < native_present_slot_busy_retry_after_) {
+        return true;
+    }
+
+    const WorkspaceGpuBridgeCefResult present_result =
+        present_cef_workspace_gpu_bridge_front_slot(kBrowserWorkspaceSurfaceId, present, rects);
+    if (!present_result.ok) {
+        if (present_result.result_code == "slot_display_busy") {
+            native_present_slot_busy_log_count_ += 1U;
+            native_present_slot_busy_retry_after_ = now + kNativePresentSlotBusyRetryDelay;
+            if (should_log_cadence(native_present_slot_busy_log_count_)) {
+                mmltk::logging::logger("gui")->info(
+                    "workspace GPU bridge native present skipped busy front slot: generation={} revision={} slot={} "
+                    "busy_skips={} detail={}",
+                    present.swapchain_generation, present.revision, present.front_slot_index,
+                    native_present_slot_busy_log_count_, present_result.message("slot_busy"));
+            }
+            return true;
+        }
+        native_present_error_log_count_ += 1U;
+        if (should_log_cadence(native_present_error_log_count_)) {
+            mmltk::logging::logger("gui")->warn(
+                "workspace GPU bridge native present rejected: generation={} revision={} slot={} bounds={}x{}+{},{} "
+                "damage={}x{}+{},{} detail={}",
+                present.swapchain_generation, present.revision, present.front_slot_index, rects.bounds_width,
+                rects.bounds_height, rects.bounds_x, rects.bounds_y, rects.damage_width, rects.damage_height,
+                rects.damage_x, rects.damage_y, present_result.message("present_failed"));
+        }
+        app_.record_workspace_surface_bridge_error("workspace GPU bridge native present failed: " +
+                                                   present_result.message("present_failed"));
+        return true;
+    }
+
+    native_swapchain_last_present_revision_ = present.revision;
+    native_present_slot_busy_retry_after_ = {};
+    app_.record_workspace_surface_pipeline_stage(mmltk::live::LivePipelineStage::CefPresentFrontSlot,
+                                                 kBrowserWorkspaceSurfaceId, std::to_string(present.revision),
+                                                 present.capture_ns);
+    native_present_log_count_ += 1U;
+    if (should_log_cadence(native_present_log_count_)) {
+        mmltk::logging::logger("gui")->info(
+            "workspace GPU bridge native present: frame={} revision={} slot={} generation={} bounds={}x{}+{},{} "
+            "damage={}x{}+{},{} detail={}",
+            present.frame_id.sequence, present.revision, present.front_slot_index, present.swapchain_generation,
+            rects.bounds_width, rects.bounds_height, rects.bounds_x, rects.bounds_y, rects.damage_width,
+            rects.damage_height, rects.damage_x, rects.damage_y, present_result.message("ok"));
+    }
+    app_.record_workspace_surface_bridge_error({});
+    return true;
+}
+
 void EmbeddedCefBrowserRuntime::Impl::flush_pending_messages() {
     CEF_REQUIRE_UI_THREAD();
     if (!page_callbacks_ready_ || browser_ == nullptr) {
@@ -1084,14 +1434,12 @@ void EmbeddedCefBrowserRuntime::Impl::flush_pending_messages() {
         bridge_state_, bridge_state_dirty_, runtime_capability_gate_passed_, snapshot_dirty_, current_snapshot_json_,
         error_dirty_, pending_error_text_, delivered_bridge_state_json_);
     if (dispatch.has_value()) {
-        if (!websocket_server_.url().has_value()) {
-            if (CefRefPtr<CefFrame> main_frame = browser_->GetMainFrame(); main_frame != nullptr) {
-                main_frame->ExecuteJavaScript(
-                    runtime_shared::bridge_dispatch_script(dispatch->send_bridge ? &dispatch->bridge_json : nullptr,
-                                                           dispatch->send_snapshot ? &current_snapshot_json_ : nullptr,
-                                                           dispatch->send_error ? &pending_error_text_ : nullptr),
-                    main_frame->GetURL(), 0);
-            }
+        if (CefRefPtr<CefFrame> main_frame = browser_->GetMainFrame(); main_frame != nullptr) {
+            main_frame->ExecuteJavaScript(
+                runtime_shared::bridge_dispatch_script(dispatch->send_bridge ? &dispatch->bridge_json : nullptr,
+                                                       dispatch->send_snapshot ? &current_snapshot_json_ : nullptr,
+                                                       dispatch->send_error ? &pending_error_text_ : nullptr, nullptr),
+                main_frame->GetURL(), 0);
         }
         if (dispatch->send_bridge) {
             websocket_server_.publish_bridge_state(dispatch->bridge_json);
@@ -1166,14 +1514,17 @@ void EmbeddedCefBrowserRuntime::Impl::handle_bridge_message_text(const std::stri
              &maybe_complete_runtime_capability_gate](const nlohmann::json& runtime_capabilities_message) {
                 runtime_shared::handle_runtime_capabilities_message(
                     runtime_capabilities_message, runtime_capabilities_reported_, runtime_capability_gate_passed_,
-                    quit_requested_, reported_runtime_capabilities_, [this] { refresh_snapshot(); },
+                    quit_requested_, reported_runtime_capabilities_, bridge_state_, [this] { refresh_snapshot(); },
                     [this] {
                         runtime_shared::queue_bridge_state(bridge_state_dirty_);
                         flush_pending_messages();
                     },
                     verify_runtime_capabilities_or_abort, maybe_complete_runtime_capability_gate);
             },
-            [this] { app_.release_all_workspace_surface_publications(); },
+            [this] {
+                release_all_tracked_workspace_gpu_bridge_publications();
+                app_.release_all_workspace_surface_publications();
+            },
             [](const nlohmann::json& extra_message) {
                 return runtime_shared::is_message_type(extra_message, "host.ime.context");
             },
@@ -1202,16 +1553,43 @@ void EmbeddedCefBrowserRuntime::Impl::sync_workspace_gpu_bridge_publication() {
     if (!page_callbacks_ready_ || browser_ == nullptr) {
         return;
     }
+    if (sync_workspace_native_presented_swapchain()) {
+        return;
+    }
 
     std::optional<WorkspaceGpuBridgeSurfacePublication> publication;
+    bool had_workspace_surface_source = false;
     if (const std::optional<mmltk::browser::WorkspaceSurfaceInfo> surface_info =
             app_.acquire_workspace_surface(kBrowserWorkspaceSurfaceId);
         surface_info.has_value()) {
-        if (const std::optional<RetainedBrowserImportedFrameSource> source =
-                app_.acquire_workspace_surface_source(surface_info->surface_id, surface_info->revision);
-            source.has_value()) {
-            publication = make_workspace_gpu_bridge_surface_publication(*surface_info, *source);
+        if (workspace_gpu_bridge_state_synced_ && delivered_workspace_gpu_bridge_publication_.has_value() &&
+            delivered_workspace_gpu_bridge_publication_->surface_info == *surface_info) {
+            publication = delivered_workspace_gpu_bridge_publication_;
+            had_workspace_surface_source = true;
+        } else {
+            if (const std::optional<RetainedBrowserImportedFrameSource> source =
+                    app_.acquire_workspace_surface_source(surface_info->surface_id, surface_info->revision);
+                source.has_value()) {
+                had_workspace_surface_source = true;
+                const std::uint64_t export_start_ns = mmltk::live::live_steady_clock_now_ns();
+                publication = make_workspace_gpu_bridge_surface_publication(*surface_info, *source);
+                app_.record_workspace_surface_pipeline_stage(mmltk::live::LivePipelineStage::CefExportSharedImage,
+                                                             surface_info->surface_id, surface_info->revision,
+                                                             export_start_ns);
+            }
         }
+    }
+
+    if (publication.has_value() && !publication->has_live_exported_shared_image()) {
+        app_.record_workspace_surface_bridge_error(workspace_gpu_bridge_shared_image_export_rejected_message(
+            publication->export_error.empty()
+                ? std::string_view("SharedImage export rejected the current live surface")
+                : std::string_view(publication->export_error.data(), publication->export_error.size())));
+    } else if (publication.has_value() && publication->has_live_exported_shared_image()) {
+        app_.record_workspace_surface_bridge_error({});
+    } else if (had_workspace_surface_source) {
+        app_.record_workspace_surface_bridge_error(
+            "workspace GPU bridge rejected the current live surface publication");
     }
 
     if (workspace_gpu_bridge_state_synced_ && delivered_workspace_gpu_bridge_publication_ == publication) {
@@ -1222,8 +1600,17 @@ void EmbeddedCefBrowserRuntime::Impl::sync_workspace_gpu_bridge_publication() {
     delivered_workspace_gpu_bridge_publication_ = publication;
     workspace_gpu_bridge_state_synced_ = true;
     if (publication.has_value()) {
-        websocket_server_.publish_surface_ready(
-            nlohmann::json({{"type", "surface.ready"}, {"surface", publication->surface_info}}).dump());
+        track_workspace_gpu_bridge_publication(*publication);
+        const std::string surface_ready_json =
+            nlohmann::json({{"type", "surface.ready"}, {"surface", publication->surface_info}}).dump();
+        if (browser_ != nullptr) {
+            if (CefRefPtr<CefFrame> main_frame = browser_->GetMainFrame(); main_frame != nullptr) {
+                main_frame->ExecuteJavaScript(
+                    runtime_shared::bridge_dispatch_script(nullptr, nullptr, nullptr, &surface_ready_json),
+                    main_frame->GetURL(), 0);
+            }
+        }
+        websocket_server_.publish_surface_ready(surface_ready_json);
         surface_ready_log_count_ += 1U;
         if (surface_ready_log_count_ <= 3U || surface_ready_log_count_ % 300U == 0U) {
             mmltk::logging::logger("gui")->info("surface.ready revision {} ({}x{})", publication->surface_info.revision,
@@ -1242,6 +1629,7 @@ void EmbeddedCefBrowserRuntime::Impl::on_workspace_gpu_bridge_release(const CefR
     if (!app_.release_workspace_surface(surface_id, revision)) {
         return;
     }
+    release_tracked_workspace_gpu_bridge_publication(surface_id, revision);
     surface_release_log_count_ += 1U;
     if (surface_release_log_count_ <= 3U || surface_release_log_count_ % 300U == 0U) {
         mmltk::logging::logger("gui")->info("surface.release {} revision {}", surface_id, revision);
@@ -1251,6 +1639,36 @@ void EmbeddedCefBrowserRuntime::Impl::on_workspace_gpu_bridge_release(const CefR
 }
 
 namespace {
+
+[[nodiscard]] std::string_view cef_log_severity_name(const cef_log_severity_t level) noexcept {
+    switch (level) {
+        case LOGSEVERITY_DEFAULT:
+            return "default";
+        case LOGSEVERITY_VERBOSE:
+            return "verbose";
+        case LOGSEVERITY_INFO:
+            return "info";
+        case LOGSEVERITY_WARNING:
+            return "warning";
+        case LOGSEVERITY_ERROR:
+            return "error";
+        case LOGSEVERITY_FATAL:
+            return "fatal";
+        case LOGSEVERITY_DISABLE:
+            return "disabled";
+    }
+    return "unknown";
+}
+
+[[nodiscard]] bool should_log_cef_console_message(const cef_log_severity_t level,
+                                                  const std::string_view message) noexcept {
+    if (level >= LOGSEVERITY_WARNING) {
+        return true;
+    }
+    return message.find("[mmltk.webgpu]") != std::string_view::npos ||
+           message.find("WebGPU") != std::string_view::npos || message.find("webgpu") != std::string_view::npos ||
+           message.find("workspace GPU bridge") != std::string_view::npos;
+}
 
 void CefRuntimeClient::OnTitleChange(CefRefPtr<CefBrowser> browser, const CefString& title) {
     CEF_REQUIRE_UI_THREAD();
@@ -1298,6 +1716,30 @@ void CefRuntimeClient::OnLoadError(CefRefPtr<CefBrowser> browser, CefRefPtr<CefF
     if (runtime_ != nullptr && frame != nullptr && frame->IsMain()) {
         runtime_->on_load_error(browser, errorText.ToString(), failedUrl.ToString(), static_cast<int>(errorCode));
     }
+}
+
+bool CefRuntimeClient::OnConsoleMessage(CefRefPtr<CefBrowser> browser, cef_log_severity_t level,
+                                        const CefString& message, const CefString& source, int line) {
+    CEF_REQUIRE_UI_THREAD();
+    const std::string message_text = message.ToString();
+    if (!should_log_cef_console_message(level, message_text)) {
+        return false;
+    }
+    const int browser_id = browser != nullptr ? browser->GetIdentifier() : -1;
+    const std::string source_text = source.ToString();
+    const auto logger = mmltk::logging::logger("gui");
+    const std::string_view severity = cef_log_severity_name(level);
+    if (level >= LOGSEVERITY_ERROR) {
+        logger->error("CEF console [{}] browser={} source={} line={} message={}", severity, browser_id, source_text,
+                      line, message_text);
+    } else if (level >= LOGSEVERITY_WARNING) {
+        logger->warn("CEF console [{}] browser={} source={} line={} message={}", severity, browser_id, source_text,
+                     line, message_text);
+    } else {
+        logger->info("CEF console [{}] browser={} source={} line={} message={}", severity, browser_id, source_text,
+                     line, message_text);
+    }
+    return false;
 }
 
 bool CefRuntimeClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> browser, CefRefPtr<CefFrame>, CefProcessId,

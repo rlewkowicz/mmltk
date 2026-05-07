@@ -29,7 +29,7 @@ export class WorkflowShellComponent {
 
   constructor() {
     const subscription = this.route.data.subscribe((data) => {
-      this.shell.activateWorkflow(coerceWorkflow(data['workflow']));
+      this.shell.setRouteWorkflow(coerceWorkflow(data['workflow']));
     });
     this.destroyRef.onDestroy(() => {
       subscription.unsubscribe();

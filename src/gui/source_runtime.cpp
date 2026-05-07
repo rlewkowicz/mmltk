@@ -3,11 +3,16 @@
 #include "rfdetr/backends_internal.h"
 #include "string_utils.h"
 
+#include <algorithm>
+#include <cerrno>
+#include <cstring>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <system_error>
 #include <vector>
+
+#include <unistd.h>
 
 namespace mmltk::gui {
 
@@ -70,6 +75,54 @@ PredictImageInput make_single_image_predict_input(const SourceSelectionState& st
 
 }  // namespace
 
+std::string validate_video_stream_source(const SourceSelectionState& state) {
+    if (state.kind != SourceKind::VideoStream) {
+        return "Video-stream source required.";
+    }
+    if (state.capture_width <= 0 || state.capture_height <= 0 || state.capture_fps <= 0) {
+        return "Video device capture width, height, and fps must be greater than zero.";
+    }
+    if (state.v4l2_buffer_count <= 0) {
+        return "Video device V4L2 buffer count must be greater than zero.";
+    }
+    if (state.crop_x < 0 || state.crop_y < 0 || state.crop_width < 0 || state.crop_height < 0) {
+        return "Video device crop coordinates and dimensions must not be negative.";
+    }
+
+    const ResolvedVideoCrop crop = resolve_video_crop(state);
+    if (crop.width <= 0 || crop.height <= 0) {
+        return "Video device crop width and height must resolve to positive values.";
+    }
+    if (crop.width > state.capture_width) {
+        return "Video device crop width exceeds the requested capture width.";
+    }
+    if (crop.height > state.capture_height) {
+        return "Video device crop height exceeds the requested capture height.";
+    }
+    if (crop.x < 0 || crop.y < 0 || crop.x + crop.width > state.capture_width ||
+        crop.y + crop.height > state.capture_height) {
+        return "Video device crop must resolve within the requested capture extent.";
+    }
+
+    const fs::path device_path = "/dev/video" + std::to_string(std::max(0, state.device_index));
+    std::error_code exists_error;
+    if (!fs::exists(device_path, exists_error)) {
+        return exists_error ? "Unable to inspect video device: " + device_path.string() + ": " + exists_error.message()
+                            : "Video device does not exist: " + device_path.string();
+    }
+    std::error_code type_error;
+    if (!fs::is_character_file(device_path, type_error)) {
+        return type_error ? "Unable to inspect video device type: " + device_path.string() + ": " + type_error.message()
+                          : "Video source is not a character device: " + device_path.string();
+    }
+    if (::access(device_path.c_str(), R_OK | W_OK) != 0) {
+        const int access_errno = errno;
+        return "Video device must be readable and writable: " + device_path.string() + ": " +
+               std::strerror(access_errno);
+    }
+    return {};
+}
+
 std::string validate_predict_source(const SourceSelectionState& state) {
     switch (state.kind) {
         case SourceKind::CompiledDataset:
@@ -106,38 +159,7 @@ std::string validate_predict_source(const SourceSelectionState& state) {
             }
             return {};
         case SourceKind::VideoStream:
-            if (state.capture_width <= 0 || state.capture_height <= 0 || state.capture_fps <= 0) {
-                return "Video device capture width, height, and fps must be greater than zero.";
-            }
-            if (state.v4l2_buffer_count <= 0) {
-                return "Video device V4L2 buffer count must be greater than zero.";
-            }
-            if (state.crop_x < 0 || state.crop_y < 0 || state.crop_width < 0 || state.crop_height < 0) {
-                return "Video device crop coordinates and dimensions must not be negative.";
-            }
-            {
-                const ResolvedVideoCrop crop = resolve_video_crop(state);
-                if (crop.width <= 0 || crop.height <= 0) {
-                    return "Video device crop width and height must resolve to positive values.";
-                }
-                if (crop.width > state.capture_width) {
-                    return "Video device crop width exceeds the requested capture width.";
-                }
-                if (crop.height > state.capture_height) {
-                    return "Video device crop height exceeds the requested capture height.";
-                }
-                if (crop.x < 0 || crop.y < 0 || crop.x + crop.width > state.capture_width ||
-                    crop.y + crop.height > state.capture_height) {
-                    return "Video device crop must resolve within the requested capture extent.";
-                }
-            }
-            {
-                const fs::path device_path = "/dev/video" + std::to_string(std::max(0, state.device_index));
-                if (!fs::exists(device_path)) {
-                    return "Video device does not exist: " + device_path.string();
-                }
-            }
-            return {};
+            return validate_video_stream_source(state);
     }
     return "Unsupported prediction source.";
 }

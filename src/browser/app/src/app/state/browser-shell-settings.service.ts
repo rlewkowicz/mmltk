@@ -27,7 +27,7 @@ export class BrowserShellSettingsState {
   readonly shellDensityOptions = shellDensityOptionsList();
   readonly canApplyShellSettings = computed(() => this.dirty());
   readonly shellSettingsNote = computed(() =>
-    this.dirty() ? "shell settings draft staged" : "shell settings synchronized",
+    this.dirty() ? "UI settings pending" : "UI settings ready",
   );
 
   constructor() {

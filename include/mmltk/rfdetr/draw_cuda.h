@@ -49,6 +49,43 @@ struct PackedImageU8 {
     return image.pixels != nullptr && image.width > 0 && image.height > 0;
 }
 
+enum class WorkspaceRgbaTargetKind : std::uint8_t {
+    None = 0,
+    Pitched = 1,
+    SurfaceObject = 2,
+};
+
+struct WorkspaceRgbaTarget {
+    WorkspaceRgbaTargetKind kind = WorkspaceRgbaTargetKind::None;
+    MutableSurfaceU8 pitched;
+    cudaSurfaceObject_t surface = 0;
+    int width = 0;
+    int height = 0;
+};
+
+[[nodiscard]] inline WorkspaceRgbaTarget make_workspace_rgba_pitched_target(std::uint8_t* pixels,
+                                                                            std::size_t pitch_bytes, int width,
+                                                                            int height) {
+    return WorkspaceRgbaTarget{WorkspaceRgbaTargetKind::Pitched,
+                               make_pitched_surface(pixels, pitch_bytes, width, height), 0, width, height};
+}
+
+[[nodiscard]] inline WorkspaceRgbaTarget make_workspace_rgba_surface_target(cudaSurfaceObject_t surface, int width,
+                                                                            int height) {
+    return WorkspaceRgbaTarget{WorkspaceRgbaTargetKind::SurfaceObject, {}, surface, width, height};
+}
+
+[[nodiscard]] inline bool is_valid(const WorkspaceRgbaTarget& target) {
+    if (target.width <= 0 || target.height <= 0) {
+        return false;
+    }
+    if (target.kind == WorkspaceRgbaTargetKind::Pitched) {
+        return is_valid(target.pitched) && target.pitched.width == target.width &&
+               target.pitched.height == target.height;
+    }
+    return target.kind == WorkspaceRgbaTargetKind::SurfaceObject && target.surface != 0;
+}
+
 [[nodiscard]] constexpr inline int normalized_positive_size(const int value) noexcept {
     return value > 0 ? value : 1;
 }
@@ -158,10 +195,29 @@ struct CompositeRgbaOverRgbaPitchedLaunch {
     cudaStream_t stream = nullptr;
 };
 
+struct CompositeRgbaOverWorkspaceRgbaLaunch {
+    WorkspaceRgbaTarget base_rgba;
+    ConstSurfaceU8 overlay_rgba;
+    cudaStream_t stream = nullptr;
+};
+
 struct CopyBgrToRgbaPitchedLaunch {
     ConstSurfaceU8 source_bgr;
     MutableSurfaceU8 target_rgba;
     std::uint8_t alpha = 255;
+    cudaStream_t stream = nullptr;
+};
+
+struct CopyBgrToWorkspaceRgbaLaunch {
+    ConstSurfaceU8 source_bgr;
+    WorkspaceRgbaTarget target_rgba;
+    std::uint8_t alpha = 255;
+    cudaStream_t stream = nullptr;
+};
+
+struct FillWorkspaceRgbaPatternLaunch {
+    WorkspaceRgbaTarget target_rgba;
+    std::uint64_t seed = 0;
     cudaStream_t stream = nullptr;
 };
 
@@ -302,6 +358,16 @@ inline void launch_composite_rgba_over_rgba_pitched(std::uint8_t* base_rgba, std
         draw_launch::make_pitched_surface(overlay_rgba, overlay_pitch_bytes, width, height), stream});
 }
 
+MMLTK_DRAW_CUDA_DECLARE_LAUNCHER(launch_composite_rgba_over_workspace_rgba,
+                                 draw_launch::CompositeRgbaOverWorkspaceRgbaLaunch)
+
+inline void launch_composite_rgba_over_workspace_rgba(draw_launch::WorkspaceRgbaTarget base_rgba,
+                                                      const std::uint8_t* overlay_rgba, std::size_t overlay_pitch_bytes,
+                                                      int width, int height, cudaStream_t stream) {
+    launch_composite_rgba_over_workspace_rgba(draw_launch::CompositeRgbaOverWorkspaceRgbaLaunch{
+        base_rgba, draw_launch::make_pitched_surface(overlay_rgba, overlay_pitch_bytes, width, height), stream});
+}
+
 MMLTK_DRAW_CUDA_DECLARE_LAUNCHER(launch_copy_bgr_to_rgba_pitched, draw_launch::CopyBgrToRgbaPitchedLaunch)
 
 inline void launch_copy_bgr_to_rgba_pitched(const std::uint8_t* source_bgr, std::size_t source_pitch_bytes,
@@ -310,6 +376,22 @@ inline void launch_copy_bgr_to_rgba_pitched(const std::uint8_t* source_bgr, std:
     launch_copy_bgr_to_rgba_pitched(draw_launch::CopyBgrToRgbaPitchedLaunch{
         draw_launch::make_pitched_surface(source_bgr, source_pitch_bytes, width, height),
         draw_launch::make_pitched_surface(target_rgba, target_pitch_bytes, width, height), alpha, stream});
+}
+
+MMLTK_DRAW_CUDA_DECLARE_LAUNCHER(launch_copy_bgr_to_workspace_rgba, draw_launch::CopyBgrToWorkspaceRgbaLaunch)
+
+inline void launch_copy_bgr_to_workspace_rgba(const std::uint8_t* source_bgr, std::size_t source_pitch_bytes,
+                                              draw_launch::WorkspaceRgbaTarget target_rgba, int width, int height,
+                                              std::uint8_t alpha, cudaStream_t stream) {
+    launch_copy_bgr_to_workspace_rgba(draw_launch::CopyBgrToWorkspaceRgbaLaunch{
+        draw_launch::make_pitched_surface(source_bgr, source_pitch_bytes, width, height), target_rgba, alpha, stream});
+}
+
+MMLTK_DRAW_CUDA_DECLARE_LAUNCHER(launch_fill_workspace_rgba_pattern, draw_launch::FillWorkspaceRgbaPatternLaunch)
+
+inline void launch_fill_workspace_rgba_pattern(draw_launch::WorkspaceRgbaTarget target_rgba, std::uint64_t seed,
+                                               cudaStream_t stream) {
+    launch_fill_workspace_rgba_pattern(draw_launch::FillWorkspaceRgbaPatternLaunch{target_rgba, seed, stream});
 }
 
 MMLTK_DRAW_CUDA_DECLARE_LAUNCHER(launch_draw_manual_mask_rgba_pitched, draw_launch::ManualMaskRgbaPitchedLaunch)

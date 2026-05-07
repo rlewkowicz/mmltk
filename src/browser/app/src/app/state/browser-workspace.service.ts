@@ -26,10 +26,17 @@ import {
 import {
   buildWorkspaceRenderFrame,
   type WorkspaceCanvasLayout,
+  type WorkspaceSurfaceRect,
   type WorkspaceRenderInput,
   workspaceCanvasLayoutsEqual,
 } from "../../workspace_renderer";
-import { WorkspaceWebGpuRenderer } from "../workspace/workspace-webgpu-renderer";
+import {
+  liveStatusState,
+} from "../../browser_shell_state";
+import {
+  WorkspaceWebGpuRenderer,
+  type WorkspaceRendererHostEvent,
+} from "../workspace/workspace-webgpu-renderer";
 import { BrowserHostRuntimeState } from "./browser-host-runtime.service";
 import { BrowserWorkflowRouteState } from "./browser-workflow-route.service";
 import {
@@ -56,6 +63,52 @@ const kWorkspaceSurfaceCommitDelayMs = 48;
 
 type WorkspaceRenderInputFactory = () => WorkspaceRenderInput;
 
+function roundedCaptureRegion(rect: {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}): CaptureRegion {
+  return {
+    x: Math.max(0, Math.round(rect.x)),
+    y: Math.max(0, Math.round(rect.y)),
+    width: Math.max(0, Math.round(rect.width)),
+    height: Math.max(0, Math.round(rect.height)),
+  };
+}
+
+function roundedSurfaceRect(rect: WorkspaceSurfaceRect): WorkspaceSurfaceRect {
+  return {
+    x: Number(rect.x.toFixed(3)),
+    y: Number(rect.y.toFixed(3)),
+    width: Number(rect.width.toFixed(3)),
+    height: Number(rect.height.toFixed(3)),
+  };
+}
+
+function workspaceBoundsPayload(
+  layout: WorkspaceCanvasLayout,
+  input: WorkspaceRenderInput,
+): Record<string, unknown> {
+  return {
+    canvas_device: {
+      x: 0,
+      y: 0,
+      width: layout.canvasWidth,
+      height: layout.canvasHeight,
+    },
+    canvas_css: roundedSurfaceRect(layout.surfaceBoundsCss),
+    viewport_device: roundedCaptureRegion(layout.viewportBoundsDevice),
+    viewport_css: roundedSurfaceRect(layout.viewportBoundsCss),
+    device_pixel_ratio: Number(layout.devicePixelRatio.toFixed(4)),
+    clip: layout.workflow === "annotate" || layout.workflow === "live"
+      ? input.clip === null
+        ? null
+        : roundRegion(input.clip)
+      : null,
+  };
+}
+
 export interface WorkspaceDiagnosticsVm {
   framePathLabel: string;
   overlayPathLabel: string;
@@ -65,7 +118,6 @@ export interface WorkspaceDiagnosticsVm {
 
 export interface WorkspaceVm {
   title: string;
-  gpuStatus: string;
 }
 
 export interface WorkspaceCanvasChromeVm {
@@ -92,45 +144,24 @@ interface WorkspaceFramePathVm {
     | "workspace_zero_copy_pending"
     | "workspace_zero_copy_blocked"
     | "workspace_surface_pending"
-    | "workspace_surface_bridge_target";
+    | "workspace_surface_bridge_target"
+    | "workspace_native_presented_live";
   label: string;
   detail: string;
   status: CapabilityStatusViewState["status"];
   fallbackLabel: string | null;
 }
 
-type WorkspaceFramePathStatusSurface = "canvas" | "gpu";
-
 const kWorkspaceFramePathStatusLabels: Partial<
-  Record<
-    WorkspaceFramePathVm["kind"],
-    Record<WorkspaceFramePathStatusSurface, string>
-  >
+  Record<WorkspaceFramePathVm["kind"], string>
 > = {
-  workspace_surface_bridge_target: {
-    canvas: "surface bridge",
-    gpu: "surface bridge",
-  },
-  workspace_surface_bridge_blocked: {
-    canvas: "bridge blocked",
-    gpu: "bridge blocked",
-  },
-  workspace_zero_copy_blocked: {
-    canvas: "zero-copy blocked",
-    gpu: "zero-copy blocked",
-  },
-  workspace_surface_bridge_pending: {
-    canvas: "bridge pending",
-    gpu: "bridge pending",
-  },
-  workspace_zero_copy_pending: {
-    canvas: "zero-copy pending",
-    gpu: "zero-copy pending",
-  },
-  mock_workspace_surface: {
-    canvas: "mock workspace",
-    gpu: "mock surface",
-  },
+  workspace_surface_bridge_target: "surface bridge",
+  workspace_native_presented_live: "native live",
+  workspace_surface_bridge_blocked: "bridge blocked",
+  workspace_zero_copy_blocked: "zero-copy blocked",
+  workspace_surface_bridge_pending: "bridge pending",
+  workspace_zero_copy_pending: "zero-copy pending",
+  mock_workspace_surface: "mock workspace",
 };
 
 function formatSurfaceRect(
@@ -154,7 +185,7 @@ function workspaceSurfaceStatusLabel(
     return "surface-pending";
   }
   return canvasLayout.overlayPrimitiveCount > 0
-    ? "surface-ready · overlay-active"
+    ? "surface-ready · annotations-ready"
     : "surface-ready";
 }
 
@@ -203,6 +234,22 @@ function workspaceFramePathVm(
       fallbackLabel: "Workspace canvas pending",
     };
   }
+  const liveStatus = liveStatusState(snapshot);
+  if (
+    snapshot.source.kind === "video_stream" &&
+    liveStatus.runtime.activeMode !== "none" &&
+    liveStatus.preview.nativePresented &&
+    (canvasLayout.workflow === "annotate" || canvasLayout.workflow === "live")
+  ) {
+    return {
+      kind: "workspace_native_presented_live",
+      label: "native-presented live workspace",
+      detail:
+        "The native runtime is presenting live workspace frames through the CEF compositor while the browser owns layout and input.",
+      status: "ready",
+      fallbackLabel: null,
+    };
+  }
   const bridgeViability =
     runtimeWorkspaceSurfaceBridgeViability(runtimeCapabilities);
   if (bridgeViability === "blocked") {
@@ -212,7 +259,7 @@ function workspaceFramePathVm(
       detail:
         "The workspace canvas is measured, but the runtime has not kept the workspace surface bridge available.",
       status: "blocked",
-      fallbackLabel: "Workspace surface bridge unavailable",
+      fallbackLabel: "Surface bridge unavailable",
     };
   }
   if (bridgeViability === "pending") {
@@ -222,7 +269,7 @@ function workspaceFramePathVm(
       detail:
         "The workspace canvas is measured while the runtime finishes enabling the workspace surface bridge.",
       status: "pending",
-      fallbackLabel: "Workspace surface bridge pending",
+      fallbackLabel: "Surface bridge pending",
     };
   }
   const zeroCopyStatus =
@@ -234,7 +281,7 @@ function workspaceFramePathVm(
       detail:
         "The runtime cannot alias the current workspace surface as a zero-copy GPU texture.",
       status: "blocked",
-      fallbackLabel: "Workspace zero-copy unavailable",
+      fallbackLabel: "Zero-copy unavailable",
     };
   }
   if (zeroCopyStatus !== "available") {
@@ -244,7 +291,7 @@ function workspaceFramePathVm(
       detail:
         "The workspace surface bridge is up, but the runtime has not confirmed zero-copy GPU texture aliasing yet.",
       status: "pending",
-      fallbackLabel: "Workspace zero-copy pending",
+      fallbackLabel: "Zero-copy pending",
     };
   }
   if (snapshot.workspace_surface === null || snapshot.workspace_surface === undefined) {
@@ -254,7 +301,7 @@ function workspaceFramePathVm(
       detail:
         "The workspace canvas is ready, but the runtime has not published a current workspace surface revision yet.",
       status: "pending",
-      fallbackLabel: "Workspace surface pending",
+      fallbackLabel: "Surface pending",
     };
   }
   return {
@@ -291,6 +338,7 @@ function workspaceFramePathStatus(
 function workspaceOverlayPathStatus(
   canvasLayout: WorkspaceCanvasLayout | null,
   overlayArmed: boolean,
+  nativePresentedLive = false,
 ): CapabilityStatusViewState {
   if (canvasLayout === null) {
     return {
@@ -299,6 +347,15 @@ function workspaceOverlayPathStatus(
       status: "pending",
       summary: "overlay surface pending",
       detail: "overlay pending",
+    };
+  }
+  if (nativePresentedLive) {
+    return {
+      key: "overlay_path",
+      label: "Overlay Path",
+      status: "ready",
+      summary: "overlay path native manual overlay",
+      detail: "native manual overlay",
     };
   }
   if (overlayArmed || canvasLayout.overlayPrimitiveCount > 0) {
@@ -326,15 +383,7 @@ function workspaceFallbackLabel(
 }
 
 function workspaceCanvasStatusLabel(framePath: WorkspaceFramePathVm): string {
-  return (
-    kWorkspaceFramePathStatusLabels[framePath.kind]?.canvas ?? "canvas pending"
-  );
-}
-
-function workspaceGpuStatusLabel(
-  framePath: WorkspaceFramePathVm,
-): string {
-  return kWorkspaceFramePathStatusLabels[framePath.kind]?.gpu ?? "canvas pending";
+  return kWorkspaceFramePathStatusLabels[framePath.kind] ?? "canvas pending";
 }
 
 function workspaceViewportNote(
@@ -395,15 +444,20 @@ export class BrowserWorkspaceStateService {
   private viewportCommitTimer: ReturnType<typeof globalThis.setTimeout> | null =
     null;
   private readonly rendererStatusOverride = signal<string | null>(null);
-  private renderer = new WorkspaceWebGpuRenderer();
+  private renderer = new WorkspaceWebGpuRenderer((event) =>
+    this.dispatchWorkspaceRendererEvent(event),
+  );
   private workspaceCanvas: HTMLCanvasElement | null = null;
   private workspaceRenderInputFactory: WorkspaceRenderInputFactory | null = null;
   private workspaceCanvasResizeObserver: ResizeObserver | null = null;
   private workspaceCanvasListenerController: AbortController | null = null;
+  private workspaceDevicePixelRatioMediaQuery: MediaQueryList | null = null;
+  private workspaceDevicePixelRatioChangeHandler: (() => void) | null = null;
   private renderFrameId: number | null = null;
   private renderWork: Promise<void> | null = null;
   private renderQueued = false;
   private renderGeneration = 0;
+  private lastWorkspaceBoundsSignature = "";
 
   readonly workspaceState = signal<BrowserWorkspaceState>(
     makeWorkspaceState(this.runtime.snapshot()),
@@ -475,6 +529,7 @@ export class BrowserWorkspaceStateService {
       workflow: this.workflowRoute.selectedWorkflow(),
       canvasWidth: geometry.canvasWidth,
       canvasHeight: geometry.canvasHeight,
+      nativePresentedLive: this.nativePresentedLiveActive(snapshot),
       captureWidth: workspaceState.captureWidth,
       captureHeight: workspaceState.captureHeight,
       frameX: geometry.frameX,
@@ -505,12 +560,23 @@ export class BrowserWorkspaceStateService {
       canvasLayout,
       this.workflowRoute.selectedWorkflow() === "annotate" ||
         this.runtime.snapshot().annotation.instance_count > 0,
+      framePath.kind === "workspace_native_presented_live",
     );
+    const runtimeStatusItems =
+      framePath.kind === "workspace_native_presented_live"
+        ? []
+        : this.runtime.runtimeCapabilityStatus();
+    const transportStatusItems =
+      framePath.kind === "workspace_native_presented_live"
+        ? this.runtime
+            .transportStatus()
+            .statusItems.filter((item) => item.key === "transport")
+        : this.runtime.transportStatus().statusItems;
     const statusItems = [
       framePathStatus,
       overlayPathStatus,
-      ...this.runtime.runtimeCapabilityStatus(),
-      ...this.runtime.transportStatus().statusItems,
+      ...runtimeStatusItems,
+      ...transportStatusItems,
     ];
     return {
       framePathLabel: framePath.label,
@@ -528,7 +594,6 @@ export class BrowserWorkspaceStateService {
     );
     return {
       title: `${this.workflowRoute.selectedWorkflow()} workspace surface`,
-      gpuStatus: workspaceGpuStatusLabel(framePath),
     };
   });
   readonly workspaceCanvasChrome = computed<WorkspaceCanvasChromeVm>(() => {
@@ -619,6 +684,7 @@ export class BrowserWorkspaceStateService {
         },
         { signal: this.workspaceCanvasListenerController.signal },
       );
+      this.armDevicePixelRatioWatcher();
       this.renderer.attachCanvas(canvas);
     } else {
       this.workspaceRenderInputFactory = renderInputFactory;
@@ -971,11 +1037,16 @@ export class BrowserWorkspaceStateService {
         return;
       }
       this.updateWorkspaceCanvasLayout(renderFrame.canvasLayout);
+      this.dispatchWorkspaceBoundsIfNeeded(renderFrame.canvasLayout, renderInput);
       const stats = await renderer.render(renderFrame);
       if (!this.isCurrentWorkspaceRender(renderGeneration, canvas, renderer)) {
         return;
       }
-      this.setRendererStatus(stats.statusText);
+      this.setRendererStatus(
+        stats.lastDrawError.length > 0
+          ? `${stats.statusText} · ${stats.lastDrawError}`
+          : stats.statusText,
+      );
     } catch (error) {
       if (!this.isCurrentWorkspaceRender(renderGeneration, canvas, renderer)) {
         return;
@@ -1000,6 +1071,53 @@ export class BrowserWorkspaceStateService {
     );
   }
 
+  private dispatchWorkspaceRendererEvent(event: WorkspaceRendererHostEvent): void {
+    if (
+      event.workflow !== "predict" &&
+      event.workflow !== "annotate" &&
+      event.workflow !== "live"
+    ) {
+      return;
+    }
+    this.runtime.dispatch(event.workflow, event.intent, {
+      surface_id: event.surfaceId,
+      revision: event.revision,
+      operation: event.operation,
+      result_code: event.resultCode,
+      result_detail: event.resultDetail,
+    });
+  }
+
+  private nativePresentedLiveActive(snapshot: StateSnapshot): boolean {
+    if (snapshot.source.kind !== "video_stream") {
+      return false;
+    }
+    const liveStatus = liveStatusState(snapshot);
+    const workflow = this.workflowRoute.selectedWorkflow();
+    return (
+      liveStatus.runtime.activeMode !== "none" &&
+      liveStatus.preview.nativePresented &&
+      (workflow === "annotate" || workflow === "live")
+    );
+  }
+
+  private dispatchWorkspaceBoundsIfNeeded(
+    layout: WorkspaceCanvasLayout,
+    input: WorkspaceRenderInput,
+  ): void {
+    if (layout.workflow !== "annotate" && layout.workflow !== "live") {
+      this.lastWorkspaceBoundsSignature = "";
+      return;
+    }
+    const payload = workspaceBoundsPayload(layout, input);
+    const signature = `${layout.workflow}:${JSON.stringify(payload)}`;
+    if (signature === this.lastWorkspaceBoundsSignature) {
+      return;
+    }
+    this.lastWorkspaceBoundsSignature = signature;
+    this.runtime.dispatch(layout.workflow, "workspace.bounds", payload);
+  }
+
   private detachWorkspaceCanvas(recreateRenderer: boolean): void {
     this.renderGeneration += 1;
     if (this.renderFrameId !== null) {
@@ -1011,15 +1129,53 @@ export class BrowserWorkspaceStateService {
     this.workspaceCanvasListenerController = null;
     this.workspaceCanvasResizeObserver?.disconnect();
     this.workspaceCanvasResizeObserver = null;
+    this.disarmDevicePixelRatioWatcher();
     this.workspaceCanvas = null;
     this.workspaceRenderInputFactory = null;
     this.workspaceCanvasLayout.set(null);
     this.rendererStatusOverride.set(null);
+    this.lastWorkspaceBoundsSignature = "";
     if (recreateRenderer) {
       this.renderer.dispose();
-      this.renderer = new WorkspaceWebGpuRenderer();
+      this.renderer = new WorkspaceWebGpuRenderer((event) =>
+        this.dispatchWorkspaceRendererEvent(event),
+      );
       return;
     }
     this.renderer.dispose();
+  }
+
+  private armDevicePixelRatioWatcher(): void {
+    this.disarmDevicePixelRatioWatcher();
+    if (typeof globalThis.matchMedia !== "function") {
+      return;
+    }
+    const dpr = Math.max(0.001, globalThis.devicePixelRatio || 1);
+    const mediaQuery = globalThis.matchMedia(`(resolution: ${dpr}dppx)`);
+    const handler = (): void => {
+      this.syncWorkspaceCanvasResolution();
+      if (this.workspaceCanvas !== null) {
+        this.armDevicePixelRatioWatcher();
+      }
+    };
+    mediaQuery.addEventListener("change", handler, {
+      signal: this.workspaceCanvasListenerController?.signal,
+    });
+    this.workspaceDevicePixelRatioMediaQuery = mediaQuery;
+    this.workspaceDevicePixelRatioChangeHandler = handler;
+  }
+
+  private disarmDevicePixelRatioWatcher(): void {
+    if (
+      this.workspaceDevicePixelRatioMediaQuery !== null &&
+      this.workspaceDevicePixelRatioChangeHandler !== null
+    ) {
+      this.workspaceDevicePixelRatioMediaQuery.removeEventListener(
+        "change",
+        this.workspaceDevicePixelRatioChangeHandler,
+      );
+    }
+    this.workspaceDevicePixelRatioMediaQuery = null;
+    this.workspaceDevicePixelRatioChangeHandler = null;
   }
 }

@@ -150,36 +150,14 @@ inline bool ensure_annotation_workflow_live_annotation_frame_pixels(const Source
         source, frame, annotation_live_running,
         [controller, full_frame](AnnotationFrame& frame_snapshot, const SourceSelectionState& source_snapshot,
                                  std::string* readback_error) {
-            if (controller == nullptr || !frame_snapshot.live_frame_id.has_value()) {
-                return false;
+            (void)controller;
+            (void)full_frame;
+            (void)frame_snapshot;
+            (void)source_snapshot;
+            if (readback_error != nullptr) {
+                *readback_error = "live annotation frame pixels are unavailable on the native-presented live path";
             }
-
-            std::vector<std::uint8_t> pixels_bgr;
-            std::uint32_t width = 0;
-            std::uint32_t height = 0;
-            mmltk::live::LiveCaptureRegion region{};
-            if (!controller->readback_raw_base(*frame_snapshot.live_frame_id, &pixels_bgr, &width, &height, &region,
-                                               readback_error)) {
-                return false;
-            }
-
-            AnnotationFrame raw_frame = frame_snapshot;
-            raw_frame.pixels_bgr = std::move(pixels_bgr);
-            raw_frame.width = width;
-            raw_frame.height = height;
-            raw_frame.view_x = region.x;
-            raw_frame.view_y = region.y;
-            raw_frame.capture_width = static_cast<std::uint32_t>(std::max(1, source_snapshot.capture_width));
-            raw_frame.capture_height = static_cast<std::uint32_t>(std::max(1, source_snapshot.capture_height));
-            const mmltk::live::LiveCaptureRegion display_region =
-                preview_region_for_source(region, source_snapshot, full_frame);
-            if (display_region.x != region.x || display_region.y != region.y || display_region.width != region.width ||
-                display_region.height != region.height) {
-                frame_snapshot = extract_annotation_frame_region(raw_frame, box_from_live_region(display_region));
-            } else {
-                frame_snapshot = std::move(raw_frame);
-            }
-            return true;
+            return false;
         },
         error_message);
 }

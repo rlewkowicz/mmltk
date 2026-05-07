@@ -1,6 +1,5 @@
-import { ChangeDetectionStrategy, Component, computed, inject } from '@angular/core';
+import { ChangeDetectionStrategy, Component, inject } from '@angular/core';
 import type { CaptureRegion } from '../host_api';
-import { BrowserHostRuntimeState } from './state/browser-host-runtime.service';
 import { BrowserWorkspaceStateService } from './state/browser-workspace.service';
 import { WorkspaceCanvasComponent } from './workspace/workspace-canvas.component';
 
@@ -15,20 +14,6 @@ import { WorkspaceCanvasComponent } from './workspace/workspace-canvas.component
         <div>
           <p class="eyebrow">Workspace surface</p>
           <h2 id="workspace-title">{{ workspace.workspace().title }}</h2>
-        </div>
-        <div class="workspace-status">
-          <div class="pill">
-            <span>Workspace Bridge</span>
-            <strong id="gpu-status">{{ workspaceBridgeLabel() }}</strong>
-          </div>
-          <div class="pill">
-            <span>Workspace Path</span>
-            <strong id="shader-status">{{ workspace.workspaceDiagnostics().framePathLabel }}</strong>
-          </div>
-          <div class="pill">
-            <span>Overlay</span>
-            <strong>{{ workspace.workspaceDiagnostics().overlayPathLabel }}</strong>
-          </div>
         </div>
       </div>
 
@@ -64,20 +49,7 @@ import { WorkspaceCanvasComponent } from './workspace/workspace-canvas.component
             <span>Clip</span>
             <strong>{{ clipLabel() }}</strong>
           </div>
-          <div class="pill">
-            <span>Viewport</span>
-            <strong>{{ viewportLabel() }}</strong>
-          </div>
-          <div class="pill">
-            <span>Overlay Bounds</span>
-            <strong>{{ overlayBoundsLabel() }}</strong>
-          </div>
-          <div class="pill">
-            <span>Bridge</span>
-            <strong>{{ runtime.transportStatus().runtimeLabel }}</strong>
-          </div>
         </div>
-        <p id="workspace-note">{{ workspaceNote() }}</p>
       </div>
     </main>
   `,
@@ -127,7 +99,7 @@ import { WorkspaceCanvasComponent } from './workspace/workspace-canvas.component
         font-size: 0.78rem;
         font-weight: 700;
         letter-spacing: 0.08em;
-        text-transform: uppercase;
+        text-transform: none;
       }
 
       .workspace-hard-error__title {
@@ -146,33 +118,7 @@ import { WorkspaceCanvasComponent } from './workspace/workspace-canvas.component
   ],
 })
 export class WorkspaceHostComponent {
-  protected readonly runtime = inject(BrowserHostRuntimeState);
   protected readonly workspace = inject(BrowserWorkspaceStateService);
-  protected readonly workspaceBridgeLabel = computed(() => {
-    const workspaceBridge = this.runtime.runtimeCapabilityStatus().find(
-      (item) => item.key === 'workspace_surface_bridge',
-    );
-    if (workspaceBridge === undefined) {
-      return this.workspace.workspace().gpuStatus;
-    }
-    switch (workspaceBridge.status) {
-      case 'ready':
-        return 'bridge ready';
-      case 'blocked':
-        return 'unavailable';
-      default:
-        return 'pending';
-    }
-  });
-  protected readonly workspaceNote = computed(() => {
-    const details = [
-      this.runtime.runtimeCapabilityStatus().find((item) => item.key === 'workspace_surface_bridge')?.detail,
-      this.runtime.transportStatus().statusItems.find((item) => item.key === 'workspace_surface_zero_copy')?.detail,
-      this.workspace.workspaceViewportDetail(),
-    ].filter((detail): detail is string => typeof detail === 'string' && detail.trim().length > 0);
-
-    return details.filter((detail, index, items) => items.indexOf(detail) === index).join(' ');
-  });
 
   protected zoomLabel(): string {
     const zoom = this.workspace.workspaceState().zoom;
@@ -189,31 +135,7 @@ export class WorkspaceHostComponent {
     return clip === null ? 'none' : this.formatRegion(clip);
   }
 
-  protected viewportLabel(): string {
-    const report = this.workspace.workspaceCanvasLayout();
-    return report === null ? 'pending' : this.formatSurfaceRect(report.viewportBoundsCss);
-  }
-
-  protected overlayBoundsLabel(): string {
-    const report = this.workspace.workspaceCanvasLayout();
-    if (report === null) {
-      return 'pending';
-    }
-    return report.overlayBoundsCss === null
-      ? 'none'
-      : this.formatSurfaceRect(report.overlayBoundsCss);
-  }
-
   private formatRegion(region: CaptureRegion): string {
     return `${region.x},${region.y} · ${region.width}x${region.height}`;
-  }
-
-  private formatSurfaceRect(region: {
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-  }): string {
-    return `${region.x.toFixed(1)},${region.y.toFixed(1)} · ${region.width.toFixed(1)}x${region.height.toFixed(1)}`;
   }
 }

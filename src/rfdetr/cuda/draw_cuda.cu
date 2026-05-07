@@ -42,6 +42,25 @@ inline dim3 draw_kernel_grid(const int width, const int height) {
            has_valid_mask_box_label_inputs(launch.instances);
 }
 
+template <typename Surface>
+__device__ bool pixel_xy_in_bounds(const Surface& surface, int& x, int& y) {
+    x = blockIdx.x * blockDim.x + threadIdx.x;
+    y = blockIdx.y * blockDim.y + threadIdx.y;
+    return x < surface.width && y < surface.height;
+}
+
+__device__ bool load_visible_rgba_overlay(const draw_launch::ConstSurfaceU8& overlay, const int x, const int y,
+                                          cuda_launch::RgbaPixelU8& pixel) {
+    pixel = cuda_launch::load_rgba_pixel(overlay.pixels, overlay.pitch_bytes, x, y);
+    return pixel.a != 0U;
+}
+
+template <typename Surface>
+__device__ bool load_composite_rgba_overlay(const Surface& base, const draw_launch::ConstSurfaceU8& overlay, int& x,
+                                            int& y, cuda_launch::RgbaPixelU8& pixel) {
+    return pixel_xy_in_bounds(base, x, y) && load_visible_rgba_overlay(overlay, x, y, pixel);
+}
+
 __global__ void build_instance_colors_from_labels_kernel(const draw_launch::InstanceColorBuildLaunch launch) {
     const int index = blockIdx.x * blockDim.x + threadIdx.x;
     const int count = static_cast<int>(launch.count);
@@ -268,8 +287,8 @@ __global__ void composite_rgba_over_bgr_pitched_kernel(const draw_launch::Compos
         return;
     }
 
-    const auto overlay_pixel = cuda_launch::load_rgba_pixel(overlay_rgba.pixels, overlay_rgba.pitch_bytes, x, y);
-    if (overlay_pixel.a == 0U) {
+    cuda_launch::RgbaPixelU8 overlay_pixel{};
+    if (!load_visible_rgba_overlay(overlay_rgba, x, y, overlay_pixel)) {
         return;
     }
 
@@ -281,20 +300,35 @@ __global__ void composite_rgba_over_bgr_pitched_kernel(const draw_launch::Compos
 __global__ void composite_rgba_over_rgba_pitched_kernel(const draw_launch::CompositeRgbaOverRgbaPitchedLaunch launch) {
     const auto& base_rgba = launch.base_rgba;
     const auto& overlay_rgba = launch.overlay_rgba;
-    const int x = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= base_rgba.width || y >= base_rgba.height) {
-        return;
-    }
-
-    const auto overlay_pixel = cuda_launch::load_rgba_pixel(overlay_rgba.pixels, overlay_rgba.pitch_bytes, x, y);
-    if (overlay_pixel.a == 0U) {
+    int x = 0;
+    int y = 0;
+    cuda_launch::RgbaPixelU8 overlay_pixel{};
+    if (!load_composite_rgba_overlay(base_rgba, overlay_rgba, x, y, overlay_pixel)) {
         return;
     }
 
     const auto base_pixel = cuda_launch::load_rgba_pixel(base_rgba.pixels, base_rgba.pitch_bytes, x, y);
     cuda_launch::store_rgba_pixel(base_rgba.pixels, base_rgba.pitch_bytes, x, y,
                                   cuda_launch::composite_rgba_over_rgba(base_pixel, overlay_pixel));
+}
+
+__global__ void composite_rgba_over_workspace_rgba_kernel(
+    const draw_launch::CompositeRgbaOverWorkspaceRgbaLaunch launch) {
+    const auto& base_rgba = launch.base_rgba;
+    const auto& overlay_rgba = launch.overlay_rgba;
+    int x = 0;
+    int y = 0;
+    cuda_launch::RgbaPixelU8 overlay_pixel{};
+    if (!load_composite_rgba_overlay(base_rgba, overlay_rgba, x, y, overlay_pixel)) {
+        return;
+    }
+
+    uchar4 raw_base{};
+    surf2Dread(&raw_base, base_rgba.surface, x * static_cast<int>(sizeof(uchar4)), y);
+    const auto base_pixel = cuda_launch::RgbaPixelU8{raw_base.x, raw_base.y, raw_base.z, raw_base.w};
+    const auto composited = cuda_launch::composite_rgba_over_rgba(base_pixel, overlay_pixel);
+    surf2Dwrite(make_uchar4(composited.r, composited.g, composited.b, composited.a), base_rgba.surface,
+                x * static_cast<int>(sizeof(uchar4)), y);
 }
 
 __global__ void copy_bgr_to_rgba_pitched_kernel(const draw_launch::CopyBgrToRgbaPitchedLaunch launch) {
@@ -314,6 +348,49 @@ __global__ void copy_bgr_to_rgba_pitched_kernel(const draw_launch::CopyBgrToRgba
                                       cuda_launch::clamp_to_u8(source_pixel.b),
                                       launch.alpha,
                                   });
+}
+
+__global__ void copy_bgr_to_workspace_rgba_kernel(const draw_launch::CopyBgrToWorkspaceRgbaLaunch launch) {
+    const auto& source_bgr = launch.source_bgr;
+    const auto& target_rgba = launch.target_rgba;
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= source_bgr.width || y >= source_bgr.height) {
+        return;
+    }
+
+    const auto source_pixel = cuda_launch::load_bgr_pixel(source_bgr.pixels, source_bgr.pitch_bytes, x, y);
+    surf2Dwrite(make_uchar4(cuda_launch::clamp_to_u8(source_pixel.r), cuda_launch::clamp_to_u8(source_pixel.g),
+                            cuda_launch::clamp_to_u8(source_pixel.b), launch.alpha),
+                target_rgba.surface, x * static_cast<int>(sizeof(uchar4)), y);
+}
+
+__device__ uchar4 synthetic_workspace_pattern_pixel(const int x, const int y, const std::uint64_t seed) {
+    const auto low = static_cast<unsigned int>(seed & 0xffU);
+    const auto mid = static_cast<unsigned int>((seed >> 8U) & 0xffU);
+    const auto high = static_cast<unsigned int>((seed >> 16U) & 0xffU);
+    return make_uchar4(static_cast<unsigned char>((static_cast<unsigned int>(x) * 17U + low) & 0xffU),
+                       static_cast<unsigned char>((static_cast<unsigned int>(y) * 31U + mid) & 0xffU),
+                       static_cast<unsigned char>(
+                           ((static_cast<unsigned int>(x) ^ static_cast<unsigned int>(y)) * 13U + high) & 0xffU),
+                       255U);
+}
+
+__global__ void fill_workspace_rgba_pattern_kernel(const draw_launch::FillWorkspaceRgbaPatternLaunch launch) {
+    const auto& target_rgba = launch.target_rgba;
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= target_rgba.width || y >= target_rgba.height) {
+        return;
+    }
+
+    const uchar4 pixel = synthetic_workspace_pattern_pixel(x, y, launch.seed);
+    if (target_rgba.kind == draw_launch::WorkspaceRgbaTargetKind::Pitched) {
+        cuda_launch::store_rgba_pixel(target_rgba.pitched.pixels, target_rgba.pitched.pitch_bytes, x, y,
+                                      cuda_launch::RgbaPixelU8{pixel.x, pixel.y, pixel.z, pixel.w});
+        return;
+    }
+    surf2Dwrite(pixel, target_rgba.surface, x * static_cast<int>(sizeof(uchar4)), y);
 }
 
 __global__ void draw_manual_mask_rgba_pitched_kernel(const draw_launch::ManualMaskRgbaPitchedLaunch launch) {
@@ -531,6 +608,25 @@ MMLTK_DRAW_CUDA_DEFINE_LAUNCHER(launch_composite_rgba_over_rgba_pitched,
     composite_rgba_over_rgba_pitched_kernel<<<grid, block, 0, launch.stream>>>(launch);
 }
 
+MMLTK_DRAW_CUDA_DEFINE_LAUNCHER(launch_composite_rgba_over_workspace_rgba,
+                                draw_launch::CompositeRgbaOverWorkspaceRgbaLaunch) {
+    if (!draw_launch::is_valid(launch.base_rgba) || !draw_launch::is_valid(launch.overlay_rgba)) {
+        return;
+    }
+    if (launch.base_rgba.width != launch.overlay_rgba.width || launch.base_rgba.height != launch.overlay_rgba.height) {
+        return;
+    }
+    if (launch.base_rgba.kind == draw_launch::WorkspaceRgbaTargetKind::Pitched) {
+        launch_composite_rgba_over_rgba_pitched(draw_launch::CompositeRgbaOverRgbaPitchedLaunch{
+            launch.base_rgba.pitched, launch.overlay_rgba, launch.stream});
+        return;
+    }
+
+    const dim3 block = draw_kernel_block();
+    const dim3 grid = draw_kernel_grid(launch.base_rgba.width, launch.base_rgba.height);
+    composite_rgba_over_workspace_rgba_kernel<<<grid, block, 0, launch.stream>>>(launch);
+}
+
 MMLTK_DRAW_CUDA_DEFINE_LAUNCHER(launch_copy_bgr_to_rgba_pitched, draw_launch::CopyBgrToRgbaPitchedLaunch) {
     if (!draw_launch::is_valid(launch.source_bgr) || !draw_launch::is_valid(launch.target_rgba)) {
         return;
@@ -542,6 +638,34 @@ MMLTK_DRAW_CUDA_DEFINE_LAUNCHER(launch_copy_bgr_to_rgba_pitched, draw_launch::Co
     const dim3 block = draw_kernel_block();
     const dim3 grid = draw_kernel_grid(launch.source_bgr.width, launch.source_bgr.height);
     copy_bgr_to_rgba_pitched_kernel<<<grid, block, 0, launch.stream>>>(launch);
+}
+
+MMLTK_DRAW_CUDA_DEFINE_LAUNCHER(launch_copy_bgr_to_workspace_rgba, draw_launch::CopyBgrToWorkspaceRgbaLaunch) {
+    if (!draw_launch::is_valid(launch.source_bgr) || !draw_launch::is_valid(launch.target_rgba)) {
+        return;
+    }
+    if (launch.source_bgr.width != launch.target_rgba.width || launch.source_bgr.height != launch.target_rgba.height) {
+        return;
+    }
+    if (launch.target_rgba.kind == draw_launch::WorkspaceRgbaTargetKind::Pitched) {
+        launch_copy_bgr_to_rgba_pitched(draw_launch::CopyBgrToRgbaPitchedLaunch{
+            launch.source_bgr, launch.target_rgba.pitched, launch.alpha, launch.stream});
+        return;
+    }
+
+    const dim3 block = draw_kernel_block();
+    const dim3 grid = draw_kernel_grid(launch.source_bgr.width, launch.source_bgr.height);
+    copy_bgr_to_workspace_rgba_kernel<<<grid, block, 0, launch.stream>>>(launch);
+}
+
+MMLTK_DRAW_CUDA_DEFINE_LAUNCHER(launch_fill_workspace_rgba_pattern, draw_launch::FillWorkspaceRgbaPatternLaunch) {
+    if (!draw_launch::is_valid(launch.target_rgba)) {
+        return;
+    }
+
+    const dim3 block = draw_kernel_block();
+    const dim3 grid = draw_kernel_grid(launch.target_rgba.width, launch.target_rgba.height);
+    fill_workspace_rgba_pattern_kernel<<<grid, block, 0, launch.stream>>>(launch);
 }
 
 MMLTK_DRAW_CUDA_DEFINE_LAUNCHER(launch_draw_manual_mask_rgba_pitched, draw_launch::ManualMaskRgbaPitchedLaunch) {

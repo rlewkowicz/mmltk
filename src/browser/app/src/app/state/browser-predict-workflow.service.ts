@@ -78,7 +78,6 @@ export class BrowserPredictWorkflowState {
 
   updateTextField(
     field:
-      | "selectedPreset"
       | "weightsPath"
       | "onnxPath"
       | "tensorrtPath"

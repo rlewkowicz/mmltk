@@ -25,10 +25,19 @@ __pycache__/
 *.dmp
 *.stackdump
 *.trace
-core
-core.*
+/core
+/core.*
 
 # Large dataset and model artifacts
+*.json
+*.jsonl
+!CMakePresets.json
+!src/browser/app/angular.json
+!src/browser/app/package.json
+!src/browser/app/package-lock.json
+!src/browser/app/tsconfig.app.json
+!src/browser/app/tsconfig.json
+!src/browser/app/tsconfig.tests.json
 *.bin
 *.npy
 *.npz
@@ -63,5 +72,10 @@ src/browser/app/.test-dist-debug/
 src/browser/app/.test-dist-debug*/
 src/browser/app/.tmp-helper-test/
 src/browser/app/dist/
+src/browser/app/test-results/
 
 actionplan.md
+gui.json
+log.txt
+cleanup/
+cleanup/**test-results**

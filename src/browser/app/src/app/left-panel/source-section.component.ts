@@ -35,12 +35,22 @@ import { BrowserSourceState } from '../state/browser-source-state.service';
           </label>
           <label class="field" [class.field-span]="store.canEditSourceLocator()">
             <span>{{ sourceLocatorLabel() }}</span>
-            <input
-              type="text"
-              [ngModel]="store.draft().locator"
-              (ngModelChange)="updateSourceLocator($event)"
-              [disabled]="!store.canEditSourceLocator()"
-            />
+            <div class="field-group">
+              <input
+                type="text"
+                [ngModel]="store.draft().locator"
+                (ngModelChange)="updateSourceLocator($event)"
+                [disabled]="!store.canEditSourceLocator()"
+              />
+              <button
+                class="field-browse"
+                type="button"
+                [disabled]="!store.canBrowseSource()"
+                (click)="store.browse()"
+              >
+                Browse
+              </button>
+            </div>
           </label>
           <label class="field">
             <span>Recursive</span>
@@ -107,15 +117,6 @@ import { BrowserSourceState } from '../state/browser-source-state.service';
           }
         </div>
       }
-      <div class="action-row">
-        <button type="button" [disabled]="!store.canApplySource()" (click)="store.apply()">
-          Apply Source
-        </button>
-        <button type="button" [disabled]="!store.canBrowseSource()" (click)="store.browse()">
-          {{ sourceBrowseLabel() }}
-        </button>
-      </div>
-      <p class="section-copy">{{ store.sourceNote() }}</p>
     </section>
   `,
 })
@@ -133,10 +134,6 @@ export class SourceSectionComponent {
       default:
         return 'Device Path';
     }
-  }
-
-  protected sourceBrowseLabel(): string {
-    return this.store.draft().kind === 'image_folder' ? 'Browse Folder' : 'Browse File';
   }
 
   protected updateSourceKind(kind: string): void {

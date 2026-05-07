@@ -43,6 +43,18 @@ inline bool manual_selected_instance_equals(const std::optional<std::size_t>& lh
     return lhs == rhs;
 }
 
+inline bool manual_brush_preview_equals(const std::optional<live::ManualOverlayBrushPreview>& lhs,
+                                        const std::optional<live::ManualOverlayBrushPreview>& rhs) {
+    if (lhs.has_value() != rhs.has_value()) {
+        return false;
+    }
+    if (!lhs.has_value()) {
+        return true;
+    }
+    return lhs->capture_x == rhs->capture_x && lhs->capture_y == rhs->capture_y && lhs->radius == rhs->radius &&
+           lhs->erase == rhs->erase;
+}
+
 inline bool manual_instance_equals(const live::ManualOverlayInstance& lhs, const live::ManualOverlayInstance& rhs) {
     return lhs.instance_id == rhs.instance_id && lhs.enabled == rhs.enabled && manual_box_equals(lhs.box, rhs.box) &&
            manual_mask_region_equals(lhs.mask_region, rhs.mask_region) && lhs.mask == rhs.mask &&
@@ -58,6 +70,7 @@ inline bool manual_snapshot_equals(const live::ManualOverlayDocumentSnapshot& lh
     return lhs.document_generation == rhs.document_generation && lhs.session_revision == rhs.session_revision &&
            lhs.capture_width == rhs.capture_width && lhs.capture_height == rhs.capture_height &&
            manual_selected_instance_equals(lhs.selected_instance, rhs.selected_instance) &&
+           manual_brush_preview_equals(lhs.brush_preview, rhs.brush_preview) &&
            detail::sequence_equal(lhs.instances, rhs.instances, manual_instance_equals);
 }
 

@@ -12,6 +12,7 @@
 
   div {
     padding: 0.65rem;
+    border: 1px solid var(--panel-border);
     border-radius: radius-token(sm);
     background: var(--inset-fill);
   }
@@ -26,6 +27,13 @@
     margin: 0;
     word-break: break-word;
   }
+}
+
+.form-grid + .detail-grid,
+.detail-grid + .form-grid,
+.choice-grid + .form-grid,
+.form-grid + .choice-grid {
+  margin-top: space-token(md);
 }
 
 .form-grid {
@@ -57,6 +65,8 @@
 
 .field-browse {
   border-radius: radius-token(sm);
+  max-width: 100%;
+  overflow-wrap: anywhere;
   white-space: nowrap;
 }
 
@@ -71,13 +81,20 @@
 
 .choice-grid {
   @include grid(repeat(2, minmax(0, 1fr)), 0.7rem);
+
+  margin-top: space-token(md);
 }
 
 .choice-chip {
   @include row-center(0.55rem);
   @include inset-surface($padding: 0.6rem 0.7rem, $radius: radius-token(sm));
 
+  min-width: 0;
+
   span {
     @include uppercase-label($size: 0.76rem, $color: var(--text-1));
+
+    min-width: 0;
+    overflow-wrap: anywhere;
   }
 }

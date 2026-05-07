@@ -434,6 +434,7 @@ resolve_gui_session() {
 
 prepare_bind_mounts() {
     bind_mount_specs=()
+    append_bind_mount /dev /dev rw
     if (( ! gui_mode )); then
         return 0
     fi
@@ -454,6 +455,10 @@ prepare_bind_mounts() {
 
     if [[ -n "${gui_dbus_socket_host_path}" ]]; then
         append_bind_mount "${gui_dbus_socket_host_path}" "${gui_dbus_socket_container_path}" rw
+    fi
+
+    if [[ -d /run/dbus ]]; then
+        append_bind_mount /run/dbus /run/dbus rw
     fi
 }
 
@@ -668,6 +673,33 @@ ensure_runtime_test_cli_compatibility() {
         ' >/dev/null
 }
 
+terminate_existing_gui_instances() {
+    if (( ! gui_mode )); then
+        return 0
+    fi
+
+    if docker exec -u 0 "${container_name}" /bin/sh -lc '
+        pgrep -f "[m]mltk-browser-host" >/dev/null 2>&1 ||
+        pgrep -f "[m]mltk-browser-helper" >/dev/null 2>&1
+    ' >/dev/null 2>&1; then
+        log "terminating existing GUI runtime before starting a new one"
+    fi
+
+    docker exec -u 0 "${container_name}" /bin/sh -lc '
+        pkill -TERM -f "[m]mltk-browser-host" 2>/dev/null || true
+        pkill -TERM -f "[m]mltk-browser-helper" 2>/dev/null || true
+        for _ in $(seq 1 50); do
+            if ! pgrep -f "[m]mltk-browser-host" >/dev/null 2>&1 &&
+               ! pgrep -f "[m]mltk-browser-helper" >/dev/null 2>&1; then
+                exit 0
+            fi
+            sleep 0.1
+        done
+        pkill -KILL -f "[m]mltk-browser-host" 2>/dev/null || true
+        pkill -KILL -f "[m]mltk-browser-helper" 2>/dev/null || true
+    ' >/dev/null 2>&1 || true
+}
+
 build_exec_env_args() {
     exec_env_args=()
     exec_env_args+=(-e "MMLTK_RFDETR_TEST_CACHE_DIR=/host${repo_root}/.mmltk-data/test-cache/rfdetr")
@@ -722,11 +754,19 @@ build_exec_env_args() {
             exec_env_args+=(-e "__NV_PRIME_RENDER_OFFLOAD=${__NV_PRIME_RENDER_OFFLOAD}")
         fi
 
+        if [[ -n "${MMLTK_CEF_REMOTE_DEBUGGING_PORT:-}" ]]; then
+            exec_env_args+=(-e "MMLTK_CEF_REMOTE_DEBUGGING_PORT=${MMLTK_CEF_REMOTE_DEBUGGING_PORT}")
+        fi
+        if [[ -n "${MMLTK_GUI_E2E_INTENT_TRACE_PATH:-}" ]]; then
+            exec_env_args+=(-e "MMLTK_GUI_E2E_INTENT_TRACE_PATH=$(rewrite_host_path "${MMLTK_GUI_E2E_INTENT_TRACE_PATH}")")
+        fi
+
         for env_name in \
             MMLTK_CEF_WEBGPU_RUNTIME \
             MMLTK_CEF_ENABLE_UNSAFE_WEBGPU \
             MMLTK_CEF_FORCE_HIGH_PERFORMANCE_GPU \
             MMLTK_CEF_ROOT_CACHE_PATH \
+            MMLTK_CEF_LOG_FILE \
             MMLTK_CEF_VERBOSE_LOGGING \
             MMLTK_CEF_LOG_VERBOSITY \
             MMLTK_CEF_VMODULE; do
@@ -784,6 +824,7 @@ reset_gui_session_resolution() {
 prepare_container_invocation() {
     ensure_container
     ensure_runtime_test_cli_compatibility
+    terminate_existing_gui_instances
     build_exec_env_args
 
     container_workdir="/host${host_workdir}"
@@ -823,10 +864,16 @@ run_prepared_container_invocation() {
 
 gui_mode=0
 tidy_mode=0
+prepare_gui_container_mode=0
 passthrough_args=()
 for arg in "$@"; do
     if [[ "${arg}" == "--gui" ]]; then
         gui_mode=1
+        continue
+    fi
+    if [[ "${arg}" == "--prepare-gui-container" ]]; then
+        gui_mode=1
+        prepare_gui_container_mode=1
         continue
     fi
     if [[ "${arg}" == "--tidy" ]]; then
@@ -848,5 +895,9 @@ if (( tidy_mode )); then
 fi
 
 prepare_container_invocation
+
+if (( prepare_gui_container_mode )); then
+    exit 0
+fi
 
 run_prepared_container_invocation

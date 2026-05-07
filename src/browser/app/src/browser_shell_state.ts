@@ -72,9 +72,18 @@ export interface LiveStatusViewState {
 }
 
 export type LiveActiveMode = "predict" | "annotate" | "none";
+export type LiveStartupState = "idle" | "starting" | "drawable" | "failed";
+export type LiveDisplayStartupState =
+  | "idle"
+  | "capture running"
+  | "surface published"
+  | "texture imported"
+  | "draw submitted"
+  | "native presented";
 
 export interface LiveRuntimeViewState {
   activeMode: LiveActiveMode;
+  startupState: LiveStartupState;
   starting: boolean;
   stopping: boolean;
   showIdleStartError: boolean;
@@ -84,15 +93,51 @@ export interface LiveRuntimeViewState {
 export interface LivePreviewViewState {
   initialized: boolean;
   hasFrame: boolean;
+  nativePresented: boolean;
   width: number;
   height: number;
   frameId: number;
   liveFrameId: LiveFrameId | null;
+  surfaceRevision: string;
+  owner: string;
+  publishNs: number;
+  displayStartupState: LiveDisplayStartupState;
+  rendererAcquiredRevision: string;
+  rendererImportedRevision: string;
+  rendererSubmittedRevision: string;
+  rendererDrawnRevision: string;
+  rendererReleasePendingRevision: string;
+  rendererLastDrawError: string;
+  rendererLastResultCode: string;
+  rendererLastResultDetail: string;
   fitToCapture: boolean;
   cropOverlayMode: boolean;
   staticSourceName: string;
   interopFailed: boolean;
   error: string;
+  lastError: string;
+  lastFailureReason: string;
+  lastFailureDetail: string;
+  lastFailureRevision: string;
+  lastFailureStage: string;
+  lastFailureLiveFrameId: LiveFrameId | null;
+  lastFailureCudaDevice: number | null;
+  lastFailureResultCode: string;
+  lastFailureResultDetail: string;
+  publicationCounters: LivePreviewPublicationCountersViewState;
+}
+
+export interface LivePreviewPublicationCountersViewState {
+  attemptedWorkspaceAcquisitions: number;
+  startupWorkspaceAcquisitionMisses: number;
+  postStartupWorkspaceAcquisitionMisses: number;
+  retainedSurfaces: number;
+  rejectedStaleFrames: number;
+  cefExportFailures: number;
+  rendererReleases: number;
+  nativeReleaseFailures: number;
+  rendererImportFailures: number;
+  rendererReleaseRejections: number;
 }
 
 export interface LiveControllerViewState {
@@ -317,6 +362,25 @@ function firstRecord(candidates: ReadonlyArray<unknown>): JsonRecord | null {
 
 function liveActiveModeFromValue(value: unknown): LiveActiveMode {
   return value === "predict" || value === "annotate" ? value : "none";
+}
+
+function liveStartupStateFromValue(value: unknown): LiveStartupState {
+  return value === "starting" || value === "drawable" || value === "failed"
+    ? value
+    : "idle";
+}
+
+function liveDisplayStartupStateFromValue(
+  value: unknown,
+  fallback: LiveDisplayStartupState,
+): LiveDisplayStartupState {
+  return value === "capture running" ||
+    value === "surface published" ||
+    value === "texture imported" ||
+    value === "draw submitted" ||
+    value === "native presented"
+    ? value
+    : fallback;
 }
 
 function liveFrameIdFromValue(value: unknown): LiveFrameId | null {
@@ -790,6 +854,7 @@ export function liveStatusState(snapshot: StateSnapshot): LiveStatusViewState {
   );
   const runtime: LiveRuntimeViewState = {
     activeMode: liveActiveModeFromValue(record?.active_mode),
+    startupState: liveStartupStateFromValue(record?.startup_state),
     starting: booleanFromValue(record?.starting, false),
     stopping: booleanFromValue(record?.stopping, false),
     showIdleStartError: booleanFromValue(record?.show_idle_start_error, false),
@@ -861,7 +926,7 @@ export function liveStatusState(snapshot: StateSnapshot): LiveStatusViewState {
     (showStaticPreview && staticPreviewSource.length > 0);
   const previewHasFrame = booleanFromValue(
     preview?.has_frame ?? record?.preview_has_frame,
-    previewHasExplicitFrameMetadata,
+    showStaticPreview && previewHasExplicitFrameMetadata,
   );
   const previewLiveFrameId =
     previewPublishedLiveFrameId ??
@@ -883,6 +948,9 @@ export function liveStatusState(snapshot: StateSnapshot): LiveStatusViewState {
       ? previewPublishedFrameId
       : previewLiveFrameId?.sequence ?? 0;
   const previewInteropFailed = booleanFromValue(preview?.interop_failed, false);
+  const previewPublicationCounters = isRecord(preview?.publication_counters)
+    ? preview.publication_counters
+    : null;
   const previewStatus: CapabilityStatusViewState["status"] =
     previewInteropFailed
       ? "fallback"
@@ -891,12 +959,22 @@ export function liveStatusState(snapshot: StateSnapshot): LiveStatusViewState {
           ? "ready"
           : "active"
         : "pending";
+  const displayStartupFallback: LiveDisplayStartupState = previewHasFrame
+    ? "surface published"
+    : showRunningSection || runtime.starting
+      ? "capture running"
+      : "idle";
+  const displayStartupState = liveDisplayStartupStateFromValue(
+    preview?.display_startup_state,
+    displayStartupFallback,
+  );
   const previewSummary =
     previewHasFrame
       ? showStaticPreview && staticPreviewSource.length > 0
         ? `static preview ${previewWidth}x${previewHeight}`
         : `preview frame ${previewFrameId > 0 ? previewFrameId : previewLiveFrameId?.sequence ?? 0}`
       : "preview awaiting frame";
+  const lastFailureCudaDeviceValue = preview?.last_failure_cuda_device;
   const previewState: LivePreviewViewState = {
     initialized: booleanFromValue(preview?.initialized, previewHasFrame),
     hasFrame: previewHasFrame,
@@ -904,11 +982,87 @@ export function liveStatusState(snapshot: StateSnapshot): LiveStatusViewState {
     height: previewHeight,
     frameId: previewFrameId,
     liveFrameId: previewLiveFrameId,
+    surfaceRevision: stringFromValue(preview?.surface_revision),
+    owner: stringFromValue(preview?.owner, "none"),
+    publishNs: integerFromValue(preview?.publish_ns, 0),
+    displayStartupState,
+    nativePresented: booleanFromValue(preview?.native_presented, false),
+    rendererAcquiredRevision: stringFromValue(preview?.renderer_acquired_revision),
+    rendererImportedRevision: stringFromValue(preview?.renderer_imported_revision),
+    rendererSubmittedRevision: stringFromValue(preview?.renderer_submitted_revision),
+    rendererDrawnRevision: stringFromValue(preview?.renderer_drawn_revision),
+    rendererReleasePendingRevision: stringFromValue(
+      preview?.renderer_release_pending_revision,
+    ),
+    rendererLastDrawError: stringFromValue(preview?.renderer_last_draw_error),
+    rendererLastResultCode: stringFromValue(preview?.renderer_last_result_code),
+    rendererLastResultDetail: stringFromValue(
+      preview?.renderer_last_result_detail,
+    ),
     fitToCapture: booleanFromValue(preview?.fit_to_capture, false),
     cropOverlayMode: booleanFromValue(preview?.crop_overlay_mode, false),
     staticSourceName: staticPreviewSource,
     interopFailed: previewInteropFailed,
     error: stringFromValue(preview?.error ?? record?.preview_error),
+    lastError: stringFromValue(preview?.last_error),
+    lastFailureReason: stringFromValue(preview?.last_failure_reason),
+    lastFailureDetail: stringFromValue(preview?.last_failure_detail),
+    lastFailureRevision: stringFromValue(preview?.last_failure_revision),
+    lastFailureStage: stringFromValue(preview?.last_failure_stage),
+    lastFailureLiveFrameId: liveFrameIdFromValue(
+      preview?.last_failure_live_frame_id,
+    ),
+    lastFailureCudaDevice:
+      lastFailureCudaDeviceValue === null ||
+      lastFailureCudaDeviceValue === undefined
+        ? null
+        : integerFromValue(lastFailureCudaDeviceValue, -1),
+    lastFailureResultCode: stringFromValue(preview?.last_failure_result_code),
+    lastFailureResultDetail: stringFromValue(
+      preview?.last_failure_result_detail,
+    ),
+    publicationCounters: {
+      attemptedWorkspaceAcquisitions: integerFromValue(
+        previewPublicationCounters?.attempted_workspace_acquisitions,
+        0,
+      ),
+      startupWorkspaceAcquisitionMisses: integerFromValue(
+        previewPublicationCounters?.startup_workspace_acquisition_misses,
+        0,
+      ),
+      postStartupWorkspaceAcquisitionMisses: integerFromValue(
+        previewPublicationCounters?.post_startup_workspace_acquisition_misses,
+        0,
+      ),
+      retainedSurfaces: integerFromValue(
+        previewPublicationCounters?.retained_surfaces,
+        0,
+      ),
+      rejectedStaleFrames: integerFromValue(
+        previewPublicationCounters?.rejected_stale_frames,
+        0,
+      ),
+      cefExportFailures: integerFromValue(
+        previewPublicationCounters?.cef_export_failures,
+        0,
+      ),
+      rendererReleases: integerFromValue(
+        previewPublicationCounters?.renderer_releases,
+        0,
+      ),
+      nativeReleaseFailures: integerFromValue(
+        previewPublicationCounters?.native_release_failures,
+        0,
+      ),
+      rendererImportFailures: integerFromValue(
+        previewPublicationCounters?.renderer_import_failures,
+        0,
+      ),
+      rendererReleaseRejections: integerFromValue(
+        previewPublicationCounters?.renderer_release_rejections,
+        0,
+      ),
+    },
   };
   const manualOverlayRunning = booleanFromValue(manualOverlay?.running, false);
   const manualOverlayError = stringFromValue(manualOverlay?.last_error);
@@ -937,6 +1091,7 @@ export function liveStatusState(snapshot: StateSnapshot): LiveStatusViewState {
     stringFromValue(record?.start_error),
     stringFromValue(record?.action_error),
     previewState.error,
+    previewState.rendererLastDrawError,
     controllerState.lastError,
     analyzerState.lastError,
     workspacePathState.lastError,
@@ -952,6 +1107,7 @@ export function liveStatusState(snapshot: StateSnapshot): LiveStatusViewState {
       : "No preview frame";
   const previewLabel = joinStatusSegments([
     previewLabelBase,
+    displayStartupState !== "idle" ? displayStartupState : "",
     previewState.cropOverlayMode ? "full-frame" : "",
     !previewState.cropOverlayMode && previewState.fitToCapture ? "fit" : "",
     previewState.interopFailed ? "interop fallback" : "",
@@ -993,8 +1149,8 @@ export function liveStatusState(snapshot: StateSnapshot): LiveStatusViewState {
           workspacePathState.overlayActive ? "overlay active" : "",
         ])
       : previewHasFrame || workspacePathState.lastFrameId !== null
-        ? "workspace bridge staged"
-        : "workspace bridge pending";
+        ? "workspace path staged"
+        : "workspace path pending";
   const workspacePathStatus: CapabilityStatusViewState["status"] =
     workspacePathState.running
       ? "active"
@@ -1009,8 +1165,8 @@ export function liveStatusState(snapshot: StateSnapshot): LiveStatusViewState {
         ? `workspace path ${framesComposited} / ${workspacePathState.framesDropped} dropped`
         : `workspace path ${framesComposited}`
       : previewHasFrame || workspacePathState.lastFrameId !== null
-        ? "workspace bridge staged"
-        : "workspace bridge pending";
+        ? "workspace path staged"
+        : "workspace path pending";
   const statusItems: CapabilityStatusViewState[] = [
     statusItemFromContract(record, "session", {
       key: "session",
@@ -1378,7 +1534,7 @@ export function annotateShellControlsState(
         workflow: workflowFromValue(save?.hold_save_workflow, "annotate"),
         intent: stringFromValue(save?.hold_save_intent, "annotate.hold_save"),
         label: "Hold Save",
-        payloadKey: stringFromValue(save?.hold_save_payload_key, "active"),
+        payloadKey: stringFromValue(save?.hold_save_payload_key, "enabled"),
       }),
       holdSaveBlocked,
     },

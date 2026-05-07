@@ -34,11 +34,12 @@ export class ValidateWorkflowControlsComponent extends WorkflowTextBooleanAction
   protected readonly textFields: ReadonlyArray<
     WorkflowTextFieldConfig<ValidateTextField>
   > = [
-    { label: "Compiled Dataset", field: "compiledPath", wide: true },
-    { label: "Source Root", field: "sourceDir", wide: true },
-    { label: "ONNX Path", field: "onnxPath", wide: true },
-    { label: "TensorRT Path", field: "tensorrtPath", wide: true },
-    { label: "Report JSON", field: "reportJsonPath", wide: true },
+    { label: "Compiled Dataset", field: "compiledPath", wide: true, browseAction: "compiledPath" },
+    { label: "Source Root", field: "sourceDir", wide: true, browseAction: "sourceDir" },
+    { label: "ONNX Path", field: "onnxPath", wide: true, browseAction: "onnxPath" },
+    { label: "TensorRT Path", field: "tensorrtPath", wide: true, browseAction: "tensorrtPath" },
+    { label: "Save Engine", field: "saveEnginePath", wide: true, browseAction: "saveEnginePath" },
+    { label: "Report JSON", field: "reportJsonPath", wide: true, browseAction: "reportJsonPath" },
     { label: "CPU Affinity", field: "cpuAffinity", wide: true },
     { label: "Device", field: "deviceId", inputmode: "numeric" },
     { label: "Batch Size", field: "batchSize", inputmode: "numeric" },
@@ -52,11 +53,5 @@ export class ValidateWorkflowControlsComponent extends WorkflowTextBooleanAction
   ];
   protected readonly browseActions: ReadonlyArray<
     WorkflowActionButtonConfig<ValidateBrowseField>
-  > = [
-    { label: "Dataset", action: "compiledPath" },
-    { label: "Source Root", action: "sourceDir" },
-    { label: "ONNX", action: "onnxPath" },
-    { label: "TensorRT", action: "tensorrtPath" },
-    { label: "Report", action: "reportJsonPath" },
-  ];
+  > = [];
 }

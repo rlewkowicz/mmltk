@@ -110,7 +110,7 @@ struct us_socket_context_t {
     alignas(LIBUS_EXT_ALIGNMENT) struct us_loop_t* loop;
     LIBUS_SOCKET_CONTEXT_SHARED_FIELDS
 
-    LIBUS_SOCKET_DESCRIPTOR (*on_pre_open)
+    LIBUS_SOCKET_DESCRIPTOR(*on_pre_open)
     (struct us_socket_context_t* context, LIBUS_SOCKET_DESCRIPTOR fd, char* ip, int ip_length);
     LIBUS_SOCKET_CONTEXT_CALLBACK_FIELDS
     int (*is_low_prio)(struct us_socket_t*);

@@ -2681,6 +2681,31 @@ JSON_HEDLEY_DIAGNOSTIC_POP
         NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_TO, __VA_ARGS__))                             \
     }
 
+#define NLOHMANN_JSON_DERIVED_TO_JSON(Type, BaseType, FriendSpec, ...)                                       \
+    template <typename BasicJsonType,                                                                        \
+              nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0> \
+    FriendSpec void to_json(BasicJsonType& nlohmann_json_j, const Type& nlohmann_json_t) {                   \
+        nlohmann::to_json(nlohmann_json_j, static_cast<const BaseType&>(nlohmann_json_t));                   \
+        NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_TO, __VA_ARGS__))                             \
+    }
+
+#define NLOHMANN_JSON_DERIVED_FROM_JSON(Type, BaseType, FriendSpec, FromMacro, ...)                          \
+    template <typename BasicJsonType,                                                                        \
+              nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0> \
+    FriendSpec void from_json(const BasicJsonType& nlohmann_json_j, Type& nlohmann_json_t) {                 \
+        nlohmann::from_json(nlohmann_json_j, static_cast<BaseType&>(nlohmann_json_t));                       \
+        NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(FromMacro, __VA_ARGS__))                                    \
+    }
+
+#define NLOHMANN_JSON_DERIVED_FROM_JSON_WITH_DEFAULT(Type, BaseType, FriendSpec, ...)                        \
+    template <typename BasicJsonType,                                                                        \
+              nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0> \
+    FriendSpec void from_json(const BasicJsonType& nlohmann_json_j, Type& nlohmann_json_t) {                 \
+        nlohmann::from_json(nlohmann_json_j, static_cast<BaseType&>(nlohmann_json_t));                       \
+        const Type nlohmann_json_default_obj{};                                                              \
+        NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_FROM_WITH_DEFAULT, __VA_ARGS__))              \
+    }
+
 /*!
 @brief macro
 @def NLOHMANN_DEFINE_DERIVED_TYPE_INTRUSIVE
@@ -2688,18 +2713,8 @@ JSON_HEDLEY_DIAGNOSTIC_POP
 @sa https://json.nlohmann.me/api/macros/nlohmann_define_derived_type/
 */
 #define NLOHMANN_DEFINE_DERIVED_TYPE_INTRUSIVE(Type, BaseType, ...)                                          \
-    template <typename BasicJsonType,                                                                        \
-              nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0> \
-    friend void to_json(BasicJsonType& nlohmann_json_j, const Type& nlohmann_json_t) {                       \
-        nlohmann::to_json(nlohmann_json_j, static_cast<const BaseType&>(nlohmann_json_t));                   \
-        NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_TO, __VA_ARGS__))                             \
-    }                                                                                                        \
-    template <typename BasicJsonType,                                                                        \
-              nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0> \
-    friend void from_json(const BasicJsonType& nlohmann_json_j, Type& nlohmann_json_t) {                     \
-        nlohmann::from_json(nlohmann_json_j, static_cast<BaseType&>(nlohmann_json_t));                       \
-        NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_FROM, __VA_ARGS__))                           \
-    }
+    NLOHMANN_JSON_DERIVED_TO_JSON(Type, BaseType, friend, __VA_ARGS__)                                       \
+    NLOHMANN_JSON_DERIVED_FROM_JSON(Type, BaseType, friend, NLOHMANN_JSON_FROM, __VA_ARGS__)
 
 /*!
 @brief macro
@@ -2708,19 +2723,8 @@ JSON_HEDLEY_DIAGNOSTIC_POP
 @sa https://json.nlohmann.me/api/macros/nlohmann_define_derived_type/
 */
 #define NLOHMANN_DEFINE_DERIVED_TYPE_INTRUSIVE_WITH_DEFAULT(Type, BaseType, ...)                             \
-    template <typename BasicJsonType,                                                                        \
-              nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0> \
-    friend void to_json(BasicJsonType& nlohmann_json_j, const Type& nlohmann_json_t) {                       \
-        nlohmann::to_json(nlohmann_json_j, static_cast<const BaseType&>(nlohmann_json_t));                   \
-        NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_TO, __VA_ARGS__))                             \
-    }                                                                                                        \
-    template <typename BasicJsonType,                                                                        \
-              nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0> \
-    friend void from_json(const BasicJsonType& nlohmann_json_j, Type& nlohmann_json_t) {                     \
-        nlohmann::from_json(nlohmann_json_j, static_cast<BaseType&>(nlohmann_json_t));                       \
-        const Type nlohmann_json_default_obj{};                                                              \
-        NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_FROM_WITH_DEFAULT, __VA_ARGS__))              \
-    }
+    NLOHMANN_JSON_DERIVED_TO_JSON(Type, BaseType, friend, __VA_ARGS__)                                       \
+    NLOHMANN_JSON_DERIVED_FROM_JSON_WITH_DEFAULT(Type, BaseType, friend, __VA_ARGS__)
 
 /*!
 @brief macro
@@ -2729,12 +2733,7 @@ JSON_HEDLEY_DIAGNOSTIC_POP
 @sa https://json.nlohmann.me/api/macros/nlohmann_define_derived_type/
 */
 #define NLOHMANN_DEFINE_DERIVED_TYPE_INTRUSIVE_ONLY_SERIALIZE(Type, BaseType, ...)                           \
-    template <typename BasicJsonType,                                                                        \
-              nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0> \
-    friend void to_json(BasicJsonType& nlohmann_json_j, const Type& nlohmann_json_t) {                       \
-        nlohmann::to_json(nlohmann_json_j, static_cast<const BaseType&>(nlohmann_json_t));                   \
-        NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_TO, __VA_ARGS__))                             \
-    }
+    NLOHMANN_JSON_DERIVED_TO_JSON(Type, BaseType, friend, __VA_ARGS__)
 
 /*!
 @brief macro
@@ -2743,18 +2742,8 @@ JSON_HEDLEY_DIAGNOSTIC_POP
 @sa https://json.nlohmann.me/api/macros/nlohmann_define_derived_type/
 */
 #define NLOHMANN_DEFINE_DERIVED_TYPE_NON_INTRUSIVE(Type, BaseType, ...)                                      \
-    template <typename BasicJsonType,                                                                        \
-              nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0> \
-    void to_json(BasicJsonType& nlohmann_json_j, const Type& nlohmann_json_t) {                              \
-        nlohmann::to_json(nlohmann_json_j, static_cast<const BaseType&>(nlohmann_json_t));                   \
-        NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_TO, __VA_ARGS__))                             \
-    }                                                                                                        \
-    template <typename BasicJsonType,                                                                        \
-              nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0> \
-    void from_json(const BasicJsonType& nlohmann_json_j, Type& nlohmann_json_t) {                            \
-        nlohmann::from_json(nlohmann_json_j, static_cast<BaseType&>(nlohmann_json_t));                       \
-        NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_FROM, __VA_ARGS__))                           \
-    }
+    NLOHMANN_JSON_DERIVED_TO_JSON(Type, BaseType, , __VA_ARGS__)                                             \
+    NLOHMANN_JSON_DERIVED_FROM_JSON(Type, BaseType, , NLOHMANN_JSON_FROM, __VA_ARGS__)
 
 /*!
 @brief macro
@@ -2763,19 +2752,8 @@ JSON_HEDLEY_DIAGNOSTIC_POP
 @sa https://json.nlohmann.me/api/macros/nlohmann_define_derived_type/
 */
 #define NLOHMANN_DEFINE_DERIVED_TYPE_NON_INTRUSIVE_WITH_DEFAULT(Type, BaseType, ...)                         \
-    template <typename BasicJsonType,                                                                        \
-              nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0> \
-    void to_json(BasicJsonType& nlohmann_json_j, const Type& nlohmann_json_t) {                              \
-        nlohmann::to_json(nlohmann_json_j, static_cast<const BaseType&>(nlohmann_json_t));                   \
-        NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_TO, __VA_ARGS__))                             \
-    }                                                                                                        \
-    template <typename BasicJsonType,                                                                        \
-              nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0> \
-    void from_json(const BasicJsonType& nlohmann_json_j, Type& nlohmann_json_t) {                            \
-        nlohmann::from_json(nlohmann_json_j, static_cast<BaseType&>(nlohmann_json_t));                       \
-        const Type nlohmann_json_default_obj{};                                                              \
-        NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_FROM_WITH_DEFAULT, __VA_ARGS__))              \
-    }
+    NLOHMANN_JSON_DERIVED_TO_JSON(Type, BaseType, , __VA_ARGS__)                                             \
+    NLOHMANN_JSON_DERIVED_FROM_JSON_WITH_DEFAULT(Type, BaseType, , __VA_ARGS__)
 
 /*!
 @brief macro
@@ -2784,12 +2762,7 @@ JSON_HEDLEY_DIAGNOSTIC_POP
 @sa https://json.nlohmann.me/api/macros/nlohmann_define_derived_type/
 */
 #define NLOHMANN_DEFINE_DERIVED_TYPE_NON_INTRUSIVE_ONLY_SERIALIZE(Type, BaseType, ...)                       \
-    template <typename BasicJsonType,                                                                        \
-              nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0> \
-    void to_json(BasicJsonType& nlohmann_json_j, const Type& nlohmann_json_t) {                              \
-        nlohmann::to_json(nlohmann_json_j, static_cast<const BaseType&>(nlohmann_json_t));                   \
-        NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(NLOHMANN_JSON_TO, __VA_ARGS__))                             \
-    }
+    NLOHMANN_JSON_DERIVED_TO_JSON(Type, BaseType, , __VA_ARGS__)
 
 #define NLOHMANN_CAN_CALL_STD_FUNC_IMPL(std_name)                                                     \
     namespace detail {                                                                                \
@@ -6447,18 +6420,7 @@ class lexer : public lexer_base<BasicJsonType> {
 
     scan_number_zero:
         c = get();
-        if (c == '.') {
-            add(decimal_point_char);
-            decimal_point_position = token_buffer.size() - 1;
-            goto scan_number_decimal1;
-        }
-
-        if (c == 'e' || c == 'E') {
-            add(c);
-            goto scan_number_exponent;
-        }
-
-        goto scan_number_done;
+        goto scan_number_fraction_or_exponent;
 
     scan_number_any1:
         c = get();
@@ -6467,6 +6429,7 @@ class lexer : public lexer_base<BasicJsonType> {
             goto scan_number_any1;
         }
 
+    scan_number_fraction_or_exponent:
         if (c == '.') {
             add(decimal_point_char);
             decimal_point_position = token_buffer.size() - 1;
@@ -7035,6 +6998,25 @@ inline void assert_sax_handler_not_null(SAX* sax) {
     }
 }
 
+template <typename JsonPointer, typename LexerType>
+inline void set_sax_top_start_position(JsonPointer value, LexerType* lexer_ref) {
+#if JSON_DIAGNOSTIC_POSITIONS
+    if (lexer_ref) {
+        value->start_position = lexer_ref->get_position() - 1;
+    }
+#else
+    static_cast<void>(value);
+    static_cast<void>(lexer_ref);
+#endif
+}
+
+template <typename JsonPointer>
+inline void assert_sax_container_size(std::size_t len, JsonPointer value, const char* container_name) {
+    if (JSON_HEDLEY_UNLIKELY(len != detail::unknown_size() && len > value->max_size())) {
+        JSON_THROW(out_of_range::create(408, concat("excessive ", container_name, " size: ", std::to_string(len)), value));
+    }
+}
+
 #define NLOHMANN_JSON_SAX_DOM_VALUE_PARSER_CALLBACKS()       \
     bool null() {                                            \
         handle_value(nullptr);                               \
@@ -7142,16 +7124,8 @@ class json_sax_dom_parser {
     bool start_array(std::size_t len) {
         ref_stack.push_back(handle_value(BasicJsonType::value_t::array));
 
-#if JSON_DIAGNOSTIC_POSITIONS
-        if (m_lexer_ref) {
-            ref_stack.back()->start_position = m_lexer_ref->get_position() - 1;
-        }
-#endif
-
-        if (JSON_HEDLEY_UNLIKELY(len != detail::unknown_size() && len > ref_stack.back()->max_size())) {
-            JSON_THROW(
-                out_of_range::create(408, concat("excessive array size: ", std::to_string(len)), ref_stack.back()));
-        }
+        set_sax_top_start_position(ref_stack.back(), m_lexer_ref);
+        assert_sax_container_size(len, ref_stack.back(), "array");
 
         return true;
     }
@@ -7331,16 +7305,8 @@ class json_sax_dom_callback_parser {
         ref_stack.push_back(val.second);
 
         if (ref_stack.back()) {
-#if JSON_DIAGNOSTIC_POSITIONS
-            if (m_lexer_ref) {
-                ref_stack.back()->start_position = m_lexer_ref->get_position() - 1;
-            }
-#endif
-
-            if (JSON_HEDLEY_UNLIKELY(len != detail::unknown_size() && len > ref_stack.back()->max_size())) {
-                JSON_THROW(
-                    out_of_range::create(408, concat("excessive array size: ", std::to_string(len)), ref_stack.back()));
-            }
+            set_sax_top_start_position(ref_stack.back(), m_lexer_ref);
+            assert_sax_container_size(len, ref_stack.back(), "array");
         }
 
         return true;
@@ -8908,6 +8874,23 @@ class binary_reader {
 
     @return whether size determination completed
     */
+    template <typename NumberType>
+    bool get_ubjson_signed_size(std::size_t& result) {
+        NumberType number{};
+        if (JSON_HEDLEY_UNLIKELY(!get_number(input_format, number))) {
+            return false;
+        }
+        if (number < 0) {
+            return sax->parse_error(
+                chars_read, get_token_string(),
+                parse_error::create(
+                    113, chars_read,
+                    exception_message(input_format, "count in an optimized container must be positive", "size"), nullptr));
+        }
+        result = static_cast<std::size_t>(number);
+        return true;
+    }
+
     bool get_ubjson_size_value(std::size_t& result, bool& is_ndarray, char_int_type prefix = 0) {
         if (prefix == 0) {
             prefix = get_ignore_noop();
@@ -8924,55 +8907,15 @@ class binary_reader {
             }
 
             case 'i': {
-                std::int8_t number{};
-                if (JSON_HEDLEY_UNLIKELY(!get_number(input_format, number))) {
-                    return false;
-                }
-                if (number < 0) {
-                    return sax->parse_error(
-                        chars_read, get_token_string(),
-                        parse_error::create(
-                            113, chars_read,
-                            exception_message(input_format, "count in an optimized container must be positive", "size"),
-                            nullptr));
-                }
-                result = static_cast<std::size_t>(
-                    number);  // NOLINT(bugprone-signed-char-misuse,cert-str34-c): number is not a char
-                return true;
+                return get_ubjson_signed_size<std::int8_t>(result);
             }
 
             case 'I': {
-                std::int16_t number{};
-                if (JSON_HEDLEY_UNLIKELY(!get_number(input_format, number))) {
-                    return false;
-                }
-                if (number < 0) {
-                    return sax->parse_error(
-                        chars_read, get_token_string(),
-                        parse_error::create(
-                            113, chars_read,
-                            exception_message(input_format, "count in an optimized container must be positive", "size"),
-                            nullptr));
-                }
-                result = static_cast<std::size_t>(number);
-                return true;
+                return get_ubjson_signed_size<std::int16_t>(result);
             }
 
             case 'l': {
-                std::int32_t number{};
-                if (JSON_HEDLEY_UNLIKELY(!get_number(input_format, number))) {
-                    return false;
-                }
-                if (number < 0) {
-                    return sax->parse_error(
-                        chars_read, get_token_string(),
-                        parse_error::create(
-                            113, chars_read,
-                            exception_message(input_format, "count in an optimized container must be positive", "size"),
-                            nullptr));
-                }
-                result = static_cast<std::size_t>(number);
-                return true;
+                return get_ubjson_signed_size<std::int32_t>(result);
             }
 
             case 'L': {
@@ -9953,20 +9896,29 @@ class parser {
     @throw parse_error.102 if to_unicode fails or surrogate error
     @throw parse_error.103 if to_unicode fails
     */
+    template <typename SaxDomParser>
+    bool finish_sax_parse(const bool strict, BasicJsonType& result, SaxDomParser& sdp) {
+        sax_parse_internal(&sdp);
+
+        if (strict && (get_token() != token_type::end_of_input)) {
+            sdp.parse_error(m_lexer.get_position(), m_lexer.get_token_string(),
+                            parse_error::create(101, m_lexer.get_position(),
+                                                exception_message(token_type::end_of_input, "value"), nullptr));
+        }
+
+        if (sdp.is_errored()) {
+            result = value_t::discarded;
+            return false;
+        }
+
+        return true;
+    }
+
     void parse(const bool strict, BasicJsonType& result) {
         if (callback) {
             json_sax_dom_callback_parser<BasicJsonType, InputAdapterType> sdp(result, callback, allow_exceptions,
                                                                               &m_lexer);
-            sax_parse_internal(&sdp);
-
-            if (strict && (get_token() != token_type::end_of_input)) {
-                sdp.parse_error(m_lexer.get_position(), m_lexer.get_token_string(),
-                                parse_error::create(101, m_lexer.get_position(),
-                                                    exception_message(token_type::end_of_input, "value"), nullptr));
-            }
-
-            if (sdp.is_errored()) {
-                result = value_t::discarded;
+            if (!finish_sax_parse(strict, result, sdp)) {
                 return;
             }
 
@@ -9975,16 +9927,7 @@ class parser {
             }
         } else {
             json_sax_dom_parser<BasicJsonType, InputAdapterType> sdp(result, allow_exceptions, &m_lexer);
-            sax_parse_internal(&sdp);
-
-            if (strict && (get_token() != token_type::end_of_input)) {
-                sdp.parse_error(m_lexer.get_position(), m_lexer.get_token_string(),
-                                parse_error::create(101, m_lexer.get_position(),
-                                                    exception_message(token_type::end_of_input, "value"), nullptr));
-            }
-
-            if (sdp.is_errored()) {
-                result = value_t::discarded;
+            if (!finish_sax_parse(strict, result, sdp)) {
                 return;
             }
         }
@@ -12196,6 +12139,28 @@ class binary_writer {
     @param[in] use_bjdata  whether write in BJData format, default is false
     @param[in] bjdata_version  which BJData version to use, default is draft2
     */
+    template <typename Iterator>
+    bool write_ubjson_uniform_type(Iterator first, Iterator last, bool use_bjdata) {
+        if (first == last) {
+            return true;
+        }
+
+        const CharType first_prefix = ubjson_prefix(*first, use_bjdata);
+        const bool same_prefix =
+            std::all_of(std::next(first), last, [this, first_prefix, use_bjdata](const BasicJsonType& v) {
+                return ubjson_prefix(v, use_bjdata) == first_prefix;
+            });
+        const CharType bjdx[] = {'[', '{', 'S', 'H', 'T', 'F', 'N', 'Z'};
+
+        if (!same_prefix || (use_bjdata && std::find(std::begin(bjdx), std::end(bjdx), first_prefix) != std::end(bjdx))) {
+            return true;
+        }
+
+        oa->write_character(to_char_type('$'));
+        oa->write_character(first_prefix);
+        return false;
+    }
+
     void write_ubjson(const BasicJsonType& j, const bool use_count, const bool use_type, const bool add_prefix = true,
                       const bool use_bjdata = false, const bjdata_version_t bjdata_version = bjdata_version_t::draft2) {
         const bool bjdata_draft3 = use_bjdata && bjdata_version == bjdata_version_t::draft3;
@@ -12248,20 +12213,7 @@ class binary_writer {
                 bool prefix_required = true;
                 if (use_type && !j.m_data.m_value.array->empty()) {
                     JSON_ASSERT(use_count);
-                    const CharType first_prefix = ubjson_prefix(j.front(), use_bjdata);
-                    const bool same_prefix =
-                        std::all_of(j.begin() + 1, j.end(), [this, first_prefix, use_bjdata](const BasicJsonType& v) {
-                            return ubjson_prefix(v, use_bjdata) == first_prefix;
-                        });
-
-                    std::vector<CharType> bjdx = {'[', '{', 'S', 'H', 'T', 'F', 'N', 'Z'};
-
-                    if (same_prefix &&
-                        !(use_bjdata && std::find(bjdx.begin(), bjdx.end(), first_prefix) != bjdx.end())) {
-                        prefix_required = false;
-                        oa->write_character(to_char_type('$'));
-                        oa->write_character(first_prefix);
-                    }
+                    prefix_required = write_ubjson_uniform_type(j.begin(), j.end(), use_bjdata);
                 }
 
                 if (use_count) {
@@ -12330,20 +12282,7 @@ class binary_writer {
                 bool prefix_required = true;
                 if (use_type && !j.m_data.m_value.object->empty()) {
                     JSON_ASSERT(use_count);
-                    const CharType first_prefix = ubjson_prefix(j.front(), use_bjdata);
-                    const bool same_prefix =
-                        std::all_of(j.begin(), j.end(), [this, first_prefix, use_bjdata](const BasicJsonType& v) {
-                            return ubjson_prefix(v, use_bjdata) == first_prefix;
-                        });
-
-                    std::vector<CharType> bjdx = {'[', '{', 'S', 'H', 'T', 'F', 'N', 'Z'};
-
-                    if (same_prefix &&
-                        !(use_bjdata && std::find(bjdx.begin(), bjdx.end(), first_prefix) != bjdx.end())) {
-                        prefix_required = false;
-                        oa->write_character(to_char_type('$'));
-                        oa->write_character(first_prefix);
-                    }
+                    prefix_required = write_ubjson_uniform_type(j.begin(), j.end(), use_bjdata);
                 }
 
                 if (use_count) {
@@ -14403,22 +14342,18 @@ struct ordered_map : std::vector<std::pair<const Key, T>, Allocator> {
     }
 
     size_type erase(const key_type& key) {
-        for (auto it = this->begin(); it != this->end(); ++it) {
-            if (m_compare(it->first, key)) {
-                for (auto next = it; ++next != this->end(); ++it) {
-                    it->~value_type();
-                    new (&*it) value_type{std::move(*next)};
-                }
-                Container::pop_back();
-                return 1;
-            }
-        }
-        return 0;
+        return erase_key_impl(key);
     }
 
     template <class KeyType,
               detail::enable_if_t<detail::is_usable_as_key_type<key_compare, key_type, KeyType>::value, int> = 0>
     size_type erase(KeyType&& key)  // NOLINT(cppcoreguidelines-missing-std-forward)
+    {
+        return erase_key_impl(key);
+    }
+
+    template <class KeyType>
+    size_type erase_key_impl(KeyType&& key)  // NOLINT(cppcoreguidelines-missing-std-forward)
     {
         for (auto it = this->begin(); it != this->end(); ++it) {
             if (m_compare(it->first, key)) {
@@ -16278,6 +16213,14 @@ class basic_json  // NOLINT(cppcoreguidelines-special-member-functions,hicpp-spe
         return *tmp;
     }
 
+#define NLOHMANN_JSON_PRIMITIVE_ERASE_CASES \
+    case value_t::boolean:                  \
+    case value_t::number_float:             \
+    case value_t::number_integer:           \
+    case value_t::number_unsigned:          \
+    case value_t::string:                   \
+    case value_t::binary
+
     template <class IteratorType,
               detail::enable_if_t<std::is_same<IteratorType, typename basic_json_t::iterator>::value ||
                                       std::is_same<IteratorType, typename basic_json_t::const_iterator>::value,
@@ -16291,12 +16234,7 @@ class basic_json  // NOLINT(cppcoreguidelines-special-member-functions,hicpp-spe
         IteratorType result = end();
 
         switch (m_data.m_type) {
-            case value_t::boolean:
-            case value_t::number_float:
-            case value_t::number_integer:
-            case value_t::number_unsigned:
-            case value_t::string:
-            case value_t::binary: {
+            NLOHMANN_JSON_PRIMITIVE_ERASE_CASES: {
                 if (JSON_HEDLEY_UNLIKELY(!pos.m_it.primitive_iterator.is_begin())) {
                     JSON_THROW(invalid_iterator::create(205, "iterator out of range", this));
                 }
@@ -16339,12 +16277,7 @@ class basic_json  // NOLINT(cppcoreguidelines-special-member-functions,hicpp-spe
         IteratorType result = end();
 
         switch (m_data.m_type) {
-            case value_t::boolean:
-            case value_t::number_float:
-            case value_t::number_integer:
-            case value_t::number_unsigned:
-            case value_t::string:
-            case value_t::binary: {
+            NLOHMANN_JSON_PRIMITIVE_ERASE_CASES: {
                 if (JSON_HEDLEY_LIKELY(!first.m_it.primitive_iterator.is_begin() ||
                                        !last.m_it.primitive_iterator.is_end())) {
                     JSON_THROW(invalid_iterator::create(204, "iterators out of range", this));
@@ -16376,6 +16309,7 @@ class basic_json  // NOLINT(cppcoreguidelines-special-member-functions,hicpp-spe
 
         return result;
     }
+#undef NLOHMANN_JSON_PRIMITIVE_ERASE_CASES
 
    private:
     void erase_string_or_binary_value() {

@@ -29,6 +29,7 @@ export class BrowserWorkflowPrimaryActionState {
 
   runPrimaryAction(): void {
     const workflow = this.selectedWorkflow();
+    this.source.apply();
     this.shared.applyWorkflowSettingsIfDirty();
     if (workflow === "train") {
       this.train.runPrimaryAction();

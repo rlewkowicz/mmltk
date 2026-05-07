@@ -7,14 +7,14 @@ import { spawnSync } from 'node:child_process';
 
 const REPO_ROOT = process.cwd();
 const OUTPUT_DIR = join(REPO_ROOT, 'cleanup');
-const MIN_LINES = 7;
+const MIN_LINES = 8;
 const DUPLO_BINARY = '/bin/duplo';
 const THREADS = Math.max(
   1,
   typeof availableParallelism === 'function' ? availableParallelism() : cpus().length,
 );
 const OUTPUT_INDENT = 2;
-const EXCLUDED_DUPLICATION_FILE_SUFFIXES = ['.patch'];
+const EXCLUDED_DUPLICATION_FILE_SUFFIXES = ['.patch', '.generated.ts'];
 const NATIVE_EXTENSIONS = new Set(['.c', '.cc', '.cpp', '.cuh', '.cu', '.cxx', '.h', '.hpp']);
 const WEB_SOURCE_EXTENSIONS = new Set(['.cjs', '.cts', '.d.ts', '.js', '.jsx', '.mjs', '.mts', '.ts', '.tsx']);
 const WEB_STYLE_EXTENSIONS = new Set(['.css', '.less', '.sass', '.scss']);
@@ -52,51 +52,31 @@ const WEB_FRONTEND_PATTERNS = [
 ];
 const BASH_PATTERNS = ['*.sh', '*.bash', 'mmltk'];
 const THIRD_PARTY_PATTERNS = ['third_party'];
-const FULL_SWEEP_PATTERNS = [
-  ...CMAKE_PATTERNS,
-  ...NATIVE_PATTERNS,
-  ...PYTHON_PATTERNS,
-  ...WEB_FRONTEND_PATTERNS,
-  ...BASH_PATTERNS,
-  ...THIRD_PARTY_PATTERNS,
-];
 
 const SCANS = [
   {
     id: 'cmake',
-    description: 'Tracked CMake and build-module files',
     patterns: CMAKE_PATTERNS,
   },
   {
     id: 'native',
-    description: 'Tracked native C/C++/CUDA files',
     patterns: NATIVE_PATTERNS,
   },
   {
     id: 'python',
-    description: 'Tracked Python files',
     patterns: PYTHON_PATTERNS,
   },
   {
     id: 'web_frontend',
-    description:
-      'Tracked Angular/frontend source, template, style, config, and WGSL asset files',
     patterns: WEB_FRONTEND_PATTERNS,
   },
   {
     id: 'bash',
-    description: 'Tracked shell scripts and the mmltk entrypoint',
     patterns: BASH_PATTERNS,
   },
   {
     id: 'third_party',
-    description: 'Tracked third-party files',
     patterns: THIRD_PARTY_PATTERNS,
-  },
-  {
-    id: 'full',
-    description: 'Full tracked-code sweep across all cleanup slices',
-    patterns: FULL_SWEEP_PATTERNS,
   },
 ];
 
@@ -107,7 +87,6 @@ const PHASE_FILES = [
     filename: 'phase-1-cmake-build-logic.json',
     scanId: 'cmake',
     filter: 'all',
-    use: 'Use this file as the authoritative Phase 1 hit list before and after each CMake refactor batch.',
   },
   {
     number: 2,
@@ -115,7 +94,6 @@ const PHASE_FILES = [
     filename: 'phase-2-cpp-within-file-reduction.json',
     scanId: 'native',
     filter: 'within-file',
-    use: 'Use this file to drive same-file native dedupe work before touching cross-file native helpers.',
   },
   {
     number: 3,
@@ -123,7 +101,6 @@ const PHASE_FILES = [
     filename: 'phase-3-shared-cpp-across-files.json',
     scanId: 'native',
     filter: 'cross-file',
-    use: 'Use this file to drive shared native helper extraction after Phase 2 within-file work is refreshed.',
   },
   {
     number: 4,
@@ -131,8 +108,6 @@ const PHASE_FILES = [
     filename: 'phase-4-typescript-reduction.json',
     scanId: 'web_frontend',
     filter: 'all',
-    use:
-      'Use this file as the authoritative Angular/frontend hit list for tracked source, template, style, config, and WGSL asset refactors.',
   },
   {
     number: 5,
@@ -140,7 +115,6 @@ const PHASE_FILES = [
     filename: 'phase-5-python-reduction.json',
     scanId: 'python',
     filter: 'all',
-    use: 'Use this file as the authoritative Python hit list under utilities/.',
   },
   {
     number: 6,
@@ -148,7 +122,6 @@ const PHASE_FILES = [
     filename: 'phase-6-bash-entry-point-reduction.json',
     scanId: 'bash',
     filter: 'all',
-    use: 'Use this file if Phase 6 is reactivated instead of rescanning the shell slice by hand.',
   },
   {
     number: 7,
@@ -156,15 +129,6 @@ const PHASE_FILES = [
     filename: 'phase-7-third-party-tracked-code.json',
     scanId: 'third_party',
     filter: 'all',
-    use: 'Use this file to constrain Phase 7 work to tracked third_party duplicates only.',
-  },
-  {
-    number: 8,
-    title: 'Final Cross-Type Sweep',
-    filename: 'phase-8-final-cross-type-sweep.json',
-    scanId: 'full',
-    filter: 'all',
-    use: 'Use this file for the final tracked-code sweep. Refresh it only during a user-directed maintenance pass before declaring the burn-down complete.',
   },
 ];
 
@@ -379,8 +343,6 @@ function makeCommandDescription(patterns) {
       '-',
       '-',
     ],
-    notes:
-      'The file list is NUL-delimited from git, filtered for excluded suffixes, and converted to newline-delimited stdin for duplo.',
   };
 }
 
@@ -403,7 +365,6 @@ function buildPhaseArtifact(config, scanReport, generatedAt) {
       title: config.title,
     },
     generated_at: generatedAt,
-    use: config.use,
     scan_id: scanReport.scan_id,
     filter: config.filter,
     duplo: {
@@ -412,7 +373,6 @@ function buildPhaseArtifact(config, scanReport, generatedAt) {
       threads: THREADS,
     },
     scope: {
-      description: scanReport.description,
       patterns: scanReport.patterns,
       tracked_file_count: scanReport.tracked_file_count,
     },
@@ -442,7 +402,6 @@ function main() {
 
     scanReports.set(scan.id, {
       scan_id: scan.id,
-      description: scan.description,
       patterns: scan.patterns,
       tracked_file_count: trackedFiles.length,
       command: makeCommandDescription(scan.patterns),
@@ -477,7 +436,6 @@ function main() {
       title: 'Establish the Duplication Ledger',
     },
     generated_at: generatedAt,
-    use: '',
     refresh_command: ['node', 'utilities/generate_cleanup_json.mjs'],
     duplo: {
       binary: DUPLO_BINARY,
@@ -489,7 +447,6 @@ function main() {
       const matchingPhases = phaseArtifacts.filter((artifact) => artifact.scan_id === scan.id);
       return {
         scan_id: scan.id,
-        description: scan.description,
         patterns: scan.patterns,
         tracked_file_count: report.tracked_file_count,
         command: report.command,

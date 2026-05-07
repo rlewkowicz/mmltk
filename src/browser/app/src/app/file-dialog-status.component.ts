@@ -7,6 +7,13 @@ import { BrowserHostRuntimeState } from "./state/browser-host-runtime.service";
   selector: "app-file-dialog-status",
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
+  styles: [
+    `
+      :host {
+        display: contents;
+      }
+    `,
+  ],
   template: `
     @if (visible()) {
       <section class="panel-section panel-section--compact">

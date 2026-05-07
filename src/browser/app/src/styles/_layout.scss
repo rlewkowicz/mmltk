@@ -3,14 +3,13 @@
 
 .shell {
   @include panel-surface(
-    $padding: 0.8rem,
+    $padding: space-token(md),
     $fill: var(--bg-1),
     $radius: radius-token(md)
   );
 
   width: min(1740px, calc(100vw - 1rem));
   margin: 0.5rem auto;
-  box-shadow: var(--shadow);
 }
 
 .topbar,
@@ -26,20 +25,23 @@
 .topbar,
 .section-header,
 .workspace-header {
+  gap: space-token(md);
   justify-content: space-between;
+  min-width: 0;
 }
 
 .brand-block h1,
 .workspace-header h2,
-.panel-section h2 {
+.panel-section h2,
+.panel-section h3 {
   margin: 0;
 }
 
 .brand-block h1,
 .workspace-header h2 {
-  font-family: $font-display;
   letter-spacing: 0;
-  text-transform: uppercase;
+  text-transform: none;
+  font-weight: 650;
 }
 
 .eyebrow {
@@ -59,8 +61,35 @@
 }
 
 .workflow-bar {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  align-items: center;
+  gap: space-token(md);
+  margin: 1rem 0;
+}
+
+.workflow-page-buttons,
+.workflow-settings-group {
+  display: flex;
   flex-wrap: wrap;
-  margin: 0.8rem 0;
+  gap: space-token(sm);
+}
+
+.workflow-settings-group {
+  justify-content: flex-start;
+}
+
+.topbar,
+.section-header,
+.workspace-header,
+.workspace-status {
+  flex-wrap: wrap;
+}
+
+.section-header > *,
+.workspace-header > *,
+.workspace-status > * {
+  min-width: 0;
 }
 
 .shell-grid {
@@ -103,12 +132,20 @@ app-workspace-host,
 .panel-section,
 .workspace {
   @include panel-surface;
+
+  min-width: 0;
 }
 
 .panel-section--compact {
   padding: space-token(md);
 }
 
-.panel-section h2 {
-  @include uppercase-label($size: 0.88rem, $color: var(--accent-2));
+.panel-section h2,
+.panel-section h3 {
+  margin: 0;
+  color: var(--text-0);
+  font-size: 1rem;
+  font-weight: 650;
+  line-height: 1.25;
+  letter-spacing: 0;
 }

@@ -5,6 +5,7 @@ import { SourceSectionComponent } from "./left-panel/source-section.component";
 import { TrainWorkflowControlsComponent } from "./left-panel/train-workflow-controls.component";
 import { ValidateWorkflowControlsComponent } from "./left-panel/validate-workflow-controls.component";
 import { ModelConfigSectionComponent } from "./model-config-section.component";
+import { LivePreviewControlsComponent } from "./live-preview-controls.component";
 import { PredictRuntimeFieldsComponent } from "./predict-runtime-fields.component";
 import { PredictWorkflowControlsComponent } from "./predict-workflow-controls.component";
 import { RightPanelWorkflowTrainDetailsComponent } from "./right-panel/right-panel-workflow-train-details.component";
@@ -20,6 +21,7 @@ import { WorkspaceHostComponent } from "./workspace-host.component";
   imports: [
     ExportWorkflowControlsComponent,
     ModelConfigSectionComponent,
+    LivePreviewControlsComponent,
     PredictRuntimeFieldsComponent,
     PredictWorkflowControlsComponent,
     RightPanelWorkflowTrainDetailsComponent,
@@ -32,7 +34,10 @@ import { WorkspaceHostComponent } from "./workspace-host.component";
   ],
   template: `
     <main class="workflow-main" [attr.data-workflow]="workflow.selectedWorkflow()">
-      @if (workflow.selectedWorkflow() !== "annotate") {
+      @if (
+        workflow.selectedWorkflow() !== "annotate" &&
+        workflow.selectedWorkflow() !== "live"
+      ) {
         <app-model-config-section />
       }
 
@@ -105,6 +110,7 @@ import { WorkspaceHostComponent } from "./workspace-host.component";
               <app-predict-runtime-fields [liveMode]="true" />
             </section>
             <app-workflow-actions-section />
+            <app-live-preview-controls />
             <app-workspace-host class="workflow-span" />
           </div>
         }

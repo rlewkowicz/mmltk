@@ -68,7 +68,7 @@
 }
 
 @mixin panel-surface(
-  $padding: space-token(lg),
+  $padding: space-token(xl),
   $fill: var(--panel-fill),
   $border: var(--panel-border),
   $radius: radius-token(md)
@@ -77,11 +77,12 @@
   border-radius: $radius;
   background: $fill;
   padding: $padding;
+  box-shadow: var(--shadow);
 }
 
 @mixin inset-surface(
-  $padding: space-token(lg),
-  $fill: var(--inset-fill),
+  $padding: space-token(md),
+  $fill: var(--panel-fill),
   $border: var(--control-border),
   $radius: radius-token(md)
 ) {
@@ -105,8 +106,9 @@
 @mixin uppercase-label($size: 0.72rem, $color: var(--text-2)) {
   color: $color;
   font-size: $size;
+  font-weight: 500;
   letter-spacing: 0;
-  text-transform: uppercase;
+  text-transform: none;
 }
 
 @mixin copy-block($color: var(--text-1), $line-height: 1.45) {

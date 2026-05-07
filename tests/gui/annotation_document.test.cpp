@@ -258,7 +258,7 @@ void test_annotation_controller_tool_switch_clears_transient_session_state() {
     assert(!session.create_drag_session().active);
 }
 
-void test_annotation_session_overlay_revision_tracks_selection_only() {
+void test_annotation_session_overlay_revision_tracks_selection_and_brush_preview() {
     AnnotationSession session;
     assert(session.revision() == 0U);
     assert(session.overlay_revision() == 0U);
@@ -280,10 +280,10 @@ void test_annotation_session_overlay_revision_tracks_selection_only() {
         false,
     });
     assert(session.revision() > revision);
-    assert(session.overlay_revision() == overlay_revision);
+    assert(session.overlay_revision() == overlay_revision + 1U);
 
     session.select_object(2U);
-    assert(session.overlay_revision() == overlay_revision);
+    assert(session.overlay_revision() == overlay_revision + 1U);
 }
 
 void test_annotation_document_metadata_commands_update_generation() {
@@ -503,6 +503,13 @@ void test_renderer_manual_overlay_snapshot_tracks_document_and_session_revisions
     assert(document.apply(AnnotationInsertObjectCommand{object, std::nullopt}));
     session.select_object(0U);
     session.set_active_tool(AnnotationToolKind::MaskPaint);
+    session.set_brush_preview(AnnotationBrushPreview{
+        true,
+        21,
+        17,
+        9,
+        false,
+    });
 
     const AnnotationFrame frame = make_annotation_frame(64U, 48U);
 
@@ -516,6 +523,11 @@ void test_renderer_manual_overlay_snapshot_tracks_document_and_session_revisions
         require_optional_value(snapshot.selected_instance, "expected selected instance in manual overlay snapshot");
     assert(selected_instance == 0U);
     assert(snapshot.instances.size() == 1U);
+    assert(snapshot.brush_preview.has_value());
+    assert(snapshot.brush_preview->capture_x == 21);
+    assert(snapshot.brush_preview->capture_y == 17);
+    assert(snapshot.brush_preview->radius == 9);
+    assert(!snapshot.brush_preview->erase);
 }
 
 void test_renderer_manual_overlay_snapshot_includes_vector_primitives() {
@@ -1411,7 +1423,8 @@ MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]",
                          test_annotation_document_set_object_box_command_resets_dense_mask_state);
 MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]",
                          test_annotation_controller_tool_switch_clears_transient_session_state);
-MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_annotation_session_overlay_revision_tracks_selection_only);
+MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]",
+                         test_annotation_session_overlay_revision_tracks_selection_and_brush_preview);
 MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_tool_manager_resets_outgoing_tool_on_switch);
 MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_renderer_builds_interaction_overlay_snapshot);
 MMLTK_REGISTER_TEST_CASE("[gui][annotation_document]", test_annotation_workspace_model_projects_selection_and_crop);

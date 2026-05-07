@@ -92,6 +92,7 @@ void AnnotationSession::set_brush_preview(const AnnotationBrushPreview& preview)
     }
     brush_preview_ = preview;
     mark_dirty();
+    mark_overlay_dirty();
 }
 
 void AnnotationSession::set_direct_drag_index(const std::optional<std::size_t> index) {
@@ -205,6 +206,7 @@ void AnnotationSession::clear_interaction_state() {
     }
     reset_interaction_members();
     mark_dirty();
+    mark_overlay_dirty();
 }
 
 void AnnotationSession::clear_transient_state() {
@@ -213,6 +215,7 @@ void AnnotationSession::clear_transient_state() {
     }
     reset_transient_members();
     mark_dirty();
+    mark_overlay_dirty();
 }
 
 bool AnnotationSession::has_active_interaction_state() const {

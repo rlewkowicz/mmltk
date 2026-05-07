@@ -1,22 +1,7 @@
 import * as assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { type StaticProvider } from "@angular/core";
-
-import { BrowserAnnotateWorkflowState } from "../src/app/state/browser-annotate-workflow.service";
-import { BrowserExportWorkflowState } from "../src/app/state/browser-export-workflow.service";
-import { BrowserHostRuntimeState } from "../src/app/state/browser-host-runtime.service";
-import { BrowserLiveWorkflowState } from "../src/app/state/browser-live-workflow.service";
-import { BrowserPredictWorkflowState } from "../src/app/state/browser-predict-workflow.service";
-import { BrowserShellSettingsState } from "../src/app/state/browser-shell-settings.service";
 import { BrowserShellStore } from "../src/app/state/browser-shell.store";
-import { BrowserSourceState } from "../src/app/state/browser-source-state.service";
-import { BrowserTrainWorkflowState } from "../src/app/state/browser-train-workflow.service";
-import { BrowserValidateWorkflowState } from "../src/app/state/browser-validate-workflow.service";
-import { BrowserWorkflowDraftSharedState } from "../src/app/state/browser-workflow-draft-shared.service";
-import { BrowserWorkflowDraftsState } from "../src/app/state/browser-workflow-drafts.service";
-import { BrowserWorkflowRouteState } from "../src/app/state/browser-workflow-route.service";
-import { BrowserWorkspaceStateService } from "../src/app/state/browser-workspace.service";
 import type { BrowserHostTransport, StateSnapshot } from "../src/host_api";
 import {
   createAngularServiceHarness,
@@ -25,13 +10,18 @@ import {
 import {
   makeBrowserTestAnnotation,
   makeAnnotateSidebarFixture,
+  makeBrowserShellStoreProviders,
   makeBrowserTestSnapshot,
   makeBrowserTestSource,
+  makeLivePreviewControlsFixture,
   makeLivePredictRuntimeFixture,
   makeNativeBridgeContractCapabilities,
   setAnnotateWorkflowState,
 } from "./support/browser-test-fixtures";
-import { assertSemanticViewportCommitPayload } from "./support/browser-state-assertions";
+import {
+  assertPrimaryChromeOmitsRawDiagnostics,
+  assertSemanticViewportCommitPayload,
+} from "./support/browser-state-assertions";
 
 function makeSnapshot(): StateSnapshot {
   const snapshot = makeBrowserTestSnapshot({
@@ -43,15 +33,15 @@ function makeSnapshot(): StateSnapshot {
         setup_frame_navigation: {
           reload: {
             enabled: true,
-            intent: "annotate.frame.reload",
+            intent: "annotate.setup_frame.reload",
           },
           prev: {
             enabled: true,
-            intent: "annotate.frame.prev",
+            intent: "annotate.setup_frame.prev",
           },
           next: {
             enabled: true,
-            intent: "annotate.frame.next",
+            intent: "annotate.setup_frame.next",
           },
         },
         live_annotate: {
@@ -72,8 +62,8 @@ function makeSnapshot(): StateSnapshot {
           hold_save: {
             enabled: true,
             value: false,
-            intent: "annotate.save.hold",
-            payload_key: "armed",
+            intent: "annotate.hold_save",
+            payload_key: "enabled",
           },
         },
         brush: {
@@ -83,8 +73,8 @@ function makeSnapshot(): StateSnapshot {
             min: 1,
             max: 64,
             enabled: true,
-            intent: "annotate.brush.set",
-            payload_key: "size",
+            intent: "annotate.brush_radius",
+            payload_key: "radius",
           },
         },
       },
@@ -98,20 +88,7 @@ function makeSnapshot(): StateSnapshot {
           },
         },
       }),
-      live_preview_controls: {
-        fit_to_capture: {
-          value: false,
-          enabled: true,
-          intent: "live.preview.fit",
-          payload_key: "value",
-        },
-        full_frame_display: {
-          value: false,
-          enabled: true,
-          intent: "live.preview.overlay",
-          payload_key: "value",
-        },
-      },
+      live_preview_controls: makeLivePreviewControlsFixture(),
     },
     source: makeBrowserTestSource({
       kind: "image_folder",
@@ -154,49 +131,11 @@ function createStore(
   transport: AngularServiceHarness["transport"];
   destroy: () => void;
 } {
-  const providers: StaticProvider[] = [
-    { provide: BrowserHostRuntimeState, useFactory: () => new BrowserHostRuntimeState() },
-    { provide: BrowserWorkflowRouteState, useFactory: () => new BrowserWorkflowRouteState() },
-    { provide: BrowserSourceState, useFactory: () => new BrowserSourceState() },
-    { provide: BrowserTrainWorkflowState, useFactory: () => new BrowserTrainWorkflowState() },
-    {
-      provide: BrowserValidateWorkflowState,
-      useFactory: () => new BrowserValidateWorkflowState(),
-    },
-    {
-      provide: BrowserPredictWorkflowState,
-      useFactory: () => new BrowserPredictWorkflowState(),
-    },
-    {
-      provide: BrowserAnnotateWorkflowState,
-      useFactory: () => new BrowserAnnotateWorkflowState(),
-    },
-    {
-      provide: BrowserExportWorkflowState,
-      useFactory: () => new BrowserExportWorkflowState(),
-    },
-    {
-      provide: BrowserLiveWorkflowState,
-      useFactory: () => new BrowserLiveWorkflowState(),
-    },
-    {
-      provide: BrowserShellSettingsState,
-      useFactory: () => new BrowserShellSettingsState(),
-    },
-    {
-      provide: BrowserWorkflowDraftSharedState,
-      useFactory: () => new BrowserWorkflowDraftSharedState(),
-    },
-    {
-      provide: BrowserWorkflowDraftsState,
-      useFactory: () => new BrowserWorkflowDraftsState(),
-    },
-    {
-      provide: BrowserWorkspaceStateService,
-      useFactory: () => new BrowserWorkspaceStateService(),
-    },
-  ];
-  const harness = createAngularServiceHarness(snapshot, providers, { mode });
+  const harness = createAngularServiceHarness(
+    snapshot,
+    makeBrowserShellStoreProviders(),
+    { mode },
+  );
   const store = harness.run(() => new BrowserShellStore());
   harness.flush();
   return {
@@ -234,6 +173,12 @@ function publishRuntimeCapabilities(
   });
 }
 
+function assertStorePrimaryWorkspaceChromeOmitsRawDiagnostics(
+  store: BrowserShellStore,
+): void {
+  assertPrimaryChromeOmitsRawDiagnostics([store.workspace().title]);
+}
+
 test("BrowserShellStore dispatches annotate and live shell controls from published state", () => {
   const { store, transport, destroy } = createStore(makeSnapshot());
 
@@ -256,27 +201,27 @@ test("BrowserShellStore dispatches annotate and live shell controls from publish
         payload: intent.payload,
       })),
       [
-        { workflow: "annotate", intent: "annotate.frame.reload", payload: {} },
-        { workflow: "annotate", intent: "annotate.frame.prev", payload: {} },
-        { workflow: "annotate", intent: "annotate.frame.next", payload: {} },
+        { workflow: "annotate", intent: "annotate.setup_frame.reload", payload: {} },
+        { workflow: "annotate", intent: "annotate.setup_frame.prev", payload: {} },
+        { workflow: "annotate", intent: "annotate.setup_frame.next", payload: {} },
         { workflow: "annotate", intent: "annotate.live.start", payload: {} },
         { workflow: "annotate", intent: "annotate.live.stop", payload: {} },
         { workflow: "annotate", intent: "annotate.save_now", payload: {} },
         {
           workflow: "annotate",
-          intent: "annotate.save.hold",
-          payload: { armed: true },
+          intent: "annotate.hold_save",
+          payload: { enabled: true },
         },
         {
           workflow: "annotate",
-          intent: "annotate.brush.set",
-          payload: { size: 31 },
+          intent: "annotate.brush_radius",
+          payload: { radius: 31 },
         },
-        { workflow: "live", intent: "live.preview.fit", payload: { value: true } },
+        { workflow: "live", intent: "live.preview.fit_to_capture", payload: { enabled: true } },
         {
           workflow: "live",
-          intent: "live.preview.overlay",
-          payload: { value: true },
+          intent: "live.preview.full_frame_display",
+          payload: { enabled: true },
         },
       ],
     );
@@ -294,7 +239,7 @@ test("BrowserShellStore toggles the live primary action to predict.stop while li
   const { store, transport, destroy } = createStore(snapshot);
 
   try {
-    assert.equal(store.primaryActionLabel(), "Stop Live Predict");
+    assert.equal(store.primaryActionLabel(), "Stop Capture");
     store.runPrimaryAction();
 
     assert.deepEqual(
@@ -344,6 +289,7 @@ test("BrowserShellStore keeps mock workspace diagnostics centered on the single-
       store.workspaceDiagnostics().detail,
       /frame path mock workspace pending/,
     );
+    assertStorePrimaryWorkspaceChromeOmitsRawDiagnostics(store);
     assert.match(store.workspaceCanvasChrome().statusLabel, /canvas pending/);
     assert.doesNotMatch(store.workspaceCanvasChrome().statusLabel, /source \+ workspace/);
     assert.equal(

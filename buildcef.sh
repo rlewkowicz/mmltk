@@ -12,6 +12,7 @@ chromium_tag="refs/tags/146.0.7680.179"
 archive_name="mmltk_cef_linux64_minimal_debug.tar.bz2"
 archive_path="${cache_dir}/${archive_name}"
 archive_sha_path="${archive_path}.sha256"
+no_work_sentinel="${cache_dir}/.mmltk-cef-build-no-work"
 deps_image_suffix="$(
     printf '%s-%s-%s' "${docker_image}" "${cef_branch}" "${chromium_tag}" |
         tr '/:' '--' |
@@ -38,13 +39,39 @@ require_path() {
 
 require_command docker
 require_command flock
+require_command python3
 require_command sha256sum
 require_path "${script_dir}/third_party/cef/automate-git.py"
 require_path "${script_dir}/third_party/cef/patcher.py"
+require_path "${script_dir}/third_party/cef/restore_siso_mtimes.py"
 require_path "${script_dir}/third_party/cef/patch/patch.cfg"
 require_path "${script_dir}/third_party/cef/patch/patches"
 
+cef_env=(
+    CEF_INSTALL_SYSROOT="x64"
+    GN_ARGUMENTS=""
+    GN_DEFINES="use_sysroot=true symbol_level=1 is_cfi=false use_thin_lto=false"
+    MMLTK_CEF_BUILD_ARCH="x64"
+    MMLTK_CEF_BUILD_TARGET="libcef"
+    MMLTK_CEF_PATCH_ROOT="/repo/third_party/cef/patch"
+)
+
+if [[ -f "${archive_path}" && -f "${archive_sha_path}" \
+      && -f "${build_root}/.mmltk-cef-build-state.json" ]]; then
+    if env "${cef_env[@]}" python3 \
+        "${script_dir}/third_party/cef/stock_authoring_checkout.py" \
+        --check-cache-hit \
+        --repo-root "${script_dir}" \
+        --build-root "${build_root}" \
+        --archive-path "${archive_path}"; then
+        printf 'buildcef.sh: cache hit; reusing %s\n' "${archive_path}"
+        ls -lh "${archive_path}" "${archive_sha_path}"
+        exit 0
+    fi
+fi
+
 mkdir -p "${build_root}" "${cache_dir}"
+rm -f "${no_work_sentinel}"
 
 build_lock_path="${build_root}/.buildcef.lock"
 container_name_hash="$(printf '%s' "${build_root}" | sha256sum)"
@@ -197,6 +224,9 @@ docker run --rm -i \
     --label "mmltk.cef.build_root=${build_root}" \
     -e CEF_INSTALL_SYSROOT="x64" \
     -e GN_DEFINES="use_sysroot=true symbol_level=1 is_cfi=false use_thin_lto=false" \
+    -e MMLTK_CEF_BUILD_ARCH="x64" \
+    -e MMLTK_CEF_BUILD_TARGET="libcef" \
+    -e MMLTK_CEF_NO_WORK_SENTINEL="/artifacts/$(basename "${no_work_sentinel}")" \
     -e MMLTK_CEF_PATCH_ROOT="/repo/third_party/cef/patch" \
     -v "${build_root}:/work" \
     -v "${cache_dir}:/artifacts" \
@@ -204,6 +234,7 @@ docker run --rm -i \
     -w /work \
     "${deps_image}" \
     bash -lc "
+        set -euo pipefail
         for safe_dir in \
             /work/code/depot_tools \
             /work/code/chromium_git/cef \
@@ -216,27 +247,77 @@ docker run --rm -i \
                 git config --global --add safe.directory \"\${safe_dir}\"
             fi
         done
-        if [[ -f /work/code/chromium_git/chromium/src/cef/tools/patch_updater.py ]]; then
-            (
-                cd /work/code/chromium_git/chromium/src/cef
-                python3 ./tools/patch_updater.py --revert --patch component_build
-            )
+        state_output=/work/.mmltk-cef-build.env
+        MMLTK_CEF_AUTOMATE_NO_UPDATE=0
+        MMLTK_CEF_SKIP_GCLIENT_HOOK=0
+        MMLTK_CEF_BUILD_CHECKOUT_MODE=cold
+        rm -f \"\${state_output}\"
+        if [[ -e /work/code/chromium_git/chromium/src/.git && \
+              -e /work/code/chromium_git/cef/.git && \
+              -e /work/code/chromium_git/chromium/src/cef/.git ]]; then
+            python3 /repo/third_party/cef/stock_authoring_checkout.py \
+                --repo-root /repo \
+                --build-root /work \
+                --state-output \"\${state_output}\" \
+                --ensure-patched-build-checkout
+            if [[ -f \"\${state_output}\" ]]; then
+                source \"\${state_output}\"
+            fi
+            export MMLTK_CEF_PATCHES_ALREADY_APPLIED=1
+        else
+            printf 'buildcef.sh: CEF source cache is incomplete; automate-git will create it before applying patches.\n'
         fi
-        exec python3 /repo/third_party/cef/automate-git.py \
-            --download-dir=/work/code/chromium_git \
-            --depot-tools-dir=/work/code/depot_tools \
-            --branch='${cef_branch}' \
-            --chromium-checkout='${chromium_tag}' \
-            --x64-build \
-            --build-target=libcef \
-            --force-build \
-            --no-release-build \
-            --no-distrib \
-            --mmltk-patcher-source=/repo/third_party/cef/patcher.py \
-            --mmltk-build-jobs='${host_build_jobs}' \
-            --mmltk-output-dir=/artifacts \
+        printf 'buildcef.sh: CEF build checkout mode: %s\n' \"\${MMLTK_CEF_BUILD_CHECKOUT_MODE}\"
+        if [[ \"\${MMLTK_CEF_BUILD_CHECKOUT_MODE}\" == \"hot\" || \
+              \"\${MMLTK_CEF_BUILD_CHECKOUT_MODE}\" == \"patch-suffix\" || \
+              \"\${MMLTK_CEF_BUILD_CHECKOUT_MODE}\" == \"patch-targets\" ]]; then
+            mtime_jobs=\"\$(nproc)\"
+            printf 'buildcef.sh: restoring Siso mtimes with %s workers.\n' \"\${mtime_jobs}\"
+            python3 /repo/third_party/cef/restore_siso_mtimes.py \
+                --src-root /work/code/chromium_git/chromium/src \
+                --build-dir /work/code/chromium_git/chromium/src/out/Debug_GN_x64 \
+                --jobs \"\${mtime_jobs}\" \
+                --require-state
+        else
+            printf 'buildcef.sh: skipping Siso mtime restore for %s checkout.\n' \
+                \"\${MMLTK_CEF_BUILD_CHECKOUT_MODE}\"
+        fi
+        automate_args=(
+            python3 /repo/third_party/cef/automate-git.py
+            --download-dir=/work/code/chromium_git
+            --depot-tools-dir=/work/code/depot_tools
+            --no-depot-tools-update
+            --branch='${cef_branch}'
+            --chromium-checkout='${chromium_tag}'
+            --x64-build
+            --build-target=libcef
+            --force-build
+            --no-release-build
+            --no-distrib
+            --mmltk-patcher-source=/repo/third_party/cef/patcher.py
+            --mmltk-build-jobs='${host_build_jobs}'
+            --mmltk-output-dir=/artifacts
             --mmltk-output-archive-name='${archive_name}'
+        )
+        if [[ \"\${MMLTK_CEF_AUTOMATE_NO_UPDATE}\" == \"1\" ]]; then
+            automate_args+=(--no-update)
+        fi
+        if [[ \"\${MMLTK_CEF_SKIP_GCLIENT_HOOK}\" == \"1\" ]]; then
+            automate_args+=(--mmltk-skip-gclient-hook)
+        fi
+        \"\${automate_args[@]}\"
+        python3 /repo/third_party/cef/stock_authoring_checkout.py \
+            --repo-root /repo \
+            --build-root /work \
+            --state-output \"\${state_output}\" \
+            --record-patched-build-checkout
     "
+
+if [[ -f "${no_work_sentinel}" ]]; then
+    rm -f "${no_work_sentinel}"
+    printf 'buildcef.sh: ninja reported no work; artifact copy and packaging skipped.\n'
+    exit 0
+fi
 
 if [[ ! -f "${archive_path}" ]]; then
     printf 'buildcef.sh: expected archive was not created: %s\n' "${archive_path}" >&2

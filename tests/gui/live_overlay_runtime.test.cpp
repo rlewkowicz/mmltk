@@ -1,5 +1,6 @@
 #include "gui/annotation/document/document.h"
 #include "gui/annotation/session.h"
+#include "gui/browser_live_publication.h"
 #include "gui/annotation/workflow_live_overlay.h"
 #include "gui/cuda_gl_interop_error.h"
 #include "gui/preview_interaction_overlay_types.h"
@@ -11,7 +12,9 @@
 #include "support/catch2_compat.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -114,6 +117,26 @@ struct TestSlot {
     int value = 0;
 };
 
+struct HostCallbackGate {
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool open = false;
+};
+
+void wait_for_host_callback_gate(void* user_data) {
+    auto* gate = static_cast<HostCallbackGate*>(user_data);
+    std::unique_lock lock(gate->mutex);
+    gate->condition.wait(lock, [&gate]() { return gate->open; });
+}
+
+void open_host_callback_gate(HostCallbackGate& gate) {
+    {
+        std::lock_guard lock(gate.mutex);
+        gate.open = true;
+    }
+    gate.condition.notify_all();
+}
+
 std::vector<std::unique_ptr<TestSlot>> make_slots(std::size_t count) {
     std::vector<std::unique_ptr<TestSlot>> slots;
     slots.reserve(count);
@@ -131,6 +154,9 @@ void test_overlay_compare_helpers_detect_boundary_changes() {
     ManualOverlayDocumentSnapshot manual_b = manual_a;
     assert(mmltk::overlay_compare::manual_snapshot_equals(manual_a, manual_b));
     manual_b.instances[0].points.push_back(ManualOverlayPoint{99, 100});
+    assert(!mmltk::overlay_compare::manual_snapshot_equals(manual_a, manual_b));
+    manual_b = manual_a;
+    manual_b.brush_preview = ManualOverlayBrushPreview{42, 44, 12, true};
     assert(!mmltk::overlay_compare::manual_snapshot_equals(manual_a, manual_b));
 
     const PreviewInteractionOverlaySnapshot preview_a = make_preview_snapshot();
@@ -243,6 +269,63 @@ void test_live_slot_helpers_reuse_ready_stale_published_slot_only() {
     assert(slot->state.load(std::memory_order_acquire) == to_slot_state_value(SlotState::kWriting));
 }
 
+void test_live_slot_helpers_gate_acquire_on_ready_event_completion() {
+    if (!has_cuda_device()) {
+        SKIP("no CUDA device available");
+    }
+
+    ensure_cuda_ok(cudaSetDevice(0), "cudaSetDevice for ready-gated live slot test");
+    CudaEventHandle ready_event;
+    CudaStreamHandle stream;
+    ready_event.create(cudaEventDisableTiming, "cudaEventCreate ready for ready-gated live slot test");
+    stream.create_with_highest_priority("cudaStreamCreate for ready-gated live slot test");
+
+    HostCallbackGate gate;
+    ensure_cuda_ok(cudaLaunchHostFunc(stream.get(), wait_for_host_callback_gate, &gate),
+                   "cudaLaunchHostFunc for ready-gated live slot test");
+    ensure_cuda_ok(cudaEventRecord(ready_event.get(), stream.get()),
+                   "cudaEventRecord ready for ready-gated live slot test");
+
+    auto slots = make_slots(1U);
+    std::atomic<int> latest_index{0};
+    slots[0]->ready_event = ready_event.get();
+    slots[0]->state.store(to_slot_state_value(SlotState::kPublished), std::memory_order_release);
+
+    int acquired_value = 0;
+    const bool acquired_before_ready = try_acquire_latest_ready_published_slot(
+        slots, latest_index, &acquired_value, [](TestSlot& slot) { return slot.value; },
+        [](TestSlot& slot) { return slot.ready_event; }, "cudaEventQuery for ready-gated live slot test");
+    assert(!acquired_before_ready);
+    assert(acquired_value == 0);
+    assert(slots[0]->state.load(std::memory_order_acquire) == to_slot_state_value(SlotState::kPublished));
+
+    open_host_callback_gate(gate);
+    ensure_cuda_ok(cudaEventSynchronize(ready_event.get()),
+                   "cudaEventSynchronize ready for ready-gated live slot test");
+
+    const bool acquired_after_ready = try_acquire_latest_ready_published_slot(
+        slots, latest_index, &acquired_value, [](TestSlot& slot) { return slot.value; },
+        [](TestSlot& slot) { return slot.ready_event; }, "cudaEventQuery for ready-gated live slot test");
+    assert(acquired_after_ready);
+    assert(acquired_value == 1);
+    assert(slots[0]->state.load(std::memory_order_acquire) == to_slot_state_value(SlotState::kAcquired));
+    release_acquired_slot(*slots[0], "ready-gated live slot release");
+}
+
+void test_browser_live_publication_device_selection_tracks_active_mode() {
+    assert(browser_live_publication_cuda_device_index(BrowserLivePublicationMode::Annotate, 7, 2, std::nullopt) == 7);
+    assert(browser_live_publication_cuda_device_index(BrowserLivePublicationMode::Predict, 7, 2, std::nullopt) == 2);
+    assert(browser_live_publication_cuda_device_index(BrowserLivePublicationMode::Predict, 7, 2, 5) == 5);
+
+    bool rejected = false;
+    try {
+        (void)browser_live_publication_cuda_device_index(BrowserLivePublicationMode::None, 7, 2, std::nullopt);
+    } catch (const std::runtime_error&) {
+        rejected = true;
+    }
+    assert(rejected);
+}
+
 void test_annotation_workflow_live_overlay_state_tracks_boundary_changes() {
     AnnotationWorkflowRuntime runtime;
     AnnotationDocument document;
@@ -313,6 +396,10 @@ MMLTK_REGISTER_TEST_CASE("[gui][live_overlay_runtime]",
 MMLTK_REGISTER_TEST_CASE("[gui][live_overlay_runtime]",
                          test_live_slot_helpers_prefer_latest_published_slot_and_fall_back);
 MMLTK_REGISTER_TEST_CASE("[gui][live_overlay_runtime]", test_live_slot_helpers_reuse_ready_stale_published_slot_only);
+MMLTK_REGISTER_TEST_CASE("[gui][live_overlay_runtime][cuda]",
+                         test_live_slot_helpers_gate_acquire_on_ready_event_completion);
+MMLTK_REGISTER_TEST_CASE("[gui][live_overlay_runtime]",
+                         test_browser_live_publication_device_selection_tracks_active_mode);
 MMLTK_REGISTER_TEST_CASE("[gui][live_overlay_runtime]",
                          test_annotation_workflow_live_overlay_state_tracks_boundary_changes);
 MMLTK_REGISTER_TEST_CASE("[gui][live_overlay_runtime][cuda]", test_live_pitched_buffers_fit_bgr_and_rgba_pixel_rows);

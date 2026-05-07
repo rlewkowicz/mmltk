@@ -1,5 +1,6 @@
 #include "gui/browser_host_adapters.h"
 
+#include "browser/host_api_dispatch.h"
 #include "gui/annotation/common.h"
 #include "gui/annotation/controller.h"
 #include "gui/annotation/document/document.h"
@@ -28,10 +29,6 @@
 #include <utility>
 
 namespace mmltk::browser {
-
-static_assert(kRoutedIntentPayloadAlternativeCount == 29U,
-              "Update browser host adapter intent handling for "
-              "RoutedIntentPayload ABI changes.");
 
 namespace {
 
@@ -244,6 +241,16 @@ void require_annotate_workspace_document_context(const BrowserAnnotateWorkspaceC
         throw std::runtime_error("browser " + std::string(intent_name) +
                                  " requires bound annotation document, session, and frame");
     }
+}
+
+bool cancel_annotate_workspace_interaction(const BrowserAnnotateWorkspaceContext& context) {
+    require_annotate_workspace_context(context, "annotate.workspace.cancel");
+    if (context.document->transaction_active()) {
+        context.document->cancel_transaction();
+    }
+    context.session->clear_transient_state();
+    refresh_annotation_pointer_capture(*context.session);
+    return true;
 }
 
 [[nodiscard]] mmltk::gui::RectDragKind annotation_box_drag_kind_from_browser_kind(
@@ -648,6 +655,7 @@ nlohmann::json train_local_gpu_state_to_json(const std::span<const mmltk::gui::L
 nlohmann::json live_runtime_state_to_json(const BrowserLiveRuntimeState& state) {
     return nlohmann::json{
         {"active_mode", state.active_mode.empty() ? "none" : state.active_mode},
+        {"startup_state", state.startup_state.empty() ? "idle" : state.startup_state},
         {"starting", state.starting},
         {"stopping", state.stopping},
         {"show_running_section", state.show_running_section},
@@ -667,12 +675,49 @@ nlohmann::json live_runtime_state_to_json(const BrowserLiveRuntimeState& state) 
              {"static_source_name", state.preview.static_source_name},
              {"error", state.preview.error},
              {"interop_failed", state.preview.interop_failed},
+             {"last_failure_reason", state.preview.last_failure_reason},
+             {"last_failure_detail", state.preview.last_failure_detail},
+             {"last_failure_revision", state.preview.last_failure_revision},
+             {"last_failure_stage", state.preview.last_failure_stage},
+             {"last_failure_live_frame_id", optional_live_frame_id_json(state.preview.last_failure_live_frame_id)},
+             {"last_failure_cuda_device",
+              state.preview.last_failure_cuda_device.has_value()
+                  ? nlohmann::json(*state.preview.last_failure_cuda_device)
+                  : nlohmann::json(nullptr)},
+             {"last_failure_result_code", state.preview.last_failure_result_code},
+             {"last_failure_result_detail", state.preview.last_failure_result_detail},
+             {"publication_counters",
+              {
+                  {"attempted_workspace_acquisitions",
+                   state.preview.publication_counters.attempted_workspace_acquisitions},
+                  {"startup_workspace_acquisition_misses",
+                   state.preview.publication_counters.startup_workspace_acquisition_misses},
+                  {"post_startup_workspace_acquisition_misses",
+                   state.preview.publication_counters.post_startup_workspace_acquisition_misses},
+                  {"retained_surfaces", state.preview.publication_counters.retained_surfaces},
+                  {"rejected_stale_frames", state.preview.publication_counters.rejected_stale_frames},
+                  {"cef_export_failures", state.preview.publication_counters.cef_export_failures},
+                  {"renderer_releases", state.preview.publication_counters.renderer_releases},
+                  {"native_release_failures", state.preview.publication_counters.native_release_failures},
+                  {"renderer_import_failures", state.preview.publication_counters.renderer_import_failures},
+                  {"renderer_release_rejections", state.preview.publication_counters.renderer_release_rejections},
+              }},
          }},
         {"controller",
          {
              {"present", state.controller.present},
              {"running", state.controller.running},
              {"last_error", state.controller.last_error},
+         }},
+        {"fanout",
+         {
+             {"running", state.fanout.running},
+             {"frames_fanned_out", state.fanout.frames_fanned_out},
+             {"skipped_detect_publishes", state.fanout.skipped_detect_publishes},
+             {"skipped_output_publishes", state.fanout.skipped_output_publishes},
+             {"release_backlog", state.fanout.release_backlog},
+             {"acquire_misses", state.fanout.acquire_misses},
+             {"last_error", state.fanout.last_error},
          }},
         {"analyzer",
          {
@@ -696,15 +741,49 @@ nlohmann::json live_runtime_state_to_json(const BrowserLiveRuntimeState& state) 
          {
              {"running", state.compositor.running},
              {"frames_composited", state.compositor.frames_composited},
+             {"frames_composited_after_startup", state.compositor.frames_composited_after_startup},
              {"frames_dropped", state.compositor.frames_dropped},
+             {"skipped_compositor_presents", state.compositor.skipped_compositor_presents},
+             {"front_slot_index", state.compositor.front_slot_index},
+             {"front_slot_revision", state.compositor.front_slot_revision},
              {"last_frame_id", optional_live_frame_id_json(state.compositor.last_frame_id)},
              {"manual_overlay_active", state.compositor.manual_overlay_active},
              {"analysis_overlay_active", state.compositor.analysis_overlay_active},
              {"last_error", state.compositor.last_error},
          }},
+        {"single_buffer_diagnostic",
+         {
+             {"enabled", state.single_buffer_diagnostic.enabled},
+             {"frame_count", state.single_buffer_diagnostic.frame_count},
+             {"frame_budget_ns", state.single_buffer_diagnostic.frame_budget_ns},
+             {"drawn_frames", state.single_buffer_diagnostic.drawn_frames},
+             {"consecutive_miss_limit", state.single_buffer_diagnostic.consecutive_miss_limit},
+             {"completed", state.single_buffer_diagnostic.completed},
+             {"analyzer_disabled", state.single_buffer_diagnostic.analyzer_disabled},
+             {"failed", state.single_buffer_diagnostic.failed},
+             {"failure_stage", state.single_buffer_diagnostic.failure_stage},
+             {"failure_frame", state.single_buffer_diagnostic.failure_frame},
+             {"failure_latency_us", state.single_buffer_diagnostic.failure_latency_us},
+         }},
         {"start_error", state.start_error},
         {"action_error", state.action_error},
     };
+}
+
+const char* browser_live_display_startup_state(const bool capture_running, const std::string_view surface_revision,
+                                               const std::string_view renderer_imported_revision,
+                                               const std::string_view renderer_submitted_revision,
+                                               const std::string_view renderer_drawn_revision) noexcept {
+    if (surface_revision.empty()) {
+        return capture_running ? "capture running" : "idle";
+    }
+    if (renderer_submitted_revision == surface_revision || renderer_drawn_revision == surface_revision) {
+        return "draw submitted";
+    }
+    if (renderer_imported_revision == surface_revision) {
+        return "texture imported";
+    }
+    return "surface published";
 }
 
 nlohmann::json make_predict_start_settings_patch(const PredictStartIntent& intent) {
@@ -849,57 +928,13 @@ mmltk::gui::AnnotationMaskCleanupOp annotation_mask_cleanup_op_from_browser_name
 }
 
 BrowserFileDialogBinding file_dialog_binding_from_id(const std::string_view dialog_id) noexcept {
-    constexpr std::array<BrowserNamedValue<BrowserFileDialogBinding>, 43> kBindings{{
-        BrowserNamedValue<BrowserFileDialogBinding>{"train.dataset.train_compiled_path",
-                                                    BrowserFileDialogBinding::TrainTrainCompiledPath},
-        {"train.train_compiled_path", BrowserFileDialogBinding::TrainTrainCompiledPath},
-        {"train.dataset.val_compiled_path", BrowserFileDialogBinding::TrainValCompiledPath},
-        {"train.val_compiled_path", BrowserFileDialogBinding::TrainValCompiledPath},
-        {"train.dataset.test_compiled_path", BrowserFileDialogBinding::TrainTestCompiledPath},
-        {"train.test_compiled_path", BrowserFileDialogBinding::TrainTestCompiledPath},
-        {"train.model.weights", BrowserFileDialogBinding::TrainWeights},
-        {"train.training.resume_path", BrowserFileDialogBinding::TrainResumePath},
-        {"train.resume_path", BrowserFileDialogBinding::TrainResumePath},
-        {"train.training.output_dir", BrowserFileDialogBinding::TrainOutputDir},
-        {"train.output_dir", BrowserFileDialogBinding::TrainOutputDir},
-        {"predict.source.single_image", BrowserFileDialogBinding::PredictSingleImage},
-        {"predict.source.file", BrowserFileDialogBinding::PredictSingleImage},
-        {"predict.source.image_folder", BrowserFileDialogBinding::PredictImageFolder},
-        {"predict.source.folder", BrowserFileDialogBinding::PredictImageFolder},
-        {"predict.model.weights", BrowserFileDialogBinding::PredictWeights},
-        {"predict.model.onnx", BrowserFileDialogBinding::PredictOnnx},
-        {"predict.model.tensorrt", BrowserFileDialogBinding::PredictTensorRt},
-        {"predict.output", BrowserFileDialogBinding::PredictOutputPath},
-        {"predict.output_path", BrowserFileDialogBinding::PredictOutputPath},
-        {"annotate.source.single_image", BrowserFileDialogBinding::AnnotateSingleImage},
-        {"annotate.source.file", BrowserFileDialogBinding::AnnotateSingleImage},
-        {"annotate.source.image_folder", BrowserFileDialogBinding::AnnotateImageFolder},
-        {"annotate.source.folder", BrowserFileDialogBinding::AnnotateImageFolder},
-        {"annotate.model.weights", BrowserFileDialogBinding::AnnotateWeights},
-        {"annotate.model.onnx", BrowserFileDialogBinding::AnnotateOnnx},
-        {"annotate.model.tensorrt", BrowserFileDialogBinding::AnnotateTensorRt},
-        {"annotate.output", BrowserFileDialogBinding::AnnotateOutputDir},
-        {"annotate.output_dir", BrowserFileDialogBinding::AnnotateOutputDir},
-        {"validate.dataset.compiled_path", BrowserFileDialogBinding::ValidateCompiledPath},
-        {"validate.compiled_path", BrowserFileDialogBinding::ValidateCompiledPath},
-        {"validate.dataset.source_dir", BrowserFileDialogBinding::ValidateSourceRoot},
-        {"validate.source_root", BrowserFileDialogBinding::ValidateSourceRoot},
-        {"validate.model.onnx", BrowserFileDialogBinding::ValidateOnnx},
-        {"validate.model.tensorrt", BrowserFileDialogBinding::ValidateTensorRt},
-        {"validate.output.save_engine_path", BrowserFileDialogBinding::ValidateSaveEngine},
-        {"validate.save_engine_path", BrowserFileDialogBinding::ValidateSaveEngine},
-        {"validate.report_json_path", BrowserFileDialogBinding::ValidateReportJson},
-        {"validate.output.report_json", BrowserFileDialogBinding::ValidateReportJson},
-        {"export.model.weights", BrowserFileDialogBinding::ExportWeights},
-        {"export.model.onnx", BrowserFileDialogBinding::ExportOnnx},
-        {"export.output", BrowserFileDialogBinding::ExportOutputPath},
-        {"export.output_path", BrowserFileDialogBinding::ExportOutputPath},
-    }};
-    if (const std::optional<BrowserFileDialogBinding> binding = find_browser_named_value(dialog_id, kBindings);
-        binding.has_value()) {
-        return *binding;
-    }
-    return BrowserFileDialogBinding::Unknown;
+    const auto found =
+        std::lower_bound(kBrowserNativeFileDialogsById.begin(), kBrowserNativeFileDialogsById.end(), dialog_id,
+                         [](const BrowserNativeFileDialogContractSpec& spec, const std::string_view needle) {
+                             return spec.id < needle;
+                         });
+    return found != kBrowserNativeFileDialogsById.end() && found->id == dialog_id ? found->binding
+                                                                                  : BrowserFileDialogBinding::Unknown;
 }
 
 StateSnapshot make_state_snapshot(const GuiStateSnapshotInputs& inputs) {
@@ -948,6 +983,9 @@ bool apply_annotate_workspace_click(const AnnotateWorkspaceClickIntent& intent,
 bool apply_annotate_workspace_box_drag(const AnnotateWorkspaceBoxDragIntent& intent,
                                        const BrowserAnnotateWorkspaceContext& context) {
     require_annotate_workspace_context(context, "annotate.workspace.box_drag");
+    if (intent.phase == AnnotateWorkspacePhase::Cancel) {
+        return cancel_annotate_workspace_interaction(context);
+    }
 
     const auto ensure_no_conflicting_interaction = [&]() {
         if (context.session->handle_drag().has_value()) {
@@ -1120,6 +1158,9 @@ bool apply_annotate_workspace_box_drag(const AnnotateWorkspaceBoxDragIntent& int
 bool apply_annotate_workspace_handle_drag(const AnnotateWorkspaceHandleDragIntent& intent,
                                           const BrowserAnnotateWorkspaceContext& context) {
     require_annotate_workspace_context(context, "annotate.workspace.handle_drag");
+    if (intent.phase == AnnotateWorkspacePhase::Cancel) {
+        return cancel_annotate_workspace_interaction(context);
+    }
     if (context.session->active_tool() != mmltk::gui::AnnotationToolKind::Direct) {
         throw std::runtime_error("browser annotate.workspace.handle_drag requires the direct tool");
     }
@@ -1206,6 +1247,9 @@ bool apply_annotate_workspace_handle_drag(const AnnotateWorkspaceHandleDragInten
 bool apply_annotate_workspace_brush(const AnnotateWorkspaceBrushIntent& intent,
                                     const BrowserAnnotateWorkspaceContext& context) {
     require_annotate_workspace_context(context, "annotate.workspace.brush");
+    if (intent.phase == AnnotateWorkspacePhase::Cancel) {
+        return cancel_annotate_workspace_interaction(context);
+    }
     if (intent.radius <= 0) {
         throw std::runtime_error("browser annotate.workspace.brush requires a positive radius");
     }
@@ -1336,6 +1380,64 @@ bool apply_annotate_workspace_color_sample(const AnnotateWorkspaceColorSampleInt
                                                                              nosup);
 }
 
+bool apply_annotate_workspace_pointer(const AnnotateWorkspacePointerIntent& intent,
+                                      const BrowserAnnotateWorkspaceContext& context) {
+    require_annotate_workspace_context(context, "annotate.workspace.pointer");
+
+    if (intent.drag_kind.has_value()) {
+        AnnotateWorkspaceBoxDragIntent drag;
+        drag.phase = intent.phase;
+        drag.drag_kind = intent.drag_kind;
+        drag.object_index = intent.object_index;
+        drag.capture_x = intent.capture_x;
+        drag.capture_y = intent.capture_y;
+        return apply_annotate_workspace_box_drag(drag, context);
+    }
+
+    if (intent.handle.has_value()) {
+        AnnotateWorkspaceHandleDragIntent drag;
+        drag.phase = intent.phase;
+        drag.handle = intent.handle;
+        drag.capture_x = intent.capture_x;
+        drag.capture_y = intent.capture_y;
+        return apply_annotate_workspace_handle_drag(drag, context);
+    }
+
+    if (intent.tool == "mask.color_sample") {
+        if (intent.phase == AnnotateWorkspacePhase::End) {
+            return apply_annotate_workspace_color_sample(
+                AnnotateWorkspaceColorSampleIntent{intent.capture_x, intent.capture_y}, context);
+        }
+        return intent.phase == AnnotateWorkspacePhase::Cancel ? cancel_annotate_workspace_interaction(context) : false;
+    }
+
+    const mmltk::gui::AnnotationToolKind tool = annotation_tool_kind_from_name_impl(intent.tool);
+    if (mmltk::gui::annotation_tool_kind_uses_brush(tool)) {
+        AnnotateWorkspaceBrushIntent brush;
+        brush.phase = intent.phase;
+        brush.capture_x = intent.capture_x;
+        brush.capture_y = intent.capture_y;
+        brush.radius = intent.brush_radius;
+        return apply_annotate_workspace_brush(brush, context);
+    }
+    if (intent.phase == AnnotateWorkspacePhase::Cancel) {
+        return cancel_annotate_workspace_interaction(context);
+    }
+    if (intent.phase != AnnotateWorkspacePhase::End) {
+        return false;
+    }
+    if (tool == mmltk::gui::AnnotationToolKind::MaskFill) {
+        return apply_annotate_workspace_fill(
+            AnnotateWorkspaceFillIntent{intent.capture_x, intent.capture_y}, context);
+    }
+    if (tool == mmltk::gui::AnnotationToolKind::Point || tool == mmltk::gui::AnnotationToolKind::Spline ||
+        tool == mmltk::gui::AnnotationToolKind::Skeleton) {
+        return apply_annotate_workspace_click(
+            AnnotateWorkspaceClickIntent{intent.capture_x, intent.capture_y, false}, context);
+    }
+    return false;
+}
+
 void apply_settings_update(const SettingsUpdateIntent& intent, mmltk::gui::GuiSettingsSnapshot& snapshot) {
     nlohmann::json current = mmltk::gui::snapshot_gui_settings(snapshot);
     current.merge_patch(normalize_settings_patch(intent.patch));
@@ -1358,136 +1460,118 @@ void apply_crop_commit(const CropCommitIntent& intent, mmltk::gui::SourceSelecti
     source.crop_height = saturating_int(intent.crop.height);
 }
 
-void apply_routed_intent(const RoutedIntent& intent, const BrowserHostIntentContext& context) {
-    const BrowserAnnotateWorkspaceContext annotate_workspace_context{
-        context.annotation_document, context.annotation_session,    context.annotation_controller,
-        context.annotation_frame,    context.annotation_categories, context.ensure_annotation_frame_pixels,
-    };
+struct BrowserHostIntentApplyHandlers {
+    const BrowserHostIntentContext& context;
+    const BrowserAnnotateWorkspaceContext& annotate_workspace_context;
 
-    if (const auto* settings = std::get_if<SettingsUpdateIntent>(&intent.payload)) {
+    void bind_annotate_view() const noexcept {
+        if (context.current_view != nullptr) {
+            *context.current_view = mmltk::gui::View::Annotate;
+        }
+    }
+
+    void require_annotate_workflow(const RoutedIntent& routed, const std::string_view intent_name) const {
+        if (routed.workflow != Workflow::Annotate) {
+            throw std::runtime_error("browser " + std::string(intent_name) +
+                                     " is only bound for the annotate workflow");
+        }
+    }
+
+    void operator()(const RoutedIntent&, const SettingsUpdateIntent& settings) const {
         if (context.gui == nullptr) {
             throw std::runtime_error("browser settings.update requires a bound gui settings snapshot");
         }
-        apply_settings_update(*settings, *context.gui);
+        apply_settings_update(settings, *context.gui);
         if (context.current_view != nullptr) {
             *context.current_view = context.gui->current_view;
         }
         if (context.selected_preset != nullptr) {
             *context.selected_preset = context.gui->selected_preset;
         }
-        return;
     }
 
-    if (const auto* crop = std::get_if<CropCommitIntent>(&intent.payload)) {
-        mmltk::gui::SourceSelectionState* source = source_selection_for_workflow(intent.workflow, context);
+    void operator()(const RoutedIntent& routed, const CropCommitIntent& crop) const {
+        mmltk::gui::SourceSelectionState* source = source_selection_for_workflow(routed.workflow, context);
         if (source == nullptr) {
             throw std::runtime_error(
                 "browser crop.commit requires a bound source "
                 "selection for the target workflow");
         }
-        apply_crop_commit(*crop, *source);
-        return;
+        apply_crop_commit(crop, *source);
     }
 
-    if (const auto* tool = std::get_if<ToolSelectIntent>(&intent.payload)) {
-        if (intent.workflow != Workflow::Annotate) {
-            throw std::runtime_error("browser tool.select is only bound for the annotate workflow");
-        }
+    void operator()(const RoutedIntent& routed, const ToolSelectIntent& tool) const {
+        require_annotate_workflow(routed, "tool.select");
         if (context.annotation_controller == nullptr || context.annotation_document == nullptr ||
             context.annotation_session == nullptr) {
             throw std::runtime_error("browser tool.select requires bound annotation controller state");
         }
-        const mmltk::gui::AnnotationToolKind next_tool = annotation_tool_kind_from_name(tool->tool);
+        const mmltk::gui::AnnotationToolKind next_tool = annotation_tool_kind_from_name(tool.tool);
         if (!context.annotation_controller->set_active_tool(next_tool, *context.annotation_document,
                                                             *context.annotation_session)) {
             throw std::runtime_error("browser tool.select could not activate the requested tool");
         }
-        if (context.current_view != nullptr) {
-            *context.current_view = mmltk::gui::View::Annotate;
-        }
-        return;
+        bind_annotate_view();
     }
 
-    if (const auto* click = std::get_if<AnnotateWorkspaceClickIntent>(&intent.payload)) {
-        if (intent.workflow != Workflow::Annotate) {
-            throw std::runtime_error(
-                "browser annotate.workspace.click is only bound "
-                "for the annotate workflow");
-        }
-        (void)apply_annotate_workspace_click(*click, annotate_workspace_context);
-        if (context.current_view != nullptr) {
-            *context.current_view = mmltk::gui::View::Annotate;
-        }
-        return;
+    void operator()(const RoutedIntent& routed, const AnnotateWorkspaceClickIntent& click) const {
+        require_annotate_workflow(routed, "annotate.workspace.click");
+        (void)apply_annotate_workspace_click(click, annotate_workspace_context);
+        bind_annotate_view();
     }
 
-    if (const auto* box_drag = std::get_if<AnnotateWorkspaceBoxDragIntent>(&intent.payload)) {
-        if (intent.workflow != Workflow::Annotate) {
-            throw std::runtime_error(
-                "browser annotate.workspace.box_drag is only "
-                "bound for the annotate workflow");
-        }
-        (void)apply_annotate_workspace_box_drag(*box_drag, annotate_workspace_context);
-        if (context.current_view != nullptr) {
-            *context.current_view = mmltk::gui::View::Annotate;
-        }
-        return;
+    void operator()(const RoutedIntent& routed, const AnnotateWorkspaceBoxDragIntent& box_drag) const {
+        require_annotate_workflow(routed, "annotate.workspace.box_drag");
+        (void)apply_annotate_workspace_box_drag(box_drag, annotate_workspace_context);
+        bind_annotate_view();
     }
 
-    if (const auto* handle_drag = std::get_if<AnnotateWorkspaceHandleDragIntent>(&intent.payload)) {
-        if (intent.workflow != Workflow::Annotate) {
-            throw std::runtime_error(
-                "browser annotate.workspace.handle_drag is only "
-                "bound for the annotate workflow");
-        }
-        (void)apply_annotate_workspace_handle_drag(*handle_drag, annotate_workspace_context);
-        if (context.current_view != nullptr) {
-            *context.current_view = mmltk::gui::View::Annotate;
-        }
-        return;
+    void operator()(const RoutedIntent& routed, const AnnotateWorkspaceHandleDragIntent& handle_drag) const {
+        require_annotate_workflow(routed, "annotate.workspace.handle_drag");
+        (void)apply_annotate_workspace_handle_drag(handle_drag, annotate_workspace_context);
+        bind_annotate_view();
     }
 
-    if (const auto* brush = std::get_if<AnnotateWorkspaceBrushIntent>(&intent.payload)) {
-        if (intent.workflow != Workflow::Annotate) {
-            throw std::runtime_error(
-                "browser annotate.workspace.brush is only bound "
-                "for the annotate workflow");
-        }
-        (void)apply_annotate_workspace_brush(*brush, annotate_workspace_context);
-        if (context.current_view != nullptr) {
-            *context.current_view = mmltk::gui::View::Annotate;
-        }
-        return;
+    void operator()(const RoutedIntent& routed, const AnnotateWorkspaceBrushIntent& brush) const {
+        require_annotate_workflow(routed, "annotate.workspace.brush");
+        (void)apply_annotate_workspace_brush(brush, annotate_workspace_context);
+        bind_annotate_view();
     }
 
-    if (const auto* fill = std::get_if<AnnotateWorkspaceFillIntent>(&intent.payload)) {
-        if (intent.workflow != Workflow::Annotate) {
-            throw std::runtime_error(
-                "browser annotate.workspace.fill is only bound "
-                "for the annotate workflow");
-        }
-        (void)apply_annotate_workspace_fill(*fill, annotate_workspace_context);
-        if (context.current_view != nullptr) {
-            *context.current_view = mmltk::gui::View::Annotate;
-        }
-        return;
+    void operator()(const RoutedIntent& routed, const AnnotateWorkspacePointerIntent& pointer) const {
+        require_annotate_workflow(routed, "annotate.workspace.pointer");
+        (void)apply_annotate_workspace_pointer(pointer, annotate_workspace_context);
+        bind_annotate_view();
     }
 
-    if (const auto* color_sample = std::get_if<AnnotateWorkspaceColorSampleIntent>(&intent.payload)) {
-        if (intent.workflow != Workflow::Annotate) {
-            throw std::runtime_error(
-                "browser annotate.workspace.color_sample is "
-                "only bound for the annotate workflow");
-        }
-        (void)apply_annotate_workspace_color_sample(*color_sample, annotate_workspace_context);
-        if (context.current_view != nullptr) {
-            *context.current_view = mmltk::gui::View::Annotate;
-        }
-        return;
+    void operator()(const RoutedIntent& routed, const AnnotateWorkspaceFillIntent& fill) const {
+        require_annotate_workflow(routed, "annotate.workspace.fill");
+        (void)apply_annotate_workspace_fill(fill, annotate_workspace_context);
+        bind_annotate_view();
     }
 
-    throw std::runtime_error("browser host app intent not yet bound: " +
-                             std::string(routed_intent_name(intent.payload)));
+    void operator()(const RoutedIntent& routed, const AnnotateWorkspaceColorSampleIntent& color_sample) const {
+        require_annotate_workflow(routed, "annotate.workspace.color_sample");
+        (void)apply_annotate_workspace_color_sample(color_sample, annotate_workspace_context);
+        bind_annotate_view();
+    }
+
+    void operator()(const RoutedIntent&, const WorkspaceRendererEventIntent&) const {}
+
+    template <typename Payload>
+    void operator()(const RoutedIntent& routed, const Payload&) const {
+        throw std::runtime_error("browser host app intent not yet bound: " + std::string(routed_intent_name(routed)));
+    }
+};
+
+void apply_routed_intent(const RoutedIntent& intent, const BrowserHostIntentContext& context) {
+    const BrowserAnnotateWorkspaceContext annotate_workspace_context{
+        context.annotation_document, context.annotation_session,    context.annotation_controller,
+        context.annotation_frame,    context.annotation_categories, context.ensure_annotation_frame_pixels,
+    };
+
+    BrowserIntentDispatchFactory<BrowserIntentPayloadTypes, BrowserHostIntentApplyHandlers>::dispatch(
+        intent, BrowserHostIntentApplyHandlers{context, annotate_workspace_context});
 }
 
 FrameSlotDescriptor frame_slot_from_output_bundle(std::string slot_name, const FrameTransportKind transport,

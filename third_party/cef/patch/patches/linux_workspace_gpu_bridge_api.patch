@@ -10,43 +10,11 @@ index 6d0f2f1..4c3f1d1 100644
      "libcef/common/task_util.h",
      "libcef/common/thread_impl.cc",
      "libcef/common/thread_impl.h",
-@@ -887,6 +888,12 @@ source_set("libcef_static") {
-    "libcef/renderer/render_manager.h",
-    "libcef/renderer/thread_util.h",
-    "libcef/renderer/v8_impl.cc",
-+    "libcef/renderer/workspace_gpu_bridge_texture_importer.cc",
-+    "libcef/renderer/workspace_gpu_bridge_texture_importer.h",
-+    "libcef/renderer/workspace_gpu_bridge.cc",
-+    "libcef/renderer/workspace_gpu_bridge.h",
-+    "libcef/browser/workspace_gpu_bridge_surface_service.cc",
-+    "libcef/browser/workspace_gpu_bridge_surface_service.h",
-    "libcef/renderer/v8_impl.h",
- 
-    # For Chrome runtime support.
-@@ -984,6 +991,7 @@ source_set("libcef_static") {
-    "//third_party/blink/public:blink",
-    "//third_party/brotli:dec",
-    "//third_party/cld_3/src/src:cld_3",
-    "//third_party/crashpad/crashpad/handler",
-+    "//third_party/highway:libhwy",
-    "//third_party/hunspell",
-    "//third_party/leveldatabase",
 diff --git cef/libcef/common/mojom/cef.mojom cef/libcef/common/mojom/cef.mojom
 index 02f180f..64ca442 100644
 --- cef/libcef/common/mojom/cef.mojom
 +++ cef/libcef/common/mojom/cef.mojom
-@@ -52,6 +52,10 @@ interface RenderFrame {
-   // Move or resize of the renderer's containing window has started. Used on
-   // Windows and Linux with the Alloy runtime.
-   MoveOrResizeStarted();
-+
-+  // The browser-side workspace GPU bridge has fully released a surface
-+  // revision after renderer dissociation.
-+  WorkspaceGpuBridgeSurfaceReleased(string surface_id, string revision);
- };
- 
- // Interface for communicating with a frame in the browser process.
-@@ -93,6 +97,12 @@ interface BrowserFrame {
+@@ -93,6 +93,18 @@ interface BrowserFrame {
  
    // Draggable regions have updated.
    UpdateDraggableRegions(array<DraggableRegionEntry>? regions);
@@ -56,14 +24,31 @@ index 02f180f..64ca442 100644
 +  // mailbox/texture association has been torn down.
 +  ReleaseWorkspaceGpuBridgeSurface(
 +      string surface_id, string revision, bool renderer_dissociated);
++
++  // The renderer imported a workspace surface revision and now owns a mailbox
++  // texture association that must dissociate before the browser-side
++  // SharedImage can be destroyed.
++  RetainWorkspaceGpuBridgeSurfaceRenderer(
++      string surface_id, string revision);
  };
  
  struct CrossOriginWhiteListEntry {
+diff --git cef/libcef_dll/libcef.lst cef/libcef_dll/libcef.lst
+index 1871406..90672f0 100644
+--- cef/libcef_dll/libcef.lst
++++ cef/libcef_dll/libcef.lst
+@@ -5,5 +5,6 @@
+ {
+   /* Only export necessary symbols from libcef.so. */
+   global: cef_*;
++          mmltk_cef_workspace_gpu_bridge_*;
+   local: *;
+ };
 diff --git cef/libcef/common/workspace_gpu_bridge_export.h cef/libcef/common/workspace_gpu_bridge_export.h
 new file mode 100644
 --- /dev/null
 +++ cef/libcef/common/workspace_gpu_bridge_export.h
-@@ -0,0 +1,45 @@
+@@ -0,0 +1,38 @@
 +// Copyright 2026 The Chromium Embedded Framework Authors. All rights reserved.
 +// Use of this source code is governed by a BSD-style license that can be
 +// found in the LICENSE file.
@@ -75,37 +60,30 @@ new file mode 100644
 +#include <stddef.h>
 +#include <stdint.h>
 +
-+#include <string>
-+
-+#include "include/base/cef_ref_counted.h"
++#include "include/internal/cef_export.h"
 +#include "include/internal/cef_string.h"
-+#include "include/cef_v8.h"
 +
-+namespace cef::workspace_gpu_bridge {
-+
-+struct ExportedSharedImageJsonPayload {
-+  std::string serialized_json;
-+  std::string mailbox_json;
-+  bool has_metadata = false;
-+  bool has_creation_sync_token = false;
-+  uint32_t texture_target = 0;
-+  bool is_software = false;
-+};
-+
-+}  // namespace cef::workspace_gpu_bridge
-+
-+extern "C" bool mmltk_cef_workspace_gpu_bridge_export_shared_image(
++extern "C" CEF_EXPORT bool mmltk_cef_workspace_gpu_bridge_export_shared_image(
 +    const char* surface_id, size_t surface_id_length, const char* revision,
 +    size_t revision_length, const char* publication_source_json,
 +    size_t publication_source_json_length,
 +    CefString* exported_shared_image_json_out,
-+    CefString* exception) noexcept;
-+extern "C" bool
++    CefString* result_code, CefString* result_detail) noexcept;
++extern "C" CEF_EXPORT bool
 +mmltk_cef_workspace_gpu_bridge_renderer_helper_present() noexcept;
-+extern "C" bool mmltk_cef_workspace_gpu_bridge_import_texture(
-+    CefRefPtr<CefV8Value> device, const char* surface_id,
++extern "C" CEF_EXPORT bool mmltk_cef_workspace_gpu_bridge_import_texture(
++    void* device, const char* surface_id,
 +    size_t surface_id_length, const char* revision, size_t revision_length,
 +    const char* exported_shared_image_json,
 +    size_t exported_shared_image_json_length,
-+    CefRefPtr<CefV8Value>* texture_out, CefString* exception) noexcept;
++    void** texture_out, CefString* result_code,
++    CefString* result_detail) noexcept;
++extern "C" CEF_EXPORT bool mmltk_cef_workspace_gpu_bridge_release_surface(
++    const char* surface_id, size_t surface_id_length, const char* revision,
++    size_t revision_length, bool renderer_dissociated, CefString* result_code,
++    CefString* result_detail) noexcept;
++extern "C" CEF_EXPORT bool mmltk_cef_workspace_gpu_bridge_release_texture(
++    const char* surface_id, size_t surface_id_length, const char* revision,
++    size_t revision_length, CefString* result_code,
++    CefString* result_detail) noexcept;
 +#endif  // CEF_LIBCEF_COMMON_WORKSPACE_GPU_BRIDGE_EXPORT_H_

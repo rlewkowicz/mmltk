@@ -48,6 +48,8 @@ script_dir = os.path.dirname(__file__)
 _COLOR_RED = '\033[31m'
 _COLOR_BOLD = '\033[1m'
 _COLOR_RESET = '\033[0m'
+_MMLTK_NINJA_NO_WORK_MESSAGE = 'ninja: no work to do.'
+_MMLTK_NO_WORK_SENTINEL_ENV = 'MMLTK_CEF_NO_WORK_SENTINEL'
 
 
 def _stderr_msg(msg):
@@ -175,6 +177,50 @@ def run(command_line, working_dir, output_file=None):
     except subprocess.CalledProcessError:
       msg(_stderr_msg('ERROR Run failed. See %s for output.' % output_file))
       raise
+
+
+def run_mmltk_build(command_line, working_dir, output_file=None):
+  """Runs a build command and returns True when Ninja reports no work."""
+  sys.stdout.write('-------- Running "'+command_line+'" in "'+\
+                   working_dir+'"...'+"\n")
+  if options.dryrun:
+    return False
+
+  args = shlex.split(command_line.replace('\\', '\\\\'))
+  process = subprocess.Popen(
+      args,
+      cwd=working_dir,
+      shell=(sys.platform == 'win32'),
+      stderr=subprocess.STDOUT,
+      stdout=subprocess.PIPE)
+
+  no_work = False
+  output_handle = None
+  try:
+    if output_file:
+      msg('Writing %s' % output_file)
+      output_handle = open(output_file, 'w', encoding='utf-8')
+
+    for raw_line in iter(process.stdout.readline, b''):
+      line = raw_line.decode('utf-8', errors='replace')
+      if _MMLTK_NINJA_NO_WORK_MESSAGE in line:
+        no_work = True
+      if output_handle:
+        output_handle.write(line)
+      else:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+    process.wait()
+  finally:
+    if output_handle:
+      output_handle.close()
+
+  if process.returncode != 0:
+    if output_file:
+      msg(_stderr_msg('ERROR Run failed. See %s for output.' % output_file))
+    raise subprocess.CalledProcessError(process.returncode, args)
+
+  return no_work
 
 
 def create_directory(path):
@@ -662,6 +708,61 @@ def generate_mmltk_debug_bundle(output_dir, archive_name):
   finally:
     if os.path.isdir(temp_root):
       shutil.rmtree(temp_root, onerror=onerror)
+
+
+def has_mmltk_debug_bundle_archive(output_dir, archive_name):
+  """Returns True when the existing MMLTK archive metadata is present."""
+  archive_path = os.path.join(output_dir, archive_name)
+  sha_path = archive_path + '.sha256'
+  if not os.path.isfile(archive_path) or not os.path.isfile(sha_path):
+    return False
+
+  try:
+    with open(sha_path, 'r', encoding='utf-8') as fp:
+      first_line = fp.readline().strip()
+  except OSError:
+    return False
+
+  parts = first_line.split()
+  if len(parts) == 0 or not is_valid_sha256(parts[0]):
+    return False
+  if len(parts) > 1 and parts[1] != os.path.basename(archive_path):
+    return False
+
+  return True
+
+
+def should_skip_mmltk_debug_bundle_generation(build_state, output_dir,
+                                              archive_name):
+  """Returns True when an unchanged Ninja build can reuse the archive."""
+  if build_state['ran'] == 0:
+    return False
+  if build_state['ran'] != build_state['no_work']:
+    return False
+
+  archive_path = os.path.join(output_dir, archive_name)
+  if not has_mmltk_debug_bundle_archive(output_dir, archive_name):
+    msg('Ninja reported no work, but the existing MMLTK debug bundle is '
+        'missing or has invalid checksum metadata; regenerating %s' %
+        archive_path)
+    return False
+
+  msg('Ninja reported no work; reusing existing MMLTK debug bundle %s and '
+      'skipping artifact copy and packaging' % archive_path)
+  return True
+
+
+def write_mmltk_no_work_sentinel():
+  """Signal the build wrapper that the no-op Ninja fast path completed."""
+  sentinel_path = os.environ.get(_MMLTK_NO_WORK_SENTINEL_ENV, '')
+  if sentinel_path == '':
+    return
+
+  parent_dir = os.path.dirname(sentinel_path)
+  if parent_dir != '':
+    os.makedirs(parent_dir, exist_ok=True)
+  with open(sentinel_path, 'w', encoding='utf-8') as fp:
+    fp.write('ninja_no_work=1\n')
 
 
 def bootstrap_mmltk_linux_base_packages():
@@ -1326,6 +1427,13 @@ parser.add_option(
     dest='mmltkoutputarchivename',
     default='mmltk_cef_linux64_minimal_debug.tar.bz2',
     help='Archive file name written under --mmltk-output-dir.')
+parser.add_option(
+    '--mmltk-skip-gclient-hook',
+    action='store_true',
+    dest='mmltkskipgclienthook',
+    default=False,
+    help='Skip the CEF gclient hook when the repo-managed build checkout is '
+         'already patched and GN files are known unchanged.')
 
 (options, args) = parser.parse_args()
 
@@ -1850,6 +1958,8 @@ if not branch_is_master and chromium_checkout_changed:
 ##
 ##
 
+mmltk_build_state = {'ran': 0, 'no_work': 0}
+
 if not options.nobuild and (chromium_checkout_changed or \
                             cef_checkout_changed or options.forcebuild or \
                             not out_src_dir_exists):
@@ -1865,13 +1975,16 @@ if not options.nobuild and (chromium_checkout_changed or \
        key.startswith('DEPOT_TOOLS_'):
       msg('%s=%s' % (key, os.environ[key]))
 
-  if options.mmltkpatchersource != '':
+  if options.mmltkskipgclienthook:
+    msg('Skipping CEF gclient hook for cache-hot MMLTK build checkout.')
+  elif options.mmltkpatchersource != '':
     copy_file(os.path.abspath(options.mmltkpatchersource),
               os.path.join(cef_src_dir, 'tools', 'patcher.py'),
               allow_overwrite=True)
 
-  tool = os.path.join(cef_src_dir, 'tools', 'gclient_hook.py')
-  run('%s %s' % (python_exe, tool), cef_src_dir)
+  if not options.mmltkskipgclienthook:
+    tool = os.path.join(cef_src_dir, 'tools', 'gclient_hook.py')
+    run('%s %s' % (python_exe, tool), cef_src_dir)
 
   command = 'autoninja '
   if options.mmltkbuildjobs != '':
@@ -1892,9 +2005,16 @@ if not options.nobuild and (chromium_checkout_changed or \
   def run_out_build(build_path, build_target, log_suffix):
     args_path = os.path.join(chromium_src_dir, build_path, 'args.gn')
     msg(args_path + ' contents:\n' + read_file(args_path))
-    run(command + build_path + build_target, chromium_src_dir,
-        os.path.join(download_dir, 'build-%s-%s.log' % (cef_branch, log_suffix))
-          if options.buildlogfile else None)
+    output_file = os.path.join(download_dir, 'build-%s-%s.log' %
+                               (cef_branch, log_suffix)) \
+        if options.buildlogfile else None
+    if options.mmltkoutputdir != '':
+      mmltk_build_state['ran'] += 1
+      if run_mmltk_build(command + build_path + build_target,
+                         chromium_src_dir, output_file):
+        mmltk_build_state['no_work'] += 1
+    else:
+      run(command + build_path + build_target, chromium_src_dir, output_file)
 
   def run_sandbox_build_if_present(build_path, log_suffix):
     if platform not in sandbox_static_platforms:
@@ -2052,5 +2172,11 @@ if not options.nodistrib and (chromium_checkout_changed or \
       sys.exit(1)
 
 if options.mmltkoutputdir != '':
+  if should_skip_mmltk_debug_bundle_generation(
+      mmltk_build_state, options.mmltkoutputdir,
+      options.mmltkoutputarchivename):
+    write_mmltk_no_work_sentinel()
+    sys.exit(0)
+
   generate_mmltk_debug_bundle(options.mmltkoutputdir,
                               options.mmltkoutputarchivename)

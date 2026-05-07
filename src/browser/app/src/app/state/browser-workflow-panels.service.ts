@@ -48,19 +48,7 @@ export class BrowserWorkflowPanelsState {
   private buildWorkflowControlsStatus(
     workflow: Workflow,
   ): CapabilityStatusViewState[] {
-    const items: CapabilityStatusViewState[] = [
-      {
-        key: "draft",
-        label: "Draft",
-        status: this.shared.workflowDraftDirty(workflow) ? "active" : "ready",
-        summary: this.shared.workflowDraftDirty(workflow)
-          ? "workflow draft staged"
-          : "workflow draft synchronized",
-        detail: this.shared.workflowDraftDirty(workflow)
-          ? "Apply Workflow or the primary action to send settings.update."
-          : "Workflow draft matches the current host snapshot.",
-      },
-    ];
+    const items: CapabilityStatusViewState[] = [];
     switch (workflow) {
       case "train":
         items.push(this.train.controlsStatus());

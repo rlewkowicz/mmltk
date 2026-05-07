@@ -7,7 +7,6 @@ import {
   workflowLeafRecord,
   workflowRecordKey,
   workflowSectionRecord,
-  workflowStateRoot,
   workflowSourceRecord,
 } from "../../app_shared";
 import type {
@@ -16,9 +15,30 @@ import type {
   StateSnapshot,
   Workflow,
 } from "../../host_api";
+import {
+  FILE_DIALOG_CONTRACT,
+  SETTINGS_PATCH_PATHS,
+} from "../../workflow_contract.generated";
 import { sourceKindNameFromValue } from "../../workflow_utils";
 
 type JsonRecord = Record<string, unknown>;
+type FileDialogContractEntry = (typeof FILE_DIALOG_CONTRACT)[number];
+
+const kFileDialogContractById = new Map<string, FileDialogContractEntry>(
+  FILE_DIALOG_CONTRACT.map((dialog) => [dialog.id, dialog]),
+);
+const kFileDialogContractByWorkflowField = new Map<string, FileDialogContractEntry>(
+  FILE_DIALOG_CONTRACT.map((dialog) => [
+    `${dialog.workflow}:${dialog.field}`,
+    dialog,
+  ]),
+);
+
+function fileDialogFilters(
+  dialog: FileDialogContractEntry,
+): ReadonlyArray<FileDialogFilter> {
+  return dialog.filters;
+}
 
 export type ShellDensity = "compact" | "balanced" | "comfortable";
 
@@ -70,8 +90,8 @@ export function hasSelectOptionValue<T extends string>(
 }
 
 export interface FileDialogFilter {
-  name: string;
-  patterns: string[];
+  readonly name: string;
+  readonly patterns: ReadonlyArray<string>;
 }
 
 export interface SourceBrowseRequest {
@@ -79,7 +99,7 @@ export interface SourceBrowseRequest {
   mode: FileDialogMode;
   title: string;
   defaultPath: string;
-  filters: FileDialogFilter[];
+  filters: ReadonlyArray<FileDialogFilter>;
 }
 
 export interface FileDialogRequestLike {
@@ -95,24 +115,34 @@ export interface FileDialogRequestLike {
 
 export function fileDialogRequestPayload(request: FileDialogRequestLike): {
   dialog_id: string;
+  target_field: string;
   mode: FileDialogMode;
   title: string;
   default_path: string;
-  filters: FileDialogFilter[];
+  filters: ReadonlyArray<FileDialogFilter>;
 } {
+  const dialog = contractDialogForRequest(request);
   return {
     dialog_id: request.dialogId,
+    target_field: dialog.field,
     mode: request.mode,
-    title: request.title,
+    title: dialog.title,
     default_path: request.defaultPath,
-    filters: request.filters.map((filter) => ({
-      name: filter.name,
-      patterns: filter.patterns.slice(),
-    })),
+    filters: fileDialogFilters(dialog),
   };
 }
 
-const kImageFilePatterns = ["*.png", "*.jpg", "*.jpeg", "*.bmp", "*.webp"];
+const kDefaultTrainWeightsPath =
+  "./engines/output-seg-medium/train-local/checkpoint_best_regular.pt";
+const kDefaultTrainCompiledPath = "./compiled-seg-medium-synth/train.bin";
+const kDefaultValCompiledPath = "./compiled-seg-medium-synth/val.bin";
+const kDefaultTrainOutputDir = "./engines/output-seg-medium/train-local";
+const kDefaultPredictOutputPath = "./predictions.json";
+const kDefaultAnnotateOutputDir = "./annotated-scenes";
+const kDefaultExportOutputPath = "./rfdetr-engine.trt";
+const kDefaultValidationReportJsonPath = "./rfdetr-validation-report.json";
+const kDefaultSegMediumResolution = 432;
+const kDefaultSegMediumMaxDets = 200;
 const kPredictSourceKinds: ReadonlyArray<SourceKind> = [
   "compiled_dataset",
   "single_image",
@@ -129,6 +159,7 @@ const kShellDensityOptions: ReadonlyArray<SelectOption<ShellDensity>> = [
   { value: "balanced", label: "Balanced" },
   { value: "comfortable", label: "Comfortable" },
 ];
+const kSettingsPatchPathSet = new Set<string>(SETTINGS_PATCH_PATHS);
 
 function sourceKindPatchValue(kind: SourceKind): number {
   switch (kind) {
@@ -161,6 +192,30 @@ function sourceLocatorFromRecord(
     return stringFromValue(workflowSource.image_directory, fallback);
   }
   return fallback;
+}
+
+function defaultSourceDraftForWorkflow(workflow: Workflow): SourceDraft | null {
+  const kind =
+    workflow === "annotate"
+      ? "image_folder"
+      : workflow === "live"
+        ? "video_stream"
+        : workflow === "predict"
+        ? "compiled_dataset"
+        : null;
+  if (kind === null) {
+    return null;
+  }
+  return {
+    kind,
+    locator: kind === "compiled_dataset" ? kDefaultValCompiledPath : "",
+    recursive: false,
+    deviceIndex: "0",
+    captureWidth: "1920",
+    captureHeight: "1080",
+    captureFps: "120",
+    v4l2BufferCount: "1",
+  };
 }
 
 function densityFromValue(value: unknown): ShellDensity {
@@ -259,18 +314,54 @@ export function sourceDraftFromSnapshot(
 ): SourceDraft {
   const workflowSource = workflowSourceRecord(snapshot, workflow);
   const source = snapshot.source;
-  const kind = sourceKindNameFromValue(workflowSource?.kind ?? source.kind);
+  const defaultDraft = defaultSourceDraftForWorkflow(workflow);
+  const useGlobalSourceFallback =
+    workflow !== "live" &&
+    workflowSource === null &&
+    stringFromValue(source.locator).trim().length > 0;
+  const sourceFallbackKind = useGlobalSourceFallback
+    ? source.kind
+    : (defaultDraft?.kind ?? source.kind);
+  const kind = sourceKindNameFromValue(workflowSource?.kind ?? sourceFallbackKind);
+  const sourceFallbackLocator = useGlobalSourceFallback
+    ? source.locator
+    : (defaultDraft?.locator ?? source.locator);
   return {
     kind,
-    locator: sourceLocatorFromRecord(workflowSource, kind, source.locator),
-    recursive: booleanFromValue(workflowSource?.recursive, source.recursive),
-    deviceIndex: formatIntegerString(workflowSource?.device_index, source.device_index),
-    captureWidth: formatIntegerString(workflowSource?.capture_width, source.capture_width),
-    captureHeight: formatIntegerString(workflowSource?.capture_height, source.capture_height),
-    captureFps: formatIntegerString(workflowSource?.capture_fps, source.capture_fps),
+    locator: sourceLocatorFromRecord(workflowSource, kind, sourceFallbackLocator),
+    recursive: booleanFromValue(
+      workflowSource?.recursive,
+      useGlobalSourceFallback ? source.recursive : (defaultDraft?.recursive ?? source.recursive),
+    ),
+    deviceIndex: formatIntegerString(
+      workflowSource?.device_index,
+      useGlobalSourceFallback
+        ? source.device_index
+        : Number(defaultDraft?.deviceIndex ?? source.device_index),
+    ),
+    captureWidth: formatIntegerString(
+      workflowSource?.capture_width,
+      useGlobalSourceFallback
+        ? source.capture_width
+        : Number(defaultDraft?.captureWidth ?? source.capture_width),
+    ),
+    captureHeight: formatIntegerString(
+      workflowSource?.capture_height,
+      useGlobalSourceFallback
+        ? source.capture_height
+        : Number(defaultDraft?.captureHeight ?? source.capture_height),
+    ),
+    captureFps: formatIntegerString(
+      workflowSource?.capture_fps,
+      useGlobalSourceFallback
+        ? source.capture_fps
+        : Number(defaultDraft?.captureFps ?? source.capture_fps),
+    ),
     v4l2BufferCount: formatIntegerString(
       workflowSource?.v4l2_buffer_count,
-      source.v4l2_buffer_count,
+      useGlobalSourceFallback
+        ? source.v4l2_buffer_count
+        : Number(defaultDraft?.v4l2BufferCount ?? source.v4l2_buffer_count),
     ),
   };
 }
@@ -297,6 +388,7 @@ export function buildSourceSettingsPatch(
   snapshot: StateSnapshot,
 ): JsonRecord {
   const workflowKey = workflowRecordKey(workflow);
+  const sourcePatchPrefix = `workflows.${workflowKey}.source`;
   const fallback = sourceDraftFromSnapshot(snapshot, workflow);
   const locator = draft.locator.trim();
   const sourcePatch: JsonRecord = {
@@ -315,12 +407,17 @@ export function buildSourceSettingsPatch(
       Number(fallback.v4l2BufferCount),
       1,
     ),
-    compiled_path: "",
     single_image_path: "",
     image_directory: "",
   };
+  if (kSettingsPatchPathSet.has(`${sourcePatchPrefix}.compiled_path`)) {
+    sourcePatch.compiled_path = "";
+  }
 
-  if (draft.kind === "compiled_dataset") {
+  if (
+    draft.kind === "compiled_dataset" &&
+    kSettingsPatchPathSet.has(`${sourcePatchPrefix}.compiled_path`)
+  ) {
     sourcePatch.compiled_path = locator;
   } else if (draft.kind === "single_image") {
     sourcePatch.single_image_path = locator;
@@ -346,27 +443,10 @@ export function sourceBrowseRequestForDraft(
   const supportsSourceDialog =
     workflowKey === "predict" || workflowKey === "annotate";
   if (draft.kind === "single_image" && supportsSourceDialog) {
-    return {
-      dialogId: `${workflowKey}.source.single_image`,
-      mode: "open_file",
-      title: workflowKey === "annotate" ? "Select annotation image" : "Select source image",
-      defaultPath,
-      filters: [
-        {
-          name: "Images",
-          patterns: kImageFilePatterns.slice(),
-        },
-      ],
-    };
+    return contractBrowseRequest(workflowKey, "source.singleImagePath", defaultPath);
   }
   if (draft.kind === "image_folder" && supportsSourceDialog) {
-    return {
-      dialogId: `${workflowKey}.source.image_folder`,
-      mode: "open_folder",
-      title: workflowKey === "annotate" ? "Select annotation folder" : "Select source folder",
-      defaultPath,
-      filters: [],
-    };
+    return contractBrowseRequest(workflowKey, "source.imageDirectory", defaultPath);
   }
   return null;
 }
@@ -491,7 +571,6 @@ export type TrainOptimizer = "adamw" | "muon";
 export type RemoteGpuFamilyKey = "a100" | "b200" | "h100" | "h200" | "l_series";
 
 export interface TrainDraft {
-  selectedPreset: string;
   trainCompiledPath: string;
   valCompiledPath: string;
   testCompiledPath: string;
@@ -559,7 +638,6 @@ export interface ValidateDraft {
 }
 
 export interface PredictDraft {
-  selectedPreset: string;
   weightsPath: string;
   onnxPath: string;
   tensorrtPath: string;
@@ -649,8 +727,8 @@ const kPredictModelInputOptions: ReadonlyArray<SelectOption<ModelInput>> = [
 ];
 
 const kAnnotateModelInputOptions: ReadonlyArray<SelectOption<ModelInput>> = [
-  ...kPredictModelInputOptions,
   { value: "none", label: "None" },
+  ...kPredictModelInputOptions,
 ];
 
 const kTrainTargetOptions: ReadonlyArray<SelectOption<TrainTarget>> = [
@@ -676,11 +754,43 @@ const kRemoteGpuFamilyOptions: ReadonlyArray<SelectOption<RemoteGpuFamilyKey> & 
   { value: "l_series", label: "L Series", index: 4 },
 ];
 
-const kCompiledDatasetPatterns = ["*.mmltk", "*.bin"];
-const kWeightsFilePatterns = ["*.pt", "*.pth", "*.ckpt", "*.safetensors"];
-const kOnnxFilePatterns = ["*.onnx"];
-const kTensorRtFilePatterns = ["*.engine", "*.trt"];
-const kJsonFilePatterns = ["*.json"];
+function contractDialogForWorkflowField(
+  workflow: Workflow,
+  field: string,
+): FileDialogContractEntry {
+  const workflowKey = workflowRecordKey(workflow);
+  const dialog = kFileDialogContractByWorkflowField.get(`${workflowKey}:${field}`);
+  if (dialog === undefined) {
+    throw new Error(`missing generated file dialog for ${workflowKey}.${field}`);
+  }
+  return dialog;
+}
+
+function contractBrowseRequest(
+  workflow: Workflow,
+  field: string,
+  defaultPath: string,
+): SourceBrowseRequest {
+  const dialog = contractDialogForWorkflowField(workflow, field);
+  return {
+    dialogId: dialog.id,
+    mode: dialog.mode,
+    title: dialog.title,
+    defaultPath,
+    filters: fileDialogFilters(dialog),
+  };
+}
+
+function contractDialogForRequest(request: FileDialogRequestLike): FileDialogContractEntry {
+  const dialog = kFileDialogContractById.get(request.dialogId);
+  if (dialog === undefined) {
+    throw new Error(`missing generated file dialog for ${request.dialogId}`);
+  }
+  if (dialog.mode !== request.mode) {
+    throw new Error(`file dialog mode mismatch for ${request.dialogId}`);
+  }
+  return dialog;
+}
 
 function compileModeFromValue(value: unknown): CompileMode {
   if (value === "none" || value === 0 || value === "0") {
@@ -703,7 +813,7 @@ function compileModePatchValue(mode: CompileMode): number {
   }
 }
 
-function modelInputFromValue(value: unknown): ModelInput {
+function modelInputFromValue(value: unknown, fallback: ModelInput = "weights"): ModelInput {
   if (value === "onnx" || value === 1 || value === "1") {
     return "onnx";
   }
@@ -713,7 +823,7 @@ function modelInputFromValue(value: unknown): ModelInput {
   if (value === "none" || value === 3 || value === "3") {
     return "none";
   }
-  return "weights";
+  return fallback;
 }
 
 function modelInputPatchValue(modelInput: ModelInput): number {
@@ -765,10 +875,6 @@ function clampThresholdInput(value: string, fallback: number): number {
   return Math.min(1, Math.max(0, Number(parsed.toFixed(4))));
 }
 
-function selectedPresetFromSnapshot(snapshot: StateSnapshot): string {
-  return stringFromValue(workflowStateRoot(snapshot)?.selected_preset, "rf-detr-seg-medium");
-}
-
 function joinIntegerList(values: ReadonlyArray<number>): string {
   return values.join(", ");
 }
@@ -776,14 +882,17 @@ function joinIntegerList(values: ReadonlyArray<number>): string {
 function parseRemoteFamilies(value: unknown): Record<RemoteGpuFamilyKey, boolean> {
   const entries = Array.isArray(value) ? value : [];
   const remoteFamilies = {
-    a100: false,
-    b200: false,
-    h100: false,
-    h200: false,
-    l_series: false,
+    a100: true,
+    b200: true,
+    h100: true,
+    h200: true,
+    l_series: true,
   };
   for (const option of kRemoteGpuFamilyOptions) {
-    remoteFamilies[option.value] = option.index < entries.length ? entries[option.index] === true : false;
+    remoteFamilies[option.value] =
+      option.index < entries.length
+        ? entries[option.index] === true
+        : remoteFamilies[option.value];
   }
   return remoteFamilies;
 }
@@ -861,31 +970,38 @@ export function trainRemoteFamilyOptions():
 }
 
 export function trainDraftFromSnapshot(snapshot: StateSnapshot): TrainDraft {
-  const root = workflowStateRoot(snapshot);
   const datasetPaths = workflowSectionRecord(snapshot, "train", "dataset_paths");
   const artifacts = workflowSectionRecord(snapshot, "train", "model_artifacts");
   const execution = workflowSectionRecord(snapshot, "train", "execution");
   const training = workflowSectionRecord(snapshot, "train", "training");
   return {
-    selectedPreset: selectedPresetFromSnapshot(snapshot),
-    trainCompiledPath: stringFromValue(datasetPaths?.train_compiled_path),
-    valCompiledPath: stringFromValue(datasetPaths?.val_compiled_path),
+    trainCompiledPath: stringFromValue(
+      datasetPaths?.train_compiled_path,
+      kDefaultTrainCompiledPath,
+    ),
+    valCompiledPath: stringFromValue(
+      datasetPaths?.val_compiled_path,
+      kDefaultValCompiledPath,
+    ),
     testCompiledPath: stringFromValue(datasetPaths?.test_compiled_path),
-    weightsPath: stringFromValue(artifacts?.weights_path),
+    weightsPath: stringFromValue(artifacts?.weights_path, kDefaultTrainWeightsPath),
     resumePath: stringFromValue(training?.resume_path),
-    outputDir: stringFromValue(training?.output_dir),
+    outputDir: stringFromValue(training?.output_dir, kDefaultTrainOutputDir),
     inputMode: trainInputModeFromValue(training?.input_mode),
     executionTarget: trainTargetFromValue(training?.execution_target),
     cpuAffinity: stringFromValue(execution?.cpu_affinity),
     batchSize: formatIntegerString(training?.batch_size, 2),
-    valBatchSize: formatIntegerString(training?.val_batch_size, 0),
+    valBatchSize: formatIntegerString(training?.val_batch_size, 8),
     epochs: formatIntegerString(training?.epochs, 12),
     gradAccumSteps: formatIntegerString(training?.grad_accum_steps, 1),
-    evalMaxDets: formatIntegerString(training?.eval_max_dets, 500),
+    evalMaxDets: formatIntegerString(
+      training?.eval_max_dets,
+      kDefaultSegMediumMaxDets,
+    ),
     printFreq: formatIntegerString(training?.print_freq, 100),
-    prefetchFactor: formatIntegerString(training?.prefetch_factor, 2),
-    workers: formatIntegerString(execution?.workers, 8),
-    lanes: formatIntegerString(execution?.lanes, 0),
+    prefetchFactor: formatIntegerString(training?.prefetch_factor, 3),
+    workers: formatIntegerString(execution?.workers, 16),
+    lanes: formatIntegerString(execution?.lanes, 3),
     compileMode: compileModeFromValue(execution?.compile_mode),
     optimizer: trainOptimizerFromValue(training?.optimizer),
     momentum: formatFixedString(training?.momentum, 4, 0.95),
@@ -903,7 +1019,7 @@ export function trainDraftFromSnapshot(snapshot: StateSnapshot): TrainDraft {
     amp: booleanFromValue(training?.amp, true),
     ema: booleanFromValue(training?.use_ema, false),
     freezeEncoder: booleanFromValue(training?.freeze_encoder, false),
-    progressBar: booleanFromValue(execution?.progress_bar, false),
+    progressBar: booleanFromValue(execution?.progress_bar, true),
     localDeviceIds: joinIntegerList(
       Array.isArray(training?.local_device_ids)
         ? training.local_device_ids
@@ -920,7 +1036,6 @@ export function trainDraftFromSnapshot(snapshot: StateSnapshot): TrainDraft {
 
 export function trainDraftEquals(left: TrainDraft, right: TrainDraft): boolean {
   return (
-    left.selectedPreset === right.selectedPreset &&
     left.trainCompiledPath === right.trainCompiledPath &&
     left.valCompiledPath === right.valCompiledPath &&
     left.testCompiledPath === right.testCompiledPath &&
@@ -972,7 +1087,6 @@ export function buildTrainSettingsPatch(
 ): JsonRecord {
   const fallback = trainDraftFromSnapshot(snapshot);
   return {
-    selected_preset: draft.selectedPreset.trim() || fallback.selectedPreset,
     workflows: {
       train: {
         dataset_paths: {
@@ -1092,53 +1206,17 @@ export function trainBrowseRequestForField(
 ): SourceBrowseRequest {
   switch (field) {
     case "trainCompiledPath":
-      return {
-        dialogId: "train.dataset.train_compiled_path",
-        mode: "open_file",
-        title: "Choose train compiled dataset",
-        defaultPath: draft.trainCompiledPath.trim(),
-        filters: [{ name: "Compiled datasets", patterns: kCompiledDatasetPatterns.slice() }],
-      };
+      return contractBrowseRequest("train", "trainCompiledPath", draft.trainCompiledPath.trim());
     case "valCompiledPath":
-      return {
-        dialogId: "train.dataset.val_compiled_path",
-        mode: "open_file",
-        title: "Choose validation compiled dataset",
-        defaultPath: draft.valCompiledPath.trim(),
-        filters: [{ name: "Compiled datasets", patterns: kCompiledDatasetPatterns.slice() }],
-      };
+      return contractBrowseRequest("train", "valCompiledPath", draft.valCompiledPath.trim());
     case "testCompiledPath":
-      return {
-        dialogId: "train.dataset.test_compiled_path",
-        mode: "open_file",
-        title: "Choose test compiled dataset",
-        defaultPath: draft.testCompiledPath.trim(),
-        filters: [{ name: "Compiled datasets", patterns: kCompiledDatasetPatterns.slice() }],
-      };
+      return contractBrowseRequest("train", "testCompiledPath", draft.testCompiledPath.trim());
     case "weightsPath":
-      return {
-        dialogId: "train.model.weights",
-        mode: "open_file",
-        title: "Choose training weights",
-        defaultPath: draft.weightsPath.trim(),
-        filters: [{ name: "Weights", patterns: kWeightsFilePatterns.slice() }],
-      };
+      return contractBrowseRequest("train", "weightsPath", draft.weightsPath.trim());
     case "resumePath":
-      return {
-        dialogId: "train.training.resume_path",
-        mode: "open_file",
-        title: "Choose checkpoint to resume",
-        defaultPath: draft.resumePath.trim(),
-        filters: [{ name: "Checkpoints", patterns: kWeightsFilePatterns.slice() }],
-      };
+      return contractBrowseRequest("train", "resumePath", draft.resumePath.trim());
     case "outputDir":
-      return {
-        dialogId: "train.training.output_dir",
-        mode: "open_folder",
-        title: "Choose training output directory",
-        defaultPath: draft.outputDir.trim(),
-        filters: [],
-      };
+      return contractBrowseRequest("train", "outputDir", draft.outputDir.trim());
   }
 }
 
@@ -1148,20 +1226,29 @@ export function validateDraftFromSnapshot(snapshot: StateSnapshot): ValidateDraf
   const execution = workflowSectionRecord(snapshot, "validate", "execution");
   const validation = workflowSectionRecord(snapshot, "validate", "validation");
   return {
-    compiledPath: stringFromValue(datasetPaths?.compiled_path),
+    compiledPath: stringFromValue(datasetPaths?.compiled_path, kDefaultValCompiledPath),
     sourceDir: stringFromValue(datasetPaths?.source_dir),
     onnxPath: stringFromValue(artifacts?.onnx_path),
     tensorrtPath: stringFromValue(artifacts?.tensorrt_path),
     saveEnginePath: stringFromValue(validation?.save_engine_path),
-    reportJsonPath: stringFromValue(validation?.report_json_path),
+    reportJsonPath: stringFromValue(
+      validation?.report_json_path,
+      kDefaultValidationReportJsonPath,
+    ),
     split: stringFromValue(validation?.split, "val"),
-    evalOrder: stringFromValue(validation?.eval_order),
-    resolution: formatIntegerString(validation?.resolution, 960),
+    evalOrder: stringFromValue(validation?.eval_order, "onnx,tensorrt"),
+    resolution: formatIntegerString(
+      validation?.resolution,
+      kDefaultSegMediumResolution,
+    ),
     limitImages: formatIntegerString(validation?.limit_images, 0),
-    alignmentImages: formatIntegerString(validation?.alignment_images, 0),
-    evalMaxDets: formatIntegerString(validation?.eval_max_dets, 500),
+    alignmentImages: formatIntegerString(validation?.alignment_images, 16),
+    evalMaxDets: formatIntegerString(
+      validation?.eval_max_dets,
+      kDefaultSegMediumMaxDets,
+    ),
     batchSize: formatIntegerString(validation?.batch_size, 1),
-    prefetchFactor: formatIntegerString(validation?.prefetch_factor, 1),
+    prefetchFactor: formatIntegerString(validation?.prefetch_factor, 2),
     cpuAffinity: stringFromValue(execution?.cpu_affinity),
     deviceId: formatIntegerString(execution?.device_id, 0),
     workers: formatIntegerString(execution?.workers, 0),
@@ -1261,53 +1348,17 @@ export function validateBrowseRequestForField(
 ): SourceBrowseRequest {
   switch (field) {
     case "compiledPath":
-      return {
-        dialogId: "validate.dataset.compiled_path",
-        mode: "open_file",
-        title: "Choose validation compiled dataset",
-        defaultPath: draft.compiledPath.trim(),
-        filters: [{ name: "Compiled datasets", patterns: kCompiledDatasetPatterns.slice() }],
-      };
+      return contractBrowseRequest("validate", "compiledPath", draft.compiledPath.trim());
     case "sourceDir":
-      return {
-        dialogId: "validate.dataset.source_dir",
-        mode: "open_folder",
-        title: "Choose validation source root",
-        defaultPath: draft.sourceDir.trim(),
-        filters: [],
-      };
+      return contractBrowseRequest("validate", "sourceDir", draft.sourceDir.trim());
     case "onnxPath":
-      return {
-        dialogId: "validate.model.onnx",
-        mode: "open_file",
-        title: "Choose validation ONNX",
-        defaultPath: draft.onnxPath.trim(),
-        filters: [{ name: "ONNX", patterns: kOnnxFilePatterns.slice() }],
-      };
+      return contractBrowseRequest("validate", "onnxPath", draft.onnxPath.trim());
     case "tensorrtPath":
-      return {
-        dialogId: "validate.model.tensorrt",
-        mode: "open_file",
-        title: "Choose validation TensorRT engine",
-        defaultPath: draft.tensorrtPath.trim(),
-        filters: [{ name: "TensorRT", patterns: kTensorRtFilePatterns.slice() }],
-      };
+      return contractBrowseRequest("validate", "tensorrtPath", draft.tensorrtPath.trim());
     case "saveEnginePath":
-      return {
-        dialogId: "validate.output.save_engine_path",
-        mode: "save_file",
-        title: "Choose validation engine output",
-        defaultPath: draft.saveEnginePath.trim(),
-        filters: [{ name: "TensorRT", patterns: kTensorRtFilePatterns.slice() }],
-      };
+      return contractBrowseRequest("validate", "saveEnginePath", draft.saveEnginePath.trim());
     case "reportJsonPath":
-      return {
-        dialogId: "validate.report_json_path",
-        mode: "save_file",
-        title: "Choose validation report path",
-        defaultPath: draft.reportJsonPath.trim(),
-        filters: [{ name: "JSON", patterns: kJsonFilePatterns.slice() }],
-      };
+      return contractBrowseRequest("validate", "reportJsonPath", draft.reportJsonPath.trim());
   }
 }
 
@@ -1320,15 +1371,17 @@ export function predictDraftFromSnapshot(
   const execution = workflowSectionRecord(snapshot, workflow, "execution");
   const predict = workflowLeafRecord(snapshot, workflow);
   return {
-    selectedPreset: selectedPresetFromSnapshot(snapshot),
-    weightsPath: stringFromValue(artifacts?.weights_path),
+    weightsPath: stringFromValue(artifacts?.weights_path, kDefaultTrainWeightsPath),
     onnxPath: stringFromValue(artifacts?.onnx_path),
     tensorrtPath: stringFromValue(artifacts?.tensorrt_path),
-    outputPath: stringFromValue(predict?.output_path),
+    outputPath: stringFromValue(predict?.output_path, kDefaultPredictOutputPath),
     backend: stringFromValue(predict?.backend, "auto"),
     modelInput: modelInputFromValue(predict?.model_input),
-    batchSize: formatIntegerString(predict?.batch_size, 1),
-    maxDetsPerImage: formatIntegerString(predict?.max_dets_per_image, 500),
+    batchSize: formatIntegerString(predict?.batch_size, 4),
+    maxDetsPerImage: formatIntegerString(
+      predict?.max_dets_per_image,
+      kDefaultSegMediumMaxDets,
+    ),
     liveSplitCount: formatIntegerString(predict?.live_split_count, 1),
     cpuAffinity: stringFromValue(execution?.cpu_affinity),
     deviceId: formatIntegerString(execution?.device_id, 0),
@@ -1343,7 +1396,6 @@ export function predictDraftFromSnapshot(
 
 export function predictDraftEquals(left: PredictDraft, right: PredictDraft): boolean {
   return (
-    left.selectedPreset === right.selectedPreset &&
     left.weightsPath === right.weightsPath &&
     left.onnxPath === right.onnxPath &&
     left.tensorrtPath === right.tensorrtPath &&
@@ -1372,7 +1424,6 @@ export function buildPredictSettingsPatch(
   const workflowKey = workflowRecordKey(workflow);
   const fallback = predictDraftFromSnapshot(snapshot, workflow);
   return {
-    selected_preset: draft.selectedPreset.trim() || fallback.selectedPreset,
     workflows: {
       [workflowKey]: {
         model_artifacts: {
@@ -1419,37 +1470,13 @@ export function predictBrowseRequestForField(
   const workflowKey = workflowRecordKey(workflow);
   switch (field) {
     case "weightsPath":
-      return {
-        dialogId: `${workflowKey}.model.weights`,
-        mode: "open_file",
-        title: "Choose model weights",
-        defaultPath: draft.weightsPath.trim(),
-        filters: [{ name: "Weights", patterns: kWeightsFilePatterns.slice() }],
-      };
+      return contractBrowseRequest(workflowKey, "weightsPath", draft.weightsPath.trim());
     case "onnxPath":
-      return {
-        dialogId: `${workflowKey}.model.onnx`,
-        mode: "open_file",
-        title: "Choose ONNX model",
-        defaultPath: draft.onnxPath.trim(),
-        filters: [{ name: "ONNX", patterns: kOnnxFilePatterns.slice() }],
-      };
+      return contractBrowseRequest(workflowKey, "onnxPath", draft.onnxPath.trim());
     case "tensorrtPath":
-      return {
-        dialogId: `${workflowKey}.model.tensorrt`,
-        mode: "open_file",
-        title: "Choose TensorRT engine",
-        defaultPath: draft.tensorrtPath.trim(),
-        filters: [{ name: "TensorRT", patterns: kTensorRtFilePatterns.slice() }],
-      };
+      return contractBrowseRequest(workflowKey, "tensorrtPath", draft.tensorrtPath.trim());
     case "outputPath":
-      return {
-        dialogId: `${workflowKey}.output_path`,
-        mode: "save_file",
-        title: workflow === "live" ? "Choose live output path" : "Choose prediction output path",
-        defaultPath: draft.outputPath.trim(),
-        filters: [{ name: "JSON", patterns: kJsonFilePatterns.slice() }],
-      };
+      return contractBrowseRequest(workflowKey, "outputPath", draft.outputPath.trim());
   }
 }
 
@@ -1461,11 +1488,14 @@ export function annotateDraftFromSnapshot(snapshot: StateSnapshot): AnnotateDraf
     weightsPath: stringFromValue(artifacts?.weights_path),
     onnxPath: stringFromValue(artifacts?.onnx_path),
     tensorrtPath: stringFromValue(artifacts?.tensorrt_path),
-    outputDir: stringFromValue(annotate?.output_dir),
+    outputDir: stringFromValue(annotate?.output_dir, kDefaultAnnotateOutputDir),
     split: stringFromValue(annotate?.split, "train"),
     backend: stringFromValue(annotate?.backend, "auto"),
-    modelInput: modelInputFromValue(annotate?.model_input),
-    maxDetsPerImage: formatIntegerString(annotate?.max_dets_per_image, 300),
+    modelInput: modelInputFromValue(annotate?.model_input, "none"),
+    maxDetsPerImage: formatIntegerString(
+      annotate?.max_dets_per_image,
+      kDefaultSegMediumMaxDets,
+    ),
     deviceId: formatIntegerString(execution?.device_id, 0),
     threshold: formatThresholdString(annotate?.threshold, 0.25),
     allowFp16: booleanFromValue(execution?.allow_fp16, true),
@@ -1534,37 +1564,13 @@ export function annotateBrowseRequestForField(
 ): SourceBrowseRequest {
   switch (field) {
     case "weightsPath":
-      return {
-        dialogId: "annotate.model.weights",
-        mode: "open_file",
-        title: "Choose annotate model weights",
-        defaultPath: draft.weightsPath.trim(),
-        filters: [{ name: "Weights", patterns: kWeightsFilePatterns.slice() }],
-      };
+      return contractBrowseRequest("annotate", "weightsPath", draft.weightsPath.trim());
     case "onnxPath":
-      return {
-        dialogId: "annotate.model.onnx",
-        mode: "open_file",
-        title: "Choose annotate ONNX model",
-        defaultPath: draft.onnxPath.trim(),
-        filters: [{ name: "ONNX", patterns: kOnnxFilePatterns.slice() }],
-      };
+      return contractBrowseRequest("annotate", "onnxPath", draft.onnxPath.trim());
     case "tensorrtPath":
-      return {
-        dialogId: "annotate.model.tensorrt",
-        mode: "open_file",
-        title: "Choose annotate TensorRT engine",
-        defaultPath: draft.tensorrtPath.trim(),
-        filters: [{ name: "TensorRT", patterns: kTensorRtFilePatterns.slice() }],
-      };
+      return contractBrowseRequest("annotate", "tensorrtPath", draft.tensorrtPath.trim());
     case "outputDir":
-      return {
-        dialogId: "annotate.output_dir",
-        mode: "open_folder",
-        title: "Choose annotation output directory",
-        defaultPath: draft.outputDir.trim(),
-        filters: [],
-      };
+      return contractBrowseRequest("annotate", "outputDir", draft.outputDir.trim());
   }
 }
 
@@ -1575,7 +1581,7 @@ export function exportDraftFromSnapshot(snapshot: StateSnapshot): ExportDraft {
   return {
     weightsPath: stringFromValue(artifacts?.weights_path),
     onnxPath: stringFromValue(artifacts?.onnx_path),
-    outputPath: stringFromValue(exportRecord?.output_path),
+    outputPath: stringFromValue(exportRecord?.output_path, kDefaultExportOutputPath),
     deviceId: formatIntegerString(execution?.device_id, 0),
     opsetVersion: formatIntegerString(exportRecord?.opset_version, 19),
     allowFp16: booleanFromValue(execution?.allow_fp16, true),
@@ -1634,28 +1640,10 @@ export function exportBrowseRequestForField(
 ): SourceBrowseRequest {
   switch (field) {
     case "weightsPath":
-      return {
-        dialogId: "export.model.weights",
-        mode: "open_file",
-        title: "Choose export model weights",
-        defaultPath: draft.weightsPath.trim(),
-        filters: [{ name: "Weights", patterns: kWeightsFilePatterns.slice() }],
-      };
+      return contractBrowseRequest("export", "weightsPath", draft.weightsPath.trim());
     case "onnxPath":
-      return {
-        dialogId: "export.model.onnx",
-        mode: "open_file",
-        title: "Choose export ONNX model",
-        defaultPath: draft.onnxPath.trim(),
-        filters: [{ name: "ONNX", patterns: kOnnxFilePatterns.slice() }],
-      };
+      return contractBrowseRequest("export", "onnxPath", draft.onnxPath.trim());
     case "outputPath":
-      return {
-        dialogId: "export.output_path",
-        mode: "save_file",
-        title: "Choose export output path",
-        defaultPath: draft.outputPath.trim(),
-        filters: [{ name: "TensorRT", patterns: kTensorRtFilePatterns.slice() }],
-      };
+      return contractBrowseRequest("export", "outputPath", draft.outputPath.trim());
   }
 }
